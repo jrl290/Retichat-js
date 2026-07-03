@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>Retichat Web</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
+    <link rel="stylesheet" href="style.css">
+
+    <!--
+        Import map: redirects Node.js built-in module imports to browser
+        polyfills served from CDN (esm.sh). No npm, no build step, no tooling.
+        Just copy this folder to any static web server.
+    -->
+    <script type="importmap">
+    {
+        "imports": {
+            "crypto": "./lib/shims/crypto.js",
+            "buffer": "https://esm.sh/buffer@6.0.3",
+            "@noble/curves/": "https://esm.sh/@noble/curves@1.6.0/",
+            "@noble/hashes/": "https://esm.sh/@noble/hashes@1.7.1/",
+            "msgpackr": "https://esm.sh/msgpackr@1.11.2",
+            "aes-js": "https://esm.sh/aes-js@3.1.2",
+            "net": "./lib/shims/net.js",
+            "ws": "./lib/shims/ws.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="app"></div>
+    <script type="module" src="app.js"></script>
+</body>
+</html>

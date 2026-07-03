@@ -1,0 +1,10 @@
+# Local configuration
+config.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
