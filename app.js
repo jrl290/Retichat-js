@@ -412,12 +412,8 @@ function h(tag, a={}, ...kids) {
         else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2).toLowerCase(), v);
         else if (k === "htmlFor") el.setAttribute("for", v);
         else if (k === "innerHTML") el.innerHTML = v;
-        else if (boolProps.has(k)) {
-            // Boolean attributes: use DOM property, not setAttribute
-            el[k] = !!v;
-        } else {
-            el.setAttribute(k, v);
-        }
+        else if (boolProps.has(k)) { el[k] = !!v; }
+        else { el.setAttribute(k, v); }
     }
     for (const c of kids.flat()) { if (c == null || c === false) continue; el.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }
     return el;
@@ -425,50 +421,416 @@ function h(tag, a={}, ...kids) {
 function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 function fmtTime(ts) { return new Date(ts).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }
+function fmtDate(ts) {
+    const d = new Date(ts);
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    if (isToday) return fmtTime(ts);
+    const yesterday = new Date(now); yesterday.setDate(yesterday.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
+    return d.toLocaleDateString([], {month:"short", day:"numeric"});
+}
+
+/** Deterministic avatar color hue from a string (matches iOS avatarColorHue) */
+function avatarHue(name) {
+    let hash = 5381;
+    for (let i = 0; i < name.length; i++) hash = ((hash * 33) ^ name.charCodeAt(i)) >>> 0;
+    return (hash % 360);
+}
 
 // =========================================================================
-//  APP CONTROLLER
+//  APP STATE
 // =========================================================================
 const App = {
     root: document.getElementById("app"),
-    activeHash: null,
-    _view: "onboarding",
-
-    async start() {
-        if (!IdMgr.load()) { this._view = "onboarding"; this._render(); return; }
-        this._view = "main";
-        this._render();
-        try { await RnsClient.connect(); } catch(e) { console.error("RNS connect failed", e); }
-        this._wire();
+    state: {
+        view: "onboarding",     // "onboarding" | "main"
+        activeHash: null,        // destHash of open chat
+        theme: "dark",           // "dark" | "light"
+        searchQuery: "",
+        showSettings: false,
+        showAddContact: false,
+        showShareId: false,
+        isWide: window.innerWidth >= 800,
     },
 
-    _render() {
+    // ===== LIFECYCLE =====
+
+    async start() {
+        // Restore theme
+        const savedTheme = localStorage.getItem("retichat_theme");
+        if (savedTheme === "light" || savedTheme === "dark") this.state.theme = savedTheme;
+        document.documentElement.setAttribute("data-theme", this.state.theme);
+
+        if (!IdMgr.load()) { this.state.view = "onboarding"; this.render(); return; }
+        this.state.view = "main";
+        this.render();
+        try { await RnsClient.connect(); } catch(e) { console.error("RNS connect failed", e); }
+        this._wire();
+        this._listenResize();
+    },
+
+    _listenResize() {
+        window.addEventListener("resize", () => {
+            const wasWide = this.state.isWide;
+            this.state.isWide = window.innerWidth >= 800;
+            // Re-render if crossing the breakpoint
+            if (wasWide !== this.state.isWide) {
+                // On narrow, if we had a chat open, keep it
+                this.render();
+            }
+        });
+
+        // Escape key closes any open modal
+        window.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") {
+                if (this.state.showSettings || this.state.showAddContact || this.state.showShareId) {
+                    this.state.showSettings = false;
+                    this.state.showAddContact = false;
+                    this.state.showShareId = false;
+                    this.render();
+                }
+            }
+        });
+    },
+
+    // ===== RENDER =====
+
+    render() {
         clear(this.root);
-        switch (this._view) {
-            case "onboarding": this._renderOnboarding(); break;
-            case "main": this._renderMain(); break;
-            case "addContact": this._renderAddContact(); break;
-            case "chat": this._renderChat(); break;
-            case "shareId": this._renderShareId(); break;
-            case "settings": this._renderSettings(); break;
+        if (this.state.view === "onboarding") {
+            // Center the onboarding card in the viewport
+            this.root.style.justifyContent = "center";
+            this.root.style.alignItems = "center";
+            this._renderOnboarding();
+            return;
+        }
+        // Reset for two-panel layout
+        this.root.style.justifyContent = "";
+        this.root.style.alignItems = "";
+
+        // ---- Wide layout: side-by-side sidebar + detail ----
+        if (this.state.isWide) {
+            this._renderWide();
+        } else {
+            // ---- Narrow layout: single column ----
+            this._renderNarrow();
+        }
+
+        // ---- Modals (rendered as overlays) ----
+        if (this.state.showSettings) this._renderSettingsModal();
+        if (this.state.showAddContact) this._renderAddContactModal();
+        if (this.state.showShareId) this._renderShareIdModal();
+    },
+
+    /** Wide layout: sidebar (left) + detail (right) */
+    _renderWide() {
+        this.root.append(
+            h("div", { className: "sidebar" },
+                this._buildSidebarContent(),
+            ),
+            h("div", { className: "detail" },
+                this.state.activeHash
+                    ? this._buildChatView()
+                    : this._buildPlaceholder(),
+            ),
+        );
+    },
+
+    /** Narrow layout: show list or chat */
+    _renderNarrow() {
+        if (this.state.activeHash) {
+            // Chat is open — show detail panel sliding in from right
+            document.body.classList.add("narrow-chat-open");
+            this.root.append(
+                h("div", { className: "sidebar hidden" }),
+                h("div", { className: "detail" },
+                    this._buildChatView(),
+                ),
+            );
+        } else {
+            // Show sidebar
+            document.body.classList.remove("narrow-chat-open");
+            this.root.append(
+                h("div", { className: "sidebar" },
+                    this._buildSidebarContent(),
+                ),
+                h("div", { className: "detail hidden" }),
+            );
         }
     },
 
-    // ---------- ONBOARDING ----------
+    // ===== SIDEBAR CONTENT =====
+
+    _buildSidebarContent() {
+        const contacts = ContactStore.getAll();
+        const filtered = this.state.searchQuery
+            ? contacts.filter(c => {
+                const name = (c.alias || c.displayName || "").toLowerCase();
+                const hash = c.destHash.toLowerCase();
+                const q = this.state.searchQuery.toLowerCase();
+                return name.includes(q) || hash.includes(q);
+            })
+            : contacts;
+        const hasContacts = contacts.length > 0;
+        const connType = RnsClient.connType;
+
+        const frag = document.createDocumentFragment();
+
+        // Header
+        frag.appendChild(
+            h("div", { className: "sidebar-header" },
+                h("span", { id: "status-dot", className: "status-dot" }),
+                h("h1", {}, "Retichat"),
+                h("button", { className: "icon-btn", title: "Share Identity",
+                    onClick: () => { this.state.showShareId = true; this.render(); } }, "🔗"),
+                h("button", { className: "icon-btn", title: "Settings",
+                    onClick: () => { this.state.showSettings = true; this.render(); } }, "⚙"),
+            ),
+        );
+
+        // Search bar
+        frag.appendChild(
+            h("div", { className: "search-bar" },
+                h("span", { className: "search-icon" }, "🔍"),
+                h("input", {
+                    id: "search-input",
+                    type: "text",
+                    placeholder: "Search chats…",
+                    value: this.state.searchQuery,
+                    onInput: (e) => {
+                        this.state.searchQuery = e.target.value;
+                        this.render();
+                    },
+                }),
+                h("button", {
+                    className: "search-clear" + (this.state.searchQuery ? " visible" : ""),
+                    onClick: () => { this.state.searchQuery = ""; this.render(); },
+                }, "✕"),
+            ),
+        );
+
+        // Contact list or empty state
+        if (hasContacts && filtered.length === 0 && this.state.searchQuery) {
+            frag.appendChild(
+                h("div", { className: "empty-list" },
+                    h("div", { className: "empty-icon" }, "🔍"),
+                    h("h2", {}, "No results"),
+                    h("p", {}, `No contacts match "${esc(this.state.searchQuery)}"`),
+                ),
+            );
+        } else if (!hasContacts) {
+            frag.appendChild(
+                h("div", { className: "empty-list" },
+                    h("div", { className: "empty-icon" }, "💬"),
+                    h("h2", {}, "No conversations yet"),
+                    h("p", {}, "Add a contact using the + button to start chatting privately over Reticulum."),
+                    h("button", { className: "btn btn-primary", style: { marginTop: "8px" },
+                        onClick: () => { this.state.showAddContact = true; this.render(); } },
+                        "+ Add Contact"),
+                ),
+            );
+        } else {
+            frag.appendChild(
+                h("div", { className: "contact-list" },
+                    ...filtered.map(c => this._buildContactItem(c)),
+                ),
+            );
+        }
+
+        // FAB for adding contact
+        if (hasContacts) {
+            frag.appendChild(
+                h("button", { className: "fab",
+                    onClick: () => { this.state.showAddContact = true; this.render(); } }, "+"),
+            );
+        }
+
+        return frag;
+    },
+
+    _buildContactItem(c) {
+        const name = c.alias || c.displayName || "?" + c.destHash.slice(0, 8);
+        const preview = MsgStore.preview(c.destHash);
+        const msgs = MsgStore.get(c.destHash);
+        const lastTs = msgs.length > 0 ? msgs[msgs.length - 1].timestamp : c.lastSeen;
+        const isActive = this.state.activeHash === c.destHash;
+        const hue = avatarHue(name);
+
+        return h("div", {
+            className: "contact-item" + (isActive ? " active" : ""),
+            onClick: () => this.openChat(c.destHash),
+        },
+            h("div", {
+                className: "contact-avatar",
+                style: { color: `hsl(${hue}, 50%, 65%)`, background: `hsla(${hue}, 50%, 40%, 0.15)`, borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
+            }, name.charAt(0).toUpperCase()),
+            h("div", { className: "contact-info" },
+                h("div", { className: "contact-name" }, esc(name)),
+                preview
+                    ? h("div", { className: "contact-preview" }, esc(preview))
+                    : h("div", { className: "contact-preview", style: { fontStyle: "italic" } }, "Tap to chat"),
+            ),
+            h("div", { className: "contact-meta" },
+                h("div", { className: "contact-time" }, lastTs ? fmtDate(lastTs) : ""),
+                !c.publicKey
+                    ? h("span", { className: "contact-badge waiting" }, "⏳")
+                    : null,
+            ),
+        );
+    },
+
+    // ===== DETAIL PANEL =====
+
+    _buildPlaceholder() {
+        return h("div", { className: "placeholder" },
+            h("div", { className: "ph-icon" }, "💬"),
+            h("h2", {}, "Select a conversation"),
+            h("p", { style: { color: "var(--text-muted)", fontSize: "14px" } },
+                "Choose a contact from the sidebar to start chatting."),
+        );
+    },
+
+    _buildChatView() {
+        const c = ContactStore.get(this.state.activeHash);
+        if (!c) { this.state.activeHash = null; this.render(); return document.createDocumentFragment(); }
+        const name = c.alias || c.displayName || "?" + c.destHash.slice(0, 8);
+        const msgs = MsgStore.get(c.destHash);
+        const hue = avatarHue(name);
+
+        return h("div", { className: "chat-view" },
+            // Header
+            h("div", { className: "chat-header" },
+                h("button", { className: "back-btn",
+                    onClick: () => this.closeChat() }, "←"),
+                h("div", {
+                    className: "header-avatar",
+                    style: { color: `hsl(${hue}, 50%, 65%)`, background: `hsla(${hue}, 50%, 40%, 0.15)`, borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
+                }, name.charAt(0).toUpperCase()),
+                h("div", { className: "header-info" },
+                    h("div", { className: "header-name" }, esc(name)),
+                    h("div", { className: "header-hash" },
+                        c.destHash + (c.publicKey ? "" : " — waiting for public key…")),
+                ),
+                h("button", { className: "icon-btn", title: "Contact info",
+                    onClick: () => { /* future: contact info sheet */ } }, "ℹ"),
+            ),
+
+            // Messages
+            h("div", { className: "message-list", id: "msg-list" },
+                ...(msgs.length === 0
+                    ? [h("div", { className: "msg-system" },
+                        "Share your identity link with this contact so they can add you back. Messages are end-to-end encrypted. 🔐")]
+                    : msgs.map(m => {
+                        const isOwn = m.dir === "out";
+                        return h("div", { className: `msg-row ${isOwn ? "own" : "their"}` },
+                            h("div", { className: "msg-bubble" }, esc(m.content)),
+                            h("div", { className: "msg-meta" },
+                                h("span", {}, fmtTime(m.timestamp)),
+                                isOwn ? h("span", {}, m.status === "sent" ? "✓" : "✓✓") : null,
+                            ),
+                        );
+                    })),
+            ),
+
+            // Composer
+            h("div", { className: "composer" },
+                h("textarea", {
+                    id: "composer-input",
+                    placeholder: c.publicKey ? "Message…" : "Waiting for public key…",
+                    rows: 1,
+                    disabled: !c.publicKey,
+                    onKeydown: (e) => {
+                        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.sendMessage(); }
+                    },
+                    onInput: (e) => {
+                        e.target.style.height = "auto";
+                        e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
+                    },
+                }),
+                h("button", {
+                    className: "btn-send",
+                    disabled: !c.publicKey,
+                    onClick: () => this.sendMessage(),
+                }, "➤"),
+            ),
+        );
+    },
+
+    // ===== ACTIONS =====
+
+    openChat(hash) {
+        this.state.activeHash = hash;
+        this.state.showSettings = false;
+        this.state.showAddContact = false;
+        this.state.showShareId = false;
+        this.render();
+        // Scroll to bottom after render
+        requestAnimationFrame(() => this._scrollChatBottom());
+    },
+
+    closeChat() {
+        this.state.activeHash = null;
+        document.body.classList.remove("narrow-chat-open");
+        this.render();
+    },
+
+    sendMessage() {
+        const ta = document.getElementById("composer-input");
+        if (!ta) return;
+        const content = ta.value.trim();
+        if (!content) return;
+        const c = ContactStore.get(this.state.activeHash);
+        if (!c) return;
+        try {
+            RnsClient.sendMessage(c, content);
+            ta.value = "";
+            ta.style.height = "auto";
+            this.render();
+            requestAnimationFrame(() => {
+                this._scrollChatBottom();
+                document.getElementById("composer-input")?.focus();
+            });
+        } catch(e) { alert("Send failed: " + e.message); }
+    },
+
+    _scrollChatBottom() {
+        const ml = document.getElementById("msg-list");
+        if (ml) ml.scrollTop = ml.scrollHeight;
+    },
+
+    toggleTheme() {
+        this.state.theme = this.state.theme === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", this.state.theme);
+        localStorage.setItem("retichat_theme", this.state.theme);
+        // Update theme-color meta tag
+        const mc = document.querySelector('meta[name="theme-color"]');
+        if (mc) mc.content = this.state.theme === "dark" ? "#0F0F1A" : "#F2F3F7";
+    },
+
+    // ===== ONBOARDING =====
+
     _renderOnboarding() {
         this.root.appendChild(
             h("div", { className: "onboarding" },
                 h("h1", {}, "🜃 Retichat Web"),
                 h("p", { className: "subtitle" }, "Private chat over the Reticulum Network Stack"),
-                h("div", { className: "form-group" },
+                h("div", { className: "settings-field", style: { marginBottom: "20px" } },
                     h("label", {}, "Create a new identity"),
-                    h("button", { className: "btn btn-primary", onClick: () => { IdMgr.create(); this._showIdCreated(); } }, "✨ Create New Identity"),
+                    h("button", { className: "btn btn-primary btn-block",
+                        onClick: () => { IdMgr.create(); this._showIdCreated(); } },
+                        "✨ Create New Identity"),
                 ),
-                h("div", { className: "divider" }, "or"),
-                h("div", { className: "form-group" },
+                h("div", { className: "form-divider" }, "or"),
+                h("div", { className: "settings-field" },
                     h("label", { htmlFor: "import-hex" }, "Import existing identity (hex private key)"),
-                    h("textarea", { id: "import-hex", placeholder: "Paste 128-char hex private key...", rows: 3 }),
-                    h("button", { className: "btn btn-secondary", style: { marginTop:"8px", width:"100%" },
+                    h("textarea", {
+                        id: "import-hex",
+                        placeholder: "Paste 128-char hex private key…",
+                        rows: 3,
+                        style: { marginTop: "4px" },
+                    }),
+                    h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
                         onClick: () => this._importId() }, "📥 Import Identity"),
                 ),
             )
@@ -487,331 +849,155 @@ const App = {
             h("div", { className: "onboarding" },
                 h("h1", {}, "✅ Identity Ready"),
                 h("p", { className: "subtitle" }, "Save your private key somewhere safe!"),
-                h("div", { className: "form-group" },
-                    h("label", {}, "Your identity hash (for backup only — not what you share)"),
-                    h("div", { className: "identity-preview" }, IdMgr.hash ?? "???"),
+                h("div", { className: "settings-field" },
+                    h("label", {}, "Your identity hash (for backup only)"),
+                    h("div", { className: "mono-value" }, IdMgr.hash ?? "???"),
                 ),
-                h("div", { className: "form-group" },
+                h("div", { className: "settings-field" },
                     h("label", {}, "Private key (save this!)"),
-                    h("textarea", { readonly: true, rows: 3, style: { background:"#fff3cd" } }, IdMgr.privKey ?? ""),
+                    h("textarea", {
+                        readonly: true,
+                        rows: 3,
+                        style: { background: "var(--warning-bg)", color: "var(--warning)" },
+                    }, IdMgr.privKey ?? ""),
                 ),
-                h("button", { className: "btn btn-primary", onClick: () => this._enterApp() }, "🚀 Enter Retichat"),
+                h("button", { className: "btn btn-primary btn-block",
+                    onClick: () => this._enterApp() }, "🚀 Enter Retichat"),
             )
         );
     },
 
     async _enterApp() {
-        this._view = "main"; this._render();
+        this.state.view = "main";
+        this.render();
         try { await RnsClient.connect(); } catch(e) { console.error(e); }
         this._wire();
     },
 
-    // ---------- MAIN (Contact List) ----------
-    _renderMain() {
-        const contacts = ContactStore.getAll();
-        const hasContacts = contacts.length > 0;
-        const hasDirectSockets = DirectSocketsInterface.isAvailable();
-        const connType = RnsClient.connType;
+    // ===== MODALS =====
 
-        // Build the top area
-        const topChildren = [
-            h("div", { className: "sidebar-header" },
-                h("div", { style: { display:"flex", alignItems:"center", gap:"8px" } },
-                    h("span", { id:"status-dot", className:"status-dot offline" }),
-                    h("h1", {}, "Retichat"),
-                ),
-                h("div", { style: { display:"flex", gap:"4px" } },
-                    hasContacts ? h("button", { className:"btn btn-secondary", style:{padding:"6px 10px",fontSize:"12px"},
-                        onClick: () => { this._view = "addContact"; this._render(); } }, "+") : null,
-                    h("button", { className:"btn btn-secondary", style:{padding:"6px 10px",fontSize:"12px"},
-                        onClick: () => { this._view = "shareId"; this._render(); } }, "🔗"),
-                    h("button", { className:"btn btn-secondary", style:{padding:"6px 10px",fontSize:"12px"},
-                        onClick: () => { this._view = "settings"; this._render(); } }, "⚙"),
-                ),
-            ),
-        ];
-
-        // Show connection status banner
-        if (connType === "exchange") {
-            topChildren.push(
-                h("div", { style: {
-                    padding: "6px 12px", fontSize: "11px", background: "#d4edda",
-                    borderBottom: "1px solid #28a745", color: "#155724",
-                }},
-                    "🟢 Connected via HTTP Exchange (Reticulum-php node)"
-                ),
-            );
-        } else if (connType === "direct") {
-            topChildren.push(
-                h("div", { style: {
-                    padding: "6px 12px", fontSize: "11px", background: "#d4edda",
-                    borderBottom: "1px solid #28a745", color: "#155724",
-                }},
-                    "🟢 Connected via Direct Sockets (raw TCP)"
-                ),
-            );
-        } else if (!hasDirectSockets && connType !== "websocket") {
-            topChildren.push(
-                h("div", { style: {
-                    padding: "8px 12px", fontSize: "11px", background: "#fff3cd",
-                    borderBottom: "1px solid #ffc107", color: "#856404", lineHeight: "1.4",
-                }},
-                    "⚠ No connection method configured. Set ",
-                    h("code", { style: { background:"#ffeeba", padding:"1px 4px", borderRadius:"3px" } }, "exchangeUrl"),
-                    " in config.json to connect to your Reticulum-php node."
-                ),
-            );
-        } else if (!hasDirectSockets && connType === "websocket") {
-            topChildren.push(
-                h("div", { style: {
-                    padding: "8px 12px", fontSize: "11px", background: "#fff3cd",
-                    borderBottom: "1px solid #ffc107", color: "#856404", lineHeight: "1.4",
-                }},
-                    "⚠ Direct Sockets unavailable — using WebSocket fallback."
-                ),
-            );
-        }
-
-        topChildren.push(
-            hasContacts
-                ? h("div", { className: "contact-list", style: { flex:1, overflowY:"auto" } },
-                    ...contacts.map(c => {
-                        const name = c.alias || c.displayName || "?"+c.destHash.slice(0,8);
-                        const preview = MsgStore.preview(c.destHash);
-                        return h("div", {
-                            className: "contact-item",
-                            onClick: () => { this.activeHash = c.destHash; this._view = "chat"; this._render(); },
-                        },
-                            h("div", { className: "contact-avatar" }, name.charAt(0).toUpperCase()),
-                            h("div", { className: "contact-info" },
-                                h("div", { className: "contact-name" }, esc(name)),
-                                preview
-                                    ? h("div", { className: "contact-preview" }, esc(preview))
-                                    : h("div", { className: "contact-preview", style:{fontStyle:"italic"} }, "Tap to chat"),
-                            ),
-                            h("div", { className: "contact-hops" }, c.publicKey ? "" : "⏳"),
-                        );
-                    }))
-                : h("div", { className: "empty-state", style:{flex:1} },
-                    h("div", { className: "icon" }, "🔒"),
-                    h("h2", {}, "No contacts yet"),
-                    h("p", {}, "Retichat is private by default. Add a contact by entering their destination hash."),
-                    h("button", { className:"btn btn-primary", style:{marginTop:"12px"},
-                        onClick: () => { this._view = "addContact"; this._render(); } }, "+ Add Contact"),
-                ),
-        );
-
-        this.root.appendChild(
-            h("div", { className: "app-shell" },
-                h("div", { className: "sidebar", style: { width:"100%", minWidth:"unset", display:"flex", flexDirection:"column" } },
-                    ...topChildren,
-                ),
-            )
-        );
-    },
-
-    // ---------- ADD CONTACT ----------
-    _renderAddContact() {
-        let inputValue = "";
-        const doAdd = () => {
-            const raw = inputValue.trim();
-            if (!raw) { alert("Enter a destination hash."); return; }
-            let hash = raw.toLowerCase().replace(/^lxmf:\/\/|^lxma:\/\//, "");
-            const colonIdx = hash.indexOf(":");
-            if (colonIdx > -1) hash = hash.substring(0, colonIdx);
-            hash = hash.replace(/[^0-9a-f]/g, "");
-            if (hash.length !== 32) { alert("Destination hash must be exactly 32 hex characters.\n\nGot: " + (hash || "(empty)") + " (" + hash.length + " chars)"); return; }
-            try {
-                ContactStore.add(hash);
-                this._view = "main"; this._render();
-            } catch(e) { alert(e.message); }
-        };
-
-        this.root.appendChild(
-            h("div", { className: "onboarding" },
-                h("h1", {}, "Add Contact"),
-                h("p", { className: "subtitle" }, "Enter their destination hash, or paste an lxmf:// link."),
-                h("div", { className: "form-group" },
-                    h("label", { htmlFor: "add-hash" }, "Destination hash (32 hex characters)"),
-                    h("input", {
-                        id: "add-hash", type: "text",
-                        placeholder: "e.g. a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-                        onInput: (e) => { inputValue = e.target.value; },
-                        onKeydown: (e) => { if (e.key === "Enter") doAdd(); },
-                    }),
-                    h("div", { style:{fontSize:"11px",color:"var(--text-muted)",marginTop:"4px"} },
-                        "You can also paste an lxmf:// or lxma:// link from another Retichat user."),
-                ),
-                h("div", { className: "btn-row" },
-                    h("button", { className:"btn btn-primary", onClick: doAdd }, "Add Contact"),
-                    h("button", { className:"btn btn-secondary",
-                        onClick: () => { this._view = "main"; this._render(); } }, "Cancel"),
-                ),
-            )
-        );
-        setTimeout(() => this.root.querySelector("#add-hash")?.focus(), 100);
-    },
-
-    // ---------- CHAT ----------
-    _renderChat() {
-        const c = ContactStore.get(this.activeHash);
-        if (!c) { this._view = "main"; this._render(); return; }
-        const name = c.alias || c.displayName || "?"+c.destHash.slice(0,8);
-        const msgs = MsgStore.get(c.destHash);
-
-        this.root.appendChild(
-            h("div", { className:"app-shell", style:{flexDirection:"column"} },
-                h("div", { className:"chat-header", style:{flexShrink:0} },
-                    h("button", { className:"btn btn-secondary", style:{padding:"4px 8px",fontSize:"12px"},
-                        onClick: () => { this._view = "main"; this._render(); } }, "←"),
-                    h("div", { className:"contact-avatar", style:{width:"32px",height:"32px",fontSize:"13px"} }, name.charAt(0).toUpperCase()),
-                    h("div", {},
-                        h("div", { className:"peer-name" }, esc(name)),
-                        h("div", { className:"peer-hash" }, c.destHash + (c.publicKey ? "" : " — waiting for public key...")),
-                    ),
-                ),
-                h("div", { className:"message-list", id:"msg-list", style:{flex:1} },
-                    ...(msgs.length === 0
-                        ? [h("div", { className:"message-system" }, "Share your identity link with this contact so they can add you back. Messages are end-to-end encrypted. 🔐")]
-                        : msgs.map(m => {
-                            const isOwn = m.dir === "out";
-                            return h("div", { className:`message-row ${isOwn?"own":"their"}` },
-                                h("div", { className:"message-bubble" }, esc(m.content)),
-                                h("div", { className:"message-meta" },
-                                    h("span", {}, fmtTime(m.timestamp)),
-                                    isOwn ? h("span", {}, m.status==="sent" ? "✓" : "✓✓") : null,
-                                ),
-                            );
-                        })),
-                ),
-                h("div", { className:"composer", style:{flexShrink:0} },
-                    h("textarea", {
-                        id:"composer-input",
-                        placeholder: c.publicKey ? "Type a message..." : "Waiting for contact's public key...",
-                        rows:1,
-                        disabled: !c.publicKey,
-                        onKeydown: (e) => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); this._sendMsg(); } },
-                        onInput: (e) => { e.target.style.height="auto"; e.target.style.height=Math.min(e.target.scrollHeight,120)+"px"; },
-                    }),
-                    h("button", { className:"btn-send", disabled:!c.publicKey, onClick:() => this._sendMsg() }, "➤"),
-                ),
-            )
-        );
-        requestAnimationFrame(() => {
-            const ml = document.getElementById("msg-list");
-            if (ml) ml.scrollTop = ml.scrollHeight;
-            document.getElementById("composer-input")?.focus();
-        });
-    },
-
-    _sendMsg() {
-        const ta = document.getElementById("composer-input");
-        if (!ta) return;
-        const content = ta.value.trim(); if (!content) return;
-        const c = ContactStore.get(this.activeHash); if (!c) return;
-        try {
-            RnsClient.sendMessage(c, content);
-            ta.value = ""; ta.style.height = "auto";
-            this._render();
-            requestAnimationFrame(() => {
-                const ml = document.getElementById("msg-list");
-                if (ml) ml.scrollTop = ml.scrollHeight;
-                document.getElementById("composer-input")?.focus();
-            });
-        } catch(e) { alert("Send failed: " + e.message); }
-    },
-
-    // ---------- SHARE IDENTITY ----------
-    _renderShareId() {
-        const hash = RnsClient.ownHash || IdMgr.hash || "???";
-        const pubKey = IdMgr.pubKey ?? "";
-        const lxmfLink = `lxmf://${hash}`;
-        const lxmaLink = pubKey.length === 128 ? `lxma://${hash}:${pubKey}` : null;
-
-        this.root.appendChild(
-            h("div", { className:"onboarding" },
-                h("h1", {}, "🔗 Share Your Identity"),
-                h("p", { className:"subtitle" }, "Give this to others so they can add you as a contact in their Retichat."),
-                h("div", { className:"form-group" },
-                    h("label", {}, "Your destination hash"),
-                    h("div", { className:"identity-preview", style:{fontSize:"14px"} },
-                        hash,
-                        h("br"),
-                        h("span", { style:{fontSize:"11px",color:"var(--text-muted)"} }, "32 hex characters"),
-                    ),
-                    h("button", { className:"btn btn-secondary", style:{marginTop:"8px",width:"100%"},
-                        onClick: () => { navigator.clipboard.writeText(hash).then(() => {}).catch(() => {}); } }, "📋 Copy Hash"),
-                ),
-                h("div", { className:"form-group" },
-                    h("label", {}, "LXMF link (hash only)"),
-                    h("div", { className:"identity-preview", style:{fontSize:"13px"} }, lxmfLink),
-                    h("button", { className:"btn btn-secondary", style:{marginTop:"8px",width:"100%"},
-                        onClick: () => { navigator.clipboard.writeText(lxmfLink).then(() => {}).catch(() => {}); } }, "📋 Copy Link"),
-                ),
-                lxmaLink ? h("div", { className:"form-group" },
-                    h("label", {}, "LXMA link (with public key — preferred)"),
-                    h("div", { className:"identity-preview", style:{fontSize:"11px",wordBreak:"break-all"} }, lxmaLink),
-                    h("button", { className:"btn btn-primary", style:{marginTop:"8px",width:"100%"},
-                        onClick: () => { navigator.clipboard.writeText(lxmaLink).then(() => {}).catch(() => {}); } }, "📋 Copy Full Link"),
-                ) : null,
-                h("button", { className:"btn btn-secondary", style:{marginTop:"20px",width:"100%"},
-                    onClick: () => { this._view = "main"; this._render(); } }, "← Back"),
-            )
-        );
-    },
-
-    // ---------- SETTINGS ----------
-    _renderSettings() {
+    /** Settings modal — mirrors iOS SettingsView sections */
+    _renderSettingsModal() {
         const cfg = RnsClient.cfg;
         const connType = RnsClient.connType;
-        this.root.appendChild(
-            h("div", { className:"onboarding" },
-                h("h1", {}, "⚙ Settings"),
-                h("div", { style:{fontSize:"13px",color:"var(--text-muted)",marginBottom:"16px"} },
-                    "Connection: " + (
-                        connType === "exchange" ? "🟢 HTTP Exchange (Reticulum-php)" :
-                        connType === "direct" ? "🟢 Direct Sockets" :
-                        connType === "websocket" ? "🔵 WebSocket" : "⚫ None")),
-                h("div", { className:"form-group" },
-                    h("label", { htmlFor:"cfg-exchange" }, "Reticulum-php Exchange URL (primary)"),
-                    h("input", { id:"cfg-exchange", type:"text", value: cfg.exchangeUrl || "",
+        const connLabel = connType === "exchange" ? "HTTP Exchange"
+            : connType === "direct" ? "Direct Sockets"
+            : connType === "websocket" ? "WebSocket" : "None";
+
+        const overlay = h("div", { className: "modal-overlay",
+            onClick: (e) => { if (e.target === overlay) { this.state.showSettings = false; this.render(); } },
+        });
+
+        const sheet = h("div", { className: "modal-sheet" });
+
+        // Header
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "Settings"),
+                h("button", { className: "icon-btn",
+                    onClick: () => { this.state.showSettings = false; this.render(); } }, "✕"),
+            ),
+        );
+
+        const body = h("div", { className: "modal-body" });
+
+        // ---- Identity section ----
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Identity"),
+                h("div", { className: "settings-field" },
+                    h("label", {}, "Your identity hash"),
+                    h("div", { className: "mono-value", style: { fontSize: "11px" } },
+                        (IdMgr.hash ?? "N/A")),
+                ),
+                h("div", { className: "btn-row", style: { marginTop: "8px" } },
+                    h("button", { className: "btn btn-secondary",
+                        onClick: () => {
+                            navigator.clipboard.writeText(IdMgr.hash ?? "").catch(() => {});
+                        } }, "📋 Copy Hash"),
+                    h("button", { className: "btn btn-secondary",
+                        onClick: () => {
+                            this.state.showSettings = false;
+                            this.state.showShareId = true;
+                            this.render();
+                        } }, "🔗 Share"),
+                ),
+            ),
+        );
+
+        // ---- Profile section ----
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Profile"),
+                h("div", { className: "settings-field" },
+                    h("label", { htmlFor: "cfg-name" }, "Display Name"),
+                    h("input", { id: "cfg-name", type: "text", value: cfg.displayName || "" }),
+                    h("div", { className: "field-hint" }, "Shown in your announces on the network."),
+                ),
+            ),
+        );
+
+        // ---- Theme section ----
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Appearance"),
+                h("div", { className: "settings-row" },
+                    h("span", { className: "row-label" },
+                        this.state.theme === "dark" ? "🌙 Dark Mode" : "☀️ Light Mode"),
+                    h("label", { className: "toggle" },
+                        h("input", {
+                            type: "checkbox",
+                            checked: this.state.theme === "dark",
+                            onChange: () => this.toggleTheme(),
+                        }),
+                        h("span", { className: "slider" }),
+                    ),
+                ),
+            ),
+        );
+
+        // ---- Connection section ----
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Connection"),
+                h("div", { style: { fontSize: "12px", color: "var(--text-muted)", marginBottom: "12px" } },
+                    "Current: ", h("strong", {}, connLabel)),
+                h("div", { className: "settings-field" },
+                    h("label", { htmlFor: "cfg-exchange" }, "HTTP Exchange URL"),
+                    h("input", { id: "cfg-exchange", type: "text", value: cfg.exchangeUrl || "",
                         placeholder: "https://your-host.com/reticulum" }),
-                    h("div", { style:{fontSize:"11px",color:"var(--text-muted)",marginTop:"4px"} },
+                    h("div", { className: "field-hint" },
                         "Uses HTTP POST polling — no WebSocket or open ports needed."),
                 ),
-                h("div", { className:"form-group" },
-                    h("label", { htmlFor:"cfg-ep" }, "WebSocket Endpoint (fallback)"),
-                    h("input", { id:"cfg-ep", type:"text", value: cfg.rnsEndpoint || "" }),
-                ),
-                h("div", { className:"form-group" },
-                    h("label", { htmlFor:"cfg-name" }, "Display Name"),
-                    h("input", { id:"cfg-name", type:"text", value: cfg.displayName }),
-                ),
-                h("div", { className:"form-group" },
-                    h("label", {}, "Identity"),
-                    h("div", { className:"identity-preview" }, "Hash: " + (IdMgr.hash ?? "N/A")),
-                ),
-                h("div", { className:"btn-row", style:{marginTop:"20px"} },
-                    h("button", { className:"btn btn-primary",
-                        onClick: () => this._saveSettings() }, "Save & Reconnect"),
-                    h("button", { className:"btn btn-danger",
-                        onClick: () => this._resetAll() }, "Reset All Data"),
-                    h("button", { className:"btn btn-secondary",
-                        onClick: () => { this._view = "main"; this._render(); } }, "← Back"),
-                ),
-            )
+            ),
         );
+
+        // ---- Actions ----
+        body.appendChild(
+            h("div", { className: "btn-row" },
+                h("button", { className: "btn btn-primary",
+                    onClick: () => this._saveSettings() }, "Save & Reconnect"),
+                h("button", { className: "btn btn-danger",
+                    onClick: () => this._resetAll() }, "Reset All"),
+            ),
+        );
+
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        this.root.appendChild(overlay);
+
+        // Focus the first input
+        setTimeout(() => sheet.querySelector("input")?.focus(), 150);
     },
 
     async _saveSettings() {
-        const exchangeUrl = this.root.querySelector("#cfg-exchange")?.value?.trim();
-        const ep = this.root.querySelector("#cfg-ep")?.value?.trim();
-        const name = this.root.querySelector("#cfg-name")?.value?.trim();
-        if (exchangeUrl) RnsClient._cfg.exchangeUrl = exchangeUrl;
-        if (ep) RnsClient._cfg.rnsEndpoint = ep;
-        if (name) RnsClient._cfg.displayName = name;
+        const exchangeUrl = document.getElementById("cfg-exchange")?.value?.trim();
+        const name = document.getElementById("cfg-name")?.value?.trim();
+        if (exchangeUrl !== undefined) RnsClient._cfg.exchangeUrl = exchangeUrl;
+        if (name !== undefined) RnsClient._cfg.displayName = name;
         try { await RnsClient.reconnect(); } catch(e) { console.error(e); }
-        this._view = "main"; this._render();
+        this.state.showSettings = false;
+        this.render();
     },
 
     _resetAll() {
@@ -820,40 +1006,156 @@ const App = {
         }
     },
 
-    // ---------- REACTIVE WIRING ----------
+    /** Add Contact modal */
+    _renderAddContactModal() {
+        let inputValue = "";
+
+        const doAdd = () => {
+            const raw = inputValue.trim();
+            if (!raw) { alert("Enter a destination hash."); return; }
+            let hash = raw.toLowerCase().replace(/^lxmf:\/\/|^lxma:\/\//, "");
+            const colonIdx = hash.indexOf(":");
+            if (colonIdx > -1) hash = hash.substring(0, colonIdx);
+            hash = hash.replace(/[^0-9a-f]/g, "");
+            if (hash.length !== 32) {
+                alert("Destination hash must be exactly 32 hex characters.\n\nGot: " + (hash || "(empty)") + " (" + hash.length + " chars)");
+                return;
+            }
+            try {
+                ContactStore.add(hash);
+                this.state.showAddContact = false;
+                this.render();
+            } catch(e) { alert(e.message); }
+        };
+
+        const overlay = h("div", { className: "modal-overlay",
+            onClick: (e) => { if (e.target === overlay) { this.state.showAddContact = false; this.render(); } },
+        });
+
+        const sheet = h("div", { className: "modal-sheet" });
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "Add Contact"),
+                h("button", { className: "icon-btn",
+                    onClick: () => { this.state.showAddContact = false; this.render(); } }, "✕"),
+            ),
+        );
+
+        const body = h("div", { className: "modal-body" });
+        body.appendChild(
+            h("div", { className: "settings-field" },
+                h("label", { htmlFor: "add-hash" }, "Destination hash (32 hex characters)"),
+                h("input", {
+                    id: "add-hash", type: "text",
+                    placeholder: "e.g. a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+                    onInput: (e) => { inputValue = e.target.value; },
+                    onKeydown: (e) => { if (e.key === "Enter") doAdd(); },
+                }),
+                h("div", { className: "field-hint" },
+                    "You can also paste an lxmf:// or lxma:// link from another Retichat user."),
+            ),
+            h("div", { className: "btn-row", style: { marginTop: "16px" } },
+                h("button", { className: "btn btn-primary", onClick: doAdd }, "Add Contact"),
+                h("button", { className: "btn btn-secondary",
+                    onClick: () => { this.state.showAddContact = false; this.render(); } }, "Cancel"),
+            ),
+        );
+
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        this.root.appendChild(overlay);
+
+        setTimeout(() => document.getElementById("add-hash")?.focus(), 150);
+    },
+
+    /** Share Identity modal */
+    _renderShareIdModal() {
+        const hash = RnsClient.ownHash || IdMgr.hash || "???";
+        const pubKey = IdMgr.pubKey ?? "";
+        const lxmfLink = `lxmf://${hash}`;
+        const lxmaLink = pubKey.length === 128 ? `lxma://${hash}:${pubKey}` : null;
+
+        const overlay = h("div", { className: "modal-overlay",
+            onClick: (e) => { if (e.target === overlay) { this.state.showShareId = false; this.render(); } },
+        });
+
+        const sheet = h("div", { className: "modal-sheet" });
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "🔗 Share Your Identity"),
+                h("button", { className: "icon-btn",
+                    onClick: () => { this.state.showShareId = false; this.render(); } }, "✕"),
+            ),
+        );
+
+        const body = h("div", { className: "modal-body" });
+
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Destination Hash"),
+                h("div", { className: "mono-value", style: { fontSize: "13px" } }, hash),
+                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
+                    onClick: () => { navigator.clipboard.writeText(hash).catch(() => {}); } },
+                    "📋 Copy Hash"),
+            ),
+        );
+
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "LXMF Link"),
+                h("div", { className: "mono-value", style: { fontSize: "13px" } }, lxmfLink),
+                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
+                    onClick: () => { navigator.clipboard.writeText(lxmfLink).catch(() => {}); } },
+                    "📋 Copy Link"),
+            ),
+        );
+
+        if (lxmaLink) {
+            body.appendChild(
+                h("div", { className: "settings-section" },
+                    h("h3", {}, "LXMA Link (with public key — preferred)"),
+                    h("div", { className: "mono-value", style: { fontSize: "11px" } }, lxmaLink),
+                    h("button", { className: "btn btn-primary btn-block", style: { marginTop: "8px" },
+                        onClick: () => { navigator.clipboard.writeText(lxmaLink).catch(() => {}); } },
+                        "📋 Copy Full Link"),
+                ),
+            );
+        }
+
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        this.root.appendChild(overlay);
+    },
+
+    // ===== REACTIVE WIRING =====
+
     _wire() {
+        // Status dot updates
         RnsClient.onStatus(status => {
             const dot = document.getElementById("status-dot");
             if (dot) {
                 dot.className = `status-dot ${status}`;
-                const typeStr = RnsClient.connType === "exchange" ? "HTTP Exchange" :
-                                RnsClient.connType === "direct" ? "Direct Sockets" :
-                                RnsClient.connType === "websocket" ? "WebSocket" : "none";
-                dot.title = `RNS: ${status} (${typeStr})`;
+                dot.title = `RNS: ${status}`;
             }
         });
 
+        // Incoming messages: refresh the view (unless a modal is open)
         RnsClient.onMessage((msg, peerHash) => {
-            if (this._view === "chat" && peerHash === this.activeHash) {
-                this._render();
-                requestAnimationFrame(() => {
-                    const ml = document.getElementById("msg-list");
-                    if (ml) ml.scrollTop = ml.scrollHeight;
-                });
+            if (this.state.view !== "main") return;
+            // Don't disrupt open modals — they'll see updates when dismissed
+            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId) return;
+            const inActiveChat = this.state.activeHash === peerHash;
+            this.render();
+            if (inActiveChat) {
+                requestAnimationFrame(() => this._scrollChatBottom());
             }
-            if (this._view === "main") this._render();
         });
 
+        // Contact list changes — only refresh if no modal is open
         ContactStore.onChange(() => {
-            if (this._view === "main") this._render();
-            // Also re-render chat view if the active contact's info updated
-            if (this._view === "chat" && this.activeHash) {
-                this._render();
-                requestAnimationFrame(() => {
-                    const ml = document.getElementById("msg-list");
-                    if (ml) ml.scrollTop = ml.scrollHeight;
-                });
-            }
+            if (this.state.view !== "main") return;
+            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId) return;
+            this.render();
         });
     },
 };
