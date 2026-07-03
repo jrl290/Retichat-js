@@ -31,7 +31,7 @@ import {
     LXMF,
     WebsocketClientInterface,
     DirectSocketsInterface,
-    HttpExchangeInterface,
+    PostInterface,
 } from "./lib/rns/reticulum.js";
 
 // =========================================================================
@@ -240,7 +240,7 @@ const RnsClient = {
         // ---- Strategy 1: HTTP Exchange (Reticulum-php native) ----
         if (this._cfg.exchangeUrl) {
             console.log("[rns] Using HTTP exchange with Reticulum-php node at", this._cfg.exchangeUrl);
-            const iface = new HttpExchangeInterface(
+            const iface = new PostInterface(
                 this._cfg.interfaceName,
                 this._cfg.exchangeUrl,
                 IdMgr.hash
@@ -298,6 +298,12 @@ const RnsClient = {
             //     console.log(`[rns] 🔒 Filtered: ${srcHash.slice(0,12)}... not in contact list`);
             //     return;
             // }
+
+            // Auto-create contact for unknown senders so messages appear in UI
+            if (!ContactStore.isContact(srcHash)) {
+                console.log(`[rns] 📇 Auto-adding contact: ${srcHash.slice(0,12)}...`);
+                ContactStore.add(srcHash);
+            }
 
             MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash });
             this._onMsg.forEach(fn => fn(lxmfMsg, srcHash));
