@@ -70,6 +70,11 @@ async function loadConfig() {
             if (Array.isArray(json.tcpBackbones)) cfg.tcpBackbones = json.tcpBackbones;
         }
     } catch(e) {}
+    // Saved settings from localStorage override config.json
+    const savedExchangeUrl = sGet("exchangeUrl");
+    if (savedExchangeUrl) cfg.exchangeUrl = savedExchangeUrl;
+    const savedDisplayName = sGet("displayName");
+    if (savedDisplayName) cfg.displayName = savedDisplayName;
     return cfg;
 }
 
@@ -321,7 +326,7 @@ const RnsClient = {
             this._annTimer = setInterval(() => this._announce(), this._cfg.announceIntervalMs);
         }
 
-        // Status monitor
+        // Status monitor — checks every 2s if any interface is ready
         this._monTimer = setInterval(() => {
             const ifaces = this._rns?.interfaces || [];
             let anyReady = false;
@@ -334,10 +339,9 @@ const RnsClient = {
             }
             if (anyReady && this._status !== "online") this._setStatus("online");
             else if (!anyReady && ifaces.length > 0 && this._status !== "offline") this._setStatus("offline");
-        }, 5000);
+        }, 2000);
 
-        this._setStatus("online");
-        console.log(`[rns] Connected via ${this._connType} (${addedAny} interface(s))`);
+        console.log(`[rns] Connecting via ${this._connType} (${addedAny} interface(s))...`);
     },
 
     _announce() {
@@ -453,6 +457,7 @@ const App = {
         showShareId: false,
         isWide: window.innerWidth >= 800,
     },
+    _pathRequestedThisSession: new Set(),
 
     // ===== LIFECYCLE =====
 
@@ -521,6 +526,17 @@ const App = {
         if (this.state.showSettings) this._renderSettingsModal();
         if (this.state.showAddContact) this._renderAddContactModal();
         if (this.state.showShareId) this._renderShareIdModal();
+
+        // Re-apply status dot after DOM rebuild (RNS status hasn't changed so listener won't fire)
+        this._applyStatusDot();
+    },
+
+    /** Restore the status dot color after a render destroys the old DOM. */
+    _applyStatusDot() {
+        const dot = document.getElementById("status-dot");
+        if (dot && RnsClient._status) {
+            dot.className = `status-dot ${RnsClient._status}`;
+        }
     },
 
     /** Wide layout: sidebar (left) + detail (right) */
@@ -719,15 +735,16 @@ const App = {
             // Messages
             h("div", { className: "message-list", id: "msg-list" },
                 ...(msgs.length === 0
-                    ? [h("div", { className: "msg-system" },
-                        "Share your identity link with this contact so they can add you back. Messages are end-to-end encrypted. 🔐")]
+                    ? []
                     : msgs.map(m => {
                         const isOwn = m.dir === "out";
                         return h("div", { className: `msg-row ${isOwn ? "own" : "their"}` },
-                            h("div", { className: "msg-bubble" }, esc(m.content)),
-                            h("div", { className: "msg-meta" },
-                                h("span", {}, fmtTime(m.timestamp)),
-                                isOwn ? h("span", {}, m.status === "sent" ? "✓" : "✓✓") : null,
+                            h("div", { className: "msg-bubble" },
+                                esc(m.content),
+                                h("div", { className: "msg-meta" },
+                                    h("span", {}, fmtTime(m.timestamp)),
+                                    isOwn ? h("span", {}, m.status === "sent" ? "✓" : "✓✓") : null,
+                                ),
                             ),
                         );
                     })),
@@ -764,9 +781,32 @@ const App = {
         this.state.showSettings = false;
         this.state.showAddContact = false;
         this.state.showShareId = false;
+
+        // Send a path request if we don't have this contact's public key yet
+        // (first time opening this chat in the session)
+        const c = ContactStore.get(hash);
+        if (c && !c.publicKey) {
+            this._requestPathForContact(hash);
+        }
+
         this.render();
         // Scroll to bottom after render
         requestAnimationFrame(() => this._scrollChatBottom());
+    },
+
+    /** Send a path request to discover the route to a destination.
+     *  Only sends once per session per destination hash. */
+    _requestPathForContact(destHash) {
+        if (this._pathRequestedThisSession.has(destHash)) return;
+        const transport = RnsClient._rns?.transport;
+        if (!transport) return;
+        try {
+            transport.requestPath(destHash);
+            this._pathRequestedThisSession.add(destHash);
+            console.log(`[app] Path request sent for ${destHash.slice(0,12)}...`);
+        } catch(e) {
+            console.warn(`[app] Path request failed for ${destHash.slice(0,12)}...`, e.message);
+        }
     },
 
     closeChat() {
@@ -901,30 +941,6 @@ const App = {
 
         const body = h("div", { className: "modal-body" });
 
-        // ---- Identity section ----
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Identity"),
-                h("div", { className: "settings-field" },
-                    h("label", {}, "Your identity hash"),
-                    h("div", { className: "mono-value", style: { fontSize: "11px" } },
-                        (IdMgr.hash ?? "N/A")),
-                ),
-                h("div", { className: "btn-row", style: { marginTop: "8px" } },
-                    h("button", { className: "btn btn-secondary",
-                        onClick: () => {
-                            navigator.clipboard.writeText(IdMgr.hash ?? "").catch(() => {});
-                        } }, "📋 Copy Hash"),
-                    h("button", { className: "btn btn-secondary",
-                        onClick: () => {
-                            this.state.showSettings = false;
-                            this.state.showShareId = true;
-                            this.render();
-                        } }, "🔗 Share"),
-                ),
-            ),
-        );
-
         // ---- Profile section ----
         body.appendChild(
             h("div", { className: "settings-section" },
@@ -993,8 +1009,8 @@ const App = {
     async _saveSettings() {
         const exchangeUrl = document.getElementById("cfg-exchange")?.value?.trim();
         const name = document.getElementById("cfg-name")?.value?.trim();
-        if (exchangeUrl !== undefined) RnsClient._cfg.exchangeUrl = exchangeUrl;
-        if (name !== undefined) RnsClient._cfg.displayName = name;
+        if (exchangeUrl !== undefined) { RnsClient._cfg.exchangeUrl = exchangeUrl; sSet("exchangeUrl", exchangeUrl); }
+        if (name !== undefined) { RnsClient._cfg.displayName = name; sSet("displayName", name); }
         try { await RnsClient.reconnect(); } catch(e) { console.error(e); }
         this.state.showSettings = false;
         this.render();
@@ -1023,6 +1039,7 @@ const App = {
             }
             try {
                 ContactStore.add(hash);
+                this._requestPathForContact(hash);
                 this.state.showAddContact = false;
                 this.render();
             } catch(e) { alert(e.message); }
