@@ -1,14 +1,6 @@
 {
-    "_comment": "Retichat Web configuration.",
-    "_primary": "Set exchangeUrl to your Reticulum-php node for HTTP polling (no WebSocket, no open ports needed).",
-    "exchangeUrl": "https://your-node.example.com/reticulum",
-    "_exchangeUrl_hint": "Your Reticulum-php node URL, e.g. https://your-host.com/reticulum",
-    "rnsEndpoint": "wss://rns-wss.liamcottle.net",
-    "tcpBackbones": [
-        { "host": "amsterdam.connect.reticulum.network", "port": 4965 },
-        { "host": "reticulum.betweentheborders.com", "port": 4242 },
-        { "host": "v0lttech.com", "port": 4242 }
-    ],
+    "_comment": "Retichat Web configuration. Primary transport is HTTP exchange via Reticulum-php.",
+    "exchangeUrl": "https://retichat.com/reticulum",
     "displayName": "Retichat Web",
     "announceIntervalMs": 300000
 }

@@ -29,8 +29,6 @@ import {
     LXMessage,
     LXMRouter,
     LXMF,
-    WebsocketClientInterface,
-    DirectSocketsInterface,
     PostInterface,
 } from "./lib/rns/reticulum.js";
 
@@ -38,39 +36,26 @@ import {
 //  CONFIG
 // =========================================================================
 const DEFAULT_CONFIG = {
-    // ---- HTTP Exchange (Reticulum-php native) ----
-    // Set this to your Reticulum-php node URL to use HTTP POST polling.
-    // This is the preferred transport — no WebSocket, no open ports needed.
-    exchangeUrl: "",  // e.g. "https://your-host.com/reticulum"
-
-    // ---- WebSocket (fallback) ----
-    rnsEndpoint: "wss://rns-wss.liamcottle.net",
-
-    // ---- Direct Sockets (raw TCP from Chrome) ----
-    tcpBackbones: [
-        { host: "amsterdam.connect.reticulum.network", port: 4965 },
-        { host: "reticulum.betweentheborders.com", port: 4242 },
-        { host: "v0lttech.com", port: 4242 },
-    ],
+    // HTTP Exchange (Reticulum-php native) — primary transport.
+    // Announces flood through the PHP node to all interfaces including
+    // PHP peer connections. Wake-driven between nodes.
+    exchangeUrl: "https://retichat.com/reticulum",
 
     interfaceName: "Retichat Web",
     displayName: "Retichat Web",
     announceIntervalMs: 300000,
 };
 async function loadConfig() {
-    const cfg = { ...DEFAULT_CONFIG, tcpBackbones: [...(DEFAULT_CONFIG.tcpBackbones || [])] };
+    const cfg = { ...DEFAULT_CONFIG };
     try {
         const resp = await fetch("./config.json");
         if (resp.ok) {
             const json = await resp.json();
             if (json.exchangeUrl) cfg.exchangeUrl = json.exchangeUrl;
-            if (json.rnsEndpoint) cfg.rnsEndpoint = json.rnsEndpoint;
             if (json.displayName) cfg.displayName = json.displayName;
             if (typeof json.announceIntervalMs === "number") cfg.announceIntervalMs = json.announceIntervalMs;
-            if (Array.isArray(json.tcpBackbones)) cfg.tcpBackbones = json.tcpBackbones;
         }
     } catch(e) {}
-    // Saved settings from localStorage override config.json
     const savedExchangeUrl = sGet("exchangeUrl");
     if (savedExchangeUrl) cfg.exchangeUrl = savedExchangeUrl;
     const savedDisplayName = sGet("displayName");
@@ -240,50 +225,21 @@ const RnsClient = {
         this._setStatus("connecting");
 
         this._rns = new Reticulum();
-        let addedAny = false;
 
-        // ---- Strategy 1: HTTP Exchange (Reticulum-php native) ----
-        if (this._cfg.exchangeUrl) {
-            console.log("[rns] Using HTTP exchange with Reticulum-php node at", this._cfg.exchangeUrl);
-            const iface = new PostInterface(
-                this._cfg.interfaceName,
-                this._cfg.exchangeUrl,
-                IdMgr.hash
-            );
-            this._rns.addInterface(iface);
-            this._connType = "exchange";
-            addedAny = true;
-            console.log("[rns] HTTP exchange interface added");
-        }
-
-        // ---- Strategy 2: Direct Sockets (raw TCP from browser) ----
-        if (!addedAny && DirectSocketsInterface.isAvailable() && this._cfg.tcpBackbones?.length > 0) {
-            console.log("[rns] Direct Sockets available — connecting to TCP backbones directly");
-            for (const bb of this._cfg.tcpBackbones) {
-                if (!bb.host || !bb.port) continue;
-                const iface = new DirectSocketsInterface(bb.host + ":" + bb.port, bb.host, bb.port);
-                this._rns.addInterface(iface);
-                addedAny = true;
-            }
-            if (addedAny) {
-                this._connType = "direct";
-                console.log(`[rns] Added ${this._cfg.tcpBackbones.length} Direct Sockets interface(s)`);
-            }
-        }
-
-        // ---- Strategy 3: WebSocket (fallback) ----
-        if (!addedAny && this._cfg.rnsEndpoint) {
-            console.log("[rns] Using WebSocket fallback:", this._cfg.rnsEndpoint);
-            const iface = new WebsocketClientInterface(this._cfg.interfaceName, this._cfg.rnsEndpoint);
-            this._rns.addInterface(iface);
-            this._connType = "websocket";
-            addedAny = true;
-        }
-
-        if (!addedAny) {
+        // HTTP Exchange (Reticulum-php) — the only transport.
+        if (!this._cfg.exchangeUrl) {
             this._setStatus("offline");
-            throw new Error("No interfaces configured. Set exchangeUrl in config.json for Reticulum-php, or enable Direct Sockets, or set a WebSocket endpoint.");
+            throw new Error("No exchangeUrl configured. Set exchangeUrl in config.json.");
         }
+
+        console.log("[rns] HTTP exchange →", this._cfg.exchangeUrl);
+        const iface = new PostInterface(
+            this._cfg.interfaceName,
+            this._cfg.exchangeUrl,
+            IdMgr.hash
+        );
+        this._rns.addInterface(iface);
+        this._connType = "exchange";
 
         // Set up LXMF router
         this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id);
@@ -308,6 +264,18 @@ const RnsClient = {
             if (!ContactStore.isContact(srcHash)) {
                 console.log(`[rns] 📇 Auto-adding contact: ${srcHash.slice(0,12)}...`);
                 ContactStore.add(srcHash);
+            }
+
+            // Update display name from per-message FIELD_SENDER_NAME (0x10).
+            // This is privacy-preserving — only message recipients see it,
+            // unlike the old broadcast announce approach.
+            const senderName = LXMF.senderNameFromFields(lxmfMsg.fields);
+            if (senderName) {
+                const contact = ContactStore.get(srcHash);
+                if (contact && !contact.alias && contact.displayName !== senderName) {
+                    contact.displayName = senderName;
+                    ContactStore._save();
+                }
             }
 
             MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash });
@@ -341,7 +309,7 @@ const RnsClient = {
             else if (!anyReady && ifaces.length > 0 && this._status !== "offline") this._setStatus("offline");
         }, 2000);
 
-        console.log(`[rns] Connecting via ${this._connType} (${addedAny} interface(s))...`);
+        console.log(`[rns] Connecting via ${this._connType} (${(this._rns?.interfaces || []).length} interface(s))...`);
     },
 
     _announce() {
