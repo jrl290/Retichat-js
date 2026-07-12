@@ -1,6 +1,0 @@
-{
-    "_comment": "Retichat Web configuration. Primary transport is HTTP exchange via Reticulum-php.",
-    "exchangeUrl": "https://retichat.com/reticulum",
-    "displayName": "Retichat Web",
-    "announceIntervalMs": 300000
-}
