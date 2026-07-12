@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RNS Debug Console</title>
+<style>
+  body { font-family: monospace; background: #0a0a0a; color: #0f0; margin: 0; padding: 10px; }
+  #log { max-height: 55vh; overflow-y: auto; white-space: pre-wrap; font-size: 12px; line-height: 1.4; border-bottom: 1px solid #333; padding-bottom: 6px; }
+  .ts  { color: #666; } .info { color: #0cf; } .warn { color: #fa0; } .err { color: #f44; } .tx { color: #0f0; } .rx { color: #ff0; } .ok { color: #0f0; font-weight: bold; }
+  #controls { margin: 8px 0; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  button, select, input { font-family: monospace; font-size: 12px; padding: 4px 8px; background: #222; color: #0f0; border: 1px solid #0f0; border-radius: 2px; cursor: pointer; }
+  button:hover { background: #333; }
+  button:active { background: #0f0; color: #000; }
+  input { width: 320px; }
+  #status { margin: 4px 0; font-size: 11px; color: #888; }
+  #status b { color: #0f0; }
+  #contacts { margin: 4px 0; font-size: 11px; color: #888; }
+  #contacts b { color: #ff0; }
+</style>
+</head>
+<body>
+<div id="status">Loading...</div>
+<div id="contacts"></div>
+<div id="controls">
+  <button onclick="Debug.announce()">📢 Announce</button>
+  <button onclick="Debug.sendMsg()">✉ Send to...</button>
+  <button onclick="Debug.sendToFirst()">✉ Send to 1st Contact</button>
+  <button onclick="Debug.pingExchange()">🔄 Exchange</button>
+  <button onclick="Debug.dumpState()">📋 State</button>
+  <button onclick="Debug.clearLog()">🗑 Clear</button>
+  <select id="announceInterval" onchange="Debug.setAnnounceInterval(this.value)">
+    <option value="0">Announce: off</option>
+    <option value="15000" selected>Announce: 15s</option>
+    <option value="30000">Announce: 30s</option>
+    <option value="60000">Announce: 60s</option>
+  </select>
+</div>
+<div id="log"></div>
+
+<script type="importmap">
+{
+    "imports": {
+        "crypto": "./lib/shims/crypto.js",
+        "buffer": "https://esm.sh/buffer@6.0.3",
+        "@noble/curves/": "https://esm.sh/@noble/curves@1.6.0/",
+        "@noble/hashes/": "https://esm.sh/@noble/hashes@1.7.1/",
+        "msgpackr": "https://esm.sh/msgpackr@1.11.2",
+        "aes-js": "https://esm.sh/aes-js@3.1.2",
+        "net": "./lib/shims/net.js",
+        "ws": "./lib/shims/ws.js"
+    }
+}
+</script>
+<script type="module">
+import { Buffer } from 'buffer';
+globalThis.Buffer = Buffer;
+import { Reticulum, Identity, Destination, PostInterface } from './lib/rns/reticulum.js';
+import LXMRouter from './lib/rns/lxmf/lxmf_router.js';
+import LXMessage from './lib/rns/lxmf/lxmf_message.js';
+import LXMF from './lib/rns/lxmf/lxmf.js';
+
+var $el = document.getElementById('log');
+function log(msg, cls) {
+  cls = cls || 'info';
+  var ts = new Date().toISOString().slice(11, 23);
+  $el.innerHTML += '<span class="ts">' + ts + '</span> <span class="' + cls + '">' + msg + '</span>\n';
+  $el.scrollTop = $el.scrollHeight;
+}
+
+var rns = null;
+var ident = null;
+var identHash = null;
+var lxmfRouter = null;
+var ownLxmfDest = null;
+var announceTimer = null;
+var contacts = {};  // destHash → { publicKey, identityHash, displayName, lastSeen }
+
+async function init(exchangeUrl) {
+  log('Creating identity...');
+  ident = Identity.create();
+  identHash = ident.hash.toString('hex');
+  log('Identity: <b>' + identHash + '</b>');
+
+  log('Exchange: ' + exchangeUrl);
+  rns = new Reticulum();
+
+  rns.on('packet', function(pkt) {
+    var pt = pkt.packet_type || '?';
+    var dh = (pkt.destination_hash_hex || pkt.destinationHash || '?').slice(0,12);
+    if (pt !== 1) log('📦 RX PACKET type=' + pt + ' dest=' + dh, 'rx');
+  });
+
+  var iface = new PostInterface('debug', exchangeUrl, identHash, 1);
+  rns.addInterface(iface);
+  await iface.connect();
+  log('Interface: ' + (iface._interfaceId || '?'));
+
+  // Set up LXMF router for receiving messages
+  lxmfRouter = new LXMRouter(rns, ident);
+  ownLxmfDest = lxmfRouter.destination;
+  log('LXMF dest: ' + ownLxmfDest.hash.toString('hex'));
+
+  lxmfRouter.on('message', function(msg) {
+    var src = msg.sourceHash ? msg.sourceHash.toString('hex') : '?';
+    var content = msg.content ? msg.content.toString() : '';
+    var title = msg.title ? msg.title.toString() : '';
+    log('📥 <b>RX LXMF</b> from ' + src.slice(0,12) + '  title="' + title.slice(0,40) + '"  content="' + content.slice(0,80) + '"', 'ok');
+    // Auto-reply for testing
+    if (content.indexOf('AUTO-REPLY') === -1 && content.indexOf('DEBUG') === 0) {
+      setTimeout(function() {
+        Debug.sendMsg(src, 'AUTO-REPLY: got "' + content.slice(0,50) + '"');
+      }, 500);
+    }
+  });
+
+  // Track announces to build contact list
+  rns.on('announce', function(ev) {
+    try {
+      var ann = ev.announce || ev;
+      var destHash = ann.destinationHash ? ann.destinationHash.toString('hex') : '?';
+      // Public key is on the identity object, not the announce directly
+      var pubKey = null;
+      if (ann.identity && ann.identity.publicKey) {
+        pubKey = ann.identity.publicKey.toString('hex');
+      } else if (ann.identity && ann.identity.getPublicKey) {
+        pubKey = ann.identity.getPublicKey().toString('hex');
+      }
+      var appData = ann.appData || null;
+      var hops = ev.hops || '?';
+      log('📢 ANNOUNCE dest=' + destHash.slice(0,12) + ' pk=' + (pubKey||'none').slice(0,12) + ' hops=' + hops, 'rx');
+      if (destHash !== '?' && pubKey) {
+        var own = ownLxmfDest ? ownLxmfDest.hash.toString('hex') : '';
+        if (destHash !== own) {
+          var name = '';
+          try { name = LXMF.displayNameFromAppData(appData) || ''; } catch(e) {}
+          contacts[destHash] = { publicKey: pubKey, displayName: name, lastSeen: Date.now() };
+          log('  ✅ Added contact: ' + destHash.slice(0,12) + ' name=' + name, 'ok');
+          updateContacts();
+        }
+      }
+    } catch(e) {
+      log('Announce error: ' + e.message, 'err');
+    }
+  });
+
+  log('✅ <b>READY</b>', 'ok');
+  updateStatus(exchangeUrl);
+}
+
+function updateStatus(url) {
+  document.getElementById('status').innerHTML =
+    'Hash: <b>' + (identHash || '?') + '</b>'
+    + ' &nbsp;|&nbsp; LXMF: <b>' + (ownLxmfDest ? ownLxmfDest.hash.toString('hex') : '?') + '</b>'
+    + ' &nbsp;|&nbsp; Contacts: <b>' + Object.keys(contacts).length + '</b>';
+}
+
+function updateContacts() {
+  var el = document.getElementById('contacts');
+  var keys = Object.keys(contacts);
+  if (keys.length === 0) { el.innerHTML = 'No contacts yet — waiting for announces'; return; }
+  var html = 'Contacts: ';
+  for (var i = 0; i < keys.length; i++) {
+    var c = contacts[keys[i]];
+    html += '<b>' + keys[i] + '</b>(' + (c.displayName || '?') + ') ';
+  }
+  el.innerHTML = html;
+}
+
+async function doAnnounce() {
+  if (!lxmfRouter) return log('Not ready', 'err');
+  log('📢 Announcing...', 'tx');
+  lxmfRouter.announce('Debug-' + identHash.slice(0,8));
+  updateStatus();
+}
+
+async function sendMsg(targetHex, content) {
+  if (!rns || !lxmfRouter) return log('Not ready', 'err');
+  if (!targetHex) {
+    targetHex = prompt('Target LXMF destination hash (hex):', '');
+    if (!targetHex || targetHex.length < 16) return;
+  }
+  if (!content) {
+    content = prompt('Message content:', 'DEBUG ' + new Date().toISOString());
+    if (!content) return;
+  }
+
+  var contact = contacts[targetHex];
+  if (!contact || !contact.publicKey) {
+    log('No public key for ' + targetHex.slice(0,12) + ' — waiting for announce', 'warn');
+    return;
+  }
+
+  log('✉ Sending to ' + targetHex.slice(0,12) + ': "' + content.slice(0,60) + '"', 'tx');
+  try {
+    var peerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, 'hex'));
+    var dest = rns.registerDestination(peerId, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+    log('  dest=' + dest.hash.toString('hex').slice(0,12) + ' peer=' + peerId.hash.toString('hex').slice(0,12), 'tx');
+
+    var msg = new LXMessage();
+    msg.sourceHash = ownLxmfDest.hash;
+    msg.destinationHash = dest.hash;
+    msg.title = '';
+    msg.content = content;
+    msg.fields = new Map();
+    var packed = msg.pack(ident, true);
+    log('  packed ' + packed.length + 'B', 'tx');
+    dest.send(packed);
+    log('✅ Sent!', 'ok');
+  } catch(e) {
+    log('Send error: ' + e.message, 'err');
+    console.error(e);
+  }
+}
+
+function sendToFirst() {
+  var keys = Object.keys(contacts);
+  if (keys.length === 0) return log('No contacts yet', 'warn');
+  sendMsg(keys[0]);
+}
+
+async function pingExchange() {
+  if (!rns) return log('Not ready', 'err');
+  log('🔄 Exchange...', 'tx');
+  for (var i = 0; i < rns.interfaces.length; i++) {
+    var iface = rns.interfaces[i];
+    if (typeof iface.processIncoming === 'function') {
+      try { await iface.processIncoming(); } catch(e) {}
+    }
+  }
+  updateStatus();
+}
+
+function dumpState() {
+  if (!rns) return log('Not ready', 'err');
+  log('═══ STATE ═══');
+  log('Identity: ' + identHash);
+  log('LXMF dest: ' + (ownLxmfDest ? ownLxmfDest.hash.toString('hex').slice(0,12) : '?'));
+  log('Contacts (' + Object.keys(contacts).length + '):');
+  Object.keys(contacts).forEach(function(k) {
+    var c = contacts[k];
+    log('  ' + k.slice(0,12) + ' pk=' + (c.publicKey||'?').slice(0,12) + ' name=' + (c.displayName||'?'));
+  });
+  log('═════════════');
+}
+
+function clearLog() { $el.innerHTML = ''; }
+
+function setAnnounceInterval(val) {
+  var ms = parseInt(val);
+  if (announceTimer) clearInterval(announceTimer);
+  if (ms > 0) { announceTimer = setInterval(doAnnounce, ms); log('Auto-announce every ' + (ms/1000) + 's'); }
+  else { log('Auto-announce off'); }
+}
+
+var pageUrl = new URL(window.location.href);
+var exchangeUrl = pageUrl.hostname === 'retichat.com' ? 'https://retichat.com/reticulum'
+  : pageUrl.hostname === 'selectivesubconscious.com' ? 'https://selectivesubconscious.com/reticulum'
+  : 'https://' + pageUrl.hostname + '/reticulum';
+
+init(exchangeUrl).then(function() {
+  announceTimer = setInterval(doAnnounce, 15000);
+  setTimeout(doAnnounce, 2000);
+}).catch(function(e) {
+  log('INIT FAILED: ' + e.message, 'err');
+  console.error(e);
+});
+
+window.Debug = {
+  announce: doAnnounce, sendMsg: sendMsg, sendToFirst: sendToFirst,
+  pingExchange: pingExchange, dumpState: dumpState, clearLog: clearLog,
+  setAnnounceInterval: setAnnounceInterval,
+  get ident() { return ident; }, get rns() { return rns; },
+  get identHash() { return identHash; }, get contacts() { return contacts; },
+  get ownLxmfDest() { return ownLxmfDest ? ownLxmfDest.hash.toString('hex') : null; },
+};
+</script>
+</body>
+</html>

@@ -250,7 +250,8 @@ const RnsClient = {
             const ts = lxmfMsg.timestamp;
 
             // Log EVERY incoming message BEFORE the privacy filter
-            console.log(`[rns] 📥 RX message: src=${srcHash?.slice(0,12) ?? "???"}... title="${title.slice(0,40)}" content="${content.slice(0,80)}" ts=${ts} fields=${lxmfMsg.fields?.size ?? 0}`);
+            console.log(`[retichat] 📥 RX message: src=${srcHash?.slice(0,12) ?? "???"}... title="${title.slice(0,40)}" content="${content.slice(0,80)}" ts=${ts} fields=${lxmfMsg.fields?.size ?? 0}`);
+            console.log(`[retichat]   ownHash=${RnsClient.ownHash?.slice(0,12)} msg.destHash=${lxmfMsg.destinationHash?.toString("hex")?.slice(0,12)}`);
 
             if (!srcHash) return;
 
@@ -338,8 +339,11 @@ const RnsClient = {
         if (!this._rns || !this._lxmfRouter) throw new Error("Not connected");
         if (!contact.publicKey) throw new Error("No public key for this contact yet. Wait for them to come online, or ask them for their full lxma:// link.");
 
+        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}" ownHash=${this.ownHash?.slice(0,12)} pk=${contact.publicKey.slice(0,12)}...`);
+
         const peerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
         const dest = this._rns.registerDestination(peerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+        console.log(`[retichat]   dest.hash=${dest.hash.toString("hex").slice(0,12)}... peerId.hash=${peerId.hash.toString("hex").slice(0,12)}...`);
 
         const msg = new LXMessage();
         msg.sourceHash = this._lxmfRouter.destination.hash;
@@ -347,7 +351,9 @@ const RnsClient = {
         msg.title = "";
         msg.content = content;
         msg.fields = new Map();
-        dest.send(msg.pack(IdMgr.id, true));
+        const packed = msg.pack(IdMgr.id, true);
+        console.log(`[retichat]   packed LXMF: ${packed.length} bytes, first 8: ${Buffer.from(packed.slice(0,8)).toString("hex")}`);
+        dest.send(packed);
 
         return MsgStore.add(contact.destHash, {
             dir: "out", content, status: "sent",
@@ -711,7 +717,6 @@ const App = {
                                 esc(m.content),
                                 h("div", { className: "msg-meta" },
                                     h("span", {}, fmtTime(m.timestamp)),
-                                    isOwn ? h("span", {}, m.status === "sent" ? "✓" : "✓✓") : null,
                                 ),
                             ),
                         );
@@ -1146,3 +1151,112 @@ const App = {
 };
 
 App.start();
+
+// =========================================================================
+//  E2E TEST HELPERS — run in browser console: RetichatTest.help()
+// =========================================================================
+window.RetichatTest = {
+    help() {
+        console.log(`
+RetichatTest commands:
+  .state()        — show connection state, contacts, messages
+  .contacts()     — list all contacts with public keys
+  .messages(hash) — show messages for contact (or all if no hash)
+  .send(hash,msg) — send a test message to contact hash
+  .ping(hash)     — check if contact has public key
+  .raw()          — dump raw RNS/LXMF internals
+        `);
+    },
+
+    state() {
+        const s = {
+            status: RnsClient.status,
+            connType: RnsClient.connType,
+            ownHash: RnsClient.ownHash,
+            lxmfDest: RnsClient._lxmfRouter?.destination?.hash?.toString("hex"),
+            interface: RnsClient._rns?.interfaces?.[0]?._interfaceId?.slice(0,12),
+            registered: RnsClient._rns?.interfaces?.[0]?.isRegistered,
+            contacts: ContactStore.getAll().length,
+        };
+        console.table(s);
+        return s;
+    },
+
+    contacts() {
+        const all = ContactStore.getAll();
+        const rows = all.map(c => ({
+            destHash: c.destHash.slice(0,12) + '...',
+            displayName: c.displayName,
+            hasPublicKey: !!c.publicKey,
+            pkPreview: c.publicKey?.slice(0,12) + '...' || 'NONE',
+            lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',
+        }));
+        console.table(rows);
+        return rows;
+    },
+
+    messages(hash) {
+        if (hash) {
+            const msgs = MsgStore.get(hash);
+            console.log(`${msgs.length} messages for ${hash.slice(0,12)}...`);
+            msgs.forEach(m => console.log(`  [${m.dir}] "${m.content?.slice(0,60)}" status=${m.status}`));
+            return msgs;
+        }
+        const all = ContactStore.getAll();
+        for (const c of all) {
+            const msgs = MsgStore.get(c.destHash);
+            if (msgs.length) {
+                console.log(`--- ${c.displayName} (${c.destHash.slice(0,12)}...) : ${msgs.length} msgs ---`);
+                msgs.slice(-3).forEach(m => console.log(`  [${m.dir}] "${m.content?.slice(0,60)}"`));
+            }
+        }
+        return 'see console';
+    },
+
+    send(destHash, content) {
+        destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, '');
+        const contact = ContactStore.get(destHash);
+        if (!contact) return `Contact ${destHash.slice(0,12)}... not found. Add it first.`;
+        if (!contact.publicKey) return `No public key for ${destHash.slice(0,12)}.... Wait for announce.`;
+        try {
+            RnsClient.sendMessage(contact, content || 'E2E test ' + Date.now());
+            return 'Sent — check console';
+        } catch(e) {
+            console.error('Send failed:', e.message);
+            return 'Error: ' + e.message;
+        }
+    },
+
+    ping(destHash) {
+        destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, '');
+        const c = ContactStore.get(destHash);
+        if (!c) return { error: 'not a contact', hint: 'Add this destHash as a contact first' };
+        return {
+            destHash: c.destHash.slice(0,12) + '...',
+            displayName: c.displayName,
+            hasPublicKey: !!c.publicKey,
+            publicKey: c.publicKey?.slice(0,12) + '...' || null,
+            lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',
+        };
+    },
+
+    raw() {
+        const rns = RnsClient._rns;
+        const lxmf = RnsClient._lxmfRouter;
+        const iface = rns?.interfaces?.[0];
+        const dests = rns?._destinations ? [...rns._destinations.keys()].map(k => k.slice(0,12) + '...') : [];
+        console.log({
+            ownHash: RnsClient.ownHash,
+            lxmfDestHash: lxmf?.destination?.hash?.toString("hex")?.slice(0,12) + '...',
+            lxmfDestType: lxmf?.destination?.type,
+            lxmfDestDirection: lxmf?.destination?.direction,
+            interfaceId: iface?._interfaceId?.slice(0,12) + '...',
+            interfaceRegistered: iface?.isRegistered,
+            pollIntervalMs: iface?._pollIntervalMs,
+            outboundQueueLen: iface?._outboundQueue?.length ?? 0,
+            registeredDests: dests.length,
+            destHashes: dests.slice(0, 10),
+        });
+    },
+};
+console.log('[retichat] 🧪 RetichatTest helpers loaded. Type RetichatTest.help()');
