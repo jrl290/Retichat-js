@@ -140,7 +140,7 @@ html, body {
     position: relative;
 }
 
-/* ---- Narrow: hide sidebar when chat is active ---- */
+/* ---- Narrow: slide-based navigation between list ↔ chat ---- */
 @media (max-width: 799px) {
     #app {
         max-width: 100%;
@@ -156,13 +156,20 @@ html, body {
         inset: 0;
         z-index: 20;
         transform: translateX(100%);
-        transition: transform var(--transition);
+        transition: transform 0.28s cubic-bezier(0.25, 0.1, 0.25, 1);
     }
     body.narrow-chat-open .sidebar {
         display: none;
     }
     body.narrow-chat-open .detail {
         transform: translateX(0);
+    }
+
+    /* Back button in chat header — more prominent on narrow */
+    .chat-header .back-btn {
+        width: 36px; height: 36px;
+        font-size: 20px;
+        margin-right: 4px;
     }
 }
 
@@ -547,6 +554,17 @@ html, body {
     gap: 4px;
     align-items: center;
 }
+
+/* Message delivery status icons */
+.msg-status {
+    font-size: 13px;
+    line-height: 1;
+    font-weight: 700;
+}
+.msg-status.sending     { opacity: 0.7; color: var(--text-secondary); }
+.msg-status.propagated  { opacity: 0.8; color: var(--text-secondary); }
+.msg-status.proved      { color: var(--primary); opacity: 1; }
+.msg-status.failed      { color: var(--danger); opacity: 1; }
 
 .msg-system {
     align-self: center;

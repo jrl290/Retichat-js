@@ -26,20 +26,33 @@ import {
     Reticulum,
     Destination,
     Identity,
+    Link,
+    Packet,
     LXMessage,
     LXMRouter,
     LXMF,
     PostInterface,
 } from "./lib/rns/reticulum.js";
+import MsgPack from "./lib/rns/msgpack.js";
 
 // =========================================================================
 //  CONFIG
 // =========================================================================
 const DEFAULT_CONFIG = {
     // HTTP Exchange (Reticulum-php native) — primary transport.
-    // Announces flood through the PHP node to all interfaces including
-    // PHP peer connections. Wake-driven between nodes.
     exchangeUrl: "https://retichat.com/reticulum",
+
+    // RFed node identity hash. Used as the root for deriving propagation
+    // and other capability destination hashes. Hidden default matches iOS.
+    rfedNodeHash: "7e5ff856dc2aa0fbc9fc8831b62d2834",
+
+    // Explicit LXMF propagation override. Empty = derive from RFed node hash.
+    lxmfPropagationOverride: "",
+
+    // Resolved propagation node (derived from RFed, or explicit override).
+    // Filled at startup by resolvePropagationHash().
+    propagationNodeHash: "",
+    propagationNodePubKey: "",
 
     interfaceName: "Retichat Web",
     displayName: "Retichat Web",
@@ -60,6 +73,9 @@ async function loadConfig() {
     if (savedExchangeUrl) cfg.exchangeUrl = savedExchangeUrl;
     const savedDisplayName = sGet("displayName");
     if (savedDisplayName) cfg.displayName = savedDisplayName;
+    cfg.rfedNodeHash = sGet("rfedNodeHash") || DEFAULT_CONFIG.rfedNodeHash;
+    cfg.lxmfPropagationOverride = sGet("lxmfPropagationOverride") || "";
+    cfg.propagationNodePubKey = sGet("propagationNodePubKey") || "";
     return cfg;
 }
 
@@ -132,9 +148,10 @@ const ContactStore = {
             destHash,
             displayName: existing?.displayName ?? "?" + destHash.slice(0,8),
             publicKey: existing?.publicKey ?? null,
-            alias: existing?.alias ?? null,
+            nameCustomized: existing?.nameCustomized ?? false,
             addedAt: existing?.addedAt ?? Date.now(),
             lastSeen: existing?.lastSeen ?? 0,
+            reachable: existing?.reachable ?? null,  // null=unknown, true=direct proof received, false=offline
         };
         this._contacts.set(destHash, contact);
         this._save();
@@ -147,7 +164,7 @@ const ContactStore = {
         const c = this._contacts.get(destHash);
         if (!c) return;
 
-        if (!c.alias && announce.appData) {
+        if (!c.nameCustomized && announce.appData) {
             try {
                 const n = LXMF.displayNameFromAppData(announce.appData);
                 if (n) c.displayName = n;
@@ -163,9 +180,32 @@ const ContactStore = {
 
     isContact(destHash) { return this._contacts.has(destHash); },
 
-    setAlias(destHash, alias) {
+    setDisplayName(destHash, name) {
         const c = this._contacts.get(destHash);
-        if (c) { c.alias = alias || null; this._save(); this._notify(); }
+        if (c) { c.displayName = name || ("?" + destHash.slice(0,8)); c.nameCustomized = true; this._save(); this._notify(); }
+    },
+
+    setReachable(destHash, reachable) {
+        const c = this._contacts.get(destHash);
+        if (c) { c.reachable = reachable; this._save(); this._notify(); }
+    },
+
+    /** Seconds to wait before propagating: 5 for online/unknown, 1 for offline. */
+    propagationDelay(destHash) {
+        const c = this._contacts.get(destHash);
+        return (c && c.reachable === false) ? 1 : 5;
+    },
+
+    /** Bump lastSeen without triggering a re-render (caller handles that). */
+    touch(destHash) {
+        const c = this._contacts.get(destHash);
+        if (c) { c.lastSeen = Date.now(); this._save(); }
+    },
+
+    remove(destHash) {
+        this._contacts.delete(destHash);
+        this._save();
+        this._notify();
     },
 
     get(destHash) { return this._contacts.get(destHash) ?? null; },
@@ -187,6 +227,15 @@ const MsgStore = {
         sSet("msg_"+hash, msgs);
         return msgs[msgs.length-1];
     },
+    updateStatus(hash, msgId, newStatus) {
+        const msgs = this.get(hash);
+        const m = msgs.find(x => x.id === msgId);
+        if (m) { m.status = newStatus; sSet("msg_"+hash, msgs); }
+        return m;
+    },
+    remove(hash) {
+        sSet("msg_"+hash, []);
+    },
     preview(hash) {
         const msgs = this.get(hash);
         if (!msgs.length) return null;
@@ -202,6 +251,9 @@ const RnsClient = {
     _rns: null, _lxmfRouter: null, _cfg: null,
     _status: "offline", _connType: "none", // "direct" | "websocket" | "none"
     _annTimer: null, _monTimer: null,
+    _pendingTickets: new Map(),  // ticket → {contactHash, messageId}
+    _pendingPacketHashes: new Map(),  // provedPacketHash (hex) → {contactHash, messageId}
+    _pendingTimeouts: new Map(),  // messageId → timeoutId
     _onStatus: [], _onMsg: [],
 
     get status() { return this._status; },
@@ -211,6 +263,11 @@ const RnsClient = {
 
     onStatus(fn) { this._onStatus.push(fn); },
     onMessage(fn) { this._onMsg.push(fn); },
+
+    /** Update the delivery status of an outgoing message (e.g. "proved", "failed"). */
+    updateMessageStatus(contactHash, msgId, newStatus) {
+        MsgStore.updateStatus(contactHash, msgId, newStatus);
+    },
 
     _setStatus(s, type) {
         if (type) this._connType = type;
@@ -222,6 +279,16 @@ const RnsClient = {
     async connect() {
         if (!IdMgr.has) throw new Error("No identity");
         this._cfg = await loadConfig();
+
+        // Resolve propagation node hash: explicit override, or derive from RFed.
+        if (this._cfg.lxmfPropagationOverride) {
+            this._cfg.propagationNodeHash = this._cfg.lxmfPropagationOverride;
+        } else if (this._cfg.rfedNodeHash) {
+            const rfedIdBytes = Buffer.from(this._cfg.rfedNodeHash, "hex");
+            this._cfg.propagationNodeHash = Destination.hash({hash: rfedIdBytes}, "lxmf", "propagation").toString("hex");
+        }
+        console.log(`[retichat] Propagation node: ${this._cfg.propagationNodeHash.slice(0,12)}...`);
+
         this._setStatus("connecting");
 
         this._rns = new Reticulum();
@@ -255,6 +322,25 @@ const RnsClient = {
 
             if (!srcHash) return;
 
+            // ---- Delivery notification (proof) ----
+            // If the incoming message has FIELD_TICKET and empty content, it's a
+            // delivery notification from a recipient proving they got our message.
+            const FIELD_TICKET = 0x0C;
+            const ticket = lxmfMsg.fields?.get(FIELD_TICKET);
+            if (ticket && (!content || content.length === 0)) {
+                const pending = this._pendingTickets.get(ticket);
+                if (pending) {
+                    this._pendingTickets.delete(ticket);
+                    console.log(`[retichat] ✅ PROOF (LXMF) ticket=${ticket.slice(0,8)}... from ${srcHash.slice(0,12)}`);
+                    if (pending.onProof) pending.onProof(pending.messageId);
+                    else {
+                        MsgStore.updateStatus(pending.contactHash, pending.messageId, "proved");
+                        this._onMsg.forEach(fn => fn(lxmfMsg, srcHash));
+                    }
+                }
+                return;
+            }
+
             // Privacy filter — DISABLED for testing
             // if (!ContactStore.isContact(srcHash)) {
             //     console.log(`[rns] 🔒 Filtered: ${srcHash.slice(0,12)}... not in contact list`);
@@ -273,24 +359,75 @@ const RnsClient = {
             const senderName = LXMF.senderNameFromFields(lxmfMsg.fields);
             if (senderName) {
                 const contact = ContactStore.get(srcHash);
-                if (contact && !contact.alias && contact.displayName !== senderName) {
+                if (contact && !contact.nameCustomized && contact.displayName !== senderName) {
                     contact.displayName = senderName;
                     ContactStore._save();
                 }
             }
 
             MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash });
+            ContactStore.touch(srcHash);
             this._onMsg.forEach(fn => fn(lxmfMsg, srcHash));
         });
 
-        // Listen for announces to enrich contacts
+        // Listen for announces on lxmf.propagation — these arrive in response
+        // to path requests and carry the propagation node's public key.
+        // Do NOT add to contact store — the propagation node is infrastructure,
+        // not a chat contact.
+        this._rns.registerAnnounceHandler("lxmf.propagation", (event) => {
+            const hash = event.announce.destinationHash.toString("hex");
+            if (hash === this._cfg.propagationNodeHash && event.announce.identity) {
+                const pk = event.announce.identity.getPublicKey()?.toString("hex") ?? "";
+                if (pk) {
+                    this._cfg.propagationNodePubKey = pk;
+                    sSet("propagationNodePubKey", pk);
+                    console.log(`[retichat] 📡 Learned propagation node pub key from announce: ${pk.slice(0,12)}...`);
+                    // Now that we have the pub key, establish a persistent link
+                    this._establishPropagationLink();
+                }
+            }
+        });
+
+        // Listen for announces on lxmf.delivery to enrich contacts
         this._rns.registerAnnounceHandler("lxmf.delivery", (event) => {
             const hash = event.announce.destinationHash.toString("hex");
             ContactStore.updateFromAnnounce(hash, event.announce);
         });
 
+        // Listen for RNS-level delivery proofs (packet.prove() responses)
+        this._rns.on("proof", (event) => {
+            const provedHash = event.provedPacketHash?.toString("hex");
+            if (!provedHash) return;
+            console.log(`[retichat] PROOF lookup: provedHash=${provedHash.slice(0,12)}... pendingKeys=[${[...this._pendingPacketHashes.keys()].map(k=>k.slice(0,12)).join(",")}]`);
+            const pending = this._pendingPacketHashes.get(provedHash);
+            if (pending) {
+                this._pendingPacketHashes.delete(provedHash);
+                console.log(`[retichat] ✅ PROOF (RNS) for packet ${provedHash.slice(0,12)}...`);
+                if (pending.onProof) pending.onProof(pending.messageId);
+                else {
+                    MsgStore.updateStatus(pending.contactHash, pending.messageId, "proved");
+                    this._onMsg.forEach(fn => fn(null, pending.contactHash));
+                }
+                // Clear the failure timeout
+                // Trigger a re-render so the status icon updates
+                this._onMsg.forEach(fn => fn(null, pending.contactHash));
+            }
+        });
+
         // Periodic announce
         setTimeout(() => this._announce(), 3000);
+
+        // Request a path to the propagation node so we learn its public key
+        // and can send store-and-forward messages.
+        if (this._cfg.propagationNodeHash) {
+            setTimeout(() => {
+                try {
+                    this._rns.transport.requestPath(this._cfg.propagationNodeHash);
+                    console.log(`[retichat] Path request sent for propagation node ${this._cfg.propagationNodeHash.slice(0,12)}...`);
+                } catch(e) { console.warn("[retichat] Path request for propagation node failed:", e.message); }
+            }, 4000);  // wait for interface registration + first announce
+        }
+
         if (this._cfg.announceIntervalMs > 0) {
             this._annTimer = setInterval(() => this._announce(), this._cfg.announceIntervalMs);
         }
@@ -335,15 +472,325 @@ const RnsClient = {
         } catch(e) { console.warn("[rns] announce error", e.message); }
     },
 
+    /** Build the propagation_packed wire format matching iOS/Rust.
+     *  lxmfPacked = dest_hash(16) | source_hash(16) | sig(64) | msgpack_payload
+     *  Returns: msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | stamp(32)]]])
+     */
+    async _buildPropagationPacked(lxmfPacked, peerPublicKeyHex) {
+        const destHash = lxmfPacked.slice(0, 16);
+        const rest = lxmfPacked.slice(16);  // source_hash | sig | payload
+        const peerIdentity = Identity.fromPublicKey(Buffer.from(peerPublicKeyHex, "hex"));
+        const encrypted = peerIdentity.encrypt(rest);
+        let lxmfData = Buffer.concat([destHash, encrypted]);
+
+        // Compute propagation stamp (PoW proof-of-work, matching iOS)
+        const stamp = await this._computePropagationStamp(lxmfData);
+        if (stamp) {
+            lxmfData = Buffer.concat([lxmfData, stamp]);
+            console.log(`[retichat] 🔨 Propagation stamp computed, appended 32B`);
+        } else {
+            console.warn(`[retichat] ⚠️ Stamp computation failed, sending without stamp (will be rejected by node)`);
+        }
+
+        // msgpack: [timestamp_f64, [binary_blob]]
+        return MsgPack.pack([Date.now() / 1000, [lxmfData]]);
+    },
+
+    /** Compute a 32-byte PoW stamp for propagation.
+     *  Returns a Promise that resolves to a 32-byte Buffer or null on failure.
+     *  Target: >= 13 leading zero bits (rfed default cost=16, flex=3). */
+    async _computePropagationStamp(lxmfData) {
+        try {
+            const { sha256 } = await import("@noble/hashes/sha256");
+            const { hkdf } = await import("@noble/hashes/hkdf");
+
+            // Step 1: transient_id = sha256(lxmfData)  (Identity.full_hash is single SHA256)
+            const transientId = sha256(lxmfData);
+
+            // Step 2: build workblock through 1000 HKDF expansion rounds.
+            // Rust: salt = sha256(transientId || msgpack_uint(n))  (Identity.full_hash is single SHA256)
+            //       hkdf = Hkdf::new(Some(&salt), transientId)
+            //       hkdf.expand(&[], &mut derived)  → 256 bytes
+            const EXPAND_ROUNDS = 1000;
+            const EXPAND_BYTES = 256;
+            const workblockParts = [];
+
+            // MsgPack unsigned integer encoding (matching rmp::encode::write_uint)
+            const msgpackUint = (n) => {
+                if (n <= 127) return Buffer.from([n]);
+                if (n <= 255) return Buffer.from([0xcc, n]);
+                if (n <= 65535) { const b = Buffer.alloc(3); b[0] = 0xcd; b.writeUInt16BE(n, 1); return b; }
+                const b = Buffer.alloc(5); b[0] = 0xce; b.writeUInt32BE(n, 1); return b;
+            };
+
+            for (let n = 0; n < EXPAND_ROUNDS; n++) {
+                const saltInput = Buffer.concat([transientId, msgpackUint(n)]);
+                const salt = sha256(saltInput);
+                // HKDF: IKM=transientId, salt=salt, info="", length=256
+                const expanded = hkdf(sha256, transientId, salt, '', EXPAND_BYTES);
+                workblockParts.push(Buffer.from(expanded));
+                if (n % 50 === 49) await new Promise(r => setTimeout(r, 0));
+            }
+            const workblock = Buffer.concat(workblockParts);
+
+            // Step 3: mine a 32-byte stamp where sha256(workblock || stamp)
+            // has >= 13 leading zero bits (stamp_valid uses Identity.full_hash = single SHA256)
+            const TARGET_ZERO_BITS = 13;
+            const STAMP_SIZE = 32;
+            let attempts = 0;
+            const stamp = Buffer.alloc(STAMP_SIZE);
+
+            while (true) {
+                crypto.getRandomValues(stamp);
+                const hashInput = Buffer.concat([workblock, stamp]);
+                const hash = sha256(hashInput);
+                let leadingZeros = 0;
+                for (let i = 0; i < hash.length; i++) {
+                    if (hash[i] === 0) { leadingZeros += 8; }
+                    else { leadingZeros += Math.clz32(hash[i]) - 24; break; }
+                }
+                attempts++;
+                if (leadingZeros >= TARGET_ZERO_BITS) {
+                    console.log(`[retichat] 🔨 Stamp found after ${attempts} attempts (${leadingZeros} leading zero bits)`);
+                    return stamp;
+                }
+                if (attempts % 100 === 0) await new Promise(r => setTimeout(r, 0));
+            }
+        } catch (e) {
+            console.warn("[retichat] Stamp computation error:", e.message);
+            return null;
+        }
+    },
+
+    /** Establish a persistent link to the propagation node so we can send
+     *  store-and-forward messages. Matching iOS AppLinks::open_persistent. */
+    _establishPropagationLink() {
+        if (!this._cfg.propagationNodePubKey || !this._cfg.propagationNodeHash) return;
+
+        // Already have an active link?
+        if (this._propLink && this._propLink.status === Link.ACTIVE) return;
+
+        const propIdentity = Identity.fromPublicKey(
+            Buffer.from(this._cfg.propagationNodePubKey, "hex")
+        );
+        const propDest = this._rns.registerDestination(
+            propIdentity,
+            Destination.OUT,
+            Destination.LINK,
+            "lxmf",
+            "propagation"
+        );
+
+        const link = new Link();
+        this._propLink = link;
+
+        link.on("established", () => {
+            console.log(`[retichat] 🔗 Propagation link established, rtt=${link.rtt}ms`);
+            // Flush any messages that missed the propagation window while
+            // the link was still being established.
+            this._flushPropagation();
+        });
+
+        link.on("close", () => {
+            console.log("[retichat] Propagation link closed");
+            this._propLink = null;
+        });
+
+        link.establish(propDest);
+        console.log(`[retichat] 🔗 Establishing propagation link to ${this._cfg.propagationNodeHash.slice(0,12)}...`);
+    },
+
+    /** Flush any pending messages that need propagation now that the link is up. */
+    async _flushPropagation() {
+        const link = this._propLink;
+        if (!link || link.status !== Link.ACTIVE) return;
+
+        // Track which messages we've already propagated to avoid double-sends
+        if (!this._propagatedMsgIds) this._propagatedMsgIds = new Set();
+
+        for (const [contactHash, msgs] of MsgStore._messages || []) {
+            const contact = ContactStore.get(contactHash);
+            if (!contact || !contact.publicKey) continue;
+            for (const msg of msgs) {
+                if (msg.dir !== "out" || msg.status !== "sending") continue;
+                if (this._propagatedMsgIds.has(msg.id)) continue;
+                this._propagatedMsgIds.add(msg.id);
+
+                console.log(`[retichat] 📡 Flush propagation for ${contactHash.slice(0,8)} msg=${msg.id.slice(0,8)}`);
+
+                // Build LXMF message addressed to the contact
+                const contactPeerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
+                const contactDest = this._rns.registerDestination(contactPeerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+                const FIELD_TICKET = 0x0C;
+                const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
+
+                const lxmfMsg = new LXMessage();
+                lxmfMsg.sourceHash = this._lxmfRouter.destination.hash;
+                lxmfMsg.destinationHash = contactDest.hash;
+                lxmfMsg.title = "";
+                lxmfMsg.content = msg.content;
+                lxmfMsg.fields = new Map();
+                lxmfMsg.fields.set(FIELD_TICKET, ticket);
+                // Non-opportunistic: dest_hash at offset 0 for propagation node to read
+                const packed = lxmfMsg.pack(IdMgr.id, false);
+
+                // Build and send propagation_packed
+                try {
+                    const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
+                    const pkt = new Packet();
+                    pkt.headerType = Packet.HEADER_1;
+                    pkt.packetType = Packet.DATA;
+                    pkt.transportType = 0;
+                    pkt.context = Packet.NONE;
+                    pkt.contextFlag = Packet.FLAG_UNSET;
+                    pkt.destination = link;
+                    pkt.destinationHash = link.hash;
+                    pkt.destinationType = Destination.LINK;
+                    pkt.data = propagationPacked;
+                    const raw = pkt.pack();
+
+                    const truncatedHex = pkt.packetHash.slice(0, 16).toString("hex");
+                    this._pendingPacketHashes.set(truncatedHex, {
+                        contactHash: contactHash,
+                        messageId: msg.id,
+                        onProof: (msgId) => {
+                            MsgStore.updateStatus(contactHash, msgId, "propagated");
+                            console.log(`[retichat] ✓ Propagation proof for ${contactHash.slice(0,8)}`);
+                            this._onMsg.forEach(fn => fn(null, contactHash));
+                        }
+                    });
+
+                    this._rns.sendData(raw, link.attachedInterface);
+                    console.log(`[retichat] 📡 Flushed propagation for ${contactHash.slice(0,8)}`);
+                } catch (e) {
+                    console.warn(`[retichat] Propagation flush failed for ${contactHash.slice(0,8)}:`, e.message);
+                }
+            }
+        }
+    },
+
     sendMessage(contact, content) {
         if (!this._rns || !this._lxmfRouter) throw new Error("Not connected");
-        if (!contact.publicKey) throw new Error("No public key for this contact yet. Wait for them to come online, or ask them for their full lxma:// link.");
+        if (!contact.publicKey) throw new Error("No public key for this contact yet.");
 
-        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}" ownHash=${this.ownHash?.slice(0,12)} pk=${contact.publicKey.slice(0,12)}...`);
+        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"`);
 
-        const peerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
+        // Create the outgoing message record
+        ContactStore.touch(contact.destHash);
+        const outMsg = MsgStore.add(contact.destHash, {
+            dir: "out", content, status: "sending",
+            srcHash: this.ownHash, destHash: contact.destHash,
+        });
+
+        // Send directly to the destination
+        let directProofReceived = false;
+        this._sendPacket(contact.destHash, contact.publicKey, content, outMsg.id,
+            (msgId) => {
+                // Direct proof callback
+                directProofReceived = true;
+                MsgStore.updateStatus(contact.destHash, msgId, "proved");
+                ContactStore.setReachable(contact.destHash, true);
+                console.log(`[retichat] ✅ Direct proof for ${contact.destHash.slice(0,8)}`);
+                this._onMsg.forEach(fn => fn(null, contact.destHash));
+            },
+            (msgId) => {
+                // Direct send error
+                MsgStore.updateStatus(contact.destHash, msgId, "failed");
+            }
+        );
+
+        // After propagation delay, if no direct proof, also send to propagation node
+        const delaySec = ContactStore.propagationDelay(contact.destHash);
+        setTimeout(async () => {
+            if (directProofReceived) return;
+            const link = this._propLink;
+            if (!link || link.status !== Link.ACTIVE) {
+                console.log(`[retichat] ⚠️ Propagation link not active, cannot propagate`);
+                // Try to re-establish
+                this._establishPropagationLink();
+                return;
+            }
+            console.log(`[retichat] 📡 Propagating via link to ${this._cfg.propagationNodeHash.slice(0,12)}... (direct proof not received in ${delaySec}s)`);
+
+            // Build LXMF message addressed to the contact's delivery destination
+            const contactPeerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
+            const contactDest = this._rns.registerDestination(contactPeerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+            const FIELD_TICKET = 0x0C;
+            const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
+
+            const msg = new LXMessage();
+            msg.sourceHash = this._lxmfRouter.destination.hash;
+            msg.destinationHash = contactDest.hash;
+            msg.title = "";
+            msg.content = content;
+            msg.fields = new Map();
+            msg.fields.set(FIELD_TICKET, ticket);
+            // Pack non-opportunistic so destinationHash is at offset 0.
+            // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
+            // to identify the final recipient.
+            const packed = msg.pack(IdMgr.id, false);
+
+            // Build propagation_packed: msgpack([timestamp, [[dest_hash | EC_encrypted(rest) | stamp]]])
+            const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
+
+            // Build a LINK-type DATA packet. Packet.pack() handles link encryption
+            // via this.destination.encrypt(), so do NOT pre-encrypt here.
+            const pkt = new Packet();
+            pkt.headerType = Packet.HEADER_1;
+            pkt.packetType = Packet.DATA;
+            pkt.transportType = 0;  // BROADCAST
+            pkt.context = Packet.NONE;
+            pkt.contextFlag = Packet.FLAG_UNSET;
+            pkt.destination = link;
+            pkt.destinationHash = link.hash;
+            pkt.destinationType = Destination.LINK;
+            pkt.data = propagationPacked;
+            const raw = pkt.pack();
+
+            // Track packet hash for proof matching
+            const truncatedHex = pkt.packetHash.slice(0, 16).toString("hex");
+            this._pendingPacketHashes.set(truncatedHex, {
+                contactHash: contact.destHash,
+                messageId: outMsg.id,
+                onProof: (msgId) => {
+                    if (!directProofReceived) {
+                        MsgStore.updateStatus(contact.destHash, msgId, "propagated");
+                        console.log(`[retichat] ✓ Propagation proof for ${contact.destHash.slice(0,8)}`);
+                        this._onMsg.forEach(fn => fn(null, contact.destHash));
+                    }
+                }
+            });
+
+            this._rns.sendData(raw, link.attachedInterface);
+
+            // Mark as likely offline
+            if (contact.reachable !== false) {
+                ContactStore.setReachable(contact.destHash, false);
+            }
+        }, delaySec * 1000);
+
+        // 15-second total timeout — mark as failed if no proof at all
+        const timeoutId = setTimeout(() => {
+            const msgs = MsgStore.get(contact.destHash);
+            const msg = msgs.find(m => m.id === outMsg.id);
+            if (msg && msg.status === "sending") {
+                MsgStore.updateStatus(contact.destHash, outMsg.id, "failed");
+                this._onMsg.forEach(fn => fn(null, contact.destHash));
+            }
+            this._pendingTimeouts.delete(outMsg.id);
+        }, 15000);
+        this._pendingTimeouts.set(outMsg.id, timeoutId);
+
+        return outMsg;
+    },
+
+    /** Core packet send: packs, sends, tracks proof, calls back. */
+    _sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError) {
+        const peerId = Identity.fromPublicKey(Buffer.from(publicKeyHex, "hex"));
         const dest = this._rns.registerDestination(peerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
-        console.log(`[retichat]   dest.hash=${dest.hash.toString("hex").slice(0,12)}... peerId.hash=${peerId.hash.toString("hex").slice(0,12)}...`);
+
+        const FIELD_TICKET = 0x0C;
+        const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
 
         const msg = new LXMessage();
         msg.sourceHash = this._lxmfRouter.destination.hash;
@@ -351,19 +798,31 @@ const RnsClient = {
         msg.title = "";
         msg.content = content;
         msg.fields = new Map();
+        msg.fields.set(FIELD_TICKET, ticket);
         const packed = msg.pack(IdMgr.id, true);
-        console.log(`[retichat]   packed LXMF: ${packed.length} bytes, first 8: ${Buffer.from(packed.slice(0,8)).toString("hex")}`);
-        dest.send(packed);
 
-        return MsgStore.add(contact.destHash, {
-            dir: "out", content, status: "sent",
-            srcHash: this.ownHash, destHash: contact.destHash,
-        });
+        this._pendingTickets.set(ticket, { contactHash, messageId, onProof });
+
+        try {
+            const sentPacketHash = dest.send(packed);
+            if (sentPacketHash) {
+                const truncatedHex = sentPacketHash.slice(0, 16).toString("hex");
+                this._pendingPacketHashes.set(truncatedHex, { contactHash, messageId, onProof });
+            }
+        } catch (e) {
+            this._pendingTickets.delete(ticket);
+            if (onError) onError(messageId);
+            throw e;
+        }
     },
 
     disconnect() {
         if (this._annTimer) { clearInterval(this._annTimer); this._annTimer = null; }
         if (this._monTimer) { clearInterval(this._monTimer); this._monTimer = null; }
+        this._pendingTickets.clear();
+        this._pendingPacketHashes.clear();
+        for (const tid of this._pendingTimeouts.values()) clearTimeout(tid);
+        this._pendingTimeouts.clear();
         // Disconnect all interfaces
         if (this._rns?.interfaces) {
             for (const iface of this._rns.interfaces) {
@@ -429,9 +888,12 @@ const App = {
         showSettings: false,
         showAddContact: false,
         showShareId: false,
+        showContactInfo: false,
+        contactInfoHash: null,
         isWide: window.innerWidth >= 800,
     },
     _pathRequestedThisSession: new Set(),
+    _savedFocus: null,  // { activeHash, cursorPos, value } for focus restoration
 
     // ===== LIFECYCLE =====
 
@@ -455,7 +917,13 @@ const App = {
             this.state.isWide = window.innerWidth >= 800;
             // Re-render if crossing the breakpoint
             if (wasWide !== this.state.isWide) {
-                // On narrow, if we had a chat open, keep it
+                // If going narrow with a chat open, set the slide class before render
+                if (!this.state.isWide && this.state.activeHash) {
+                    document.body.classList.add("narrow-chat-open");
+                }
+                if (this.state.isWide) {
+                    document.body.classList.remove("narrow-chat-open");
+                }
                 this.render();
             }
         });
@@ -463,19 +931,58 @@ const App = {
         // Escape key closes any open modal
         window.addEventListener("keydown", (e) => {
             if (e.key === "Escape") {
-                if (this.state.showSettings || this.state.showAddContact || this.state.showShareId) {
+                if (this.state.showSettings || this.state.showAddContact || this.state.showShareId || this.state.showContactInfo) {
                     this.state.showSettings = false;
                     this.state.showAddContact = false;
                     this.state.showShareId = false;
+                    this.state.showContactInfo = false;
                     this.render();
                 }
             }
         });
     },
 
+    // ===== FOCUS PRESERVATION =====
+    // Saves composer state before a render that would destroy the DOM,
+    // so we can restore focus afterward.
+    _saveComposerFocus() {
+        const ta = document.getElementById("composer-input");
+        if (ta && document.activeElement === ta) {
+            this._savedFocus = {
+                activeHash: this.state.activeHash,
+                cursorPos: ta.selectionStart,
+                value: ta.value,
+            };
+        } else {
+            this._savedFocus = null;
+        }
+    },
+
+    _restoreComposerFocus() {
+        const sf = this._savedFocus;
+        if (!sf) return;
+        // Only restore if we're still in the same chat
+        if (this.state.activeHash !== sf.activeHash) { this._savedFocus = null; return; }
+        const ta = document.getElementById("composer-input");
+        if (ta) {
+            // Restore the in-flight text and cursor position
+            if (sf.value && ta.value !== sf.value) {
+                ta.value = sf.value;
+                ta.style.height = "auto";
+                ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
+            }
+            ta.focus();
+            if (sf.cursorPos !== undefined && sf.value === ta.value) {
+                ta.setSelectionRange(sf.cursorPos, sf.cursorPos);
+            }
+        }
+        this._savedFocus = null;
+    },
+
     // ===== RENDER =====
 
     render() {
+        this._saveComposerFocus();
         clear(this.root);
         if (this.state.view === "onboarding") {
             // Center the onboarding card in the viewport
@@ -500,9 +1007,13 @@ const App = {
         if (this.state.showSettings) this._renderSettingsModal();
         if (this.state.showAddContact) this._renderAddContactModal();
         if (this.state.showShareId) this._renderShareIdModal();
+        if (this.state.showContactInfo) this._renderContactInfoModal();
 
         // Re-apply status dot after DOM rebuild (RNS status hasn't changed so listener won't fire)
         this._applyStatusDot();
+
+        // Restore composer focus if it was active before render
+        requestAnimationFrame(() => this._restoreComposerFocus());
     },
 
     /** Restore the status dot color after a render destroys the old DOM. */
@@ -515,6 +1026,8 @@ const App = {
 
     /** Wide layout: sidebar (left) + detail (right) */
     _renderWide() {
+        // Clean up narrow state if we just crossed the breakpoint
+        document.body.classList.remove("narrow-chat-open");
         this.root.append(
             h("div", { className: "sidebar" },
                 this._buildSidebarContent(),
@@ -527,11 +1040,11 @@ const App = {
         );
     },
 
-    /** Narrow layout: show list or chat */
+    /** Narrow layout: show list or chat.
+     *  `openChat()` / `closeChat()` manage the `narrow-chat-open` body class
+     *  for slide transitions; here we just render the correct panel. */
     _renderNarrow() {
         if (this.state.activeHash) {
-            // Chat is open — show detail panel sliding in from right
-            document.body.classList.add("narrow-chat-open");
             this.root.append(
                 h("div", { className: "sidebar hidden" }),
                 h("div", { className: "detail" },
@@ -539,8 +1052,6 @@ const App = {
                 ),
             );
         } else {
-            // Show sidebar
-            document.body.classList.remove("narrow-chat-open");
             this.root.append(
                 h("div", { className: "sidebar" },
                     this._buildSidebarContent(),
@@ -556,7 +1067,7 @@ const App = {
         const contacts = ContactStore.getAll();
         const filtered = this.state.searchQuery
             ? contacts.filter(c => {
-                const name = (c.alias || c.displayName || "").toLowerCase();
+                const name = (c.displayName || "").toLowerCase();
                 const hash = c.destHash.toLowerCase();
                 const q = this.state.searchQuery.toLowerCase();
                 return name.includes(q) || hash.includes(q);
@@ -640,7 +1151,7 @@ const App = {
     },
 
     _buildContactItem(c) {
-        const name = c.alias || c.displayName || "?" + c.destHash.slice(0, 8);
+        const name = c.displayName || "?" + c.destHash.slice(0, 8);
         const preview = MsgStore.preview(c.destHash);
         const msgs = MsgStore.get(c.destHash);
         const lastTs = msgs.length > 0 ? msgs[msgs.length - 1].timestamp : c.lastSeen;
@@ -684,7 +1195,7 @@ const App = {
     _buildChatView() {
         const c = ContactStore.get(this.state.activeHash);
         if (!c) { this.state.activeHash = null; this.render(); return document.createDocumentFragment(); }
-        const name = c.alias || c.displayName || "?" + c.destHash.slice(0, 8);
+        const name = c.displayName || "?" + c.destHash.slice(0, 8);
         const msgs = MsgStore.get(c.destHash);
         const hue = avatarHue(name);
 
@@ -697,13 +1208,15 @@ const App = {
                     className: "header-avatar",
                     style: { color: `hsl(${hue}, 50%, 65%)`, background: `hsla(${hue}, 50%, 40%, 0.15)`, borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
                 }, name.charAt(0).toUpperCase()),
-                h("div", { className: "header-info" },
+                h("div", { className: "header-info",
+                    onClick: () => { this.state.showContactInfo = true; this.state.contactInfoHash = c.destHash; this.render(); },
+                    style: { cursor: "pointer" } },
                     h("div", { className: "header-name" }, esc(name)),
                     h("div", { className: "header-hash" },
                         c.destHash + (c.publicKey ? "" : " — waiting for public key…")),
                 ),
                 h("button", { className: "icon-btn", title: "Contact info",
-                    onClick: () => { /* future: contact info sheet */ } }, "ℹ"),
+                    onClick: () => { this.state.showContactInfo = true; this.state.contactInfoHash = c.destHash; this.render(); } }, "ℹ"),
             ),
 
             // Messages
@@ -712,11 +1225,13 @@ const App = {
                     ? []
                     : msgs.map(m => {
                         const isOwn = m.dir === "out";
+                        const statusIcon = isOwn ? this._statusIcon(m.status) : "";
                         return h("div", { className: `msg-row ${isOwn ? "own" : "their"}` },
                             h("div", { className: "msg-bubble" },
                                 esc(m.content),
                                 h("div", { className: "msg-meta" },
-                                    h("span", {}, fmtTime(m.timestamp)),
+                                    h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
+                                    statusIcon ? h("span", { className: `msg-status ${m.status}` }, statusIcon) : null,
                                 ),
                             ),
                         );
@@ -754,14 +1269,19 @@ const App = {
         this.state.showSettings = false;
         this.state.showAddContact = false;
         this.state.showShareId = false;
+        this.state.showContactInfo = false;
 
         // Send a path request if we don't have this contact's public key yet
-        // (first time opening this chat in the session)
         const c = ContactStore.get(hash);
         if (c && !c.publicKey) {
             this._requestPathForContact(hash);
         }
 
+        // On narrow: ensure narrow-chat-open is set before render so the
+        // detail panel renders in its final (visible) position.
+        if (!this.state.isWide) {
+            document.body.classList.add("narrow-chat-open");
+        }
         this.render();
         // Scroll to bottom after render
         requestAnimationFrame(() => this._scrollChatBottom());
@@ -783,9 +1303,18 @@ const App = {
     },
 
     closeChat() {
-        this.state.activeHash = null;
-        document.body.classList.remove("narrow-chat-open");
-        this.render();
+        // On narrow devices, animate the detail panel sliding out before re-render
+        if (!this.state.isWide && document.body.classList.contains("narrow-chat-open")) {
+            document.body.classList.remove("narrow-chat-open");
+            // Wait for the CSS transition to complete, then rebuild
+            setTimeout(() => {
+                this.state.activeHash = null;
+                this.render();
+            }, 300);
+        } else {
+            this.state.activeHash = null;
+            this.render();
+        }
     },
 
     sendMessage() {
@@ -810,6 +1339,17 @@ const App = {
     _scrollChatBottom() {
         const ml = document.getElementById("msg-list");
         if (ml) ml.scrollTop = ml.scrollHeight;
+    },
+
+    /** Returns the icon character for a given message status. */
+    _statusIcon(status) {
+        switch (status) {
+            case "sending":     return "●";   // filled dot — awaiting proof
+            case "propagated":  return "✓";   // single check — stored at propagation node
+            case "proved":      return "✓✓";  // double check — direct proof received
+            case "failed":      return "✗";   // cross — failed
+            default:            return "";
+        }
     },
 
     toggleTheme() {
@@ -961,6 +1501,35 @@ const App = {
             ),
         );
 
+        // ---- RFed / Propagation section ----
+        const derivedProp = (() => {
+            try {
+                const rfedBytes = Buffer.from(cfg.rfedNodeHash || DEFAULT_CONFIG.rfedNodeHash, "hex");
+                return Destination.hash({hash: rfedBytes}, "lxmf", "propagation").toString("hex");
+            } catch(e) { return ""; }
+        })();
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "RFed & Propagation"),
+                h("div", { className: "settings-field" },
+                    h("label", { htmlFor: "cfg-rfed" }, "RFed Node Identity Hash"),
+                    h("input", { id: "cfg-rfed", type: "text",
+                        value: cfg.rfedNodeHash || "",
+                        placeholder: DEFAULT_CONFIG.rfedNodeHash }),
+                    h("div", { className: "field-hint" },
+                        "Root identity for deriving propagation, notify, and channel addresses."),
+                ),
+                h("div", { className: "settings-field" },
+                    h("label", { htmlFor: "cfg-prop-override" }, "LXMF Propagation Override"),
+                    h("input", { id: "cfg-prop-override", type: "text",
+                        value: cfg.lxmfPropagationOverride || "",
+                        placeholder: derivedProp.slice(0,16) + "… (derived from RFed)" }),
+                    h("div", { className: "field-hint" },
+                        "Leave empty to derive from RFed node. Set explicitly for a custom propagation node."),
+                ),
+            ),
+        );
+
         // ---- Actions ----
         body.appendChild(
             h("div", { className: "btn-row" },
@@ -982,8 +1551,12 @@ const App = {
     async _saveSettings() {
         const exchangeUrl = document.getElementById("cfg-exchange")?.value?.trim();
         const name = document.getElementById("cfg-name")?.value?.trim();
+        const rfedHash = document.getElementById("cfg-rfed")?.value?.trim();
+        const propOverride = document.getElementById("cfg-prop-override")?.value?.trim();
         if (exchangeUrl !== undefined) { RnsClient._cfg.exchangeUrl = exchangeUrl; sSet("exchangeUrl", exchangeUrl); }
         if (name !== undefined) { RnsClient._cfg.displayName = name; sSet("displayName", name); }
+        if (rfedHash !== undefined) { RnsClient._cfg.rfedNodeHash = rfedHash; sSet("rfedNodeHash", rfedHash); }
+        if (propOverride !== undefined) { RnsClient._cfg.lxmfPropagationOverride = propOverride; sSet("lxmfPropagationOverride", propOverride); }
         try { await RnsClient.reconnect(); } catch(e) { console.error(e); }
         this.state.showSettings = false;
         this.render();
@@ -1117,6 +1690,124 @@ const App = {
         this.root.appendChild(overlay);
     },
 
+    /** Contact Info modal — edit name, delete chat */
+    _renderContactInfoModal() {
+        const c = ContactStore.get(this.state.contactInfoHash);
+        if (!c) { this.state.showContactInfo = false; this.render(); return; }
+        const name = c.displayName || "?" + c.destHash.slice(0, 8);
+        const hue = avatarHue(name);
+
+        const overlay = h("div", { className: "modal-overlay",
+            onClick: (e) => { if (e.target === overlay) { this.state.showContactInfo = false; this.render(); } },
+        });
+
+        const sheet = h("div", { className: "modal-sheet" });
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "Contact Info"),
+                h("button", { className: "icon-btn",
+                    onClick: () => { this.state.showContactInfo = false; this.render(); } }, "✕"),
+            ),
+        );
+
+        const body = h("div", { className: "modal-body" });
+
+        // Avatar + name header
+        body.appendChild(
+            h("div", { style: { display: "flex", alignItems: "center", gap: "14px", marginBottom: "20px" } },
+                h("div", {
+                    className: "contact-avatar",
+                    style: { width: "52px", height: "52px", fontSize: "22px",
+                        color: `hsl(${hue}, 50%, 65%)`,
+                        background: `hsla(${hue}, 50%, 40%, 0.15)`,
+                        borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
+                }, name.charAt(0).toUpperCase()),
+                h("div", { style: { flex: 1 } },
+                    h("div", { style: { fontWeight: 700, fontSize: "17px" } }, esc(name)),
+                    h("div", { style: { fontSize: "11px", color: "var(--text-muted)", fontFamily: "var(--font-mono)", marginTop: "2px" } },
+                        c.destHash),
+                ),
+            ),
+        );
+
+        // Display Name (single editable field)
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Display Name"),
+                h("div", { className: "settings-field" },
+                    h("input", {
+                        id: "ci-display-name",
+                        type: "text",
+                        value: name === ("?" + c.destHash.slice(0,8)) ? "" : name,
+                        placeholder: name,
+                    }),
+                    h("div", { className: "field-hint" },
+                        "A local name for this contact. Stored only on this device."),
+                ),
+            ),
+        );
+
+        // Public key status
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Public Key"),
+                h("div", {
+                    style: {
+                        fontSize: "11px",
+                        fontFamily: "var(--font-mono)",
+                        color: c.publicKey ? "var(--success)" : "var(--warning)",
+                        wordBreak: "break-all",
+                    },
+                }, c.publicKey || "Not received yet — messages cannot be sent until the contact comes online."),
+            ),
+        );
+
+        // Actions
+        body.appendChild(
+            h("div", { className: "btn-row", style: { marginBottom: "8px" } },
+                h("button", { className: "btn btn-primary",
+                    onClick: () => this._saveContactInfo() }, "Save"),
+            ),
+        );
+
+        // Delete button
+        body.appendChild(
+            h("div", { style: { marginTop: "8px" } },
+                h("button", {
+                    className: "btn btn-danger btn-block",
+                    onClick: () => this._deleteContact(c),
+                }, "🗑 Delete Conversation"),
+            ),
+        );
+
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        this.root.appendChild(overlay);
+
+        setTimeout(() => sheet.querySelector("input")?.focus(), 150);
+    },
+
+    _saveContactInfo() {
+        const hash = this.state.contactInfoHash;
+        if (!hash) return;
+        const displayName = document.getElementById("ci-display-name")?.value?.trim();
+        if (displayName) ContactStore.setDisplayName(hash, displayName);
+        this.state.showContactInfo = false;
+        this.render();
+    },
+
+    _deleteContact(c) {
+        const name = c.displayName || c.destHash.slice(0,8);
+        if (!confirm(`Delete conversation with "${name}" and all messages? This cannot be undone.`)) return;
+        const hash = c.destHash;
+        MsgStore.remove(hash);
+        ContactStore.remove(hash);
+        this.state.showContactInfo = false;
+        if (this.state.activeHash === hash) this.state.activeHash = null;
+        document.body.classList.remove("narrow-chat-open");
+        this.render();
+    },
+
     // ===== REACTIVE WIRING =====
 
     _wire() {
@@ -1133,7 +1824,7 @@ const App = {
         RnsClient.onMessage((msg, peerHash) => {
             if (this.state.view !== "main") return;
             // Don't disrupt open modals — they'll see updates when dismissed
-            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId) return;
+            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId || this.state.showContactInfo) return;
             const inActiveChat = this.state.activeHash === peerHash;
             this.render();
             if (inActiveChat) {
@@ -1144,7 +1835,7 @@ const App = {
         // Contact list changes — only refresh if no modal is open
         ContactStore.onChange(() => {
             if (this.state.view !== "main") return;
-            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId) return;
+            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId || this.state.showContactInfo) return;
             this.render();
         });
     },
