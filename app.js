@@ -589,6 +589,11 @@ const RnsClient = {
             // Flush any messages that missed the propagation window while
             // the link was still being established.
             this._flushPropagation();
+            // Identify ourselves so the PN can authorize /get requests.
+            // Small delay to let the link settle before sending.
+            setTimeout(() => { link.identify(IdMgr.id); }, 1_000);
+            // Pull any stored messages for us — after identify has propagated
+            setTimeout(() => { this._fetchPropagatedMessages(); }, 5_000);
         });
 
         link.on("close", () => {
@@ -667,6 +672,132 @@ const RnsClient = {
                 }
             }
         }
+    },
+
+    /** Fetch propagated messages (called when propagation link establishes).
+     *  Sends /get over the link to list, download, and purge stored messages. */
+    async _fetchPropagatedMessages() {
+        const link = this._propLink;
+        if (!link || link.status !== Link.ACTIVE) return;
+        if (this._propFetchInProgress) return;
+        this._propFetchInProgress = true;
+
+        try {
+            if (!this._propSeenIds) this._propSeenIds = new Set();
+
+            // ── Step 1: List pending message IDs ──
+            console.log("[retichat] 📬 [1/4] Listing pending messages...");
+            const listReqId = link.sendRequest("/get", [null, null]);
+            const listResp = await this._waitForResponse(link, listReqId, 15000);
+
+            if (listResp === null || listResp === undefined) {
+                console.log("[retichat] 📬 [1/4] List timed out");
+                this._propFetchInProgress = false; return;
+            }
+            if (typeof listResp === 'number') {
+                const names = {0xF0:'NO_IDENTITY',0xF1:'NO_ACCESS',0xF3:'INVALID_KEY',0xF4:'INVALID_DATA'};
+                console.log(`[retichat] 📬 [1/4] List error 0x${listResp.toString(16)} (${names[listResp]||'unknown'})`);
+                this._propFetchInProgress = false; return;
+            }
+            if (!Array.isArray(listResp)) {
+                console.log(`[retichat] 📬 [1/4] List unexpected type: ${typeof listResp}`, listResp);
+                this._propFetchInProgress = false; return;
+            }
+            console.log(`[retichat] 📬 [1/4] ${listResp.length} pending, ids=${listResp.map(b=>Buffer.from(b).toString("hex").slice(0,8)).join(",")}`);
+            const pendingIds = listResp;
+            if (pendingIds.length === 0) {
+                console.log("[retichat] 📬 [1/4] No pending messages");
+                this._propFetchInProgress = false; return;
+            }
+
+            const newIds = pendingIds.filter(id => !this._propSeenIds.has(Buffer.from(id).toString("hex")));
+            if (newIds.length === 0) {
+                console.log("[retichat] 📬 All pending already seen");
+                this._propFetchInProgress = false; return;
+            }
+
+            // ── Step 2+3: Download and decrypt one at a time (avoids MTU limits) ──
+            const deliveredIds = [];
+            const myDeliverHash = this._lxmfRouter?.destination?.hash;
+            if (!myDeliverHash) {
+                console.log("[retichat] 📬 No local delivery hash — cannot decrypt");
+                this._propFetchInProgress = false; return;
+            }
+
+            for (const tid of newIds) {
+                const tidHex = Buffer.from(tid).toString("hex").slice(0,8);
+                console.log(`[retichat] 📬 [2/4] Downloading ${tidHex}...`);
+                const blobResp = await this._waitForResponse(
+                    link,
+                    link.sendRequest("/get", [[tid], null]),
+                    15000
+                );
+                if (!blobResp || !Array.isArray(blobResp) || blobResp.length === 0) {
+                    console.log(`[retichat] 📬 [2/4] ${tidHex} download failed:`, typeof blobResp === 'number' ? `0x${blobResp.toString(16)}` : (blobResp ? `got ${blobResp.length||0} items` : 'timeout'));
+                    continue;
+                }
+                const lxmfData = Buffer.from(blobResp[0]);
+                console.log(`[retichat] 📬 [3/4] ${tidHex} blob ${lxmfData.length}B dest=${lxmfData.slice(0,16).toString("hex").slice(0,12)}`);
+
+                if (lxmfData.length < 48) { console.log(`[retichat] 📬 [3/4] ${tidHex} too short`); continue; }
+                const destHash = lxmfData.slice(0, 16);
+                if (!destHash.equals(myDeliverHash)) { console.log(`[retichat] 📬 [3/4] ${tidHex} not for us`); continue; }
+
+                try {
+                    const decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
+                    if (!decrypted || decrypted.length < 80) { console.log(`[retichat] 📬 [3/4] ${tidHex} decrypt failed`); continue; }
+                    const srcHash = decrypted.slice(0, 16);
+                    const payloadBytes = decrypted.slice(80);
+
+                    let payload;
+                    try { payload = MsgPack.unpack(payloadBytes); } catch(e) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
+                    if (!Array.isArray(payload) || payload.length < 3) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload shape`); continue; }
+
+                    const [ts, titleBin, contentBin, fieldsMap] = payload;
+                    const content = Buffer.from(contentBin || []).toString();
+                    console.log(`[retichat] 📬 [3/4] ✅ ${tidHex} from ${srcHash.toString("hex").slice(0,12)}: "${content.slice(0,60)}"`);
+
+                    this._lxmfRouter.emit("message", {
+                        sourceHash: srcHash, destinationHash: destHash,
+                        title: Buffer.from(titleBin || []).toString(),
+                        content, fields: fieldsMap, timestamp: ts,
+                    });
+                    this._propSeenIds.add(Buffer.from(tid).toString("hex"));
+                    deliveredIds.push(tid);
+                } catch(e) {
+                    console.warn(`[retichat] 📬 [3/4] ${tidHex} exception:`, e.message);
+                }
+            }
+
+            // ── Step 4: Purge delivered ──
+            if (deliveredIds.length > 0) {
+                console.log(`[retichat] 📬 [4/4] Purging ${deliveredIds.length} delivered...`);
+                const haveReqId = link.sendRequest("/get", [null, deliveredIds]);
+                await this._waitForResponse(link, haveReqId, 10000);
+                console.log("[retichat] 📬 [4/4] Purge complete");
+            } else {
+                console.log("[retichat] 📬 [4/4] Nothing to purge");
+            }
+        } catch(e) {
+            console.warn("[retichat] 📬 Fetch exception:", e.message, e.stack?.slice(0,200));
+        } finally {
+            this._propFetchInProgress = false;
+        }
+    },
+
+    /** Wait for a response matching requestId on the given link. */
+    _waitForResponse(link, requestId, timeoutMs) {
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => { link.off("response", handler); resolve(null); }, timeoutMs);
+            const handler = (resp) => {
+                if (!resp.requestId || resp.requestId.length !== requestId.length) return;
+                if (!Buffer.from(resp.requestId).equals(Buffer.from(requestId))) return;
+                clearTimeout(timer);
+                link.off("response", handler);
+                resolve(resp.data);
+            };
+            link.on("response", handler);
+        });
     },
 
     sendMessage(contact, content) {
