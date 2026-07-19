@@ -1370,12 +1370,12 @@ const App = {
                     : msgs.map(m => {
                         const isOwn = m.dir === "out";
                         const statusIcon = isOwn ? this._statusIcon(m.status) : "";
-                        return h("div", { className: `msg-row ${isOwn ? "own" : "their"}` },
+                        return h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": m.id },
                             h("div", { className: "msg-bubble" },
                                 esc(m.content),
                                 h("div", { className: "msg-meta" },
                                     h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
-                                    statusIcon ? h("span", { className: `msg-status ${m.status}` }, statusIcon) : null,
+                                    statusIcon ? h("span", { className: `msg-status ${m.status}`, "data-msg-status": m.status }, statusIcon) : null,
                                 ),
                             ),
                         );
@@ -1952,6 +1952,53 @@ const App = {
         this.render();
     },
 
+    // ===== IN-PLACE DOM UPDATES =====
+    // Avoid full re-renders for events not initiated by the user:
+    // proofs, incoming messages, and contact list refreshes.
+    // This preserves scroll position and composer focus.
+
+    /** Append a single incoming message to the active chat view without re-rendering. */
+    _appendMessageToDOM(msg, contactHash, contactName) {
+        const ml = document.getElementById("msg-list");
+        if (!ml) return false;
+        const hue = avatarHue(contactName || contactHash?.slice(0,8));
+        const isOwn = msg.dir === "out";
+        const statusIcon = isOwn ? this._statusIcon(msg.status) : "";
+        const row = h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": msg.id },
+            h("div", { className: "msg-bubble" },
+                esc(msg.content),
+                h("div", { className: "msg-meta" },
+                    h("span", { className: "msg-time" }, fmtTime(msg.timestamp)),
+                    statusIcon ? h("span", { className: `msg-status ${msg.status}`, "data-msg-status": msg.status }, statusIcon) : null,
+                ),
+            ),
+        );
+        ml.appendChild(row);
+        return true;
+    },
+
+    /** Update a message status icon in-place without re-rendering.
+     *  Finds the msg-row by data-msg-id and updates its status span. */
+    _updateMsgStatusDOM(contactHash, msgId, newStatus) {
+        const row = document.querySelector(`.msg-row[data-msg-id="${msgId}"]`);
+        if (!row) return;
+        // Remove old status span if present
+        const oldStatus = row.querySelector(".msg-status");
+        if (oldStatus) oldStatus.remove();
+        // Add new status span
+        const icon = this._statusIcon(newStatus);
+        if (icon) {
+            const meta = row.querySelector(".msg-meta");
+            if (meta) {
+                const span = document.createElement("span");
+                span.className = `msg-status ${newStatus}`;
+                span.setAttribute("data-msg-status", newStatus);
+                span.textContent = icon;
+                meta.appendChild(span);
+            }
+        }
+    },
+
     // ===== REACTIVE WIRING =====
 
     _wire() {
@@ -1964,23 +2011,64 @@ const App = {
             }
         });
 
-        // Incoming messages: refresh the view (unless a modal is open)
+        // Incoming messages & proofs: update in-place when possible,
+        // fall back to full re-render only when sidebar state changed.
         RnsClient.onMessage((msg, peerHash) => {
             if (this.state.view !== "main") return;
-            // Don't disrupt open modals — they'll see updates when dismissed
             if (this.state.showSettings || this.state.showAddContact || this.state.showShareId || this.state.showContactInfo) return;
             const inActiveChat = this.state.activeHash === peerHash;
+
+            // Proof-only event (msg is null): update status icon in-place.
+            // No re-render needed — the status change doesn't affect layout.
+            if (!msg) {
+                if (!inActiveChat) return; // status update for a non-visible chat — no-op
+                // Find all outbound messages whose status may have changed and update them
+                const msgs = MsgStore.get(peerHash);
+                for (const m of msgs) {
+                    if (m.dir !== "out") continue;
+                    this._updateMsgStatusDOM(peerHash, m.id, m.status);
+                }
+                return;
+            }
+
+            // New message event: if in the active chat, append to DOM.
+            // If in a different chat or the contact list, the sidebar needs
+            // a refresh — do a full re-render (BUT only if we can't avoid it).
+            if (inActiveChat) {
+                // The msg argument is the LXMessage, not the MsgStore entry.
+                // Grab the last (just-added) message from MsgStore.
+                const msgs = MsgStore.get(peerHash);
+                const lastMsg = msgs[msgs.length - 1];
+                if (lastMsg && lastMsg.dir === "in") {
+                    const c = ContactStore.get(peerHash);
+                    const name = c?.displayName || "?" + (peerHash?.slice(0,8) ?? "");
+                    const attached = this._appendMessageToDOM(lastMsg, peerHash, name);
+                    if (attached) {
+                        requestAnimationFrame(() => this._scrollChatBottom());
+                        return;
+                    }
+                }
+            }
+
+            // Fallback: full re-render (user not in affected chat, or DOM append failed)
             this.render();
             if (inActiveChat) {
                 requestAnimationFrame(() => this._scrollChatBottom());
             }
         });
 
-        // Contact list changes — only refresh if no modal is open
+        // Contact list changes — only re-render if not in an active chat.
+        // When in a chat, the contact list is hidden behind the detail panel
+        // and re-rendering would destroy the user's scroll position.
         ContactStore.onChange(() => {
             if (this.state.view !== "main") return;
             if (this.state.showSettings || this.state.showAddContact || this.state.showShareId || this.state.showContactInfo) return;
-            this.render();
+            // Only re-render if the user is on the contact list (no active chat).
+            // When in a chat, skip — the contact list will refresh next time
+            // the user navigates back.
+            if (!this.state.activeHash) {
+                this.render();
+            }
         });
     },
 };
