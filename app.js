@@ -187,13 +187,21 @@ const ContactStore = {
 
     setReachable(destHash, reachable) {
         const c = this._contacts.get(destHash);
-        if (c) { c.reachable = reachable; this._save(); this._notify(); }
+        if (c) { c.reachable = reachable; this._save(); }
     },
 
     /** Seconds to wait before propagating: 5 for online/unknown, 1 for offline. */
     propagationDelay(destHash) {
         const c = this._contacts.get(destHash);
         return (c && c.reachable === false) ? 1 : 5;
+    },
+
+    /** Reset all contacts' propagation timers to 5s (unknown state). */
+    resetPropagationTimers() {
+        for (const c of this._contacts.values()) {
+            c.reachable = null;
+        }
+        this._save();
     },
 
     /** Bump lastSeen without triggering a re-render (caller handles that). */
@@ -289,6 +297,9 @@ const RnsClient = {
         }
         console.log(`[retichat] Propagation node: ${this._cfg.propagationNodeHash.slice(0,12)}...`);
 
+        // Reset all propagation timers to 5s on fresh open
+        ContactStore.resetPropagationTimers();
+
         this._setStatus("connecting");
 
         this._rns = new Reticulum();
@@ -367,6 +378,8 @@ const RnsClient = {
 
             MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash });
             ContactStore.touch(srcHash);
+            // Successfully received a message — reset propagation timer to 5s
+            ContactStore.setReachable(srcHash, true);
             this._onMsg.forEach(fn => fn(lxmfMsg, srcHash));
         });
 
@@ -900,7 +913,7 @@ const RnsClient = {
             }
         }, delaySec * 1000);
 
-        // 15-second total timeout — mark as failed if no proof at all
+        // 30-second total timeout — mark as failed if no proof at all
         const timeoutId = setTimeout(() => {
             const msgs = MsgStore.get(contact.destHash);
             const msg = msgs.find(m => m.id === outMsg.id);
@@ -909,7 +922,7 @@ const RnsClient = {
                 this._onMsg.forEach(fn => fn(null, contact.destHash));
             }
             this._pendingTimeouts.delete(outMsg.id);
-        }, 15000);
+        }, 30000);
         this._pendingTimeouts.set(outMsg.id, timeoutId);
 
         return outMsg;
