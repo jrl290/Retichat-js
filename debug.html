@@ -105,6 +105,17 @@ async function init(exchangeUrl) {
     var src = msg.sourceHash ? msg.sourceHash.toString('hex') : '?';
     var content = msg.content ? msg.content.toString() : '';
     var title = msg.title ? msg.title.toString() : '';
+
+    // Dedup: skip messages we've already seen (PHP re-delivers unacked batches)
+    var msgHash = msg.hash ? msg.hash.toString('hex') : (src + '|' + content);
+    if (Debug._seenMsgs.has(msgHash)) return;
+    Debug._seenMsgs.add(msgHash);
+    // Keep the set bounded
+    if (Debug._seenMsgs.size > 500) {
+      var it = Debug._seenMsgs.values();
+      for (var i = 0; i < 100; i++) Debug._seenMsgs.delete(it.next().value);
+    }
+
     log('📥 <b>RX LXMF</b> from ' + src.slice(0,12) + '  title="' + title.slice(0,40) + '"  content="' + content.slice(0,80) + '"', 'ok');
     // Auto-reply for testing
     if (content.indexOf('AUTO-REPLY') === -1 && content.indexOf('DEBUG') === 0) {
@@ -115,6 +126,9 @@ async function init(exchangeUrl) {
   });
 
   // Track announces to build contact list
+  // Dedup: skip announces for the same destHash within 5 seconds (PHP echoes
+  // announces back to all PostInterface clients, including the sender).
+  var _announceSeen = {};
   rns.on('announce', function(ev) {
     try {
       var ann = ev.announce || ev;
@@ -128,13 +142,23 @@ async function init(exchangeUrl) {
       }
       var appData = ann.appData || null;
       var hops = ev.hops || '?';
-      log('📢 ANNOUNCE dest=' + destHash.slice(0,12) + ' pk=' + (pubKey||'none').slice(0,12) + ' hops=' + hops, 'rx');
+
+      // Skip our own announces echoed back by PHP
+      var own = ownLxmfDest ? ownLxmfDest.hash.toString('hex') : '';
+      if (destHash === own || destHash === identHash) return;
+
+      // Dedup: skip if we saw this destHash in the last 5 seconds
+      var now = Date.now();
+      if (_announceSeen[destHash] && (now - _announceSeen[destHash]) < 5000) return;
+      _announceSeen[destHash] = now;
+
       if (destHash !== '?' && pubKey) {
-        var own = ownLxmfDest ? ownLxmfDest.hash.toString('hex') : '';
-        if (destHash !== own) {
-          var name = '';
-          try { name = LXMF.displayNameFromAppData(appData) || ''; } catch(e) {}
-          contacts[destHash] = { publicKey: pubKey, displayName: name, lastSeen: Date.now() };
+        var isNew = !contacts[destHash];
+        var name = '';
+        try { name = LXMF.displayNameFromAppData(appData) || ''; } catch(e) {}
+        contacts[destHash] = { publicKey: pubKey, displayName: name, lastSeen: now };
+        if (isNew) {
+          log('📢 ANNOUNCE dest=' + destHash.slice(0,12) + ' pk=' + (pubKey||'none').slice(0,12) + ' hops=' + hops, 'rx');
           log('  ✅ Added contact: ' + destHash.slice(0,12) + ' name=' + name, 'ok');
           updateContacts();
         }
@@ -256,6 +280,7 @@ function setAnnounceInterval(val) {
 var pageUrl = new URL(window.location.href);
 var exchangeUrl = pageUrl.hostname === 'retichat.com' ? 'https://retichat.com/reticulum'
   : pageUrl.hostname === 'selectivesubconscious.com' ? 'https://selectivesubconscious.com/reticulum'
+  : pageUrl.hostname === '127.0.0.1' || pageUrl.hostname === 'localhost' ? 'http://127.0.0.1:8080'
   : 'https://' + pageUrl.hostname + '/reticulum';
 
 init(exchangeUrl).then(function() {
@@ -273,6 +298,7 @@ window.Debug = {
   get ident() { return ident; }, get rns() { return rns; },
   get identHash() { return identHash; }, get contacts() { return contacts; },
   get ownLxmfDest() { return ownLxmfDest ? ownLxmfDest.hash.toString('hex') : null; },
+  _seenMsgs: new Set(),
 };
 </script>
 </body>
