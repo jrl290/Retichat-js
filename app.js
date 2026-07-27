@@ -3044,16 +3044,6 @@ const App = {
 
             // Messages
             h("div", { className: "message-list", id: "msg-list" },
-                (() => {
-                    const pull = RnsClient._rfedPullState.get(ch.channelHash);
-                    if (pull?.morePending === false) return null;
-                    return h("button", {
-                        className: "btn btn-secondary",
-                        disabled: pull?.inFlight === true,
-                        onClick: () => RnsClient.pullChannel(ch.channelName)
-                            .catch(e => alert("Channel pull failed: " + e.message)),
-                    }, pull?.inFlight ? "Loading…" : "Load earlier messages");
-                })(),
                 ...(msgs.length === 0
                     ? [h("div", { className: "empty-chat" },
                         h("p", {}, "No messages yet. Be the first to speak!"))]
