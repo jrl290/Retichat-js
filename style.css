@@ -177,18 +177,88 @@ html, body {
    Sidebar — Header & Search
    ========================================================================= */
 .sidebar-header {
-    padding: 12px 16px 8px;
+    padding: 8px 14px 8px 16px;
     display: flex;
     align-items: center;
-    gap: 10px;
+    justify-content: space-between;
+    gap: 12px;
     flex-shrink: 0;
+}
+
+.sidebar-brand {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.sidebar-title {
+    display: flex;
+    align-items: center;
+    gap: 9px;
 }
 
 .sidebar-header h1 {
     font-size: 20px;
     font-weight: 700;
     color: var(--primary);
-    flex: 1;
+}
+
+.sidebar-identity {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    padding-left: 18px;
+    gap: 3px;
+}
+
+.sidebar-hash,
+.copy-hash-btn {
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+.sidebar-hash {
+    min-width: 0;
+    padding: 0 2px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sidebar-hash:hover {
+    color: var(--primary);
+}
+
+.copy-hash-btn {
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+}
+
+.copy-hash-btn:hover:not(:disabled) {
+    color: var(--primary);
+    background: var(--primary-bg);
+}
+
+.copy-hash-btn:disabled {
+    cursor: default;
+    opacity: 0.4;
+}
+
+.sidebar-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
 }
 
 /* Status dot */
@@ -386,28 +456,6 @@ html, body {
     max-width: 260px;
 }
 
-/* FAB — floating action button */
-.fab {
-    position: absolute;
-    bottom: 20px;
-    right: 20px;
-    width: 56px; height: 56px;
-    border-radius: 50%;
-    border: none;
-    background: var(--primary);
-    color: #fff;
-    font-size: 26px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-    transition: background var(--transition), transform var(--transition);
-    z-index: 15;
-}
-.fab:hover  { background: var(--primary-hover); }
-.fab:active { transform: scale(0.94); }
-
 /* =========================================================================
    Detail — Empty placeholder
    ========================================================================= */
@@ -564,6 +612,7 @@ html, body {
 .msg-status.sending     { opacity: 0.7; color: var(--text-secondary); }
 .msg-status.propagated  { opacity: 0.8; color: var(--text-secondary); }
 .msg-status.proved      { color: var(--primary); opacity: 1; }
+.msg-status.sent        { color: var(--primary); opacity: 0.7; }
 .msg-status.failed      { color: var(--danger); opacity: 1; }
 
 .msg-system {
@@ -903,6 +952,168 @@ html, body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* =========================================================================
+   Group & Channel UI Extensions
+   ========================================================================= */
+
+/* Segmented picker — iOS-style pill control */
+.segmented-picker {
+    display: flex;
+    background: var(--surface-alt);
+    border-radius: 9px;
+    padding: 3px;
+    margin-bottom: 16px;
+    gap: 2px;
+}
+.segmented-picker .seg-btn {
+    flex: 1;
+    padding: 7px 0;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-family: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s, box-shadow 0.2s;
+    position: relative;
+}
+.segmented-picker .seg-btn.active {
+    background: var(--surface);
+    color: var(--text);
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.25), 0 0 0 0.5px rgba(255,255,255,0.06);
+}
+.segmented-picker .seg-btn:hover:not(.active) {
+    color: var(--text);
+}
+
+/* Smaller variant (e.g. Public|Private sub-picker) */
+.segmented-picker-sm {
+    padding: 2px;
+    border-radius: 7px;
+    margin-bottom: 12px;
+}
+.segmented-picker-sm .seg-btn {
+    padding: 4px 0;
+    font-size: 11px;
+    border-radius: 5px;
+}
+
+/* New-conversation sheet — fixed height, form fills remainder */
+.nc-sheet {
+    background: var(--surface);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    width: 92%;
+    max-width: 460px;
+    height: 440px;       /* fixed height — no jumping between tabs */
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    animation: slideUp 0.25s ease;
+    overflow: hidden;
+}
+.nc-sheet .modal-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 16px 20px 20px;
+}
+.nc-sheet .nc-form-body {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+.nc-form-top {
+    flex-shrink: 0;
+    padding-bottom: 8px;
+}
+.nc-form-scroll {
+    flex: 1;
+    overflow-y: auto;
+}
+.nc-form-footer {
+    flex-shrink: 0;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+/* Contact badge — pending invite */
+.contact-badge.pending {
+    background: var(--warning-bg);
+    color: var(--warning);
+    margin-left: 6px;
+}
+
+/* Pending invite bar (group conversation view) */
+.pending-invite-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    background: var(--warning-bg);
+    border-bottom: 1px solid rgba(255,179,102,0.15);
+    flex-shrink: 0;
+}
+.pending-invite-bar .pending-icon {
+    font-size: 24px;
+}
+.pending-invite-bar .pending-text {
+    flex: 1;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--warning);
+}
+
+/* Small button variant */
+.btn-sm {
+    padding: 6px 14px;
+    font-size: 13px;
+}
+
+/* System message in chat */
+.msg-row.system {
+    max-width: 100%;
+    align-self: center;
+}
+.system-msg {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 4px 12px;
+    background: var(--glass-bg);
+    border-radius: 10px;
+    text-align: center;
+}
+
+/* Sender name label (group messages from others) */
+.msg-sender {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--primary);
+    margin-bottom: 3px;
+}
+
+/* Empty chat placeholder */
+.empty-chat {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.empty-chat p {
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+/* Group member row (checkboxes in group creation) */
+.group-member-row:hover {
+    background: var(--primary-bg);
+}
 
 /* =========================================================================
    Utility
