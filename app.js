@@ -164,18 +164,19 @@ const ContactStore = {
     _notify() { const all = this.getAll(); this._listeners.forEach(fn => fn(all)); },
 
     /** Add a contact by destination hash. Returns the contact. */
-    add(destHash) {
+    add(destHash, isDistro = false) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         if (destHash.length !== 32) throw new Error("Destination hash must be exactly 32 hex characters");
         const existing = this._contacts.get(destHash);
         const contact = {
             destHash,
-            displayName: existing?.displayName ?? "?" + destHash.slice(0,8),
+            displayName: existing?.displayName ?? (isDistro ? "📡 Distro" : "?" + destHash.slice(0,8)),
             publicKey: existing?.publicKey ?? null,
             nameCustomized: existing?.nameCustomized ?? false,
             addedAt: existing?.addedAt ?? Date.now(),
             lastSeen: existing?.lastSeen ?? 0,
-            reachable: existing?.reachable ?? null,  // null=unknown, true=direct proof received, false=offline
+            reachable: existing?.reachable ?? null,
+            isDistro: existing?.isDistro ?? isDistro,
         };
         this._contacts.set(destHash, contact);
         this._save();
@@ -214,9 +215,10 @@ const ContactStore = {
         if (c) { c.reachable = reachable; this._save(); }
     },
 
-    /** Seconds to wait before propagating: 5 for online/unknown, 1 for offline. */
+    /** Seconds to wait before propagating: 0 for distro, 5 for online/unknown, 1 for offline. */
     propagationDelay(destHash) {
         const c = this._contacts.get(destHash);
+        if (c?.isDistro) return 0; // distro always goes via propagation immediately
         return (c && c.reachable === false) ? 1 : 5;
     },
 
@@ -1191,7 +1193,8 @@ const RnsClient = {
         if (!this._rns || !this._lxmfRouter) throw new Error("Not connected");
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
 
-        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"`);
+        const isDistro = contact.isDistro === true;
+        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"${isDistro ? " (distro — propagation only)" : ""}`);
 
         // Create the outgoing message record
         ContactStore.touch(contact.destHash);
@@ -1200,22 +1203,24 @@ const RnsClient = {
             srcHash: this.ownHash, destHash: contact.destHash,
         });
 
-        // Send directly to the destination
+        // Send directly to the destination (skip for distro — always use propagation)
         let directProofReceived = false;
-        this._sendPacket(contact.destHash, contact.publicKey, content, outMsg.id,
-            (msgId) => {
-                // Direct proof callback
-                directProofReceived = true;
-                MsgStore.updateStatus(contact.destHash, msgId, "proved");
-                ContactStore.setReachable(contact.destHash, true);
-                console.log(`[retichat] ✅ Direct proof for ${contact.destHash.slice(0,8)}`);
-                this._onMsg.forEach(fn => fn(null, contact.destHash));
-            },
-            (msgId) => {
-                // Direct send error
-                MsgStore.updateStatus(contact.destHash, msgId, "failed");
-            }
-        );
+        if (!isDistro) {
+            this._sendPacket(contact.destHash, contact.publicKey, content, outMsg.id,
+                (msgId) => {
+                    // Direct proof callback
+                    directProofReceived = true;
+                    MsgStore.updateStatus(contact.destHash, msgId, "proved");
+                    ContactStore.setReachable(contact.destHash, true);
+                    console.log(`[retichat] ✅ Direct proof for ${contact.destHash.slice(0,8)}`);
+                    this._onMsg.forEach(fn => fn(null, contact.destHash));
+                },
+                (msgId) => {
+                    // Direct send error
+                    MsgStore.updateStatus(contact.destHash, msgId, "failed");
+                }
+            );
+        }
 
         // After propagation delay, if no direct proof, also send to propagation node
         const delaySec = ContactStore.propagationDelay(contact.destHash);
@@ -3051,6 +3056,7 @@ const App = {
         const lastTs = msgs.length > 0 ? msgs[msgs.length - 1].timestamp : c.lastSeen;
         const isActive = this.state.activeHash === c.destHash;
         const hue = avatarHue(name);
+        const avatarText = c.isDistro ? "📡" : name.charAt(0).toUpperCase();
 
         return h("div", {
             className: "contact-item" + (isActive ? " active" : ""),
@@ -3059,9 +3065,12 @@ const App = {
             h("div", {
                 className: "contact-avatar",
                 style: { color: `hsl(${hue}, 50%, 65%)`, background: `hsla(${hue}, 50%, 40%, 0.15)`, borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
-            }, name.charAt(0).toUpperCase()),
+            }, avatarText),
             h("div", { className: "contact-info" },
-                h("div", { className: "contact-name" }, esc(name)),
+                h("div", { className: "contact-name" },
+                    esc(name),
+                    c.isDistro ? h("span", { className: "contact-badge distro" }, "distro") : null,
+                ),
                 preview
                     ? h("div", { className: "contact-preview" }, esc(preview))
                     : h("div", { className: "contact-preview", style: { fontStyle: "italic" } }, "Tap to chat"),
@@ -3819,13 +3828,25 @@ const App = {
 
         body.appendChild(
             h("div", { className: "settings-section" },
-                h("h3", {}, "Share URI (contains private key)"),
+                h("h3", {}, "Distro Contact (share with senders)"),
                 h("div", { className: "field-hint", style: { marginBottom: "8px" } },
-                    "⚠️ This URI contains the private key. Share it only with trusted devices. The receiving device will have full access to all distro messages."),
-                h("div", { className: "mono-value", style: { fontSize: "11px", wordBreak: "break-all" } }, uri),
+                    "Share this with anyone who wants to send you distro messages. It contains the public key only — safe to share openly."),
+                h("div", { className: "mono-value", style: { fontSize: "11px", wordBreak: "break-all" } }, DistroManager.exportLxmaUri()),
                 h("button", { className: "btn btn-primary btn-block", style: { marginTop: "8px" },
+                    onClick: () => { navigator.clipboard.writeText(DistroManager.exportLxmaUri()).catch(() => {}); } },
+                    "📋 Copy Contact URI"),
+            ),
+        );
+
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Private Key (keep secret)"),
+                h("div", { className: "field-hint", style: { marginBottom: "8px" } },
+                    "⚠️ This contains the private key. Share it only with your own devices. Anyone with this key can read all distro messages."),
+                h("div", { className: "mono-value", style: { fontSize: "11px", wordBreak: "break-all" } }, uri),
+                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
                     onClick: () => { navigator.clipboard.writeText(uri).catch(() => {}); } },
-                    "📋 Copy URI"),
+                    "📋 Copy Private Key URI"),
             ),
         );
 
@@ -3904,6 +3925,7 @@ const App = {
         const doAdd = () => {
             const raw = inputValue.trim();
             if (!raw) { alert("Enter a destination hash."); return; }
+            const isDistro = raw.toLowerCase().startsWith("lxma://");
             let hash = raw.toLowerCase().replace(/^lxmf:\/\/|^lxma:\/\//, "");
             const colonIdx = hash.indexOf(":");
             if (colonIdx > -1) hash = hash.substring(0, colonIdx);
@@ -3913,7 +3935,7 @@ const App = {
                 return;
             }
             try {
-                ContactStore.add(hash);
+                ContactStore.add(hash, isDistro);
                 this._requestPathForContact(hash);
                 this.state.showAddContact = false;
                 this.render();
@@ -4228,13 +4250,14 @@ const App = {
         const doAdd = () => {
             const raw = inputValue.trim();
             if (!raw) return;
+            const isDistro = raw.toLowerCase().startsWith("lxma://");
             let hash = raw.toLowerCase().replace(/^lxmf:\/\/|^lxma:\/\//, "");
             const colonIdx = hash.indexOf(":");
             if (colonIdx > -1) hash = hash.substring(0, colonIdx);
             hash = hash.replace(/[^0-9a-f]/g, "");
             if (hash.length !== 32) { alert("Destination hash must be exactly 32 hex characters."); return; }
             try {
-                ContactStore.add(hash);
+                ContactStore.add(hash, isDistro);
                 this._requestPathForContact(hash);
                 this.state.showNewConversation = false;
                 this.render();
