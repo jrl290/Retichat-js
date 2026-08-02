@@ -1943,7 +1943,7 @@ const RnsClient = {
     _requestRfedServicePaths() {
         if (this._rfedServicePathsRequested) return;
         this._rfedServicePathsRequested = true;
-        for (const aspects of [["channel"], ["channel", "stream"], ["channel", "pull"]]) {
+        for (const aspects of [["channel"], ["channel", "stream"], ["channel", "pull"], ["distro", "register"]]) {
             const destination = this._getRfedDest(aspects);
             this._rns.transport.requestPath(destination.hash);
             console.log(`[retichat] Path request sent for rfed.${aspects.join(".")} ${destination.hash.toString("hex").slice(0,12)}...`);
