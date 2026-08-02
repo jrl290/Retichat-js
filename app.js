@@ -1339,16 +1339,13 @@ const RnsClient = {
     // =========================================================================
 
     /** Handle incoming distro identity transfer (FIELD_DISTRO_ID). */
-    _handleDistroIdentityTransfer(lxmfMsg, srcHash, encryptedHex) {
+    _handleDistroIdentityTransfer(lxmfMsg, srcHash, privateKeyHex) {
         console.log(`[distro] 📥 Received distro identity transfer from ${srcHash.slice(0,12)}...`);
         try {
-            const encrypted = Buffer.from(encryptedHex, "hex");
-            const privateKeyBytes = IdMgr.id.decrypt(encrypted);
-            if (!privateKeyBytes || privateKeyBytes.length !== 64) {
-                console.warn(`[distro] Decrypted payload has wrong length: ${privateKeyBytes?.length ?? 0}`);
+            if (!privateKeyHex || privateKeyHex.length !== 128) {
+                console.warn(`[distro] Private key has wrong length: ${privateKeyHex?.length ?? 0}`);
                 return;
             }
-            const privateKeyHex = privateKeyBytes.toString("hex");
             const senderName = LXMF.senderNameFromFields(lxmfMsg.fields) || srcHash.slice(0,8);
 
             // Prompt user to import
@@ -3777,13 +3774,11 @@ const App = {
             return;
         }
 
-        // Build the encrypted payload: private key encrypted to recipient's identity
+        // Build the payload: private key as hex (already encrypted by LXMF layer)
         const privateKeyHex = DistroManager.exportHex();
-        const privateKeyBytes = Buffer.from(privateKeyHex, "hex");
-        const recipientIdentity = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
-        const encrypted = recipientIdentity.encrypt(privateKeyBytes);
 
-        // Build LXMF message with the encrypted payload
+        // Build LXMF message with the private key in fields (LXMF encrypts the whole message)
+        const recipientIdentity = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
         const contactDest = RnsClient._rns.registerDestination(recipientIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
         const FIELD_DISTRO_ID = 0x0D; // Custom field for distro identity transfer
         const msg = new LXMessage();
@@ -3792,7 +3787,7 @@ const App = {
         msg.title = "Distro Identity";
         msg.content = "Import this distro identity to receive messages on all your devices.";
         msg.fields = new Map();
-        msg.fields.set(FIELD_DISTRO_ID, encrypted.toString("hex"));
+        msg.fields.set(FIELD_DISTRO_ID, privateKeyHex);
         const packed = msg.pack(IdMgr.id, true);
 
         // Send directly
