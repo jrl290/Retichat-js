@@ -1232,7 +1232,8 @@ const RnsClient = {
                 this._establishPropagationLink();
                 return;
             }
-            console.log(`[retichat] 📡 Propagating via link to ${this._cfg.propagationNodeHash.slice(0,12)}... (direct proof not received in ${delaySec}s)`);
+            const reason = contact.isDistro ? "distro address" : `direct proof not received in ${delaySec}s`;
+            console.log(`[retichat] 📡 Propagating via link to ${this._cfg.propagationNodeHash.slice(0,12)}... (${reason})`);
 
             // Build LXMF message addressed to the contact's delivery destination
             const contactPeerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
