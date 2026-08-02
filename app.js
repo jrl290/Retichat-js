@@ -43,6 +43,9 @@ import MsgPack from "./lib/rns/msgpack.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
 import DistroManager from "./lib/distro.js";
 
+// Initialize DistroManager after Buffer polyfill is available
+DistroManager.init();
+
 // =========================================================================
 //  CONFIG
 // =========================================================================
