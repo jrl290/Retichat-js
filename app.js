@@ -41,6 +41,7 @@ import {
 } from "./lib/rns/reticulum.js?v=20260726-keys2";
 import MsgPack from "./lib/rns/msgpack.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
+import DistroManager from "./lib/distro.js";
 
 // =========================================================================
 //  CONFIG
@@ -3402,6 +3403,39 @@ const App = {
             ),
         );
 
+        // ---- Distro section ----
+        const distroState = DistroManager.has
+            ? { hash: DistroManager.hash, pubKey: DistroManager.pubKey }
+            : null;
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Distro Identity"),
+                distroState
+                    ? h("div", { className: "settings-field" },
+                        h("div", { className: "mono-value", style: { fontSize: "13px", marginBottom: "8px" } },
+                            distroState.hash),
+                        h("div", { className: "field-hint", style: { marginBottom: "12px" } },
+                            "Your distro identity is active. Messages sent to this identity will be fanned out to all registered devices."),
+                        h("div", { className: "btn-row" },
+                            h("button", { className: "btn btn-secondary",
+                                onClick: () => this._showDistroShare() }, "📤 Share"),
+                            h("button", { className: "btn btn-danger",
+                                onClick: () => this._forgetDistro() }, "🗑 Forget"),
+                        ),
+                    )
+                    : h("div", { className: "settings-field" },
+                        h("div", { className: "field-hint", style: { marginBottom: "12px" } },
+                            "Generate a distro identity to receive messages on multiple devices. All devices share the same identity and can decrypt the same messages."),
+                        h("div", { className: "btn-row" },
+                            h("button", { className: "btn btn-primary",
+                                onClick: () => this._generateDistro() }, "✨ Generate"),
+                            h("button", { className: "btn btn-secondary",
+                                onClick: () => this._showDistroImport() }, "📥 Import"),
+                        ),
+                    ),
+            ),
+        );
+
         // ---- RFed / Propagation section ----
         const derivedProp = (() => {
             try {
@@ -3477,6 +3511,113 @@ const App = {
         if (confirm("Delete your identity and ALL messages? This cannot be undone.")) {
             IdMgr.forget(); localStorage.clear(); location.reload();
         }
+    },
+
+    // ===== DISTRO IDENTITY MANAGEMENT =====
+
+    _generateDistro() {
+        if (!confirm("Generate a new distro identity? This will create a new shared identity for receiving messages on multiple devices.")) return;
+        try {
+            const hash = DistroManager.generate();
+            console.log(`[distro] Generated new identity: ${hash}`);
+            this.render();
+        } catch(e) {
+            alert("Failed to generate distro identity: " + e.message);
+        }
+    },
+
+    _forgetDistro() {
+        if (!confirm("Forget the current distro identity? You will no longer receive distro messages on this device. Other devices with the same identity are unaffected.")) return;
+        DistroManager.forget();
+        console.log("[distro] Identity forgotten");
+        this.render();
+    },
+
+    _showDistroImport() {
+        const uri = prompt("Paste the rfed-distro-id:// URI or 128-char hex private key:");
+        if (!uri) return;
+        try {
+            const hash = DistroManager.importUri(uri.trim());
+            console.log(`[distro] Imported identity: ${hash}`);
+            this.render();
+        } catch(e) {
+            alert("Failed to import: " + e.message);
+        }
+    },
+
+    _showDistroShare() {
+        const uri = DistroManager.exportUri();
+        const overlay = h("div", { className: "modal-overlay",
+            onClick: (e) => { if (e.target === overlay) { this.render(); } },
+        });
+
+        const sheet = h("div", { className: "modal-sheet" });
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "📤 Share Distro Identity"),
+                h("button", { className: "icon-btn",
+                    onClick: () => { this.render(); } }, "✕"),
+            ),
+        );
+
+        const body = h("div", { className: "modal-body" });
+
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Distro Identity Hash"),
+                h("div", { className: "mono-value", style: { fontSize: "13px" } }, DistroManager.hash),
+                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
+                    onClick: () => { navigator.clipboard.writeText(DistroManager.hash).catch(() => {}); } },
+                    "📋 Copy Hash"),
+            ),
+        );
+
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Share URI (contains private key)"),
+                h("div", { className: "field-hint", style: { marginBottom: "8px" } },
+                    "⚠️ This URI contains the private key. Share it only with trusted devices. The receiving device will have full access to all distro messages."),
+                h("div", { className: "mono-value", style: { fontSize: "11px", wordBreak: "break-all" } }, uri),
+                h("button", { className: "btn btn-primary btn-block", style: { marginTop: "8px" },
+                    onClick: () => { navigator.clipboard.writeText(uri).catch(() => {}); } },
+                    "📋 Copy URI"),
+            ),
+        );
+
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("h3", {}, "Send via LXMF"),
+                h("div", { className: "field-hint", style: { marginBottom: "8px" } },
+                    "Send the identity encrypted to another Retichat user. They will be prompted to import it."),
+                h("div", { className: "settings-field" },
+                    h("label", { htmlFor: "distro-lxmf-dest" }, "Recipient LXMF Address"),
+                    h("input", { id: "distro-lxmf-dest", type: "text",
+                        placeholder: "32-char hex destination hash" }),
+                ),
+                h("button", { className: "btn btn-primary btn-block", style: { marginTop: "8px" },
+                    onClick: () => this._sendDistroViaLxmf() },
+                    "📨 Send Encrypted Identity"),
+            ),
+        );
+
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        this.root.appendChild(overlay);
+    },
+
+    _sendDistroViaLxmf() {
+        const destHash = document.getElementById("distro-lxmf-dest")?.value?.trim();
+        if (!destHash || destHash.length !== 32) {
+            alert("Enter a valid 32-char destination hash");
+            return;
+        }
+        const contact = ContactStore.get(destHash);
+        if (!contact || !contact.publicKey) {
+            alert("Contact not found or public key not yet received. Add the contact first and wait for their announce.");
+            return;
+        }
+        // TODO: Implement LXMF encrypted transfer
+        alert("LXMF transfer not yet implemented. Use the URI instead.");
     },
 
     /** Add Contact modal */
