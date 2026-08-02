@@ -1348,26 +1348,118 @@ const RnsClient = {
             }
             const senderName = LXMF.senderNameFromFields(lxmfMsg.fields) || srcHash.slice(0,8);
 
-            // Prompt user to import
-            const importIt = confirm(
-                `${senderName} sent you a distro identity.\n\n` +
-                `Importing it will allow this device to receive all messages sent to that identity.\n\n` +
-                `Import distro identity?`
-            );
-            if (!importIt) {
-                console.log(`[distro] User declined import from ${srcHash.slice(0,12)}`);
-                return;
-            }
-
-            const hash = DistroManager.importHex(privateKeyHex);
-            console.log(`[distro] ✅ Imported identity: ${hash}`);
-            RnsClient._registerDistro();
-            alert(`Distro identity imported!\n\nHash: ${hash.slice(0,16)}...\n\nYou can now receive distro messages on this device.`);
-            this._onMsg.forEach(fn => fn(null, null)); // trigger UI refresh
+            // Show custom modal instead of confirm() (which gets suppressed in background tabs)
+            this._showDistroImportPrompt(senderName, privateKeyHex);
         } catch(e) {
             console.error(`[distro] Failed to import identity:`, e);
-            alert("Failed to import distro identity: " + e.message);
+            this._showDistroImportError(e.message);
         }
+    },
+
+    /** Show a custom modal prompting the user to import a distro identity. */
+    _showDistroImportPrompt(senderName, privateKeyHex) {
+        const overlay = h("div", { className: "modal-overlay", style: { zIndex: 10000 } });
+        const sheet = h("div", { className: "modal-sheet" });
+
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "📥 Import Distro Identity"),
+            ),
+        );
+
+        const body = h("div", { className: "modal-body" });
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("p", { style: { fontSize: "15px", lineHeight: "1.5" } },
+                    `${senderName} sent you a distro identity.`),
+                h("p", { style: { fontSize: "14px", color: "var(--text-muted)", lineHeight: "1.5" } },
+                    "Importing it will allow this device to receive all messages sent to that identity."),
+            ),
+        );
+
+        const doImport = () => {
+            try {
+                const hash = DistroManager.importHex(privateKeyHex);
+                console.log(`[distro] ✅ Imported identity: ${hash}`);
+                RnsClient._registerDistro();
+                document.body.removeChild(overlay);
+                this._showDistroImportSuccess(hash);
+                this._onMsg.forEach(fn => fn(null, null));
+            } catch(e) {
+                document.body.removeChild(overlay);
+                this._showDistroImportError(e.message);
+            }
+        };
+
+        const doDecline = () => {
+            console.log(`[distro] User declined import`);
+            document.body.removeChild(overlay);
+        };
+
+        body.appendChild(
+            h("div", { className: "btn-row", style: { marginTop: "20px" } },
+                h("button", { className: "btn btn-primary", onClick: doImport }, "Import"),
+                h("button", { className: "btn btn-secondary", onClick: doDecline }, "Decline"),
+            ),
+        );
+
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        document.body.appendChild(overlay);
+    },
+
+    _showDistroImportSuccess(hash) {
+        const overlay = h("div", { className: "modal-overlay", style: { zIndex: 10000 },
+            onClick: (e) => { if (e.target === overlay) document.body.removeChild(overlay); },
+        });
+        const sheet = h("div", { className: "modal-sheet" });
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "✅ Distro Identity Imported"),
+            ),
+        );
+        const body = h("div", { className: "modal-body" });
+        body.appendChild(
+            h("div", { className: "settings-section" },
+                h("div", { className: "mono-value", style: { fontSize: "13px" } }, hash),
+                h("p", { style: { fontSize: "14px", color: "var(--text-muted)", marginTop: "12px" } },
+                    "You can now receive distro messages on this device."),
+            ),
+        );
+        body.appendChild(
+            h("div", { className: "btn-row", style: { marginTop: "20px" } },
+                h("button", { className: "btn btn-primary",
+                    onClick: () => document.body.removeChild(overlay) }, "OK"),
+            ),
+        );
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        document.body.appendChild(overlay);
+    },
+
+    _showDistroImportError(msg) {
+        const overlay = h("div", { className: "modal-overlay", style: { zIndex: 10000 },
+            onClick: (e) => { if (e.target === overlay) document.body.removeChild(overlay); },
+        });
+        const sheet = h("div", { className: "modal-sheet" });
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, "❌ Import Failed"),
+            ),
+        );
+        const body = h("div", { className: "modal-body" });
+        body.appendChild(
+            h("p", { style: { fontSize: "14px" } }, msg),
+        );
+        body.appendChild(
+            h("div", { className: "btn-row", style: { marginTop: "20px" } },
+                h("button", { className: "btn btn-primary",
+                    onClick: () => document.body.removeChild(overlay) }, "OK"),
+            ),
+        );
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        document.body.appendChild(overlay);
     },
 
     /** Handle an incoming group message (detected by GROUP_FIELDS.GROUP_ID). */
