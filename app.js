@@ -975,7 +975,7 @@ const RnsClient = {
             setTimeout(() => { this._fetchPropagatedMessages(); }, 5_000);
             // Also pull distro messages if we have a distro identity
             if (DistroManager.has) {
-                setTimeout(() => { this._pullDistroMessages(); }, 7_000);
+                setTimeout(() => { RnsClient._pullDistroMessages(); }, 7_000);
             }
         });
 
@@ -1364,7 +1364,7 @@ const RnsClient = {
 
             const hash = DistroManager.importHex(privateKeyHex);
             console.log(`[distro] ✅ Imported identity: ${hash}`);
-            this._registerDistro();
+            RnsClient._registerDistro();
             alert(`Distro identity imported!\n\nHash: ${hash.slice(0,16)}...\n\nYou can now receive distro messages on this device.`);
             this._onMsg.forEach(fn => fn(null, null)); // trigger UI refresh
         } catch(e) {
@@ -1842,7 +1842,7 @@ const RnsClient = {
         }
         // Register distro identity if we have one
         if (DistroManager.has) {
-            this._registerDistro();
+            RnsClient._registerDistro();
         }
     },
 
@@ -3673,7 +3673,7 @@ const App = {
         try {
             const hash = DistroManager.generate();
             console.log(`[distro] Generated new identity: ${hash}`);
-            this._registerDistro();
+            RnsClient._registerDistro();
             this.render();
         } catch(e) {
             alert("Failed to generate distro identity: " + e.message);
@@ -3682,7 +3682,7 @@ const App = {
 
     _forgetDistro() {
         if (!confirm("Forget the current distro identity? You will no longer receive distro messages on this device. Other devices with the same identity are unaffected.")) return;
-        this._unregisterDistro();
+        RnsClient._unregisterDistro();
         DistroManager.forget();
         console.log("[distro] Identity forgotten");
         this.render();
@@ -3694,7 +3694,7 @@ const App = {
         try {
             const hash = DistroManager.importUri(uri.trim());
             console.log(`[distro] Imported identity: ${hash}`);
-            this._registerDistro();
+            RnsClient._registerDistro();
             this.render();
         } catch(e) {
             alert("Failed to import: " + e.message);
