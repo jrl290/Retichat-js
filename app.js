@@ -590,6 +590,8 @@ const RnsClient = {
     _rfedServiceWaiters: new Map(),
     _rfedServicePathsRequested: false,
     _propagationPathRequested: false,
+    _propagationInitialized: false,
+    _propRetryTimer: null,
     _rfedOpenedChannelHashes: new Set(),
     _rfedPullState: new Map(),
     _rfedStampRefreshed: new Set(),
@@ -761,8 +763,8 @@ const RnsClient = {
                     this._cfg.propagationNodePubKey = pk;
                     sSet("propagationNodePubKey", pk);
                     console.log(`[retichat] 📡 Learned propagation node pub key from announce: ${pk.slice(0,12)}...`);
-                    // Now that we have the pub key, establish a persistent link
-                    this._establishPropagationLink();
+                    // Defer link establishment — follow same pattern as channel init
+                    this._initPropagation();
                 }
             }
         });
@@ -952,7 +954,7 @@ const RnsClient = {
         const propDest = this._rns.registerDestination(
             propIdentity,
             Destination.OUT,
-            Destination.LINK,
+            Destination.SINGLE,
             "lxmf",
             "propagation"
         );
@@ -1231,8 +1233,8 @@ const RnsClient = {
             const link = this._propLink;
             if (!link || link.status !== Link.ACTIVE) {
                 console.log(`[retichat] ⚠️ Propagation link not active, cannot propagate`);
-                // Try to re-establish
-                this._establishPropagationLink();
+                // Trigger retry via the ensure path
+                this._ensurePropagationLink().catch(() => {});
                 return;
             }
             const reason = contact.isDistro ? "distro address" : `direct proof not received in ${delaySec}s`;
@@ -1962,6 +1964,53 @@ const RnsClient = {
         } catch(e) {
             console.warn("[retichat] Path request for propagation node failed:", e.message);
         }
+    },
+
+    /** Initialize the persistent propagation link with retry.
+     *  The LINKREQUEST can fail if path entries haven't propagated to all
+     *  intermediate exchanges yet. Retry with exponential backoff until
+     *  the link is established. Same pattern as _ensureRfedLink. */
+    _initPropagation() {
+        if (!this._cfg.propagationNodeHash || !this._cfg.propagationNodePubKey) return;
+        if (this._propagationInitialized) return;
+        this._propagationInitialized = true;
+        console.log(`[retichat] 📡 Propagation service ready, retrying link until established...`);
+        this._retryPropagationLink(2000);
+    },
+
+    /** Retry propagation link establishment with exponential backoff.
+     *  Closes any stale PENDING link before creating a new one. */
+    _retryPropagationLink(delayMs) {
+        // Already active — done
+        if (this._propLink?.status === Link.ACTIVE) return;
+
+        // Clear any pending retry timer
+        if (this._propRetryTimer) {
+            clearTimeout(this._propRetryTimer);
+            this._propRetryTimer = null;
+        }
+
+        // If there's an existing pending link that's never going to
+        // complete, close it so we can start fresh.
+        if (this._propLink && this._propLink.status !== Link.ACTIVE) {
+            try { this._propLink.close(); } catch(e) {}
+            this._propLink = null;
+            this._propLinkPromise = null;
+            this._propLinkResolve = null;
+            this._propLinkReject = null;
+        }
+
+        console.log(`[retichat] 🔄 Establishing propagation link (retry in ${(delayMs/1000).toFixed(0)}s)...`);
+        this._propRetryTimer = setTimeout(() => {
+            this._propRetryTimer = null;
+            this._ensurePropagationLink().then(() => {
+                console.log(`[retichat] 🔗 Propagation link established via retry`);
+            }).catch((e) => {
+                const nextDelay = Math.min(delayMs * 2, 30000);
+                console.warn(`[retichat] Propagation link retry failed: ${e.message}, next in ${(nextDelay/1000).toFixed(0)}s`);
+                this._retryPropagationLink(nextDelay);
+            });
+        }, delayMs);
     },
 
     _markRfedServiceReady(aspects, event) {
