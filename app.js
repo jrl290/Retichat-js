@@ -3784,10 +3784,10 @@ const App = {
         const encrypted = recipientIdentity.encrypt(privateKeyBytes);
 
         // Build LXMF message with the encrypted payload
-        const contactDest = this._rns.registerDestination(recipientIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+        const contactDest = RnsClient._rns.registerDestination(recipientIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
         const FIELD_DISTRO_ID = 0x0D; // Custom field for distro identity transfer
         const msg = new LXMessage();
-        msg.sourceHash = this._lxmfRouter.destination.hash;
+        msg.sourceHash = RnsClient._lxmfRouter.destination.hash;
         msg.destinationHash = contactDest.hash;
         msg.title = "Distro Identity";
         msg.content = "Import this distro identity to receive messages on all your devices.";
