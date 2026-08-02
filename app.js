@@ -676,6 +676,15 @@ const RnsClient = {
 
             if (!srcHash) return;
 
+            // ---- Distro identity transfer detection ----
+            // Check for FIELD_DISTRO_ID (0x0D) BEFORE the ticket check.
+            const FIELD_DISTRO_ID = 0x0D;
+            const distroEncryptedHex = lxmfMsg.fields?.get(FIELD_DISTRO_ID);
+            if (distroEncryptedHex) {
+                this._handleDistroIdentityTransfer(lxmfMsg, srcHash, distroEncryptedHex);
+                return;
+            }
+
             // ---- Group message detection ----
             // Check for group fields BEFORE the ticket/epty-content check,
             // since group protocol messages carry content.
@@ -964,6 +973,10 @@ const RnsClient = {
             setTimeout(() => { link.identify(IdMgr.id); }, 1_000);
             // Pull any stored messages for us — after identify has propagated
             setTimeout(() => { this._fetchPropagatedMessages(); }, 5_000);
+            // Also pull distro messages if we have a distro identity
+            if (DistroManager.has) {
+                setTimeout(() => { this._pullDistroMessages(); }, 7_000);
+            }
         });
 
         link.on("close", () => {
@@ -1324,6 +1337,41 @@ const RnsClient = {
     // =========================================================================
     //  GROUP PROTOCOL — handle incoming group messages + send group operations
     // =========================================================================
+
+    /** Handle incoming distro identity transfer (FIELD_DISTRO_ID). */
+    _handleDistroIdentityTransfer(lxmfMsg, srcHash, encryptedHex) {
+        console.log(`[distro] 📥 Received distro identity transfer from ${srcHash.slice(0,12)}...`);
+        try {
+            const encrypted = Buffer.from(encryptedHex, "hex");
+            const privateKeyBytes = IdMgr.id.decrypt(encrypted);
+            if (!privateKeyBytes || privateKeyBytes.length !== 64) {
+                console.warn(`[distro] Decrypted payload has wrong length: ${privateKeyBytes?.length ?? 0}`);
+                return;
+            }
+            const privateKeyHex = privateKeyBytes.toString("hex");
+            const senderName = LXMF.senderNameFromFields(lxmfMsg.fields) || srcHash.slice(0,8);
+
+            // Prompt user to import
+            const importIt = confirm(
+                `${senderName} sent you a distro identity.\n\n` +
+                `Importing it will allow this device to receive all messages sent to that identity.\n\n` +
+                `Import distro identity?`
+            );
+            if (!importIt) {
+                console.log(`[distro] User declined import from ${srcHash.slice(0,12)}`);
+                return;
+            }
+
+            const hash = DistroManager.importHex(privateKeyHex);
+            console.log(`[distro] ✅ Imported identity: ${hash}`);
+            this._registerDistro();
+            alert(`Distro identity imported!\n\nHash: ${hash.slice(0,16)}...\n\nYou can now receive distro messages on this device.`);
+            this._onMsg.forEach(fn => fn(null, null)); // trigger UI refresh
+        } catch(e) {
+            console.error(`[distro] Failed to import identity:`, e);
+            alert("Failed to import distro identity: " + e.message);
+        }
+    },
 
     /** Handle an incoming group message (detected by GROUP_FIELDS.GROUP_ID). */
     _handleGroupMessage(lxmfMsg, srcHash, content, groupInfo) {
@@ -1792,6 +1840,10 @@ const RnsClient = {
         if (this._cfg.rfedNodePubKey?.length === 128) {
             this._requestRfedServicePaths();
         }
+        // Register distro identity if we have one
+        if (DistroManager.has) {
+            this._registerDistro();
+        }
     },
 
     _requestRfedServicePaths() {
@@ -2071,6 +2123,107 @@ const RnsClient = {
         const response = await this._rfedRequest(["channel"], "/rfed/unsubscribe", unsubscribePayload);
         if (response !== true) throw new Error(`RFed refused unsubscribe from #${channelName}`);
         console.log(`[retichat] 📡 Unsubscribed from #${channelName}`);
+    },
+
+    /** Register the distro identity with RFed so messages get fanned out. */
+    async _registerDistro() {
+        if (!DistroManager.has) {
+            console.warn("[distro] No distro identity to register");
+            return false;
+        }
+        try {
+            const distroPubKey = DistroManager.identity.getPublicKey();
+            const devicePubKey = IdMgr.id.getPublicKey();
+            const sig = DistroManager.identity.sign(devicePubKey);
+            const payload = MsgPack.pack([devicePubKey, distroPubKey, sig]);
+            const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/register", payload);
+            if (response === true || (Array.isArray(response) && response[0] === true)) {
+                console.log(`[distro] ✅ Registered device with RFed (distro=${DistroManager.hash.slice(0,12)}...)`);
+                return true;
+            } else {
+                console.warn(`[distro] RFed refused registration:`, response);
+                return false;
+            }
+        } catch(e) {
+            console.error(`[distro] Registration failed:`, e);
+            return false;
+        }
+    },
+
+    /** Unregister the distro identity from RFed. */
+    async _unregisterDistro() {
+        if (!DistroManager.has) return false;
+        try {
+            const distroPubKey = DistroManager.identity.getPublicKey();
+            const devicePubKey = IdMgr.id.getPublicKey();
+            const sig = DistroManager.identity.sign(devicePubKey);
+            const payload = MsgPack.pack([devicePubKey, distroPubKey, sig]);
+            const response = await this._rfedRequest(["distro", "unregister"], "/rfed/distro/unregister", payload);
+            if (response === true) {
+                console.log(`[distro] ✅ Unregistered device from RFed`);
+                return true;
+            }
+            return false;
+        } catch(e) {
+            console.error(`[distro] Unregistration failed:`, e);
+            return false;
+        }
+    },
+
+    /** PULL deferred distro messages from RFed. */
+    async _pullDistroMessages() {
+        if (!DistroManager.has) return [];
+        try {
+            const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", Buffer.alloc(0));
+            if (!Array.isArray(response) || response.length < 2) return [];
+            const [pairs, morePending] = response;
+            const count = pairs?.length ?? 0;
+            console.log(`[distro] 📬 PULL returned ${count} blob(s), more=${morePending}`);
+            for (const pair of pairs || []) {
+                if (!Array.isArray(pair) || pair.length < 2) continue;
+                const [distroHash, blob] = pair;
+                this._handleDistroBlob(distroHash, blob);
+            }
+            return pairs || [];
+        } catch(e) {
+            console.error(`[distro] PULL failed:`, e);
+            return [];
+        }
+    },
+
+    /** Handle a distro blob from PULL. */
+    _handleDistroBlob(distroHash, blob) {
+        try {
+            const data = Buffer.from(blob);
+            if (data.length < 48) return;
+            // blob format: [dest_hash(16) | EC_encrypted(lxmf_data)]
+            const destHash = data.slice(0, 16);
+            const myLxmfHash = DistroManager.lxmfDeliveryHash;
+            if (!destHash.equals(Buffer.from(myLxmfHash, "hex"))) {
+                console.log(`[distro] Blob not for us: ${destHash.toString("hex").slice(0,12)}`);
+                return;
+            }
+            // Decrypt with distro identity
+            const decrypted = DistroManager.identity.decrypt(data.slice(16));
+            if (!decrypted || decrypted.length < 80) return;
+            const srcHash = decrypted.slice(0, 16);
+            const payloadBytes = decrypted.slice(80);
+            const payload = MsgPack.unpack(payloadBytes);
+            if (!Array.isArray(payload) || payload.length < 3) return;
+            const [ts, titleBin, contentBin, fieldsMap] = payload;
+            const content = Buffer.from(contentBin || []).toString();
+            const srcHashHex = srcHash.toString("hex");
+            console.log(`[distro] 📥 Message from ${srcHashHex.slice(0,12)}: "${content.slice(0,60)}"`);
+            // Auto-add contact and store message
+            if (!ContactStore.isContact(srcHashHex)) {
+                ContactStore.add(srcHashHex);
+            }
+            MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex });
+            ContactStore.touch(srcHashHex);
+            this._onMsg.forEach(fn => fn(null, srcHashHex));
+        } catch(e) {
+            console.error(`[distro] Failed to handle blob:`, e);
+        }
     },
 
     async _configureChannelStream() {
@@ -3520,6 +3673,7 @@ const App = {
         try {
             const hash = DistroManager.generate();
             console.log(`[distro] Generated new identity: ${hash}`);
+            this._registerDistro();
             this.render();
         } catch(e) {
             alert("Failed to generate distro identity: " + e.message);
@@ -3528,6 +3682,7 @@ const App = {
 
     _forgetDistro() {
         if (!confirm("Forget the current distro identity? You will no longer receive distro messages on this device. Other devices with the same identity are unaffected.")) return;
+        this._unregisterDistro();
         DistroManager.forget();
         console.log("[distro] Identity forgotten");
         this.render();
@@ -3539,6 +3694,7 @@ const App = {
         try {
             const hash = DistroManager.importUri(uri.trim());
             console.log(`[distro] Imported identity: ${hash}`);
+            this._registerDistro();
             this.render();
         } catch(e) {
             alert("Failed to import: " + e.message);
@@ -3616,8 +3772,42 @@ const App = {
             alert("Contact not found or public key not yet received. Add the contact first and wait for their announce.");
             return;
         }
-        // TODO: Implement LXMF encrypted transfer
-        alert("LXMF transfer not yet implemented. Use the URI instead.");
+        if (!DistroManager.has) {
+            alert("No distro identity to send");
+            return;
+        }
+
+        // Build the encrypted payload: private key encrypted to recipient's identity
+        const privateKeyHex = DistroManager.exportHex();
+        const privateKeyBytes = Buffer.from(privateKeyHex, "hex");
+        const recipientIdentity = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
+        const encrypted = recipientIdentity.encrypt(privateKeyBytes);
+
+        // Build LXMF message with the encrypted payload
+        const contactDest = this._rns.registerDestination(recipientIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+        const FIELD_DISTRO_ID = 0x0D; // Custom field for distro identity transfer
+        const msg = new LXMessage();
+        msg.sourceHash = this._lxmfRouter.destination.hash;
+        msg.destinationHash = contactDest.hash;
+        msg.title = "Distro Identity";
+        msg.content = "Import this distro identity to receive messages on all your devices.";
+        msg.fields = new Map();
+        msg.fields.set(FIELD_DISTRO_ID, encrypted.toString("hex"));
+        const packed = msg.pack(IdMgr.id, true);
+
+        // Send directly
+        try {
+            const sentPacketHash = contactDest.send(packed);
+            if (sentPacketHash) {
+                alert("Distro identity sent! The recipient will be prompted to import it.");
+                console.log(`[distro] Sent identity to ${destHash.slice(0,12)}...`);
+            } else {
+                alert("Failed to send — no packet hash returned");
+            }
+        } catch(e) {
+            alert("Failed to send: " + e.message);
+            console.error("[distro] Send failed:", e);
+        }
     },
 
     /** Add Contact modal */
