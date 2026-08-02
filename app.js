@@ -164,14 +164,14 @@ const ContactStore = {
     _notify() { const all = this.getAll(); this._listeners.forEach(fn => fn(all)); },
 
     /** Add a contact by destination hash. Returns the contact. */
-    add(destHash, isDistro = false) {
+    add(destHash, isDistro = false, publicKey = null) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         if (destHash.length !== 32) throw new Error("Destination hash must be exactly 32 hex characters");
         const existing = this._contacts.get(destHash);
         const contact = {
             destHash,
-            displayName: existing?.displayName ?? (isDistro ? "📡 Distro" : "?" + destHash.slice(0,8)),
-            publicKey: existing?.publicKey ?? null,
+            displayName: existing?.displayName ?? ("?" + destHash.slice(0,8)),
+            publicKey: existing?.publicKey ?? publicKey,
             nameCustomized: existing?.nameCustomized ?? false,
             addedAt: existing?.addedAt ?? Date.now(),
             lastSeen: existing?.lastSeen ?? 0,
@@ -1193,8 +1193,7 @@ const RnsClient = {
         if (!this._rns || !this._lxmfRouter) throw new Error("Not connected");
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
 
-        const isDistro = contact.isDistro === true;
-        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"${isDistro ? " (distro — propagation only)" : ""}`);
+        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"`);
 
         // Create the outgoing message record
         ContactStore.touch(contact.destHash);
@@ -1205,7 +1204,7 @@ const RnsClient = {
 
         // Send directly to the destination (skip for distro — always use propagation)
         let directProofReceived = false;
-        if (!isDistro) {
+        if (!contact.isDistro) {
             this._sendPacket(contact.destHash, contact.publicKey, content, outMsg.id,
                 (msgId) => {
                     // Direct proof callback
@@ -3056,7 +3055,7 @@ const App = {
         const lastTs = msgs.length > 0 ? msgs[msgs.length - 1].timestamp : c.lastSeen;
         const isActive = this.state.activeHash === c.destHash;
         const hue = avatarHue(name);
-        const avatarText = c.isDistro ? "📡" : name.charAt(0).toUpperCase();
+        const avatarText = name.charAt(0).toUpperCase();
 
         return h("div", {
             className: "contact-item" + (isActive ? " active" : ""),
@@ -3069,7 +3068,7 @@ const App = {
             h("div", { className: "contact-info" },
                 h("div", { className: "contact-name" },
                     esc(name),
-                    c.isDistro ? h("span", { className: "contact-badge distro" }, "distro") : null,
+
                 ),
                 preview
                     ? h("div", { className: "contact-preview" }, esc(preview))
@@ -3925,17 +3924,34 @@ const App = {
         const doAdd = () => {
             const raw = inputValue.trim();
             if (!raw) { alert("Enter a destination hash."); return; }
-            const isDistro = raw.toLowerCase().startsWith("lxma://");
-            let hash = raw.toLowerCase().replace(/^lxmf:\/\/|^lxma:\/\//, "");
-            const colonIdx = hash.indexOf(":");
-            if (colonIdx > -1) hash = hash.substring(0, colonIdx);
+            let isDistro = false;
+            let publicKey = null;
+            let hash = raw.toLowerCase();
+
+            // Parse lxma:// URI (contains public key)
+            if (hash.startsWith("lxma://")) {
+                isDistro = true;
+                hash = hash.slice(7); // Remove "lxma://"
+                const colonIdx = hash.indexOf(":");
+                if (colonIdx > -1) {
+                    publicKey = hash.slice(colonIdx + 1);
+                    hash = hash.substring(0, colonIdx);
+                }
+            }
+            // Parse lxmf:// URI (no public key)
+            else if (hash.startsWith("lxmf://")) {
+                hash = hash.slice(7); // Remove "lxmf://"
+                const colonIdx = hash.indexOf(":");
+                if (colonIdx > -1) hash = hash.substring(0, colonIdx);
+            }
+
             hash = hash.replace(/[^0-9a-f]/g, "");
             if (hash.length !== 32) {
                 alert("Destination hash must be exactly 32 hex characters.\n\nGot: " + (hash || "(empty)") + " (" + hash.length + " chars)");
                 return;
             }
             try {
-                ContactStore.add(hash, isDistro);
+                ContactStore.add(hash, isDistro, publicKey);
                 this._requestPathForContact(hash);
                 this.state.showAddContact = false;
                 this.render();
@@ -4250,14 +4266,31 @@ const App = {
         const doAdd = () => {
             const raw = inputValue.trim();
             if (!raw) return;
-            const isDistro = raw.toLowerCase().startsWith("lxma://");
-            let hash = raw.toLowerCase().replace(/^lxmf:\/\/|^lxma:\/\//, "");
-            const colonIdx = hash.indexOf(":");
-            if (colonIdx > -1) hash = hash.substring(0, colonIdx);
+            let isDistro = false;
+            let publicKey = null;
+            let hash = raw.toLowerCase();
+
+            // Parse lxma:// URI (contains public key)
+            if (hash.startsWith("lxma://")) {
+                isDistro = true;
+                hash = hash.slice(7); // Remove "lxma://"
+                const colonIdx = hash.indexOf(":");
+                if (colonIdx > -1) {
+                    publicKey = hash.slice(colonIdx + 1);
+                    hash = hash.substring(0, colonIdx);
+                }
+            }
+            // Parse lxmf:// URI (no public key)
+            else if (hash.startsWith("lxmf://")) {
+                hash = hash.slice(7); // Remove "lxmf://"
+                const colonIdx = hash.indexOf(":");
+                if (colonIdx > -1) hash = hash.substring(0, colonIdx);
+            }
+
             hash = hash.replace(/[^0-9a-f]/g, "");
             if (hash.length !== 32) { alert("Destination hash must be exactly 32 hex characters."); return; }
             try {
-                ContactStore.add(hash, isDistro);
+                ContactStore.add(hash, isDistro, publicKey);
                 this._requestPathForContact(hash);
                 this.state.showNewConversation = false;
                 this.render();
