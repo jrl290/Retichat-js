@@ -779,7 +779,18 @@ const RnsClient = {
         this._rns.registerAnnounceHandler("rfed.node", (event) => {
             this._catchRfedNodeAnnounce(event);
         });
-        for (const aspects of [["channel"], ["channel", "stream"], ["channel", "pull"]]) {
+        // Announce handlers that mark an rfed.* service "ready" when its
+        // destination announces.  This MUST include distro.register (and the
+        // other distro aspects): _registerDistro() -> _rfedRequest() ->
+        // _ensureRfedLink(["distro","register"]) -> _waitForRfedService()
+        // blocks until _rfedServiceReady contains "distro.register".  Without
+        // the handler below, distro.register never became ready, so the
+        // register request was never sent — the distro device never reached
+        // the RFed.  (Bug found 2026-08-08: only channel* were subscribed.)
+        for (const aspects of [
+            ["channel"], ["channel", "stream"], ["channel", "pull"],
+            ["distro", "register"], ["distro", "unregister"], ["distro", "list"],
+        ]) {
             this._rns.registerAnnounceHandler(`rfed.${aspects.join(".")}`, (event) => {
                 this._markRfedServiceReady(aspects, event);
             });
