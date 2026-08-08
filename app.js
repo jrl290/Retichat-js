@@ -857,6 +857,12 @@ const RnsClient = {
             const ownShort = RnsClient.ownHash?.slice(0,12) ?? IdMgr.shortHash ?? "";
             const name = this._cfg.displayName + (ownShort ? ` (${ownShort})` : "");
             this._lxmfRouter.announce(Buffer.from(name));
+            // Re-announce rfed.delivery alongside lxmf.delivery so the RFed's
+            // path back to us stays fresh (the distro fanout + deferred flush
+            // depend on it).  See _initChannels().
+            if (this._rfedDeliveryDest) {
+                try { this._rfedDeliveryDest.announce(); } catch(_) {}
+            }
         } catch(e) { console.warn("[rns] announce error", e.message); }
     },
 
@@ -2150,8 +2156,16 @@ const RnsClient = {
                 IdMgr.id, Destination.IN, Destination.SINGLE, "rfed", "delivery"
             );
             deliveryDest.on("packet", ({data}) => this._handleChannelPacket(data));
+            // ANNOUNCE rfed.delivery so the RFed learns a path back to us.
+            // The distro fanout checks has_path(rfed.delivery) and the deferred
+            // flush fires on an rfed.delivery announce — but we never announced
+            // it, so fanout always deferred and the flush never fired (devices
+            // never received fanned-out distro messages).  Announce now and on
+            // the periodic _announce() cycle (see _announce()).
+            this._rfedDeliveryDest = deliveryDest;
+            try { deliveryDest.announce(); } catch(e) { console.warn("[retichat] rfed.delivery announce error", e.message); }
             this._channelsInitialized = true;
-            console.log(`[retichat] 📡 Channel delivery dest registered: ${deliveryHash.slice(0,12)}...`);
+            console.log(`[retichat] 📡 Channel delivery dest registered+announced: ${deliveryHash.slice(0,12)}...`);
         }
 
         if (!this._channelsResubscribed) {
