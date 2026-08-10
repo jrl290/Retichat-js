@@ -2447,6 +2447,10 @@ const RnsClient = {
                 const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/register", payload);
                 if (response === true || (Array.isArray(response) && response[0] === true)) {
                     console.log(`[distro] ✅ Registered device with RFed (distro=${DistroManager.hash.slice(0,12)}...)`);
+                    // Registration must land first: RFed refuses an announce for
+                    // a distro with no registered device, since it would be
+                    // advertising a route it cannot serve.
+                    await this._publishDistroAnnounce();
                     return true;
                 } else {
                     console.warn(`[distro] RFed refused registration:`, response);
@@ -2462,9 +2466,57 @@ const RnsClient = {
         return this._registerDistroInFlight;
     },
 
-    /** Unregister the distro identity from RFed. */
-    async _unregisterDistro() {
+    /**
+     * Hand RFed a pre-signed announce for the distro address so it can
+     * rebroadcast it on the distro's behalf.
+     *
+     * Announces are the only mechanism in Reticulum that distributes a public
+     * key, and only the private key holder can sign one. RFed is given the
+     * distro *public* key at registration and nothing more, so it cannot mint
+     * this itself — without it, no third-party client (MeshChat, Sideband) can
+     * ever learn the distro key, and LXMF cannot even construct a propagated
+     * message to an identity it has no key for.
+     *
+     * This device holds the distro private key, so it signs the announce here
+     * and RFed replays the bytes verbatim — the same operation a transport node
+     * performs when it answers a path request out of its announce cache.
+     */
+    async _publishDistroAnnounce() {
         if (!DistroManager.has) return false;
+        try {
+            const distroIdentity = DistroManager.identity;
+            // Not registered with the Reticulum instance: this destination is
+            // only a vehicle for building the announce bytes. Registering it
+            // would make this browser claim inbound delivery for the distro.
+            const distroDestination = new Destination(
+                this._rns, distroIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery",
+            );
+            const { announceData, contextFlag } = distroDestination.buildAnnounceData(null);
+
+            // value = flags(1) ‖ announceData; bit 0 signals a ratchet, which
+            // shifts where the signature starts when RFed parses it.
+            const flags = Buffer.from([contextFlag === Packet.FLAG_SET ? 0x01 : 0x00]);
+            const value = Buffer.concat([flags, announceData]);
+
+            const distroPubKey = distroIdentity.getPublicKey();
+            const sig = distroIdentity.sign(value);
+            const payload = MsgPack.pack([value, distroPubKey, sig]);
+
+            const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/announce", payload);
+            if (response === true || (Array.isArray(response) && response[0] === true)) {
+                console.log(`[distro] 📡 RFed is now announcing the distro address (${DistroManager.hash.slice(0,12)}...)`);
+                return true;
+            }
+            console.warn(`[distro] RFed refused the pre-signed announce:`, response);
+            return false;
+        } catch(e) {
+            console.error(`[distro] Announce publication failed:`, e);
+            return false;
+        }
+    },
+
+    /** Unregister the distro identity from RFed. */
+    async _unregisterDistro() {        if (!DistroManager.has) return false;
         try {
             const distroPubKey = DistroManager.identity.getPublicKey();
             const devicePubKey = IdMgr.id.getPublicKey();

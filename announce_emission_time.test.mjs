@@ -80,6 +80,16 @@ const announce = new Function(
     `return function announce(appDataBytes = null) {${body}};`,
 )(CryptographyStub, PacketStub, TransportStub);
 
+// announce() delegates the signing to buildAnnounceData(), so the payload under
+// test lives there; both are lifted and attached to the same stub destination.
+const buildBody = extractMethod("buildAnnounceData(appDataBytes = null)");
+const buildAnnounceData = new Function(
+    "Cryptography",
+    "Packet",
+    "Transport",
+    `return function buildAnnounceData(appDataBytes = null) {${buildBody}};`,
+)(CryptographyStub, PacketStub, TransportStub);
+
 /** A destination that captures the announce it would have transmitted. */
 function newDestination() {
     return {
@@ -88,6 +98,7 @@ function newDestination() {
         type: 0x00,
         sent: [],
         signed: [],
+        buildAnnounceData,
         identity: {
             getPublicKey: () => PUBLIC_KEY,
             sign(data) { this.owner.signed.push(Buffer.from(data)); return SIGNATURE; },
