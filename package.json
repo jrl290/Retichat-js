@@ -1,0 +1,15 @@
+{
+  "name": "retichat-js",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  },
+  "comment": "The browser loads dependencies from the importmap in index.html; this file exists only so the test suite can resolve them under Node. Keep msgpackr pinned to the same version as the importmap.",
+  "devDependencies": {
+    "@noble/curves": "^1.6.0",
+    "@noble/hashes": "^1.7.1",
+    "aes-js": "^3.1.2",
+    "msgpackr": "1.11.2"
+  }
+}

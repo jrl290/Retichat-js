@@ -38,7 +38,7 @@ import {
     channelLxmUnpack,
     channelComputeStamp,
     rfedDeliveryDestHash,
-} from "./lib/rns/reticulum.js?v=20260726-keys2";
+} from "./lib/rns/reticulum.js?v=20260809-destreg";
 import MsgPack from "./lib/rns/msgpack.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
 import DistroManager from "./lib/distro.js";
@@ -91,6 +91,8 @@ async function loadConfig() {
     if (savedExchangeUrl) cfg.exchangeUrl = savedExchangeUrl;
     const savedDisplayName = sGet("displayName");
     if (savedDisplayName) cfg.displayName = savedDisplayName;
+    const savedInterfaceName = sGet("interfaceName");
+    if (savedInterfaceName) cfg.interfaceName = savedInterfaceName;
     cfg.rfedNodeHash = sGet("rfedNodeHash") || DEFAULT_CONFIG.rfedNodeHash;
     cfg.lxmfPropagationOverride = sGet("lxmfPropagationOverride") || "";
     cfg.propagationNodePubKey = sGet("propagationNodePubKey") || "";
@@ -253,6 +255,51 @@ const ContactStore = {
 ContactStore.init();
 
 // =========================================================================
+//  HARNESS — in-memory observation surface for headless E2E drivers.
+//  Never used by the UI; exists so tests never scrape the DOM or localStorage.
+// =========================================================================
+const Harness = {
+    inbox: [],
+    events: [],
+    errors: [],
+    _readyResolve: null,
+    ready: null,
+
+    recordInbound(peerHash, msg) {
+        this.inbox.push({
+            peerHash,
+            srcHash: msg.srcHash ?? peerHash,
+            content: msg.content ?? "",
+            via: msg.via ?? "direct",
+            timestamp: msg.timestamp,
+            id: msg.id,
+        });
+        if (this.inbox.length > 500) this.inbox.splice(0, this.inbox.length - 500);
+        this.event("rx", { via: msg.via ?? "direct", src: (msg.srcHash ?? peerHash).slice(0, 12), content: (msg.content ?? "").slice(0, 80) });
+    },
+
+    event(kind, detail) {
+        this.events.push({ t: Date.now(), kind, detail });
+        if (this.events.length > 2000) this.events.splice(0, this.events.length - 2000);
+    },
+
+    error(where, e) {
+        this.errors.push({ t: Date.now(), where, message: e?.message ?? String(e) });
+        this.event("error", { where, message: e?.message ?? String(e) });
+    },
+
+    /** Resolves once the RNS interface is registered and LXMF is listening. */
+    markReady() { if (this._readyResolve) { this._readyResolve(); this._readyResolve = null; } },
+
+    /** True once a message matching `marker` has arrived, optionally via a path. */
+    received(marker, via) {
+        return this.inbox.some(m => m.content.includes(marker) && (!via || m.via === via));
+    },
+};
+Harness.ready = new Promise(resolve => { Harness._readyResolve = resolve; });
+window.Harness = Harness;
+
+// =========================================================================
 //  MESSAGE STORE
 // =========================================================================
 const MsgStore = {
@@ -262,7 +309,10 @@ const MsgStore = {
         msgs.push({ id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg });
         if (msgs.length > 500) msgs.splice(0, msgs.length-500);
         sSet("msg_"+hash, msgs);
-        return msgs[msgs.length-1];
+        const stored = msgs[msgs.length-1];
+        // In-memory mirror so headless harnesses can assert without reparsing localStorage.
+        if (stored.dir === "in") Harness.recordInbound(hash, stored);
+        return stored;
     },
     updateStatus(hash, msgId, newStatus) {
         const msgs = this.get(hash);
@@ -630,6 +680,8 @@ const RnsClient = {
         if (type) this._connType = type;
         if (this._status === s) return;
         this._status = s;
+        Harness.event("status", { status: s, connType: this._connType });
+        if (s === "online") Harness.markReady();
         this._onStatus.forEach(fn => fn(s));
     },
 
@@ -744,7 +796,7 @@ const RnsClient = {
                 }
             }
 
-            MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash });
+            MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash, via: "direct" });
             ContactStore.touch(srcHash);
             // Successfully received a message — reset propagation timer to 5s
             ContactStore.setReachable(srcHash, true);
@@ -1247,11 +1299,17 @@ const RnsClient = {
         const delaySec = ContactStore.propagationDelay(contact.destHash);
         setTimeout(async () => {
             if (directProofReceived) return;
-            const link = this._propLink;
-            if (!link || link.status !== Link.ACTIVE) {
-                console.log(`[retichat] ⚠️ Propagation link not active, cannot propagate`);
-                // Trigger retry via the ensure path
-                this._ensurePropagationLink().catch(() => {});
+            // Wait for the link instead of sampling its status. A distro send
+            // always propagates, so it can reach this point while the link is
+            // still being established (observed: B started its link 6s before
+            // the send and was still handshaking), and dropping here loses the
+            // message outright. _ensurePropagationLink() resolves on the
+            // in-flight attempt rather than starting a competing one.
+            let link;
+            try {
+                link = await this._ensurePropagationLink();
+            } catch (e) {
+                console.log(`[retichat] ⚠️ Propagation link unavailable, cannot propagate: ${e.message}`);
                 return;
             }
             const reason = contact.isDistro ? "distro address" : `direct proof not received in ${delaySec}s`;
@@ -1780,6 +1838,15 @@ const RnsClient = {
             }); // AppLinks Timer P parity — see DESIGN_PRINCIPLES.md §1
             this._ensureGroupLink(memberHash, publicKeyHex).then(({link, destination}) => {
                 if (evidence.settled) return;
+                if (fullLxmfBytes.length > Link.MDU) {
+                    // Too large for one link packet, so it goes as a resource.
+                    // The resource's own proof is the delivery evidence; there
+                    // is no single packet hash to wait on.
+                    link.sendResource(fullLxmfBytes)
+                        .then(() => fulfill("direct"))
+                        .catch(error => console.warn(`[retichat] 👥 Direct group resource failed for ${memberHash.slice(0,8)}:`, error.message));
+                    return;
+                }
                 const packet = link.send(fullLxmfBytes);
                 directProofKey = packet.packetHash.slice(0, 16).toString("hex");
                 this._pendingPacketHashes.set(directProofKey, {
@@ -1953,9 +2020,7 @@ const RnsClient = {
         const nodeHash = Destination.hash({hash: rfedIdBytes}, "rfed", "node").toString("hex");
         this._rns.transport.requestPath(nodeHash);
         console.log(`[retichat] Path request sent for rfed.node ${nodeHash.slice(0,12)}...`);
-        if (this._cfg.rfedNodePubKey?.length === 128) {
-            this._requestRfedServicePaths();
-        }
+        this._requestRfedServicePaths();
         // Register distro identity if we have one
         if (DistroManager.has) {
             RnsClient._registerDistro();
@@ -1964,11 +2029,27 @@ const RnsClient = {
 
     _requestRfedServicePaths() {
         if (this._rfedServicePathsRequested) return;
+        if (!this._cfg.rfedNodeHash) return;
         this._rfedServicePathsRequested = true;
+        // Derive the service destination hashes from the configured IDENTITY
+        // HASH alone — do NOT gate this on rfedNodePubKey.
+        //
+        // NEVER REMOVE. An RNS destination hash is
+        // sha256(sha256("rfed.<aspect>")[:10] + identity_hash)[:16]; the public
+        // key is not part of it, and a path request only needs the hash. Gating
+        // these requests on rfedNodePubKey created a deadlock in the bootstrap
+        // graph: the pub key is only ever learned from an inbound rfed.*
+        // announce, and a path request is the only thing that makes RFed emit
+        // one on demand. A browser that started up between announces therefore
+        // had no way to make progress and simply sat there — observed
+        // 2026-08-09 01:12, where RFed had announced at 01:11 (restart) and the
+        // client, opened at 01:12:12, waited out the whole 15-minute service
+        // refresh interval with every distro call unusable.
         for (const aspects of [["channel"], ["channel", "stream"], ["channel", "pull"], ["distro", "register"]]) {
-            const destination = this._getRfedDest(aspects);
-            this._rns.transport.requestPath(destination.hash);
-            console.log(`[retichat] Path request sent for rfed.${aspects.join(".")} ${destination.hash.toString("hex").slice(0,12)}...`);
+            const rfedIdBytes = Buffer.from(this._cfg.rfedNodeHash, "hex");
+            const hash = Destination.hash({hash: rfedIdBytes}, "rfed", ...aspects).toString("hex");
+            this._rns.transport.requestPath(hash);
+            console.log(`[retichat] Path request sent for rfed.${aspects.join(".")} ${hash.slice(0,12)}...`);
         }
     },
 
@@ -2033,6 +2114,25 @@ const RnsClient = {
     _markRfedServiceReady(aspects, event) {
         const identityHash = event.announce.identity?.hash?.toString("hex") ?? "";
         if (identityHash !== this._cfg.rfedNodeHash) return;
+        // Harvest the RFed public key from ANY rfed.* announce, not just
+        // rfed.node.
+        //
+        // NEVER REMOVE. Every rfed.* destination belongs to the SAME identity,
+        // so every one of these announces carries the key we need, and the
+        // identityHash check above has already proven it is the node we were
+        // configured to trust (the announce signature was verified by the RNS
+        // layer before we got here).
+        //
+        // Harvesting only from rfed.node made bootstrap depend on the rarest
+        // announce on the wire: RFed publishes rfed.node at
+        // `announce_interval_secs` (the live node is configured to 360
+        // MINUTES) while every service destination refreshes every 15 min.
+        // A browser that started up therefore sat with no rfedNodePubKey and
+        // failed every distro/channel call with "RFed node identity is not
+        // known yet" for up to six hours. The startup path request for
+        // rfed.node cannot rescue it either — nothing in the mesh holds a path
+        // for a destination that has not announced, so nobody answers.
+        this._catchRfedNodeAnnounce(event);
         const key = aspects.join(".");
         this._rfedServiceReady.add(key);
         const waiters = this._rfedServiceWaiters.get(key) || [];
@@ -2082,6 +2182,12 @@ const RnsClient = {
                 resolve(link);
             });
             link.on("packet", ({data}) => {
+                if (key === "channel.stream") this._handleChannelPacket(data);
+            });
+            // A channel message too large for one link packet arrives as a
+            // resource carrying the same payload.
+            link.setResourceStrategy(Link.ACCEPT_ALL);
+            link.on("resource", ({data}) => {
                 if (key === "channel.stream") this._handleChannelPacket(data);
             });
             link.on("close", () => {
@@ -2195,6 +2301,16 @@ const RnsClient = {
 
             // First 16 bytes are the channel identity hash (routing prefix)
             const channelIdPrefix = data.slice(0, 16).toString("hex");
+
+            // Distro fanout arrives on this same rfed.delivery destination as
+            // [ distro_lxmf_hash(16) | lxmf_blob ]. The PULL path carries the
+            // bare lxmf_blob, so strip the extra routing prefix before unwrapping.
+            if (DistroManager.has && channelIdPrefix === DistroManager.lxmfDeliveryHash) {
+                Harness.event("distro-push", { distro: channelIdPrefix.slice(0, 12), bytes: data.length });
+                this._handleDistroBlob(data.slice(0, 16), data.slice(16));
+                return;
+            }
+
             const ch = ChannelStore.getByHash(channelIdPrefix);
             if (!ch) {
                 console.log(`[retichat] 📡 Channel blob for unknown channel ${channelIdPrefix.slice(0,12)}..., ignoring`);
@@ -2302,23 +2418,48 @@ const RnsClient = {
             console.warn("[distro] No distro identity to register");
             return false;
         }
-        try {
-            const distroPubKey = DistroManager.identity.getPublicKey();
-            const devicePubKey = IdMgr.id.getPublicKey();
-            const sig = DistroManager.identity.sign(devicePubKey);
-            const payload = MsgPack.pack([devicePubKey, distroPubKey, sig]);
-            const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/register", payload);
-            if (response === true || (Array.isArray(response) && response[0] === true)) {
-                console.log(`[distro] ✅ Registered device with RFed (distro=${DistroManager.hash.slice(0,12)}...)`);
-                return true;
-            } else {
-                console.warn(`[distro] RFed refused registration:`, response);
+        // Coalesce concurrent registrations into ONE in-flight request.
+        //
+        // NEVER REMOVE. _registerDistro() has two independent callers that fire
+        // within the same second of startup: _onExchangeRegistered() (automatic,
+        // as soon as the exchange interface registers) and the UI/test entry
+        // point RetichatTest.registerDistro(). Without this guard both build the
+        // same payload and issue two /rfed/distro/register requests over the SAME
+        // link, back to back. RFed then runs two registration callbacks
+        // concurrently and both wedge — verified in production 2026-08-09
+        // 00:56:54: two `[REQ] resolved path='/rfed/distro/register'` lines on
+        // link 87448189... and NEITHER ever reached `[REQ] callback completed`,
+        // so no response was ever sent and the client waited forever. Single
+        // registrations on the same build complete in well under a second
+        // (18:35:47, 18:38:38, 18:43:38 all logged `callback completed`).
+        //
+        // This is a duplicate-work bug, not a timing one: registering the same
+        // device for the same distro twice is meaningless. Do not "fix" a slow
+        // or missing response by retrying — that reproduces the exact condition
+        // that wedges the server (DESIGN_PRINCIPLES.md Rule #1).
+        if (this._registerDistroInFlight) return this._registerDistroInFlight;
+        this._registerDistroInFlight = (async () => {
+            try {
+                const distroPubKey = DistroManager.identity.getPublicKey();
+                const devicePubKey = IdMgr.id.getPublicKey();
+                const sig = DistroManager.identity.sign(devicePubKey);
+                const payload = MsgPack.pack([devicePubKey, distroPubKey, sig]);
+                const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/register", payload);
+                if (response === true || (Array.isArray(response) && response[0] === true)) {
+                    console.log(`[distro] ✅ Registered device with RFed (distro=${DistroManager.hash.slice(0,12)}...)`);
+                    return true;
+                } else {
+                    console.warn(`[distro] RFed refused registration:`, response);
+                    return false;
+                }
+            } catch(e) {
+                console.error(`[distro] Registration failed:`, e);
                 return false;
+            } finally {
+                this._registerDistroInFlight = null;
             }
-        } catch(e) {
-            console.error(`[distro] Registration failed:`, e);
-            return false;
-        }
+        })();
+        return this._registerDistroInFlight;
     },
 
     /** Unregister the distro identity from RFed. */
@@ -2389,7 +2530,7 @@ const RnsClient = {
             if (!ContactStore.isContact(srcHashHex)) {
                 ContactStore.add(srcHashHex);
             }
-            MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex });
+            MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex, via: "distro" });
             ContactStore.touch(srcHashHex);
             this._onMsg.forEach(fn => fn(null, srcHashHex));
         } catch(e) {
@@ -2558,6 +2699,13 @@ const RnsClient = {
 
             // Compute PoW stamp (only if server requires one)
             const stampCost = ChannelStore.get(channelName)?.stampCost;
+
+            // Anything at or under the link MDU goes as a single data packet;
+            // larger payloads go as an RNS Resource. Decide before mining the
+            // stamp so the PoW is never burned on a send we cannot make.
+            const stampBytes = (stampCost != null && stampCost > 0) ? 32 : 0;
+            const oversized = wire.length + stampBytes > Link.MDU;
+
             let stamp = null;
             if (stampCost != null && stampCost > 0) {
                 stamp = await channelComputeStamp(wire, stampCost);
@@ -2574,15 +2722,21 @@ const RnsClient = {
 
             const link = await this._ensureRfedLink(["channel"]);
             const echoPromise = this._waitForRfedPublishEcho(echoKey, channelName);
-            const packet = link.send(finalPayload);
-            await Promise.all([
-                this._waitForRfedPublishProof(packet, channelName, outMsg.id),
-                echoPromise,
-            ]);
+            if (oversized) {
+                // A resource has no single packet hash to prove against, so
+                // the resource's own proof is the delivery evidence.
+                await Promise.all([link.sendResource(finalPayload), echoPromise]);
+            } else {
+                const packet = link.send(finalPayload);
+                await Promise.all([
+                    this._waitForRfedPublishProof(packet, channelName, outMsg.id),
+                    echoPromise,
+                ]);
+            }
 
             // Mark as sent
             ChannelMsgStore.updateStatus(channelName, outMsg.id, "sent");
-            console.log(`[retichat] 📡 Channel message proved to #${channelName} (${finalPayload.length}B, stamp=${!!stamp})`);
+            console.log(`[retichat] 📡 Channel message proved to #${channelName} (${finalPayload.length}B, stamp=${!!stamp}, resource=${oversized})`);
         } catch(e) {
             ChannelMsgStore.updateStatus(channelName, outMsg.id, "failed");
             console.warn(`[retichat] 📡 Channel send failed for #${channelName}:`, e.message);
@@ -4865,6 +5019,65 @@ App.start();
 //  E2E TEST HELPERS — run in browser console: RetichatTest.help()
 // =========================================================================
 window.RetichatTest = {
+    // ---- Headless harness surface (see test-harnesses/distro-pipeline) ----
+    // Everything below drives the real RnsClient; nothing touches the DOM.
+    harness: Harness,
+    get ready() { return Harness.ready; },
+    get inbox() { return Harness.inbox; },
+    get events() { return Harness.events; },
+    get errors() { return Harness.errors; },
+
+    /** Identity + destination hashes this node answers on. */
+    identity() {
+        return {
+            identityHash: IdMgr.hash,
+            publicKey: IdMgr.pubKey,
+            lxmfDest: ownLxmfDestinationHash(),
+            rfedDeliveryDest: IdMgr.has ? rfedDeliveryDestHash(IdMgr.id) : null,
+            status: RnsClient.status,
+            exchangeUrl: RnsClient._cfg?.exchangeUrl ?? null,
+        };
+    },
+
+    /** Announce lxmf.delivery (and rfed.delivery once channels are up). */
+    announce() { RnsClient._announce(); return true; },
+
+    /** Register a peer's public key so we can address it without an announce.
+     *  With no key supplied, request the path the way the UI add-contact flow
+     *  does — otherwise the peer's key only arrives on its next scheduled
+     *  announce, which can be minutes away. */
+    addPeer(destHash, publicKeyHex) {
+        destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
+        ContactStore.add(destHash, false, publicKeyHex || null);
+        if (!publicKeyHex) App._requestPathForContact(destHash);
+        return ContactStore.get(destHash);
+    },
+
+    /** True once a received message contains `marker` (optionally via "direct"|"distro"). */
+    got(marker, via) { return Harness.received(marker, via); },
+
+    // ---- Distro ----
+    distro() {
+        return {
+            has: DistroManager.has,
+            hash: DistroManager.has ? DistroManager.hash : null,
+            pubKey: DistroManager.has ? DistroManager.pubKey : null,
+            lxmfDeliveryHash: DistroManager.has ? DistroManager.lxmfDeliveryHash : null,
+        };
+    },
+    async adoptDistro(privHex) {
+        DistroManager.importHex(privHex);
+        await RnsClient._registerDistro();
+        return this.distro();
+    },
+    async generateDistro() {
+        const hash = DistroManager.generate();
+        await RnsClient._registerDistro();
+        return { hash, privHex: DistroManager.exportHex(), ...this.distro() };
+    },
+    registerDistro() { return RnsClient._registerDistro(); },
+    pullDistro() { return RnsClient._pullDistroMessages(); },
+
     help() {
         console.log(`
 RetichatTest commands:
@@ -4874,6 +5087,15 @@ RetichatTest commands:
   .send(hash,msg) — send a test message to contact hash
   .ping(hash)     — check if contact has public key
   .raw()          — dump raw RNS/LXMF internals
+
+Harness (headless):
+  .ready          — promise resolving when the interface is online
+  .identity()     — own identity + destination hashes
+  .inbox          — received messages [{srcHash, content, via}]
+  .got(marker)    — true if a message containing marker arrived
+  .addPeer(h,pk)  — seed a peer's public key
+  .distro()       — distro identity state
+  .generateDistro() / .adoptDistro(privHex) / .pullDistro()
         `);
     },
 
@@ -4946,6 +5168,7 @@ RetichatTest commands:
             hasPublicKey: !!c.publicKey,
             publicKey: c.publicKey?.slice(0,12) + '...' || null,
             lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',
+            lastSeenMs: c.lastSeen || 0,
         };
     },
 

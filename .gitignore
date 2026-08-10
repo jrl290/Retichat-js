@@ -10,3 +10,10 @@ Thumbs.db
 .vscode/
 .idea/
 selectiv-snapshot/
+
+# Test-only dependencies (browser uses the importmap)
+node_modules/
+package-lock.json
+
+# Captured browser console output
+*.log
