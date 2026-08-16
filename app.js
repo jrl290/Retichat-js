@@ -41,7 +41,7 @@ import {
 } from "./lib/rns/reticulum.js?v=20260809-destreg";
 import MsgPack from "./lib/rns/msgpack.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
-import DistroManager from "./lib/distro.js?v=20260816-identity";
+import DistroManager from "./lib/distro.js?v=20260816-sendas";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -711,6 +711,30 @@ const RnsClient = {
     get status() { return this._status; },
     get connType() { return this._connType; },
     get ownHash() { return this._lxmfRouter?.destination?.hash?.toString("hex") ?? null; },
+
+    /**
+     * The identity outgoing messages are signed and addressed from.
+     *
+     * When a distro identity is loaded it wins, unconditionally. The point of a
+     * distro is that it is *the* address for a person rather than for one of
+     * their devices: replies then land on the distro and RFed fans them out to
+     * every device, instead of stranding the conversation on whichever device
+     * happened to send. Sending as the device would make the reply reachable on
+     * that device only, which defeats the feature.
+     *
+     * Returns { identity, hash, isDistro }. `hash` is the lxmf.delivery hash
+     * that recipients see as the source and reply to.
+     */
+    sendingIdentity() {
+        if (DistroManager.has) {
+            return {
+                identity: DistroManager.identity,
+                hash: DistroManager.lxmfDeliveryHash,
+                isDistro: true,
+            };
+        }
+        return { identity: IdMgr.id, hash: this.ownHash, isDistro: false };
+    },
     get cfg() { return this._cfg || DEFAULT_CONFIG; },
 
     onStatus(fn) { this._onStatus.push(fn); },
@@ -1140,15 +1164,16 @@ const RnsClient = {
                 const FIELD_TICKET = 0x0C;
                 const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
 
+                const sender = this.sendingIdentity();
                 const lxmfMsg = new LXMessage();
-                lxmfMsg.sourceHash = this._lxmfRouter.destination.hash;
+                lxmfMsg.sourceHash = Buffer.from(sender.hash, "hex");
                 lxmfMsg.destinationHash = contactDest.hash;
                 lxmfMsg.title = "";
                 lxmfMsg.content = msg.content;
                 lxmfMsg.fields = new Map();
                 lxmfMsg.fields.set(FIELD_TICKET, ticket);
                 // Non-opportunistic: dest_hash at offset 0 for propagation node to read
-                const packed = lxmfMsg.pack(IdMgr.id, false);
+                const packed = lxmfMsg.pack(sender.identity, false);
 
                 // Build and send propagation_packed
                 try {
@@ -1321,7 +1346,7 @@ const RnsClient = {
         ContactStore.touch(contact.destHash);
         const outMsg = MsgStore.add(contact.destHash, {
             dir: "out", content, status: "sending",
-            srcHash: this.ownHash, destHash: contact.destHash,
+            srcHash: this.sendingIdentity().hash, destHash: contact.destHash,
         });
 
         // Send directly to the destination (skip for distro — always use propagation)
@@ -1369,8 +1394,9 @@ const RnsClient = {
             const FIELD_TICKET = 0x0C;
             const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
 
+            const sender = this.sendingIdentity();
             const msg = new LXMessage();
-            msg.sourceHash = this._lxmfRouter.destination.hash;
+            msg.sourceHash = Buffer.from(sender.hash, "hex");
             msg.destinationHash = contactDest.hash;
             msg.title = "";
             msg.content = content;
@@ -1379,7 +1405,7 @@ const RnsClient = {
             // Pack non-opportunistic so destinationHash is at offset 0.
             // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
             // to identify the final recipient.
-            const packed = msg.pack(IdMgr.id, false);
+            const packed = msg.pack(sender.identity, false);
 
             // Build propagation_packed: msgpack([timestamp, [[dest_hash | EC_encrypted(rest) | stamp]]])
             const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
@@ -1443,14 +1469,17 @@ const RnsClient = {
         const FIELD_TICKET = 0x0C;
         const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
 
+        // Sign and address as the distro when one is loaded, so the recipient's
+        // reply reaches every device rather than just this one.
+        const sender = this.sendingIdentity();
         const msg = new LXMessage();
-        msg.sourceHash = this._lxmfRouter.destination.hash;
+        msg.sourceHash = Buffer.from(sender.hash, "hex");
         msg.destinationHash = dest.hash;
         msg.title = "";
         msg.content = content;
         msg.fields = new Map();
         msg.fields.set(FIELD_TICKET, ticket);
-        const packed = msg.pack(IdMgr.id, true);
+        const packed = msg.pack(sender.identity, true);
 
         this._pendingTickets.set(ticket, { contactHash, messageId, onProof });
 
@@ -2603,6 +2632,19 @@ const RnsClient = {
         }
     },
 
+    /** Read FIELD_TICKET (0x0C) out of a raw msgpack-decoded fields map.
+     *  Decoded as a Map (msgpack.js sets mapsAsObjects:false), but tolerate a
+     *  plain object, and normalise a binary value to hex the way the sender
+     *  wrote it. */
+    _ticketFromFields(fields) {
+        const FIELD_TICKET = 0x0C;
+        let v = null;
+        if (fields instanceof Map) v = fields.get(FIELD_TICKET);
+        else if (fields && typeof fields === "object") v = fields[FIELD_TICKET];
+        if (v == null) return null;
+        return typeof v === "string" ? v : Buffer.from(v).toString("hex");
+    },
+
     /** Handle a distro blob from PULL. */
     _handleDistroBlob(distroHash, blob) {
         try {
@@ -2633,6 +2675,25 @@ const RnsClient = {
             if (DistroSeen.check(dedupKey)) {
                 Harness.event("distro-dup", { src: srcHashHex.slice(0, 12), ts });
                 console.log(`[distro] ↩︎ duplicate, ignoring (${srcHashHex.slice(0,12)} ts=${ts})`);
+                return;
+            }
+
+            // Delivery notifications now arrive here too. Since we send as the
+            // distro, the recipient's ticket reply is addressed to the distro
+            // and reaches us fanned out rather than direct. It carries a ticket
+            // and no content; storing it would post an empty bubble.
+            const ticket = this._ticketFromFields(fieldsMap);
+            if (ticket && !content) {
+                const pending = this._pendingTickets.get(ticket);
+                if (pending) {
+                    this._pendingTickets.delete(ticket);
+                    console.log(`[distro] ✅ PROOF (LXMF via distro) ticket=${ticket.slice(0,8)}… from ${srcHashHex.slice(0,12)}`);
+                    if (pending.onProof) pending.onProof(pending.messageId);
+                    else MsgStore.updateStatus(pending.contactHash, pending.messageId, "proved");
+                    this._onMsg.forEach(fn => fn(null, pending.contactHash));
+                } else {
+                    console.log(`[distro] delivery notification for an unknown ticket ${ticket.slice(0,8)}…`);
+                }
                 return;
             }
 
@@ -3411,11 +3472,16 @@ const App = {
 
         const frag = document.createDocumentFragment();
 
-        // Header
-        const ownHash = RnsClient.ownHash || ownLxmfDestinationHash();
-        const abbreviatedHash = ownHash ? `${ownHash.slice(0, 12)}…` : "Identity unavailable";
+        // Header.
+        //
+        // One address, never two: whatever this client sends as. That is the
+        // distro delivery address when a distro identity is loaded, and the
+        // device's own delivery address otherwise — the same choice
+        // RnsClient.sendingIdentity() makes, so what is on screen is what
+        // recipients see and reply to.
         const distroLxmfHash = DistroManager.lxmfDeliveryHash;
-        const abbreviatedDistro = distroLxmfHash ? `${distroLxmfHash.slice(0, 12)}…` : null;
+        const shownHash = distroLxmfHash || RnsClient.ownHash || ownLxmfDestinationHash();
+        const abbreviated = shownHash ? `${shownHash.slice(0, 12)}…` : "Identity unavailable";
         frag.appendChild(
             h("div", { className: "sidebar-header" },
                 h("div", { className: "sidebar-brand" },
@@ -3423,24 +3489,17 @@ const App = {
                         h("span", { id: "status-dot", className: "status-dot" }),
                         h("h1", {}, "Retichat"),
                     ),
-                    distroLxmfHash
-                        ? h("div", { className: "sidebar-distro" },
-                            h("span", { className: "distro-label" }, "distro"),
-                            h("button", { className: "distro-hash-btn", title: "Open Identity",
-                                onClick: () => { this.state.showIdentity = true; this.render(); } }, abbreviatedDistro),
-                            h("button", { className: "copy-hash-btn", title: "Copy distro delivery address",
-                                onClick: () => {
-                                    navigator.clipboard.writeText(distroLxmfHash).catch(() => {});
-                                } }, "⧉"),
-                        )
-                        : null,
                     h("div", { className: "sidebar-identity" },
+                        distroLxmfHash
+                            ? h("span", { className: "distro-label" }, "distro")
+                            : null,
                         h("button", { className: "sidebar-hash", title: "Open Identity",
-                            onClick: () => { this.state.showIdentity = true; this.render(); } }, abbreviatedHash),
-                        h("button", { className: "copy-hash-btn", title: "Copy LXMF hash",
-                            disabled: !ownHash,
+                            onClick: () => { this.state.showIdentity = true; this.render(); } }, abbreviated),
+                        h("button", { className: "copy-hash-btn",
+                            title: distroLxmfHash ? "Copy distro delivery address" : "Copy delivery address",
+                            disabled: !shownHash,
                             onClick: () => {
-                                if (ownHash) navigator.clipboard.writeText(ownHash).catch(() => {});
+                                if (shownHash) navigator.clipboard.writeText(shownHash).catch(() => {});
                             } }, "⧉"),
                     ),
                 ),
@@ -4200,14 +4259,6 @@ const App = {
                         "Root identity for propagation, notify and channel addresses."),
                 ),
                 h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "cfg-rfed-pubkey" }, "RFed node public key"),
-                    h("input", { id: "cfg-rfed-pubkey", type: "text",
-                        value: cfg.rfedNodePubKey || "",
-                        placeholder: "Auto-learned from announce…" }),
-                    h("div", { className: "field-hint" },
-                        "128 hex. Learned from the node's announce; set manually only if needed."),
-                ),
-                h("div", { className: "settings-field" },
                     h("label", { htmlFor: "cfg-prop-override" }, "LXMF propagation override"),
                     h("input", { id: "cfg-prop-override", type: "text",
                         value: cfg.lxmfPropagationOverride || "",
@@ -4348,31 +4399,24 @@ const App = {
                         this.state.revealDistroKey = !this.state.revealDistroKey;
                         this.render();
                     } },
-                    this.state.revealDistroKey ? "🙈 Hide transfer key" : "📤 Add another device"),
+                    this.state.revealDistroKey ? "✕ Cancel" : "📤 Add another device"),
                 h("button", { className: "btn btn-danger btn-sm",
                     onClick: () => this._forgetDistro() }, "🗑 Forget"),
             ),
         );
 
+        // Adding a device is a transfer, never a copy-paste. The key is sent
+        // encrypted to the other device's LXMF delivery address and never
+        // rendered — a private key on screen is one screenshot, one shoulder
+        // or one clipboard manager away from being someone else's.
         if (this.state.revealDistroKey) {
-            const uri = DistroManager.exportUri();
-            section.appendChild(h("div", { className: "secret-warning" },
-                "⚠️ Private key. Share only with your own devices — anyone holding it can read every distro message."));
-            section.appendChild(h("div", { className: "secret-value" }, uri));
-            section.appendChild(
-                h("div", { className: "btn-row" },
-                    h("button", { className: "btn btn-secondary btn-sm",
-                        onClick: () => { navigator.clipboard.writeText(uri).catch(() => {}); } },
-                        "⧉ Copy transfer URI"),
-                ),
-            );
             section.appendChild(
                 h("div", { className: "settings-field", style: { marginTop: "12px" } },
-                    h("label", { htmlFor: "distro-lxmf-dest" }, "Or send it encrypted over LXMF"),
+                    h("label", { htmlFor: "distro-lxmf-dest" }, "Send to this device's LXMF address"),
                     h("input", { id: "distro-lxmf-dest", type: "text",
-                        placeholder: "32-char hex address of an existing contact" }),
+                        placeholder: "32-char hex delivery address" }),
                     h("div", { className: "field-hint" },
-                        "The recipient is prompted to import it. They must already be a contact with a known public key."),
+                        "Sent encrypted to that address; the device is prompted to accept. It must already be a contact with a known public key."),
                 ),
             );
             section.appendChild(
@@ -4390,12 +4434,13 @@ const App = {
         const exchangeUrl = document.getElementById("cfg-exchange")?.value?.trim();
         const name = document.getElementById("cfg-name")?.value?.trim();
         const rfedHash = document.getElementById("cfg-rfed")?.value?.trim();
-        const rfedPubKey = document.getElementById("cfg-rfed-pubkey")?.value?.trim();
         const propOverride = document.getElementById("cfg-prop-override")?.value?.trim();
         if (exchangeUrl !== undefined) { RnsClient._cfg.exchangeUrl = exchangeUrl; sSet("exchangeUrl", exchangeUrl); }
         if (name !== undefined) { RnsClient._cfg.displayName = name; sSet("displayName", name); }
+        // rfedNodePubKey is deliberately not editable: it is learned from the
+        // node's own announce (_catchRfedNodeAnnounce), and a hand-entered value
+        // that disagrees with the announce silently breaks channel subscribe.
         if (rfedHash !== undefined) { RnsClient._cfg.rfedNodeHash = rfedHash; sSet("rfedNodeHash", rfedHash); }
-        if (rfedPubKey !== undefined) { RnsClient._cfg.rfedNodePubKey = rfedPubKey; sSet("rfedNodePubKey", rfedPubKey); }
         if (propOverride !== undefined) { RnsClient._cfg.lxmfPropagationOverride = propOverride; sSet("lxmfPropagationOverride", propOverride); }
         try { await RnsClient.reconnect(); } catch(e) { console.error(e); }
         this.state.showSettings = false;
@@ -4431,10 +4476,15 @@ const App = {
     },
 
     _showDistroImport() {
-        const uri = prompt("Paste the rfed-distro-id:// URI or 128-char hex private key:");
+        const uri = prompt("Paste a rfed-distro-private-key:// URI or a 128-char hex private key:");
         if (!uri) return;
         try {
-            const hash = DistroManager.importUri(uri.trim());
+            // The prompt has always offered a bare hex key, but this only ever
+            // called importUri(), which requires a scheme prefix and rejected it.
+            const raw = uri.trim();
+            const hash = /^[0-9a-fA-F]{128}$/.test(raw)
+                ? DistroManager.importHex(raw.toLowerCase())
+                : DistroManager.importUri(raw);
             console.log(`[distro] Imported identity: ${hash}`);
             RnsClient._registerDistro();
             this.render();
@@ -4466,6 +4516,10 @@ const App = {
         const recipientIdentity = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
         const contactDest = RnsClient._rns.registerDestination(recipientIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
         const FIELD_DISTRO_ID = 0x0D; // Custom field for distro identity transfer
+        // Deliberately signed as this DEVICE, not as the distro: the recipient
+        // is being handed the distro key and can only judge the offer by which
+        // of their known contacts sent it. Signing as the distro would have the
+        // key vouch for itself.
         const msg = new LXMessage();
         msg.sourceHash = RnsClient._lxmfRouter.destination.hash;
         msg.destinationHash = contactDest.hash;
