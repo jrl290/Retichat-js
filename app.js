@@ -1062,6 +1062,9 @@ const RnsClient = {
             this._propLinkResolve = null;
             this._propLinkReject = null;
             this._propLink = null;
+            // Retry with backoff — the link may have closed because the
+            // upstream path changed (interface flap, peer restart, etc.).
+            this._retryPropagationLink(4000);
         });
 
         link.establish(propDest);
@@ -2072,8 +2075,8 @@ const RnsClient = {
         if (!this._cfg.propagationNodeHash || !this._cfg.propagationNodePubKey) return;
         if (this._propagationInitialized) return;
         this._propagationInitialized = true;
-        console.log(`[retichat] 📡 Propagation service ready, retrying link until established...`);
-        this._retryPropagationLink(2000);
+        console.log(`[retichat] 📡 Propagation service ready, establishing link...`);
+        this._establishPropagationLink();
     },
 
     /** Retry propagation link establishment with exponential backoff.
@@ -3188,6 +3191,8 @@ const App = {
         // Header
         const ownHash = RnsClient.ownHash || ownLxmfDestinationHash();
         const abbreviatedHash = ownHash ? `${ownHash.slice(0, 12)}…` : "Identity unavailable";
+        const distroLxmfHash = DistroManager.lxmfDeliveryHash;
+        const abbreviatedDistro = distroLxmfHash ? `${distroLxmfHash.slice(0, 12)}…` : null;
         frag.appendChild(
             h("div", { className: "sidebar-header" },
                 h("div", { className: "sidebar-brand" },
@@ -3195,6 +3200,19 @@ const App = {
                         h("span", { id: "status-dot", className: "status-dot" }),
                         h("h1", {}, "Retichat"),
                     ),
+                    distroLxmfHash
+                        ? h("div", { className: "sidebar-distro" },
+                            h("span", { className: "distro-label" }, "lxmf"),
+                            h("button", { className: "distro-hash-btn", title: "Copy distro lxmf.delivery address",
+                                onClick: () => {
+                                    navigator.clipboard.writeText(distroLxmfHash).catch(() => {});
+                                } }, abbreviatedDistro),
+                            h("button", { className: "copy-hash-btn", title: "Copy distro address",
+                                onClick: () => {
+                                    navigator.clipboard.writeText(distroLxmfHash).catch(() => {});
+                                } }, "⧉"),
+                        )
+                        : null,
                     h("div", { className: "sidebar-identity" },
                         h("button", { className: "sidebar-hash", title: "Share Your Identity",
                             onClick: () => { this.state.showShareId = true; this.render(); } }, abbreviatedHash),

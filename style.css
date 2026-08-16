@@ -212,6 +212,44 @@ html, body {
     gap: 3px;
 }
 
+.sidebar-distro {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    padding-left: 18px;
+    gap: 4px;
+}
+
+.distro-label {
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--primary);
+    background: var(--primary-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+}
+
+.distro-hash-btn {
+    border: 0;
+    background: transparent;
+    color: var(--primary);
+    cursor: pointer;
+    min-width: 0;
+    padding: 0 2px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.distro-hash-btn:hover {
+    text-decoration: underline;
+}
+
 .sidebar-hash,
 .copy-hash-btn {
     border: 0;
