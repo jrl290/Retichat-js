@@ -41,7 +41,7 @@ import {
 } from "./lib/rns/reticulum.js?v=20260809-destreg";
 import MsgPack from "./lib/rns/msgpack.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
-import DistroManager from "./lib/distro.js?v=20260816-sendas";
+import DistroManager from "./lib/distro.js?v=20260816-identity-order";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -4302,8 +4302,11 @@ const App = {
             this.render();
         };
         const { overlay, body } = this._modalShell("Identity", close);
-        body.appendChild(this._buildDeviceIdentitySection());
+        // Distro first: it is the address this client sends as and the one
+        // people are given, so it is what the user comes here to read. The
+        // device identity is underlying detail.
         body.appendChild(this._buildDistroIdentitySection());
+        body.appendChild(this._buildDeviceIdentitySection());
         this.root.appendChild(overlay);
     },
 
@@ -4682,20 +4685,9 @@ const App = {
             ),
         );
 
-        // Public key status
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Public Key"),
-                h("div", {
-                    style: {
-                        fontSize: "11px",
-                        fontFamily: "var(--font-mono)",
-                        color: c.publicKey ? "var(--success)" : "var(--warning)",
-                        wordBreak: "break-all",
-                    },
-                }, c.publicKey || "Not received yet — messages cannot be sent until the contact comes online."),
-            ),
-        );
+        // No public key panel: the key is not something to read or act on, and
+        // the state that does matter — still waiting for it — is already on the
+        // chat header and the disabled composer.
 
         // Actions
         body.appendChild(
