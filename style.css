@@ -1160,6 +1160,144 @@ html, body {
 .text-mono { font-family: var(--font-mono); }
 .text-muted { color: var(--text-muted); }
 .flex-1 { flex: 1; }
+
+/* Narrow-screen tweaks. The `@media` opener here had been lost, leaving a
+   stray `}` at the end of the file — harmless while nothing followed it, but
+   CSS error recovery then discards the whole rule that comes next. */
+@media (max-width: 799px) {
     .message-row { max-width: 85%; }
     .onboarding { margin: 20px; padding: 24px; }
+}
+
+/* =========================================================================
+   Compact settings — key/value rows
+   Replaces the one-full-width-bubble-per-hash layout: every address, hash and
+   key is a single line that truncates and copies on click.
+   ========================================================================= */
+.kv-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 0;
+    min-height: 32px;
+}
+.kv-row + .kv-row { border-top: 1px solid var(--border); }
+
+.kv-key {
+    flex: 0 0 92px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    line-height: 1.3;
+}
+
+.kv-val {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: none;
+    border: none;
+    padding: 0;
+    text-align: left;
+    cursor: pointer;
+    font-weight: 400;
+}
+.kv-val:hover { color: var(--primary); }
+.kv-val.muted { color: var(--text-muted); cursor: default; }
+.kv-val.muted:hover { color: var(--text-muted); }
+
+.kv-copy {
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    transition: background var(--transition), color var(--transition);
+}
+.kv-copy:hover { background: var(--surface-alt); color: var(--text); }
+.kv-copy.copied { color: var(--success); }
+
+/* Section heading with an inline note or action on the right */
+.section-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.section-head h3 { margin-bottom: 0; }
+.section-note {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: right;
+}
+
+/* Tighter variant of the glass card, used throughout Settings & Identity */
+.settings-section.compact { padding: 12px 14px; margin-bottom: 12px; }
+.settings-section.compact .settings-field { margin-bottom: 10px; }
+.settings-section.compact .settings-field input {
+    padding: 7px 10px;
+    font-size: 13px;
+}
+.settings-section.compact .settings-field .field-hint { margin-top: 3px; }
+.settings-section .btn-row { margin-top: 10px; }
+.settings-section .btn-row .btn.btn-sm { padding: 6px 10px; font-size: 12px; }
+
+/* Row that opens another screen (Settings → Identity) */
+.nav-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    width: 100%;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    background: var(--glass-bg);
+    border: 0.5px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+    transition: background var(--transition);
+}
+.nav-row:hover { background: var(--surface-alt); }
+.nav-row .nav-sub {
+    display: block;
+    margin-top: 2px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+.nav-row .nav-chevron { color: var(--text-muted); font-size: 16px; }
+
+/* Secrets stay collapsed until explicitly revealed */
+.secret-value {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: var(--radius-xs);
+    background: var(--warning-bg);
+    color: var(--warning);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.45;
+    word-break: break-all;
+}
+.secret-warning {
+    font-size: 11px;
+    color: var(--warning);
+    margin-top: 6px;
 }

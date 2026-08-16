@@ -41,7 +41,7 @@ import {
 } from "./lib/rns/reticulum.js?v=20260809-destreg";
 import MsgPack from "./lib/rns/msgpack.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
-import DistroManager from "./lib/distro.js";
+import DistroManager from "./lib/distro.js?v=20260816-identity";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -330,6 +330,51 @@ const MsgStore = {
         return (last.dir === "out" ? "You: " : "") + (last.content?.slice(0,60) ?? "");
     },
 };
+
+// =========================================================================
+//  DISTRO DEDUPE
+//
+//  A distro blob reaches this device on more than one path, and nothing
+//  upstream guarantees it arrives once:
+//    * live fanout as a DATA packet on rfed.delivery,
+//    * the deferred-queue PULL we run on connect and after every register,
+//    * a fresh fanout whenever an RFed node re-ingests the same blob from a
+//      federation peer (the blob store dedupes, the fanout does not).
+//  All of them carry the same LXMF message, so we key on the message itself —
+//  (source hash, LXMF timestamp) — rather than on the bytes, which differ
+//  between the live and PULL framings. The keys are persisted because a
+//  reload must not re-admit blobs still sitting in a node's deferred queue.
+// =========================================================================
+const DistroSeen = {
+    _keys: new Set(),
+    _order: [],
+    LIMIT: 500,
+
+    init() {
+        const stored = sGet("distro_seen");
+        if (Array.isArray(stored)) {
+            this._order = stored.slice(-this.LIMIT);
+            this._keys = new Set(this._order);
+        }
+    },
+
+    /** True if `key` has been handled before. Records it either way. */
+    check(key) {
+        if (this._keys.has(key)) return true;
+        this._keys.add(key);
+        this._order.push(key);
+        if (this._order.length > this.LIMIT) {
+            for (const k of this._order.splice(0, this._order.length - this.LIMIT)) {
+                this._keys.delete(k);
+            }
+        }
+        sSet("distro_seen", this._order);
+        return false;
+    },
+
+    clear() { this._keys.clear(); this._order = []; sSet("distro_seen", []); },
+};
+DistroSeen.init();
 
 // =========================================================================
 //  GROUP STORE — group chat state matching iOS GroupChatManager + ChatRepository
@@ -2580,14 +2625,28 @@ const RnsClient = {
             const [ts, titleBin, contentBin, fieldsMap] = payload;
             const content = Buffer.from(contentBin || []).toString();
             const srcHashHex = srcHash.toString("hex");
+
+            // Idempotency: the same blob is delivered more than once (see
+            // DistroSeen). Drop repeats before they reach the store, or the
+            // conversation fills with duplicates of every message.
+            const dedupKey = `${srcHashHex}:${ts}`;
+            if (DistroSeen.check(dedupKey)) {
+                Harness.event("distro-dup", { src: srcHashHex.slice(0, 12), ts });
+                console.log(`[distro] ↩︎ duplicate, ignoring (${srcHashHex.slice(0,12)} ts=${ts})`);
+                return;
+            }
+
             console.log(`[distro] 📥 Message from ${srcHashHex.slice(0,12)}: "${content.slice(0,60)}"`);
             // Auto-add contact and store message
             if (!ContactStore.isContact(srcHashHex)) {
                 ContactStore.add(srcHashHex);
             }
-            MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex, via: "distro" });
+            const stored = MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex, via: "distro" });
             ContactStore.touch(srcHashHex);
-            this._onMsg.forEach(fn => fn(null, srcHashHex));
+            // Pass the stored message, not null: listeners read a null `msg` as
+            // a proof-only event and only repaint status ticks, so a distro
+            // message used to land in storage without ever reaching the UI.
+            this._onMsg.forEach(fn => fn(stored, srcHashHex));
         } catch(e) {
             console.error(`[distro] Failed to handle blob:`, e);
         }
@@ -2924,8 +2983,35 @@ function h(tag, a={}, ...kids) {
     for (const c of kids.flat()) { if (c == null || c === false) continue; el.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }
     return el;
 }
+/** One compact settings line: KEY | value (truncated, full text in the
+ *  tooltip) | copy button. Clicking either the value or the button copies.
+ *  Replaces the full-width bubble that every hash used to get. */
+function kvRow(key, value, opts = {}) {
+    const text = value ?? "";
+    const usable = text !== "";
+    const copyBtn = usable
+        ? h("button", { className: "kv-copy", title: `Copy ${key.toLowerCase()}` }, "⧉")
+        : null;
+    const copy = () => {
+        navigator.clipboard.writeText(text).catch(() => {});
+        if (!copyBtn) return;
+        copyBtn.classList.add("copied");
+        copyBtn.textContent = "✓";
+        setTimeout(() => { copyBtn.classList.remove("copied"); copyBtn.textContent = "⧉"; }, 1200);
+    };
+    if (copyBtn) copyBtn.addEventListener("click", copy);
+    return h("div", { className: "kv-row" },
+        h("div", { className: "kv-key" }, key),
+        h("button", {
+            className: "kv-val" + (usable ? "" : " muted"),
+            title: usable ? text : "",
+            disabled: !usable,
+            onClick: () => { if (usable) copy(); },
+        }, usable ? (opts.display ?? text) : (opts.empty ?? "—")),
+        copyBtn,
+    );
+}
 function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
-function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 function fmtTime(ts) { return new Date(ts).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }
 function fmtDate(ts) {
     const d = new Date(ts);
@@ -2956,7 +3042,9 @@ const App = {
         searchQuery: "",
         showSettings: false,
         showAddContact: false,
-        showShareId: false,
+        showIdentity: false,      // consolidated Device + Distro identity screen
+        revealDeviceKey: false,   // private-key disclosure, reset on close
+        revealDistroKey: false,
         showContactInfo: false,
         contactInfoHash: null,
         showNewConversation: false,
@@ -3007,21 +3095,27 @@ const App = {
 
         // Escape key closes any open modal
         window.addEventListener("keydown", (e) => {
-            if (e.key === "Escape") {
-                if (this.state.showSettings || this.state.showAddContact || this.state.showShareId ||
-                    this.state.showContactInfo || this.state.showNewConversation || this.state.showGroupInfo ||
-                    this.state.showChannelInfo) {
-                    this.state.showSettings = false;
-                    this.state.showAddContact = false;
-                    this.state.showShareId = false;
-                    this.state.showContactInfo = false;
-                    this.state.showNewConversation = false;
-                    this.state.showGroupInfo = false;
-                    this.state.showChannelInfo = false;
-                    this.render();
-                }
-            }
+            if (e.key === "Escape" && this._closeAllModals()) this.render();
         });
+    },
+
+    /** Clear every modal flag. Returns true if anything was actually open, so
+     *  callers can skip a needless render. */
+    _closeAllModals() {
+        const wasOpen = this.state.showSettings || this.state.showAddContact ||
+            this.state.showIdentity || this.state.showContactInfo ||
+            this.state.showNewConversation || this.state.showGroupInfo ||
+            this.state.showChannelInfo;
+        this.state.showSettings = false;
+        this.state.showAddContact = false;
+        this.state.showIdentity = false;
+        this.state.revealDeviceKey = false;
+        this.state.revealDistroKey = false;
+        this.state.showContactInfo = false;
+        this.state.showNewConversation = false;
+        this.state.showGroupInfo = false;
+        this.state.showChannelInfo = false;
+        return wasOpen;
     },
 
     // ===== FOCUS PRESERVATION =====
@@ -3029,36 +3123,36 @@ const App = {
     // so we can restore focus afterward.
     _saveComposerFocus() {
         const ta = document.getElementById("composer-input");
-        if (ta && document.activeElement === ta) {
-            this._savedFocus = {
-                activeHash: this.state.activeHash,
-                cursorPos: ta.selectionStart,
-                value: ta.value,
-            };
-        } else {
-            this._savedFocus = null;
-        }
+        if (!ta) { this._savedFocus = null; return; }
+        // Capture the draft whether or not the composer holds focus — a half
+        // typed message is just as easy to lose when the user has clicked away.
+        this._savedFocus = {
+            activeHash: this.state.activeHash,
+            hadFocus: document.activeElement === ta,
+            cursorPos: ta.selectionStart,
+            value: ta.value,
+        };
     },
 
     _restoreComposerFocus() {
         const sf = this._savedFocus;
+        this._savedFocus = null;
         if (!sf) return;
         // Only restore if we're still in the same chat
-        if (this.state.activeHash !== sf.activeHash) { this._savedFocus = null; return; }
+        if (this.state.activeHash !== sf.activeHash) return;
         const ta = document.getElementById("composer-input");
-        if (ta) {
-            // Restore the in-flight text and cursor position
-            if (sf.value && ta.value !== sf.value) {
-                ta.value = sf.value;
-                ta.style.height = "auto";
-                ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
-            }
-            ta.focus();
-            if (sf.cursorPos !== undefined && sf.value === ta.value) {
-                ta.setSelectionRange(sf.cursorPos, sf.cursorPos);
-            }
+        if (!ta) return;
+        // Restore the in-flight text and cursor position
+        if (sf.value && ta.value !== sf.value) {
+            ta.value = sf.value;
+            ta.style.height = "auto";
+            ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
         }
-        this._savedFocus = null;
+        if (!sf.hadFocus) return;
+        ta.focus();
+        if (sf.cursorPos !== undefined && sf.value === ta.value) {
+            ta.setSelectionRange(sf.cursorPos, sf.cursorPos);
+        }
     },
 
     // ===== RENDER =====
@@ -3088,7 +3182,7 @@ const App = {
         // ---- Modals (rendered as overlays) ----
         if (this.state.showSettings) this._renderSettingsModal();
         if (this.state.showAddContact) this._renderAddContactModal();
-        if (this.state.showShareId) this._renderShareIdModal();
+        if (this.state.showIdentity) this._renderIdentityModal();
         if (this.state.showContactInfo) this._renderContactInfoModal();
         if (this.state.showNewConversation) this._renderNewConversationModal();
         if (this.state.showGroupInfo) this._renderGroupInfoModal();
@@ -3107,6 +3201,135 @@ const App = {
         if (dot && RnsClient._status) {
             dot.className = `status-dot ${RnsClient._status}`;
         }
+    },
+
+    // ===== SELECTIVE UPDATES =====
+    //
+    // render() tears down and rebuilds the entire tree. Anything that can
+    // arrive while the user is mid-conversation — an inbound DM, a distro
+    // blob, an announce or path response that fills in a public key — must NOT
+    // go through it, or the open chat is reset under the user's hands: scroll
+    // jumps to the top, the list flashes, and any open modal disappears.
+    // The helpers below repaint only the region that actually changed.
+
+    /** Rebuild the sidebar in place. The detail pane and any open modal
+     *  survive untouched; the search box keeps its value, caret and focus. */
+    _refreshSidebar() {
+        const sidebar = this.root.querySelector(".sidebar");
+        if (!sidebar || sidebar.classList.contains("hidden")) return;
+
+        const search = sidebar.querySelector("#search-input");
+        const hadFocus = search && document.activeElement === search;
+        const caret = hadFocus ? search.selectionStart : null;
+
+        clear(sidebar);
+        sidebar.appendChild(this._buildSidebarContent());
+        this._applyStatusDot();
+
+        if (hadFocus) {
+            const next = sidebar.querySelector("#search-input");
+            if (next) {
+                next.focus();
+                if (caret !== null) next.setSelectionRange(caret, caret);
+            }
+        }
+    },
+
+    /** Append to the open chat's message list any records that reached the
+     *  store but aren't on screen yet.
+     *
+     *  Reads from the store rather than from the event payload: the `msg`
+     *  argument handed to onMessage listeners is not consistent across senders
+     *  (some pass the LXMF message, some the stored record, some null), and
+     *  the DOM is the only reliable statement of what has already been shown.
+     *
+     *  Returns false when there is no open chat list to append to. */
+    _syncOpenChatMessages() {
+        const id = this.state.activeHash;
+        if (!id) return false;
+        const list = document.getElementById("msg-list");
+        if (!list) return false;
+
+        let records, build;
+        if (GroupStore.isGroupChat(id)) {
+            records = GroupMsgStore.get(id);
+            build = (m) => m.dir === "system" ? this._buildSystemMsg(m) : this._buildMsgBubble(m);
+        } else if (ChannelStore.get(id)) {
+            records = ChannelMsgStore.get(id);
+            build = (m) => m.dir === "system"
+                ? this._buildSystemMsg(m)
+                : this._buildMsgBubble({ ...m, senderName: m.senderName || (m.dir === "in" ? m.srcHash?.slice(0,12) : null) });
+        } else {
+            records = MsgStore.get(id);
+            build = (m) => this._buildMsgBubble(m);
+        }
+
+        const onScreen = new Set(
+            [...list.querySelectorAll("[data-msg-id]")].map(el => el.getAttribute("data-msg-id"))
+        );
+        const missing = records.filter(m => !onScreen.has(m.id));
+        if (missing.length === 0) return true;
+
+        // Group and channel views seed an "empty-chat" placeholder — drop it
+        // now that there is something real to show.
+        list.querySelector(".empty-chat")?.remove();
+        for (const m of missing) list.appendChild(build(m));
+        return true;
+    },
+
+    /** Bring the open DM's header and composer in line with the contact store.
+     *  This is what makes a path response visible: the announce fills in the
+     *  public key, and the composer flips from disabled to enabled without the
+     *  message list or the draft being touched. */
+    _syncOpenChatChrome() {
+        const id = this.state.activeHash;
+        if (!id || GroupStore.isGroupChat(id) || ChannelStore.get(id)) return;
+        const c = ContactStore.get(id);
+        if (!c) return;
+        const view = this.root.querySelector(".detail .chat-view");
+        if (!view) return;
+
+        const name = c.displayName || "?" + c.destHash.slice(0, 8);
+        const nameEl = view.querySelector(".header-name");
+        if (nameEl && nameEl.textContent !== name) nameEl.textContent = name;
+
+        const hashText = c.destHash + (c.publicKey ? "" : " — waiting for public key…");
+        const hashEl = view.querySelector(".header-hash");
+        if (hashEl && hashEl.textContent !== hashText) hashEl.textContent = hashText;
+
+        const ta = view.querySelector("#composer-input");
+        if (ta) {
+            ta.disabled = !c.publicKey;
+            ta.placeholder = c.publicKey ? "Message…" : "Waiting for public key…";
+        }
+        const send = view.querySelector(".btn-send");
+        if (send) send.disabled = !c.publicKey;
+    },
+
+    /** Rebuild only the detail pane, keeping the composer draft and the scroll
+     *  position. For structural changes an in-place patch can't express — a
+     *  group invite being accepted, a channel subscription flipping. */
+    _rebuildDetail() {
+        const detail = this.root.querySelector(".detail");
+        if (!detail || detail.classList.contains("hidden")) return;
+
+        const list = document.getElementById("msg-list");
+        const scrollTop = list ? list.scrollTop : null;
+        const wasAtBottom = list
+            ? (list.scrollHeight - list.scrollTop - list.clientHeight < 40)
+            : true;
+
+        this._saveComposerFocus();
+        clear(detail);
+        detail.appendChild(
+            this.state.activeHash ? this._buildChatView() : this._buildPlaceholder()
+        );
+
+        const next = document.getElementById("msg-list");
+        if (next && scrollTop !== null) {
+            next.scrollTop = wasAtBottom ? next.scrollHeight : scrollTop;
+        }
+        requestAnimationFrame(() => this._restoreComposerFocus());
     },
 
     /** Wide layout: sidebar (left) + detail (right) */
@@ -3202,20 +3425,18 @@ const App = {
                     ),
                     distroLxmfHash
                         ? h("div", { className: "sidebar-distro" },
-                            h("span", { className: "distro-label" }, "lxmf"),
-                            h("button", { className: "distro-hash-btn", title: "Copy distro lxmf.delivery address",
-                                onClick: () => {
-                                    navigator.clipboard.writeText(distroLxmfHash).catch(() => {});
-                                } }, abbreviatedDistro),
-                            h("button", { className: "copy-hash-btn", title: "Copy distro address",
+                            h("span", { className: "distro-label" }, "distro"),
+                            h("button", { className: "distro-hash-btn", title: "Open Identity",
+                                onClick: () => { this.state.showIdentity = true; this.render(); } }, abbreviatedDistro),
+                            h("button", { className: "copy-hash-btn", title: "Copy distro delivery address",
                                 onClick: () => {
                                     navigator.clipboard.writeText(distroLxmfHash).catch(() => {});
                                 } }, "⧉"),
                         )
                         : null,
                     h("div", { className: "sidebar-identity" },
-                        h("button", { className: "sidebar-hash", title: "Share Your Identity",
-                            onClick: () => { this.state.showShareId = true; this.render(); } }, abbreviatedHash),
+                        h("button", { className: "sidebar-hash", title: "Open Identity",
+                            onClick: () => { this.state.showIdentity = true; this.render(); } }, abbreviatedHash),
                         h("button", { className: "copy-hash-btn", title: "Copy LXMF hash",
                             disabled: !ownHash,
                             onClick: () => {
@@ -3259,7 +3480,7 @@ const App = {
                 h("div", { className: "empty-list" },
                     h("div", { className: "empty-icon" }, "🔍"),
                     h("h2", {}, "No results"),
-                    h("p", {}, `No chats match "${esc(this.state.searchQuery)}"`),
+                    h("p", {}, `No chats match "${this.state.searchQuery}"`),
                 ),
             );
         } else if (!hasEntries) {
@@ -3310,11 +3531,11 @@ const App = {
             }, "👥"),
             h("div", { className: "contact-info" },
                 h("div", { className: "contact-name" },
-                    esc(name),
+                    name,
                     isPending ? h("span", { className: "contact-badge pending" }, "invite") : null,
                 ),
                 preview
-                    ? h("div", { className: "contact-preview" }, esc(preview))
+                    ? h("div", { className: "contact-preview" }, preview)
                     : h("div", { className: "contact-preview", style: { fontStyle: "italic" } },
                         `${memberCount} members`),
             ),
@@ -3338,9 +3559,9 @@ const App = {
                 style: { color: `hsl(${hue}, 50%, 65%)`, background: `hsla(${hue}, 50%, 40%, 0.15)`, borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
             }, "#"),
             h("div", { className: "contact-info" },
-                h("div", { className: "contact-name" }, esc(name)),
+                h("div", { className: "contact-name" }, name),
                 preview
-                    ? h("div", { className: "contact-preview" }, esc(preview))
+                    ? h("div", { className: "contact-preview" }, preview)
                     : h("div", { className: "contact-preview", style: { fontStyle: "italic" } },
                         "Channel"),
             ),
@@ -3368,12 +3589,9 @@ const App = {
                 style: { color: `hsl(${hue}, 50%, 65%)`, background: `hsla(${hue}, 50%, 40%, 0.15)`, borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
             }, avatarText),
             h("div", { className: "contact-info" },
-                h("div", { className: "contact-name" },
-                    esc(name),
-
-                ),
+                h("div", { className: "contact-name" }, name),
                 preview
-                    ? h("div", { className: "contact-preview" }, esc(preview))
+                    ? h("div", { className: "contact-preview" }, preview)
                     : h("div", { className: "contact-preview", style: { fontStyle: "italic" } }, "Tap to chat"),
             ),
             h("div", { className: "contact-meta" },
@@ -3427,7 +3645,7 @@ const App = {
                 h("div", { className: "header-info",
                     onClick: () => { this.state.showContactInfo = true; this.state.contactInfoHash = c.destHash; this.render(); },
                     style: { cursor: "pointer" } },
-                    h("div", { className: "header-name" }, esc(name)),
+                    h("div", { className: "header-name" }, name),
                     h("div", { className: "header-hash" },
                         c.destHash + (c.publicKey ? "" : " — waiting for public key…")),
                 ),
@@ -3487,7 +3705,7 @@ const App = {
                 h("div", { className: "header-info",
                     onClick: () => { this.state.showGroupInfo = true; this.state.groupInfoId = g.groupId; this.render(); },
                     style: { cursor: "pointer" } },
-                    h("div", { className: "header-name" }, esc(name)),
+                    h("div", { className: "header-name" }, name),
                     h("div", { className: "header-hash" },
                         isPending ? "⏳ Pending invite" : `${memberCount} members`),
                 ),
@@ -3514,18 +3732,9 @@ const App = {
                 ...(msgs.length === 0
                     ? [h("div", { className: "empty-chat" },
                         h("p", {}, isPending ? "Accept the invite to start chatting." : "No messages yet. Say hello!"))]
-                    : msgs.map(m => {
-                        if (m.dir === "system") {
-                            return h("div", { className: "msg-row system", "data-msg-id": m.id },
-                                h("div", { className: "system-msg" },
-                                    h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
-                                    " ",
-                                    esc(m.content),
-                                ),
-                            );
-                        }
-                        return this._buildMsgBubble(m);
-                    })),
+                    : msgs.map(m => m.dir === "system"
+                        ? this._buildSystemMsg(m)
+                        : this._buildMsgBubble(m))),
             ),
 
             // Composer (hidden for pending groups)
@@ -3552,14 +3761,25 @@ const App = {
         );
     },
 
+    /** Build a system notice row (group/channel views). */
+    _buildSystemMsg(m) {
+        return h("div", { className: "msg-row system", "data-msg-id": m.id },
+            h("div", { className: "system-msg" },
+                h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
+                " ",
+                m.content,
+            ),
+        );
+    },
+
     /** Build a single message bubble (used by both DM and group views). */
     _buildMsgBubble(m) {
         const isOwn = m.dir === "out";
         const statusIcon = isOwn ? this._statusIcon(m.status) : "";
         return h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": m.id },
             h("div", { className: "msg-bubble" },
-                (!isOwn && m.senderName) ? h("div", { className: "msg-sender" }, esc(m.senderName)) : null,
-                esc(m.content),
+                (!isOwn && m.senderName) ? h("div", { className: "msg-sender" }, m.senderName) : null,
+                m.content,
                 h("div", { className: "msg-meta" },
                     h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
                     statusIcon ? h("span", { className: `msg-status ${m.status}`, "data-msg-status": m.status }, statusIcon) : null,
@@ -3588,7 +3808,7 @@ const App = {
                 h("div", { className: "header-info",
                     onClick: () => { this.state.showChannelInfo = true; this.state.channelInfoName = ch.channelName; this.render(); },
                     style: { cursor: "pointer" } },
-                    h("div", { className: "header-name" }, esc(name)),
+                    h("div", { className: "header-name" }, name),
                     h("div", { className: "header-hash" }, `Channel · ${ch.channelHash.slice(0,12)}…`),
                 ),
                 h("button", { className: "icon-btn", title: "Channel info",
@@ -3600,18 +3820,9 @@ const App = {
                 ...(msgs.length === 0
                     ? [h("div", { className: "empty-chat" },
                         h("p", {}, "No messages yet. Be the first to speak!"))]
-                    : msgs.map(m => {
-                        if (m.dir === "system") {
-                            return h("div", { className: "msg-row system", "data-msg-id": m.id },
-                                h("div", { className: "system-msg" },
-                                    h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
-                                    " ",
-                                    esc(m.content),
-                                ),
-                            );
-                        }
-                        return this._buildMsgBubble({ ...m, senderName: m.senderName || (m.dir === "in" ? m.srcHash?.slice(0,12) : null) });
-                    })),
+                    : msgs.map(m => m.dir === "system"
+                        ? this._buildSystemMsg(m)
+                        : this._buildMsgBubble({ ...m, senderName: m.senderName || (m.dir === "in" ? m.srcHash?.slice(0,12) : null) }))),
             ),
 
             // Composer
@@ -3640,13 +3851,7 @@ const App = {
 
     openChat(hash, activateChannel = true) {
         this.state.activeHash = hash;
-        this.state.showSettings = false;
-        this.state.showAddContact = false;
-        this.state.showShareId = false;
-        this.state.showContactInfo = false;
-        this.state.showNewConversation = false;
-        this.state.showGroupInfo = false;
-        this.state.showChannelInfo = false;
+        this._closeAllModals();
 
         if (activateChannel && ChannelStore.get(hash)) {
             RnsClient.openChannel(hash).catch(e => console.warn("[retichat] Open channel failed:", e.message));
@@ -3712,7 +3917,11 @@ const App = {
         const clearAndFocus = () => {
             ta.value = "";
             ta.style.height = "auto";
-            this.render();
+            // Append the outgoing bubble in place instead of re-rendering, so
+            // the chat doesn't flash and the composer keeps focus for the
+            // next message.
+            this._syncOpenChatMessages();
+            this._refreshSidebar();
             requestAnimationFrame(() => {
                 this._scrollChatBottom();
                 document.getElementById("composer-input")?.focus();
@@ -3883,7 +4092,27 @@ const App = {
 
     // ===== MODALS =====
 
-    /** Settings modal — mirrors iOS SettingsView sections */
+    /** Shell shared by Settings and Identity: overlay + sticky header + body.
+     *  `onClose` runs on backdrop click and on the ✕ button. */
+    _modalShell(title, onClose) {
+        const overlay = h("div", { className: "modal-overlay",
+            onClick: (e) => { if (e.target === overlay) onClose(); },
+        });
+        const sheet = h("div", { className: "modal-sheet" });
+        sheet.appendChild(
+            h("div", { className: "modal-header" },
+                h("h2", {}, title),
+                h("button", { className: "icon-btn", onClick: onClose }, "✕"),
+            ),
+        );
+        const body = h("div", { className: "modal-body" });
+        sheet.appendChild(body);
+        overlay.appendChild(sheet);
+        return { overlay, sheet, body };
+    },
+
+    /** Settings modal — configuration only. Everything to do with keys and
+     *  addresses lives on the Identity screen, one row down. */
     _renderSettingsModal() {
         const cfg = RnsClient.cfg;
         const connType = RnsClient.connType;
@@ -3891,42 +4120,38 @@ const App = {
             : connType === "direct" ? "Direct Sockets"
             : connType === "websocket" ? "WebSocket" : "None";
 
-        const overlay = h("div", { className: "modal-overlay",
-            onClick: (e) => { if (e.target === overlay) { this.state.showSettings = false; this.render(); } },
-        });
+        const close = () => { this.state.showSettings = false; this.render(); };
+        const { overlay, sheet, body } = this._modalShell("Settings", close);
 
-        const sheet = h("div", { className: "modal-sheet" });
-
-        // Header
-        sheet.appendChild(
-            h("div", { className: "modal-header" },
-                h("h2", {}, "Settings"),
-                h("button", { className: "icon-btn",
-                    onClick: () => { this.state.showSettings = false; this.render(); } }, "✕"),
+        // ---- Identity (link into the consolidated screen) ----
+        body.appendChild(
+            h("button", { className: "nav-row",
+                onClick: () => {
+                    this.state.showSettings = false;
+                    this.state.showIdentity = true;
+                    this.render();
+                } },
+                h("span", {},
+                    "Identity",
+                    h("span", { className: "nav-sub" },
+                        DistroManager.has ? "Device + distro addresses and keys" : "Device address and keys · no distro yet"),
+                ),
+                h("span", { className: "nav-chevron" }, "›"),
             ),
         );
 
-        const body = h("div", { className: "modal-body" });
-
-        // ---- Profile section ----
+        // ---- Profile + Appearance ----
         body.appendChild(
-            h("div", { className: "settings-section" },
+            h("div", { className: "settings-section compact" },
                 h("h3", {}, "Profile"),
                 h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "cfg-name" }, "Display Name"),
+                    h("label", { htmlFor: "cfg-name" }, "Display name"),
                     h("input", { id: "cfg-name", type: "text", value: cfg.displayName || "" }),
                     h("div", { className: "field-hint" }, "Shown in your announces on the network."),
                 ),
-            ),
-        );
-
-        // ---- Theme section ----
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Appearance"),
                 h("div", { className: "settings-row" },
                     h("span", { className: "row-label" },
-                        this.state.theme === "dark" ? "🌙 Dark Mode" : "☀️ Light Mode"),
+                        this.state.theme === "dark" ? "🌙 Dark mode" : "☀️ Light mode"),
                     h("label", { className: "toggle" },
                         h("input", {
                             type: "checkbox",
@@ -3939,56 +4164,24 @@ const App = {
             ),
         );
 
-        // ---- Connection section ----
+        // ---- Connection ----
         body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Connection"),
-                h("div", { style: { fontSize: "12px", color: "var(--text-muted)", marginBottom: "12px" } },
-                    "Current: ", h("strong", {}, connLabel)),
+            h("div", { className: "settings-section compact" },
+                h("div", { className: "section-head" },
+                    h("h3", {}, "Connection"),
+                    h("span", { className: "section-note" }, connLabel),
+                ),
                 h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "cfg-exchange" }, "HTTP Exchange URL"),
+                    h("label", { htmlFor: "cfg-exchange" }, "HTTP exchange URL"),
                     h("input", { id: "cfg-exchange", type: "text", value: cfg.exchangeUrl || "",
                         placeholder: "https://your-host.com/reticulum" }),
                     h("div", { className: "field-hint" },
-                        "Uses HTTP POST polling — no WebSocket or open ports needed."),
+                        "HTTP POST polling — no WebSocket or open ports needed."),
                 ),
             ),
         );
 
-        // ---- Distro section ----
-        const distroState = DistroManager.has
-            ? { hash: DistroManager.hash, pubKey: DistroManager.pubKey }
-            : null;
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Distro Identity"),
-                distroState
-                    ? h("div", { className: "settings-field" },
-                        h("div", { className: "mono-value", style: { fontSize: "13px", marginBottom: "8px" } },
-                            distroState.hash),
-                        h("div", { className: "field-hint", style: { marginBottom: "12px" } },
-                            "Your distro identity is active. Messages sent to this identity will be fanned out to all registered devices."),
-                        h("div", { className: "btn-row" },
-                            h("button", { className: "btn btn-secondary",
-                                onClick: () => this._showDistroShare() }, "📤 Share"),
-                            h("button", { className: "btn btn-danger",
-                                onClick: () => this._forgetDistro() }, "🗑 Forget"),
-                        ),
-                    )
-                    : h("div", { className: "settings-field" },
-                        h("div", { className: "field-hint", style: { marginBottom: "12px" } },
-                            "Generate a distro identity to receive messages on multiple devices. All devices share the same identity and can decrypt the same messages."),
-                        h("div", { className: "btn-row" },
-                            h("button", { className: "btn btn-primary",
-                                onClick: () => this._generateDistro() }, "✨ Generate"),
-                            h("button", { className: "btn btn-secondary",
-                                onClick: () => this._showDistroImport() }, "📥 Import"),
-                        ),
-                    ),
-            ),
-        );
-
-        // ---- RFed / Propagation section ----
+        // ---- RFed / Propagation ----
         const derivedProp = (() => {
             try {
                 const rfedBytes = Buffer.from(cfg.rfedNodeHash || DEFAULT_CONFIG.rfedNodeHash, "hex");
@@ -3996,31 +4189,31 @@ const App = {
             } catch(e) { return ""; }
         })();
         body.appendChild(
-            h("div", { className: "settings-section" },
+            h("div", { className: "settings-section compact" },
                 h("h3", {}, "RFed & Propagation"),
                 h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "cfg-rfed" }, "RFed Node Identity Hash"),
+                    h("label", { htmlFor: "cfg-rfed" }, "RFed node identity hash"),
                     h("input", { id: "cfg-rfed", type: "text",
                         value: cfg.rfedNodeHash || "",
                         placeholder: DEFAULT_CONFIG.rfedNodeHash }),
                     h("div", { className: "field-hint" },
-                        "Root identity for deriving propagation, notify, and channel addresses."),
+                        "Root identity for propagation, notify and channel addresses."),
                 ),
                 h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "cfg-rfed-pubkey" }, "RFed Node Public Key (128 hex)"),
+                    h("label", { htmlFor: "cfg-rfed-pubkey" }, "RFed node public key"),
                     h("input", { id: "cfg-rfed-pubkey", type: "text",
                         value: cfg.rfedNodePubKey || "",
                         placeholder: "Auto-learned from announce…" }),
                     h("div", { className: "field-hint" },
-                        "Required for channel subscribe/unsubscribe. Learned automatically when the RFed node announces; set manually if needed."),
+                        "128 hex. Learned from the node's announce; set manually only if needed."),
                 ),
                 h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "cfg-prop-override" }, "LXMF Propagation Override"),
+                    h("label", { htmlFor: "cfg-prop-override" }, "LXMF propagation override"),
                     h("input", { id: "cfg-prop-override", type: "text",
                         value: cfg.lxmfPropagationOverride || "",
-                        placeholder: derivedProp.slice(0,16) + "… (derived from RFed)" }),
+                        placeholder: derivedProp.slice(0,16) + "… (derived)" }),
                     h("div", { className: "field-hint" },
-                        "Leave empty to derive from RFed node. Set explicitly for a custom propagation node."),
+                        "Leave empty to derive from the RFed node."),
                 ),
             ),
         );
@@ -4035,12 +4228,162 @@ const App = {
             ),
         );
 
-        sheet.appendChild(body);
-        overlay.appendChild(sheet);
         this.root.appendChild(overlay);
 
         // Focus the first input
         setTimeout(() => sheet.querySelector("input")?.focus(), 150);
+    },
+
+    // ===== IDENTITY SCREEN =====
+    //
+    // One screen for every address, key and share link. Device Identity (this
+    // browser's own LXMF identity) and Distro Identity (the identity shared
+    // with your other devices) are deliberately separate groups — they are
+    // different keys with different sharing rules, and mixing them is how the
+    // distro contact link ended up advertising the wrong address.
+
+    /** Consolidated Device + Distro identity screen. */
+    _renderIdentityModal() {
+        const close = () => {
+            this.state.showIdentity = false;
+            this.state.revealDeviceKey = false;
+            this.state.revealDistroKey = false;
+            this.render();
+        };
+        const { overlay, body } = this._modalShell("Identity", close);
+        body.appendChild(this._buildDeviceIdentitySection());
+        body.appendChild(this._buildDistroIdentitySection());
+        this.root.appendChild(overlay);
+    },
+
+    /** This browser's own identity: what senders address, and the backup key. */
+    _buildDeviceIdentitySection() {
+        const deliveryHash = RnsClient.ownHash || ownLxmfDestinationHash();
+        const pubKey = IdMgr.pubKey;
+        const contactUri = (deliveryHash && pubKey?.length === 128)
+            ? `lxma://${deliveryHash}:${pubKey}`
+            : null;
+
+        const section = h("div", { className: "settings-section compact" },
+            h("div", { className: "section-head" },
+                h("h3", {}, "Device Identity"),
+                h("span", { className: "section-note" }, "This browser"),
+            ),
+            kvRow("Address", deliveryHash, { empty: "unavailable" }),
+            kvRow("Identity", IdMgr.hash),
+            kvRow("Public key", pubKey),
+            kvRow("Contact", contactUri, { empty: "needs public key" }),
+            h("div", { className: "field-hint" },
+                "The contact link carries this device's delivery address and public key — safe to share."),
+        );
+
+        section.appendChild(
+            h("div", { className: "btn-row" },
+                h("button", { className: "btn btn-secondary btn-sm",
+                    onClick: () => {
+                        this.state.revealDeviceKey = !this.state.revealDeviceKey;
+                        this.render();
+                    } },
+                    this.state.revealDeviceKey ? "🙈 Hide private key" : "🔑 Back up private key"),
+            ),
+        );
+
+        if (this.state.revealDeviceKey) {
+            const priv = IdMgr.privKey ?? "";
+            section.appendChild(h("div", { className: "secret-warning" },
+                "⚠️ Anyone holding this key is this device. Store it somewhere safe; never share it."));
+            section.appendChild(h("div", { className: "secret-value" }, priv || "unavailable"));
+            if (priv) {
+                section.appendChild(
+                    h("div", { className: "btn-row" },
+                        h("button", { className: "btn btn-secondary btn-sm",
+                            onClick: () => { navigator.clipboard.writeText(priv).catch(() => {}); } },
+                            "⧉ Copy private key"),
+                    ),
+                );
+            }
+        }
+
+        return section;
+    },
+
+    /** The shared multi-device identity. Separate group, separate key, and a
+     *  contact link built from the *delivery* address rather than the identity
+     *  hash — the identity hash routes nowhere. */
+    _buildDistroIdentitySection() {
+        const section = h("div", { className: "settings-section compact" });
+        section.appendChild(
+            h("div", { className: "section-head" },
+                h("h3", {}, "Distro Identity"),
+                h("span", { className: "section-note" },
+                    DistroManager.has ? "Shared across your devices" : "Not configured"),
+            ),
+        );
+
+        if (!DistroManager.has) {
+            section.appendChild(h("div", { className: "field-hint" },
+                "One LXMF address shared by all your devices. Anything sent to it is fanned out by RFed to every registered device."));
+            section.appendChild(
+                h("div", { className: "btn-row" },
+                    h("button", { className: "btn btn-primary btn-sm",
+                        onClick: () => this._generateDistro() }, "✨ Generate"),
+                    h("button", { className: "btn btn-secondary btn-sm",
+                        onClick: () => this._showDistroImport() }, "📥 Import"),
+                ),
+            );
+            return section;
+        }
+
+        section.appendChild(kvRow("Address", DistroManager.lxmfDeliveryHash));
+        section.appendChild(kvRow("Identity", DistroManager.hash));
+        section.appendChild(kvRow("Public key", DistroManager.pubKey));
+        section.appendChild(kvRow("Contact", DistroManager.exportLxmaUri()));
+        section.appendChild(h("div", { className: "field-hint" },
+            "Give senders the contact link. Address is where distro mail is delivered; identity is the key's own hash and is not routable."));
+
+        section.appendChild(
+            h("div", { className: "btn-row" },
+                h("button", { className: "btn btn-secondary btn-sm",
+                    onClick: () => {
+                        this.state.revealDistroKey = !this.state.revealDistroKey;
+                        this.render();
+                    } },
+                    this.state.revealDistroKey ? "🙈 Hide transfer key" : "📤 Add another device"),
+                h("button", { className: "btn btn-danger btn-sm",
+                    onClick: () => this._forgetDistro() }, "🗑 Forget"),
+            ),
+        );
+
+        if (this.state.revealDistroKey) {
+            const uri = DistroManager.exportUri();
+            section.appendChild(h("div", { className: "secret-warning" },
+                "⚠️ Private key. Share only with your own devices — anyone holding it can read every distro message."));
+            section.appendChild(h("div", { className: "secret-value" }, uri));
+            section.appendChild(
+                h("div", { className: "btn-row" },
+                    h("button", { className: "btn btn-secondary btn-sm",
+                        onClick: () => { navigator.clipboard.writeText(uri).catch(() => {}); } },
+                        "⧉ Copy transfer URI"),
+                ),
+            );
+            section.appendChild(
+                h("div", { className: "settings-field", style: { marginTop: "12px" } },
+                    h("label", { htmlFor: "distro-lxmf-dest" }, "Or send it encrypted over LXMF"),
+                    h("input", { id: "distro-lxmf-dest", type: "text",
+                        placeholder: "32-char hex address of an existing contact" }),
+                    h("div", { className: "field-hint" },
+                        "The recipient is prompted to import it. They must already be a contact with a known public key."),
+                ),
+            );
+            section.appendChild(
+                h("div", { className: "btn-row" },
+                    h("button", { className: "btn btn-primary btn-sm",
+                        onClick: () => this._sendDistroViaLxmf() }, "📨 Send identity"),
+                ),
+            );
+        }
+
+        return section;
     },
 
     async _saveSettings() {
@@ -4098,78 +4441,6 @@ const App = {
         } catch(e) {
             alert("Failed to import: " + e.message);
         }
-    },
-
-    _showDistroShare() {
-        const uri = DistroManager.exportUri();
-        const overlay = h("div", { className: "modal-overlay",
-            onClick: (e) => { if (e.target === overlay) { this.render(); } },
-        });
-
-        const sheet = h("div", { className: "modal-sheet" });
-        sheet.appendChild(
-            h("div", { className: "modal-header" },
-                h("h2", {}, "📤 Share Distro Identity"),
-                h("button", { className: "icon-btn",
-                    onClick: () => { this.render(); } }, "✕"),
-            ),
-        );
-
-        const body = h("div", { className: "modal-body" });
-
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Distro Identity Hash"),
-                h("div", { className: "mono-value", style: { fontSize: "13px" } }, DistroManager.hash),
-                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
-                    onClick: () => { navigator.clipboard.writeText(DistroManager.hash).catch(() => {}); } },
-                    "📋 Copy Hash"),
-            ),
-        );
-
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Distro Contact (share with senders)"),
-                h("div", { className: "field-hint", style: { marginBottom: "8px" } },
-                    "Share this with anyone who wants to send you distro messages. It contains the public key only — safe to share openly."),
-                h("div", { className: "mono-value", style: { fontSize: "11px", wordBreak: "break-all" } }, DistroManager.exportLxmaUri()),
-                h("button", { className: "btn btn-primary btn-block", style: { marginTop: "8px" },
-                    onClick: () => { navigator.clipboard.writeText(DistroManager.exportLxmaUri()).catch(() => {}); } },
-                    "📋 Copy Contact URI"),
-            ),
-        );
-
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Private Key (keep secret)"),
-                h("div", { className: "field-hint", style: { marginBottom: "8px" } },
-                    "⚠️ This contains the private key. Share it only with your own devices. Anyone with this key can read all distro messages."),
-                h("div", { className: "mono-value", style: { fontSize: "11px", wordBreak: "break-all" } }, uri),
-                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
-                    onClick: () => { navigator.clipboard.writeText(uri).catch(() => {}); } },
-                    "📋 Copy Private Key URI"),
-            ),
-        );
-
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Send via LXMF"),
-                h("div", { className: "field-hint", style: { marginBottom: "8px" } },
-                    "Send the identity encrypted to another Retichat user. They will be prompted to import it."),
-                h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "distro-lxmf-dest" }, "Recipient LXMF Address"),
-                    h("input", { id: "distro-lxmf-dest", type: "text",
-                        placeholder: "32-char hex destination hash" }),
-                ),
-                h("button", { className: "btn btn-primary btn-block", style: { marginTop: "8px" },
-                    onClick: () => this._sendDistroViaLxmf() },
-                    "📨 Send Encrypted Identity"),
-            ),
-        );
-
-        sheet.appendChild(body);
-        overlay.appendChild(sheet);
-        this.root.appendChild(overlay);
     },
 
     _sendDistroViaLxmf() {
@@ -4300,65 +4571,6 @@ const App = {
         setTimeout(() => document.getElementById("add-hash")?.focus(), 150);
     },
 
-    /** Share Identity modal */
-    _renderShareIdModal() {
-        const hash = RnsClient.ownHash || IdMgr.hash || "???";
-        const pubKey = IdMgr.pubKey ?? "";
-        const lxmfLink = `lxmf://${hash}`;
-        const lxmaLink = pubKey.length === 128 ? `lxma://${hash}:${pubKey}` : null;
-
-        const overlay = h("div", { className: "modal-overlay",
-            onClick: (e) => { if (e.target === overlay) { this.state.showShareId = false; this.render(); } },
-        });
-
-        const sheet = h("div", { className: "modal-sheet" });
-        sheet.appendChild(
-            h("div", { className: "modal-header" },
-                h("h2", {}, "🔗 Share Your Identity"),
-                h("button", { className: "icon-btn",
-                    onClick: () => { this.state.showShareId = false; this.render(); } }, "✕"),
-            ),
-        );
-
-        const body = h("div", { className: "modal-body" });
-
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "Destination Hash"),
-                h("div", { className: "mono-value", style: { fontSize: "13px" } }, hash),
-                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
-                    onClick: () => { navigator.clipboard.writeText(hash).catch(() => {}); } },
-                    "📋 Copy Hash"),
-            ),
-        );
-
-        body.appendChild(
-            h("div", { className: "settings-section" },
-                h("h3", {}, "LXMF Link"),
-                h("div", { className: "mono-value", style: { fontSize: "13px" } }, lxmfLink),
-                h("button", { className: "btn btn-secondary btn-block", style: { marginTop: "8px" },
-                    onClick: () => { navigator.clipboard.writeText(lxmfLink).catch(() => {}); } },
-                    "📋 Copy Link"),
-            ),
-        );
-
-        if (lxmaLink) {
-            body.appendChild(
-                h("div", { className: "settings-section" },
-                    h("h3", {}, "LXMA Link (with public key — preferred)"),
-                    h("div", { className: "mono-value", style: { fontSize: "11px" } }, lxmaLink),
-                    h("button", { className: "btn btn-primary btn-block", style: { marginTop: "8px" },
-                        onClick: () => { navigator.clipboard.writeText(lxmaLink).catch(() => {}); } },
-                        "📋 Copy Full Link"),
-                ),
-            );
-        }
-
-        sheet.appendChild(body);
-        overlay.appendChild(sheet);
-        this.root.appendChild(overlay);
-    },
-
     /** Contact Info modal — edit name, delete chat */
     _renderContactInfoModal() {
         const c = ContactStore.get(this.state.contactInfoHash);
@@ -4392,7 +4604,7 @@ const App = {
                         borderColor: `hsla(${hue}, 50%, 65%, 0.2)` },
                 }, name.charAt(0).toUpperCase()),
                 h("div", { style: { flex: 1 } },
-                    h("div", { style: { fontWeight: 700, fontSize: "17px" } }, esc(name)),
+                    h("div", { style: { fontWeight: 700, fontSize: "17px" } }, name),
                     h("div", { style: { fontSize: "11px", color: "var(--text-muted)", fontFamily: "var(--font-mono)", marginTop: "2px" } },
                         c.destHash),
                 ),
@@ -4629,7 +4841,7 @@ const App = {
                     },
                         h("div", { className: "contact-avatar", style: { width: "32px", height: "32px", fontSize: "14px", flexShrink: 0, color: `hsl(${avatarHue(c.displayName||c.destHash)}, 50%, 65%)`, background: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 40%, 0.15)`, borderColor: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 65%, 0.2)` } }, (c.displayName||"?")[0].toUpperCase()),
                         h("div", { style: { flex: 1 } },
-                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, esc(c.displayName || "?" + c.destHash.slice(0,8))),
+                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, c.displayName || "?" + c.destHash.slice(0,8)),
                             h("div", { style: { fontSize: "11px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" } }, c.destHash.slice(0,16) + "…"),
                         ),
                     )),
@@ -4683,7 +4895,7 @@ const App = {
                         h("input", { type: "checkbox", className: "group-member-check", value: c.destHash }),
                         h("div", { className: "contact-avatar", style: { width: "32px", height: "32px", fontSize: "14px", flexShrink: 0, color: `hsl(${avatarHue(c.displayName||c.destHash)}, 50%, 65%)`, background: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 40%, 0.15)`, borderColor: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 65%, 0.2)` } }, (c.displayName||"?")[0].toUpperCase()),
                         h("div", { style: { flex: 1 } },
-                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, esc(c.displayName || "?" + c.destHash.slice(0,8))),
+                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, c.displayName || "?" + c.destHash.slice(0,8)),
                             h("div", { style: { fontSize: "11px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" } }, c.destHash.slice(0,16) + "…"),
                         ),
                         c.publicKey ? null : h("span", { style: { fontSize: "11px", color: "var(--warning)" } }, "⏳"),
@@ -4812,7 +5024,7 @@ const App = {
         // Group name header
         body.appendChild(
             h("div", { style: { marginBottom: "16px" } },
-                h("div", { style: { fontSize: "18px", fontWeight: 700 } }, esc(g.groupName || "Group")),
+                h("div", { style: { fontSize: "18px", fontWeight: 700 } }, g.groupName || "Group"),
                 h("div", { style: { fontSize: "12px", color: "var(--text-muted)", fontFamily: "var(--font-mono)", marginTop: "4px" } },
                     `ID: ${g.groupId.slice(0,16)}…`),
             ),
@@ -4853,7 +5065,7 @@ const App = {
                                 borderColor: `hsla(${avatarHue(displayName)}, 50%, 65%, 0.2)` },
                         }, displayName.charAt(0).toUpperCase()),
                         h("div", { style: { flex: 1, fontSize: "13px" } },
-                            esc(displayName) + statusLabel),
+                            displayName + statusLabel),
                         h("div", { style: { fontSize: "10px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" } },
                             hash.slice(0,10) + "…"),
                     );
@@ -4951,26 +5163,7 @@ const App = {
     // Avoid full re-renders for events not initiated by the user:
     // proofs, incoming messages, and contact list refreshes.
     // This preserves scroll position and composer focus.
-
-    /** Append a single incoming message to the active chat view without re-rendering. */
-    _appendMessageToDOM(msg, contactHash, contactName) {
-        const ml = document.getElementById("msg-list");
-        if (!ml) return false;
-        const hue = avatarHue(contactName || contactHash?.slice(0,8));
-        const isOwn = msg.dir === "out";
-        const statusIcon = isOwn ? this._statusIcon(msg.status) : "";
-        const row = h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": msg.id },
-            h("div", { className: "msg-bubble" },
-                esc(msg.content),
-                h("div", { className: "msg-meta" },
-                    h("span", { className: "msg-time" }, fmtTime(msg.timestamp)),
-                    statusIcon ? h("span", { className: `msg-status ${msg.status}`, "data-msg-status": msg.status }, statusIcon) : null,
-                ),
-            ),
-        );
-        ml.appendChild(row);
-        return true;
-    },
+    // (Message rows are appended by _syncOpenChatMessages, above.)
 
     /** Update a message status icon in-place without re-rendering.
      *  Finds the msg-row by data-msg-id and updates its status span. */
@@ -5006,16 +5199,15 @@ const App = {
             }
         });
 
-        // Incoming messages & proofs: update in-place when possible,
-        // fall back to full re-render only when sidebar state changed.
+        // Incoming messages & proofs. Everything here is a targeted DOM patch:
+        // a full render() would reset the open chat (scroll, draft, in-flight
+        // interaction) and tear down any open modal, which is exactly what the
+        // user notices when a distro message or a path response lands.
         RnsClient.onMessage((msg, peerHash) => {
             if (this.state.view !== "main") return;
-            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId ||
-                this.state.showContactInfo || this.state.showNewConversation || this.state.showGroupInfo ||
-                this.state.showChannelInfo) return;
             const inActiveChat = this.state.activeHash === peerHash;
 
-            // Proof-only event (msg is null): update status icon in-place.
+            // Proof-only event (msg is null): update status icons in place.
             if (!msg) {
                 if (!inActiveChat) return;
                 // Update both DM, group, and channel messages
@@ -5041,43 +5233,42 @@ const App = {
                 return;
             }
 
-            // New message or group/channel system message: full re-render
-            this.render();
-            if (inActiveChat) {
+            // New message (DM, distro, group or channel): append the bubbles
+            // that aren't on screen yet and repaint the sidebar for preview
+            // and ordering. Both are safe with a modal open, so unlike before
+            // a message arriving mid-dialog is no longer dropped from the UI.
+            const appended = this._syncOpenChatMessages();
+            this._refreshSidebar();
+            if (inActiveChat && appended) {
                 requestAnimationFrame(() => this._scrollChatBottom());
             }
         });
 
-        // Contact list changes — only re-render if not in an active chat.
+        // Contact list changes — announces and path responses land here. The
+        // open chat keeps its message list and draft; only the header line and
+        // the composer's enabled state follow the newly learned public key.
         ContactStore.onChange(() => {
             if (this.state.view !== "main") return;
-            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId ||
-                this.state.showContactInfo || this.state.showNewConversation || this.state.showGroupInfo ||
-                this.state.showChannelInfo) return;
-            if (!this.state.activeHash) {
-                this.render();
-            }
+            this._refreshSidebar();
+            this._syncOpenChatChrome();
         });
 
-        // Group list changes — same logic
+        // Group list changes — membership and invite state are structural, so
+        // the open group chat is rebuilt (draft and scroll preserved).
         GroupStore.onChange(() => {
             if (this.state.view !== "main") return;
-            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId ||
-                this.state.showContactInfo || this.state.showNewConversation || this.state.showGroupInfo ||
-                this.state.showChannelInfo) return;
-            if (!this.state.activeHash) {
-                this.render();
+            this._refreshSidebar();
+            if (this.state.activeHash && GroupStore.isGroupChat(this.state.activeHash)) {
+                this._rebuildDetail();
             }
         });
 
         // Channel list changes — same logic
         ChannelStore.onChange(() => {
             if (this.state.view !== "main") return;
-            if (this.state.showSettings || this.state.showAddContact || this.state.showShareId ||
-                this.state.showContactInfo || this.state.showNewConversation || this.state.showGroupInfo ||
-                this.state.showChannelInfo) return;
-            if (!this.state.activeHash) {
-                this.render();
+            this._refreshSidebar();
+            if (this.state.activeHash && ChannelStore.get(this.state.activeHash)) {
+                this._rebuildDetail();
             }
         });
     },
@@ -5096,6 +5287,12 @@ window.RetichatTest = {
     get inbox() { return Harness.inbox; },
     get events() { return Harness.events; },
     get errors() { return Harness.errors; },
+
+    /** The live App and RnsClient, for the one class of assertion the
+     *  harness surface above cannot make: that an arriving message actually
+     *  reaches the screen, and does so without rebuilding the open chat. */
+    app: App,
+    client: RnsClient,
 
     /** Identity + destination hashes this node answers on. */
     identity() {
