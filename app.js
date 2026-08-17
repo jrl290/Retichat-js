@@ -96,6 +96,51 @@ const DEFAULT_CONFIG = {
 const TRAFFIC_TIMEOUT_FACTOR = 6;
 const RESPONSE_MAX_GRACE_MS = 10_000;
 
+// ── RFed link recovery, ported from the reference LXMF propagation router ───
+//
+// Establishment over this transport fails sometimes: it is lossy enough that
+// rfed's own §1 assert fires on link.establish taking 7-37s, and a single
+// dropped LINKREQUEST or LRPROOF ends the attempt. Until 2026-08-17 a failed
+// RFed link was terminal for the whole session — _ensureRfedLink rejected, the
+// cached entry was dropped, and nothing ever drove the operation again. One
+// lost packet silently cost distro registration and pull until a page reload,
+// which is exactly the "sometimes it just doesn't work" report.
+//
+// The reference does NOT solve this with a retry loop (DESIGN_PRINCIPLES §3
+// forbids one, and LXMRouter has none). It uses three pieces, ported here:
+//
+//   1. A state per link, not a silent boolean. LXMRouter.PR_* —
+//      PR_LINK_ESTABLISHING / PR_LINK_ESTABLISHED / PR_LINK_FAILED /
+//      PR_NO_PATH — so a failure is an inspectable state rather than a
+//      swallowed rejection. RFED_LINK_* below are the same states.
+//
+//   2. A janitor that clears a CLOSED link so the next attempt starts clean:
+//      LXMRouter.jobs() — `if outbound_propagation_link.status == CLOSED:
+//      outbound_propagation_link = None` plus acknowledge_sync_completion(
+//      failure_state=PR_LINK_FAILED). Our link close handler does the same.
+//
+//   3. Re-entry driven by an EVENT, never a timer. The reference records what
+//      it wanted (wants_download_on_path_available_from/to, with
+//      PR_PATH_TIMEOUT) and re-calls request_messages_from_propagation_node()
+//      when the path appears — __request_messages_path_job. Our equivalent
+//      event is the service announce: rfed re-announces every service every
+//      15 minutes, and each announce proves the destination is reachable
+//      again. _rfedPending records the wanted operation; _onRfedServiceAnnounce
+//      re-drives it.
+//
+// So nothing re-attempts on a schedule. A failed operation waits for evidence
+// that the service is back, exactly like the reference waits for a path.
+const RFED_LINK_IDLE = "idle";
+const RFED_LINK_ESTABLISHING = "establishing";
+const RFED_LINK_ESTABLISHED = "established";
+const RFED_LINK_FAILED = "link_failed";
+
+// How long a pending operation stays eligible for re-driving, mirroring
+// LXMRouter.PR_PATH_TIMEOUT. Services re-announce every 15 min, so this
+// spans a couple of announce cycles and then gives up rather than firing
+// against a node that has genuinely gone away.
+const RFED_PENDING_TIMEOUT_MS = 45 * 60 * 1000;
+
 /** Reference request timeout for a link, in ms. `rtt` is measured at
  *  establishment; before that is known, fall back to the grace term alone. */
 function rfedRequestTimeoutMs(link) {
@@ -709,6 +754,10 @@ const RnsClient = {
     _rfedLinkPromises: new Map(),
     _rfedServiceReady: new Set(),
     _rfedServiceWaiters: new Map(),
+    // Per-aspect link state and the operation waiting on it, mirroring the
+    // reference LXMF propagation router. See RFED_LINK_* and _rfedPending.
+    _rfedLinkState: new Map(),
+    _rfedPending: new Map(),
     _rfedServicePathsRequested: false,
     _propagationPathRequested: false,
     _propagationInitialized: false,
@@ -2251,6 +2300,11 @@ const RnsClient = {
         if (key === "channel") {
             this._initChannels().catch(e => console.warn("[retichat] Channel init failed:", e.message));
         }
+        // This announce is our proof the service is reachable again — the
+        // reference's "path is available" moment. Anything that failed on a
+        // dead link gets one shot at running now. Nothing is scheduled: no
+        // announce, no re-drive.
+        this._rfedRunPending(key);
     },
 
     _waitForRfedService(aspects) {
@@ -2261,6 +2315,50 @@ const RnsClient = {
             waiters.push({resolve, reject});
             this._rfedServiceWaiters.set(key, waiters);
         });
+    },
+
+    /**
+     * Record an operation that could not run because its RFed link failed,
+     * so the next announce for that service can re-drive it.
+     *
+     * This is the reference's wants_download_on_path_available_from/to/timeout
+     * (LXMRouter.request_messages_from_propagation_node), which parks the
+     * intent and lets __request_messages_path_job re-call the entry point once
+     * a path exists. Same shape, different event: rfed re-announces every
+     * service every 15 minutes, and an announce is our proof of reachability.
+     *
+     * One pending operation per aspect — re-driving the same intent twice is
+     * duplicate work, not resilience (see the _registerDistro coalescing note).
+     */
+    _rfedDeferUntilAnnounce(key, label, run) {
+        if (this._rfedPending.has(key)) return;
+        this._rfedPending.set(key, {
+            label,
+            run,
+            expiresAt: Date.now() + RFED_PENDING_TIMEOUT_MS,
+        });
+        console.warn(`[retichat] ⏳ ${label} deferred — waiting for the next `
+            + `rfed.${key} announce to re-drive it (state=${this._rfedLinkState.get(key)})`);
+    },
+
+    /**
+     * Re-drive whatever was waiting on this service, now that it has announced.
+     * The reference's __request_messages_path_job tail: path available →
+     * re-call; timed out → give up with a named failure state.
+     */
+    _rfedRunPending(key) {
+        const pending = this._rfedPending.get(key);
+        if (!pending) return;
+        this._rfedPending.delete(key);
+        if (Date.now() > pending.expiresAt) {
+            console.warn(`[retichat] ⌛ ${pending.label} expired before rfed.${key} `
+                + `announced again — not re-driving (reference: PR_NO_PATH)`);
+            return;
+        }
+        console.log(`[retichat] 🔁 rfed.${key} announced — re-driving ${pending.label}`);
+        Promise.resolve()
+            .then(() => pending.run())
+            .catch(e => console.warn(`[retichat] ${pending.label} failed again: ${e.message}`));
     },
 
     _ensureRfedLink(aspects) {
@@ -2277,6 +2375,7 @@ const RnsClient = {
         const link = new Link();
         const startedAt = Date.now();
         let established = false;
+        this._rfedLinkState.set(key, RFED_LINK_ESTABLISHING);
         const promise = new Promise((resolve, reject) => {
             link.on("established", () => {
                 if (established) return;
@@ -2289,6 +2388,7 @@ const RnsClient = {
                 console.log(`[retichat] RFed ${key} link active after ${Date.now() - startedAt}ms (rtt=${link.rtt}ms)`);
                 link.identify(IdMgr.id);
                 this._rfedLinks.set(key, link);
+                this._rfedLinkState.set(key, RFED_LINK_ESTABLISHED);
                 console.log(`[retichat] RFed ${key} link active`);
                 resolve(link);
             });
@@ -2302,8 +2402,12 @@ const RnsClient = {
                 if (key === "channel.stream") this._handleChannelPacket(data);
             });
             link.on("close", () => {
+                // The janitor, mirroring LXMRouter.jobs(): a CLOSED link is
+                // cleared so the next attempt starts from scratch, and the
+                // outcome is recorded as a state rather than vanishing.
                 if (this._rfedLinks.get(key) === link) this._rfedLinks.delete(key);
                 this._rfedLinkPromises.delete(key);
+                this._rfedLinkState.set(key, established ? RFED_LINK_IDLE : RFED_LINK_FAILED);
                 if (!established) reject(new Error(`RFed ${key} link closed before establishment`));
             });
         });
@@ -2579,6 +2683,17 @@ const RnsClient = {
                 }
             } catch(e) {
                 console.error(`[distro] Registration failed:`, e);
+                // A link that never established is transient on this transport
+                // (one lost LINKREQUEST/LRPROOF ends the attempt). Park the
+                // intent for the next rfed.distro.register announce rather
+                // than leaving the device unregistered for the whole session.
+                if (this._rfedLinkState.get("distro.register") === RFED_LINK_FAILED) {
+                    this._rfedDeferUntilAnnounce(
+                        "distro.register",
+                        "distro registration",
+                        () => this._registerDistro(),
+                    );
+                }
                 return false;
             } finally {
                 this._registerDistroInFlight = null;
@@ -2698,6 +2813,13 @@ const RnsClient = {
             return pairs || [];
         } catch(e) {
             console.error(`[distro] PULL failed:`, e);
+            if (this._rfedLinkState.get("distro.register") === RFED_LINK_FAILED) {
+                this._rfedDeferUntilAnnounce(
+                    "distro.register",
+                    "distro pull",
+                    () => this._pullDistroMessages(),
+                );
+            }
             return [];
         }
     },
@@ -5486,6 +5608,11 @@ Harness (headless):
             interface: RnsClient._rns?.interfaces?.[0]?._interfaceId?.slice(0,12),
             registered: RnsClient._rns?.interfaces?.[0]?.isRegistered,
             contacts: ContactStore.getAll().length,
+            // Link state per RFed aspect, and anything parked waiting for the
+            // next announce. A failed link used to be invisible; this is the
+            // reference's PR_* state made inspectable.
+            rfedLinks: Object.fromEntries(RnsClient._rfedLinkState),
+            rfedPending: [...RnsClient._rfedPending.keys()],
         };
         console.table(s);
         return s;
