@@ -43,11 +43,17 @@
 #
 # X-Forwarded-Proto is checked because the node sits behind a proxy that
 # terminates TLS; without it the rule loops.
+# The redirect target uses REQUEST_URI, not $1: in a per-directory .htaccess
+# the captured $1 is relative to that directory, so the $1 form deployed into
+# selectivesubconscious.com/retichat/ would redirect /retichat/app.js to
+# /app.js — silently escaping the app's own path. REQUEST_URI is absolute and
+# behaves identically at the docroot and in any subdirectory, which matters
+# because this same file is deployed to both layouts.
 RewriteEngine On
 RewriteCond %{HTTPS} !on
 RewriteCond %{SERVER_PORT} !^443$
 RewriteCond %{HTTP:X-Forwarded-Proto} !https
-RewriteRule ^(.*)$ https://%{HTTP_HOST}/$1 [R=301,L]
+RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
 
 # ── Cache policy ─────────────────────────────────────────────────────────────
 <IfModule mod_headers.c>

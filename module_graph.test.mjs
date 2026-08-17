@@ -121,9 +121,10 @@ test(".htaccess keeps forcing HTTPS", () => {
     assert.match(text, /RewriteEngine On/, ".htaccess must enable mod_rewrite");
     assert.match(
         text,
-        /RewriteRule \^\(\.\*\)\$ https:\/\/%\{HTTP_HOST\}\/\$1 \[R=301,L\]/,
-        ".htaccess must redirect plain HTTP to HTTPS — this file replaces the " +
-        "node's only copy of that rule",
+        /RewriteRule \^ https:\/\/%\{HTTP_HOST\}%\{REQUEST_URI\} \[R=301,L\]/,
+        ".htaccess must redirect plain HTTP to HTTPS via REQUEST_URI — the $1 " +
+        "form is relative to the directory, so in the selectiv subdirectory " +
+        "deployment it would redirect /retichat/x to /x",
     );
     assert.match(
         text,

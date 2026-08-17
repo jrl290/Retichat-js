@@ -2,8 +2,23 @@
 #
 # deploy.sh — the only supported way to move the web client onto a live node.
 #
-#   ./deploy.sh                  # deploy HEAD to retichat.com
+#   ./deploy.sh                  # deploy HEAD to both nodes
+#   ./deploy.sh HEAD selectiv    # ...to one node
 #   ./deploy.sh be8964d          # ...a specific ref (rollback)
+#
+# TWO NODES, ONE SOURCE
+# =====================
+# The client is served from retichat.com (docroot) AND
+# selectivesubconscious.com/retichat/ (subdirectory). The selectiv copy was
+# deployed by hand and covered by no gate; on 2026-08-17 it was discovered
+# serving a morning-old build while retichat.com had received four fixes —
+# the same shadow-copy failure mode as Reticulum-post's js/ fork, but live on
+# a public URL. Every node this script does not know about is a regression
+# that has already happened and merely hasn't been noticed.
+#
+# config.json is per-node (it names that node's exchangeUrl) and is never
+# deployed; .htaccess is shared, which is why its redirect uses REQUEST_URI
+# (see the comment there — the $1 form breaks in the subdirectory layout).
 #
 # WHAT THIS EXISTS TO PREVENT
 # ===========================
@@ -36,10 +51,16 @@
 set -uo pipefail
 
 REF="${1:-HEAD}"
+ONLY_NODE="${2:-}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REMOTE_DIR="public_html"
 LOG_FILE="${REPO_DIR}/.deploy.log"
+
+# name : host env var : pass env var : remote dir : served base URL
+NODES=(
+  "retichat|RETICHAT_SSH_HOST|RETICHAT_SSH_PASS|public_html|https://retichat.com"
+  "selectiv|SELECTIV_SSH_HOST|SELECTIV_SSH_PASS|public_html/retichat|https://selectivesubconscious.com/retichat"
+)
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'; DIM=$'\033[2m'; NC=$'\033[0m'
 SSH_OPTS=(-o ConnectTimeout=15 -o StrictHostKeyChecking=no -o LogLevel=ERROR)
@@ -165,71 +186,83 @@ done < <(find "$STAGE" -type f -name '*.js')
 [[ $MISSING -eq 0 ]] || die "${MISSING} import(s) do not resolve in ${REF_SHA}"
 echo "  ${GREEN}✓${NC} every relative import resolves"
 
-# ── 5. Push ──────────────────────────────────────────────────────────────
-step "Deploying to retichat.com"
+# ── 5. Push to every node ────────────────────────────────────────────────
+deploy_node() { # name host pass remote_dir
+  local name="$1" host="$2" pass="$3" remote_dir="$4"
+  local SSH
 
-HOST="${RETICHAT_SSH_HOST:-}"
-PASS="${RETICHAT_SSH_PASS:-}"
-[[ -n "$HOST" ]] || die "RETICHAT_SSH_HOST not set (see deploy.env.example)"
+  if [[ -n "$pass" ]]; then
+    command -v sshpass >/dev/null 2>&1 || { echo "${RED}sshpass required when ${name}'s password is set${NC}"; return 1; }
+    SSH=(env "SSHPASS=$pass" sshpass -e ssh "${SSH_OPTS[@]}")
+  else
+    SSH=(ssh "${SSH_OPTS[@]}" -o BatchMode=yes)
+  fi
 
-if [[ -n "$PASS" ]]; then
-  command -v sshpass >/dev/null 2>&1 || die "sshpass required when RETICHAT_SSH_PASS is set"
-  SCP=(env "SSHPASS=$PASS" sshpass -e scp "${SSH_OPTS[@]}")
-  SSH=(env "SSHPASS=$PASS" sshpass -e ssh "${SSH_OPTS[@]}")
-else
-  SCP=(scp "${SSH_OPTS[@]}" -o BatchMode=yes)
-  SSH=(ssh "${SSH_OPTS[@]}" -o BatchMode=yes)
-fi
+  # Roll back to the previous *served* state, not to a guess about it. Only the
+  # files this deploy will overwrite are backed up, so the rest of the remote
+  # tree (notably reticulum/, the PHP node) is never in scope.
+  echo "  ${DIM}backing up current state${NC}"
+  "${SSH[@]}" "$host" "
+    set -e
+    rm -rf ~/retichat-web-rollback
+    mkdir -p ~/retichat-web-rollback ~/${remote_dir}
+    cd ~/${remote_dir}
+    for f in index.html app.js style.css retichat-icon.png .htaccess; do
+      [ -f \"\$f\" ] && cp -p \"\$f\" ~/retichat-web-rollback/ || true
+    done
+    [ -d lib ] && cp -Rp lib ~/retichat-web-rollback/ || true
+    true
+  " || { echo "${RED}backup failed on ${name}${NC}"; return 1; }
 
-# Roll back to the previous *served* state, not to a guess about it. Only the
-# files this deploy will overwrite are backed up, so the rest of public_html
-# (notably reticulum/, the PHP node) is never in scope.
-echo "  ${DIM}backing up current state${NC}"
-"${SSH[@]}" "$HOST" "
-  set -e
-  rm -rf ~/retichat-web-rollback
-  mkdir -p ~/retichat-web-rollback
-  cd ~/${REMOTE_DIR}
-  for f in index.html app.js style.css retichat-icon.png .htaccess; do
-    [ -f \"\$f\" ] && cp -p \"\$f\" ~/retichat-web-rollback/ || true
-  done
-  [ -d lib ] && cp -Rp lib ~/retichat-web-rollback/ || true
-  true
-" || die "backup failed"
+  # Upload into a staging directory and move it into place, so a dropped
+  # connection cannot leave half a module graph serving requests.
+  echo "  ${DIM}uploading${NC}"
+  "${SSH[@]}" "$host" "rm -rf ~/.retichat-web-incoming && mkdir -p ~/.retichat-web-incoming" \
+    || { echo "${RED}could not create staging directory on ${name}${NC}"; return 1; }
+  tar -C "$STAGE" -cf - . | "${SSH[@]}" "$host" "tar -C ~/.retichat-web-incoming -xf -" \
+    || { echo "${RED}upload failed on ${name}${NC}"; return 1; }
 
-# Upload into a staging directory and move it into place, so a dropped
-# connection cannot leave half a module graph serving requests.
-echo "  ${DIM}uploading${NC}"
-"${SSH[@]}" "$HOST" "rm -rf ~/.retichat-web-incoming && mkdir -p ~/.retichat-web-incoming" \
-  || die "could not create staging directory"
-tar -C "$STAGE" -cf - . | "${SSH[@]}" "$HOST" "tar -C ~/.retichat-web-incoming -xf -" \
-  || die "upload failed"
+  "${SSH[@]}" "$host" "
+    set -e
+    cd ~/.retichat-web-incoming
+    # lib is replaced wholesale so a module deleted in git stops being served.
+    rm -rf ~/${remote_dir}/lib
+    cp -Rp lib ~/${remote_dir}/lib
+    cp -p index.html app.js style.css retichat-icon.png .htaccess ~/${remote_dir}/
+    cd ~ && rm -rf ~/.retichat-web-incoming
+  " || { echo "${RED}install failed on ${name} — previous state is in ~/retichat-web-rollback${NC}"; return 1; }
 
-"${SSH[@]}" "$HOST" "
-  set -e
-  cd ~/.retichat-web-incoming
-  # lib is replaced wholesale so a module deleted in git stops being served.
-  rm -rf ~/${REMOTE_DIR}/lib
-  cp -Rp lib ~/${REMOTE_DIR}/lib
-  cp -p index.html app.js style.css retichat-icon.png .htaccess ~/${REMOTE_DIR}/
-  cd ~ && rm -rf ~/.retichat-web-incoming
-" || die "install failed — previous state is in ~/retichat-web-rollback"
+  echo "  ${GREEN}✓${NC} ${name} — uploaded (rollback in ~/retichat-web-rollback)"
+}
 
-echo "  ${GREEN}✓${NC} uploaded (rollback in ~/retichat-web-rollback)"
+DEPLOYED=0
+for node in "${NODES[@]}"; do
+  IFS='|' read -r name host_var pass_var remote_dir base_url <<< "$node"
+  [[ -n "$ONLY_NODE" && "$ONLY_NODE" != "$name" ]] && continue
+  step "Deploying to ${name} (${base_url})"
+  host="${!host_var:-}"
+  pass="${!pass_var:-}"
+  if [[ -z "$host" ]]; then
+    die "${host_var} not set (see deploy.env.example) — every node this script does not reach is a shadow copy in the making"
+  fi
+  deploy_node "$name" "$host" "$pass" "$remote_dir" || die "deploy to ${name} failed"
+  DEPLOYED=$((DEPLOYED + 1))
+done
+[[ $DEPLOYED -gt 0 ]] || die "no node matched '${ONLY_NODE}' (valid: retichat, selectiv)"
 
 # ── 6. Prove it ──────────────────────────────────────────────────────────
 step "Verifying served bytes against ${REF_SHA}"
-if "$REPO_DIR/verify-deploy.sh" "$REF"; then
+if "$REPO_DIR/verify-deploy.sh" "$REF" "$ONLY_NODE"; then
   VERIFY_OK=1
 else
   VERIFY_OK=0
 fi
 
-printf '%s  ref=%s  dirty_override=%s  tests_skipped=%s  verified=%s\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REF_SHA" \
+printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  verified=%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REF_SHA" "${ONLY_NODE:-all}" \
   "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "$VERIFY_OK" >> "$LOG_FILE"
 
-[[ $VERIFY_OK -eq 1 ]] || die "post-deploy verification failed — the served app does not match ${REF_SHA}"
+[[ $VERIFY_OK -eq 1 ]] || die "post-deploy verification failed — a served app does not match ${REF_SHA}"
 
 echo
 echo "${GREEN}✓ ${REF_SHA} deployed and verified${NC}"
