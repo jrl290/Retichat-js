@@ -41,7 +41,7 @@ import {
 } from "./lib/rns/reticulum.js?v=20260816-stamp-parity";
 import MsgPack from "./lib/rns/msgpack.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
-import DistroManager from "./lib/distro.js?v=20260816-stamp-parity";
+import DistroManager from "./lib/distro.js?v=20260817-reftimeouts";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -75,7 +75,33 @@ const DEFAULT_CONFIG = {
 };
 // RFed-over-PostInterface can require multiple one-second exchange cycles.
 // Explicit implementation exception approved 2026-07-25.
-const RFED_OPERATION_LIMIT_MS = 10_000;
+// Timeouts follow RNS's own reference rather than a flat number.
+//
+// There used to be a single RFED_OPERATION_LIMIT_MS = 10_000 covering link
+// establishment, request/response and publish proofs alike. It did not just
+// bound the wait — it was applied *after* the fact, so a link that established
+// in 12s was closed and a response that arrived in 11s was discarded. Work that
+// had already succeeded was thrown away because it was slow, which on a polled
+// multi-hop relay (one round trip ≈ 4.5s) meant the channel flow could not
+// complete even when every hop was healthy.
+//
+// Link establishment is governed by Link.establishmentTimeout, which already
+// mirrors RNS/Link.py:284 — get_first_hop_timeout + PER_HOP * max(1, hops).
+// Nothing here may shorten it: the link's own close event is the failure.
+//
+// Request timeouts mirror RNS/Link.py:509:
+//     timeout = rtt * TRAFFIC_TIMEOUT_FACTOR + RESPONSE_MAX_GRACE_TIME * 1.125
+// (RNS/Link.py:82 TRAFFIC_TIMEOUT_FACTOR = 6, RNS/Resource.py:117
+// RESPONSE_MAX_GRACE_TIME = 10.)
+const TRAFFIC_TIMEOUT_FACTOR = 6;
+const RESPONSE_MAX_GRACE_MS = 10_000;
+
+/** Reference request timeout for a link, in ms. `rtt` is measured at
+ *  establishment; before that is known, fall back to the grace term alone. */
+function rfedRequestTimeoutMs(link) {
+    const rttMs = Number(link?.rtt) || 0;
+    return rttMs * TRAFFIC_TIMEOUT_FACTOR + RESPONSE_MAX_GRACE_MS * 1.125;
+}
 async function loadConfig() {
     const cfg = { ...DEFAULT_CONFIG };
     try {
@@ -2248,11 +2274,12 @@ const RnsClient = {
             link.on("established", () => {
                 if (established) return;
                 established = true;
-                if (Date.now() - startedAt > RFED_OPERATION_LIMIT_MS) {
-                    link.close();
-                    reject(new Error(`RFed ${key} link established after the 10-second limit`));
-                    return;
-                }
+                // An established link is never rejected for being slow. The
+                // deadline that matters is Link.establishmentTimeout (the RNS
+                // reference, per hop); if that expires the link closes itself
+                // and the close handler below rejects. Closing a link that just
+                // came up only guarantees the next attempt starts from scratch.
+                console.log(`[retichat] RFed ${key} link active after ${Date.now() - startedAt}ms (rtt=${link.rtt}ms)`);
                 link.identify(IdMgr.id);
                 this._rfedLinks.set(key, link);
                 console.log(`[retichat] RFed ${key} link active`);
@@ -2282,29 +2309,39 @@ const RnsClient = {
         const link = await this._ensureRfedLink(aspects);
         return new Promise((resolve, reject) => {
             const startedAt = Date.now();
+            // Scaled from the link's measured RTT, per RNS/Link.py:509. The old
+            // code had no timer at all: it only checked, once a response had
+            // already arrived, whether it was late — so a slow-but-correct
+            // answer was thrown away, and a response that never came hung until
+            // the link closed.
+            const timeoutMs = rfedRequestTimeoutMs(link);
             let requestId = null;
+            const done = () => {
+                clearTimeout(timer);
+                link.off("response", responseHandler);
+                link.off("close", closeHandler);
+            };
             const responseHandler = (response) => {
                 if (!requestId || !response.requestId) return;
                 if (!Buffer.from(response.requestId).equals(Buffer.from(requestId))) return;
-                link.off("response", responseHandler);
-                link.off("close", closeHandler);
-                if (Date.now() - startedAt > RFED_OPERATION_LIMIT_MS) {
-                    reject(new Error(`${path} responded after the 10-second limit`));
-                    return;
-                }
+                done();
+                console.log(`[retichat] ${path} answered in ${Date.now() - startedAt}ms (budget ${Math.round(timeoutMs)}ms)`);
                 resolve(response.data);
             };
             const closeHandler = () => {
-                link.off("response", responseHandler);
+                done();
                 reject(new Error(`${path} link closed before a response`));
             };
+            const timer = setTimeout(() => {
+                done();
+                reject(new Error(`${path} did not respond within ${Math.round(timeoutMs)}ms (rtt=${link.rtt}ms)`));
+            }, timeoutMs);
             link.on("response", responseHandler);
             link.on("close", closeHandler);
             try {
                 requestId = link.sendRequestPacked(path, packedValue);
             } catch(e) {
-                link.off("response", responseHandler);
-                link.off("close", closeHandler);
+                done();
                 reject(e);
             }
         });
@@ -2896,7 +2933,7 @@ const RnsClient = {
             this._chanSeenIds.add(echoKey);
 
             const link = await this._ensureRfedLink(["channel"]);
-            const echoPromise = this._waitForRfedPublishEcho(echoKey, channelName);
+            const echoPromise = this._waitForRfedPublishEcho(echoKey, channelName, link);
             if (oversized) {
                 // A resource has no single packet hash to prove against, so
                 // the resource's own proof is the delivery evidence.
@@ -2904,7 +2941,7 @@ const RnsClient = {
             } else {
                 const packet = link.send(finalPayload);
                 await Promise.all([
-                    this._waitForRfedPublishProof(packet, channelName, outMsg.id),
+                    this._waitForRfedPublishProof(packet, channelName, outMsg.id, link),
                     echoPromise,
                 ]);
             }
@@ -2923,35 +2960,30 @@ const RnsClient = {
         return outMsg;
     },
 
-    _waitForRfedPublishProof(packet, channelName, messageId) {
+    _waitForRfedPublishProof(packet, channelName, messageId, link) {
         const proofKey = packet.packetHash.slice(0, 16).toString("hex");
-        const startedAt = Date.now();
+        const timeoutMs = rfedRequestTimeoutMs(link);
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this._pendingPacketHashes.delete(proofKey);
-                reject(new Error(`No RFed publish proof for #${channelName} within 10 seconds`));
-            }, RFED_OPERATION_LIMIT_MS);
+                reject(new Error(`No RFed publish proof for #${channelName} within ${Math.round(timeoutMs)}ms`));
+            }, timeoutMs);
             this._pendingPacketHashes.set(proofKey, {
                 contactHash: channelName,
                 messageId,
-                onProof: () => {
-                    clearTimeout(timer);
-                    if (Date.now() - startedAt > RFED_OPERATION_LIMIT_MS) {
-                        reject(new Error(`RFed publish proof for #${channelName} arrived after 10 seconds`));
-                        return;
-                    }
-                    resolve();
-                },
+                // A proof that arrives at all is a proof. Only the timer fails.
+                onProof: () => { clearTimeout(timer); resolve(); },
             });
         });
     },
 
-    _waitForRfedPublishEcho(echoKey, channelName) {
+    _waitForRfedPublishEcho(echoKey, channelName, link) {
+        const timeoutMs = rfedRequestTimeoutMs(link);
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this._rfedPendingEchoes.delete(echoKey);
-                reject(new Error(`No RFed stream acceptance for #${channelName} within 10 seconds`));
-            }, RFED_OPERATION_LIMIT_MS);
+                reject(new Error(`No RFed stream acceptance for #${channelName} within ${Math.round(timeoutMs)}ms`));
+            }, timeoutMs);
             this._rfedPendingEchoes.set(echoKey, {
                 resolve: () => {
                     clearTimeout(timer);
