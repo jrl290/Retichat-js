@@ -2660,6 +2660,28 @@ const RnsClient = {
         if (!DistroManager.has) return [];
         try {
             const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", Buffer.alloc(0));
+            // PULL authenticates by link identity (the only rfed request that
+            // does), so the server can refuse with a bare LXMF error code —
+            // mirroring the reference propagation node, LXMF/LXMRouter.py:1445.
+            // The reference client's reaction (LXMRouter.py:1525) is to tear
+            // the link down: LINKIDENTIFY is fire-and-forget, so a fresh link
+            // whose identify precedes the next request is the recovery. Our
+            // close handler already drops the link from _rfedLinks, so the
+            // next pull re-establishes and re-identifies. No auto-retry here
+            // (DESIGN_PRINCIPLES §3) — the next scheduled pull or user action
+            // makes the attempt.
+            if (typeof response === "number") {
+                const names = {0xF0:"NO_IDENTITY",0xF1:"NO_ACCESS",0xF3:"INVALID_KEY",0xF4:"INVALID_DATA"};
+                console.warn(`[distro] 📬 PULL refused: 0x${response.toString(16)} (${names[response]||"unknown"})`);
+                if (response === 0xF0 || response === 0xF1) {
+                    const link = this._rfedLinks.get("distro.register");
+                    if (link) {
+                        console.warn("[distro] 📬 Tearing down distro.register link — next pull re-identifies (ref: LXMRouter.message_list_response)");
+                        link.close();
+                    }
+                }
+                return [];
+            }
             if (!Array.isArray(response) || response.length < 2) return [];
             const [pairs, morePending] = response;
             const count = pairs?.length ?? 0;
