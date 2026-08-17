@@ -2659,7 +2659,11 @@ const RnsClient = {
     async _pullDistroMessages() {
         if (!DistroManager.has) return [];
         try {
-            const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", Buffer.alloc(0));
+            // No request data → msgpack nil, per the Python reference
+            // (request(path, data=None)). Buffer.alloc(0) here produced a
+            // malformed 2-element request the server could not parse — see
+            // sendRequestPacked's guard.
+            const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", MsgPack.pack(null));
             // PULL authenticates by link identity (the only rfed request that
             // does), so the server can refuse with a bare LXMF error code —
             // mirroring the reference propagation node, LXMF/LXMRouter.py:1445.
