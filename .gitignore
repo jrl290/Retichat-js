@@ -2,6 +2,10 @@
 config.json
 config.local.json
 
+# Deploy credentials (see deploy.env.example)
+deploy.env
+.deploy.log
+
 # OS
 .DS_Store
 Thumbs.db

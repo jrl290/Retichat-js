@@ -38,10 +38,10 @@ import {
     channelLxmUnpack,
     channelComputeStamp,
     rfedDeliveryDestHash,
-} from "./lib/rns/reticulum.js?v=20260816-stamp-parity";
+} from "./lib/rns/reticulum.js";
 import MsgPack from "./lib/rns/msgpack.js";
-import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js?v=20260726-2";
-import DistroManager from "./lib/distro.js?v=20260817-reftimeouts";
+import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js";
+import DistroManager from "./lib/distro.js";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();

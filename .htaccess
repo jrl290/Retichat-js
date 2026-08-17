@@ -1,0 +1,49 @@
+# Retichat web client — cache policy.
+#
+# WHY THIS FILE EXISTS
+# ====================
+# This app has no build step: index.html declares an importmap and the browser
+# loads ~34 ES modules straight off the static host. Staleness was managed by
+# hand, with a `?v=` query string appended to individual import specifiers.
+#
+# That does not work, and on 2026-08-17 the tree proved it: 8 of 34 local
+# imports carried a `?v=` tag and 26 did not. `link.js`, `packet.js`,
+# `resource.js`, `post_interface.js` and `lxmf_router.js` — every module the
+# transport actually lives in — were fetched at a bare URL, and retichat.com
+# sent no Cache-Control header at all. With only Last-Modified to go on, a
+# browser applies its own heuristic freshness (commonly 10% of the document's
+# age), so a fix committed, deployed and hash-verified could still not be
+# running in the tab in front of you. A fix "regressing" with no code change is
+# indistinguishable from a fix that was reverted, and far harder to chase.
+#
+# The commit "chore: version the whole changed module chain, not just the entry
+# point" is what maintaining this by hand looks like: correct that day, wrong
+# again the next time a module changes and the chain is not walked.
+#
+# So: no hand-maintained version strings anywhere in the source, and the server
+# says plainly that these files must be revalidated. `no-cache` still lets the
+# browser store them — it just may not reuse them without asking, so the normal
+# case is a 304 with no body, not a re-download.
+#
+# verify-deploy.sh asserts this header is live. If mod_headers were ever
+# unavailable, or this file failed to upload, the deploy fails loudly instead of
+# quietly returning to heuristic caching.
+
+<IfModule mod_headers.c>
+  <FilesMatch "\.(?:js|mjs|css|html|json)$">
+    Header set Cache-Control "no-cache, must-revalidate"
+  </FilesMatch>
+</IfModule>
+
+# The icon is content-stable; let it cache normally.
+<IfModule mod_headers.c>
+  <FilesMatch "\.(?:png|ico)$">
+    Header set Cache-Control "public, max-age=86400"
+  </FilesMatch>
+</IfModule>
+
+# ES modules must be served with a JavaScript MIME type or the browser refuses
+# them outright. cPanel's default AddType covers .js; .mjs is not always mapped.
+<IfModule mod_mime.c>
+  AddType application/javascript .mjs
+</IfModule>
