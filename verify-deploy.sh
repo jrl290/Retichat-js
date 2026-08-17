@@ -102,9 +102,29 @@ if [[ $CACHE_FAIL -gt 0 ]]; then
   echo "mod_headers is enabled on the node.${NC}"
 fi
 
+# ── HTTPS enforcement ────────────────────────────────────────────────────
+# The node's public_html/.htaccess was hand-edited and tracked nowhere, and all
+# it held was a force-HTTPS redirect. deploy.sh overwrites that file, so this
+# checks the rule survived rather than assuming it did.
+echo
+echo "${CYAN}▸ Checking HTTP still redirects to HTTPS${NC}"
+HTTPS_FAIL=0
+PLAIN_URL="http://${BASE_URL#https://}"
+PLAIN_URL="http://${PLAIN_URL#http://}"
+redirect="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code} %{redirect_url}' "$PLAIN_URL/app.js" 2>/dev/null)"
+case "$redirect" in
+  30[128]" https://"*)
+    printf '  %-32s %s\n' "http → https" "${GREEN}${redirect}${NC}" ;;
+  *)
+    printf '  %-32s %s\n' "http → https" "${RED}${redirect:-no response}${NC}"
+    echo "${DIM}  The force-HTTPS redirect is gone. It lives in this repo's .htaccess"
+    echo "  because deploying that file replaces the node's only copy of it.${NC}"
+    HTTPS_FAIL=1 ;;
+esac
+
 # ── Verdict ──────────────────────────────────────────────────────────────
 echo
-if [[ $DRIFT -eq 0 && $MISSING -eq 0 && $CACHE_FAIL -eq 0 ]]; then
+if [[ $DRIFT -eq 0 && $MISSING -eq 0 && $CACHE_FAIL -eq 0 && $HTTPS_FAIL -eq 0 ]]; then
   echo "${GREEN}✓ ${BASE_URL} is serving ${REF_SHA} exactly${NC}"
   exit 0
 fi

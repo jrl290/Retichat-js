@@ -29,6 +29,27 @@
 # unavailable, or this file failed to upload, the deploy fails loudly instead of
 # quietly returning to heuristic caching.
 
+# ── Force HTTPS ──────────────────────────────────────────────────────────────
+#
+# This block was already live on retichat.com when deploy.sh was written, in a
+# hand-edited public_html/.htaccess that was in no repository. Deploying this
+# file overwrites that one, so the redirect has to live here or the first deploy
+# would silently drop TLS enforcement — a regression shipped by the very script
+# built to prevent regressions.
+#
+# It is checked twice: module_graph.test.mjs asserts the block is present in this
+# file, and verify-deploy.sh asserts a plain http:// request still answers 301 to
+# https:// after every deploy.
+#
+# X-Forwarded-Proto is checked because the node sits behind a proxy that
+# terminates TLS; without it the rule loops.
+RewriteEngine On
+RewriteCond %{HTTPS} !on
+RewriteCond %{SERVER_PORT} !^443$
+RewriteCond %{HTTP:X-Forwarded-Proto} !https
+RewriteRule ^(.*)$ https://%{HTTP_HOST}/$1 [R=301,L]
+
+# ── Cache policy ─────────────────────────────────────────────────────────────
 <IfModule mod_headers.c>
   <FilesMatch "\.(?:js|mjs|css|html|json)$">
     Header set Cache-Control "no-cache, must-revalidate"

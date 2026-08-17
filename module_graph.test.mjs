@@ -111,3 +111,23 @@ test(".htaccess makes modules revalidate", () => {
         "the no-cache policy must cover js/mjs/css",
     );
 });
+
+test(".htaccess keeps forcing HTTPS", () => {
+    // retichat.com's public_html/.htaccess was hand-edited and tracked nowhere;
+    // all it contained was this redirect. Since deploy.sh overwrites that file,
+    // dropping the block here would silently disable TLS enforcement on the
+    // next deploy.
+    const text = readFileSync(join(ROOT, ".htaccess"), "utf8");
+    assert.match(text, /RewriteEngine On/, ".htaccess must enable mod_rewrite");
+    assert.match(
+        text,
+        /RewriteRule \^\(\.\*\)\$ https:\/\/%\{HTTP_HOST\}\/\$1 \[R=301,L\]/,
+        ".htaccess must redirect plain HTTP to HTTPS — this file replaces the " +
+        "node's only copy of that rule",
+    );
+    assert.match(
+        text,
+        /RewriteCond %\{HTTP:X-Forwarded-Proto\} !https/,
+        "the proxy's X-Forwarded-Proto must be honoured or the redirect loops",
+    );
+});
