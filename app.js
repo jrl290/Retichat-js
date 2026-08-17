@@ -1250,7 +1250,7 @@ const RnsClient = {
             // ── Step 1: List pending message IDs ──
             console.log("[retichat] 📬 [1/4] Listing pending messages...");
             const listReqId = link.sendRequest("/get", [null, null]);
-            const listResp = await this._waitForResponse(link, listReqId, 15000);
+            const listResp = await this._waitForResponse(link, listReqId);
 
             if (listResp === null || listResp === undefined) {
                 console.log("[retichat] 📬 [1/4] List timed out");
@@ -1292,7 +1292,6 @@ const RnsClient = {
                 const blobResp = await this._waitForResponse(
                     link,
                     link.sendRequest("/get", [[tid], null]),
-                    15000
                 );
                 if (!blobResp || !Array.isArray(blobResp) || blobResp.length === 0) {
                     console.log(`[retichat] 📬 [2/4] ${tidHex} download failed:`, typeof blobResp === 'number' ? `0x${blobResp.toString(16)}` : (blobResp ? `got ${blobResp.length||0} items` : 'timeout'));
@@ -1335,7 +1334,7 @@ const RnsClient = {
             if (deliveredIds.length > 0) {
                 console.log(`[retichat] 📬 [4/4] Purging ${deliveredIds.length} delivered...`);
                 const haveReqId = link.sendRequest("/get", [null, deliveredIds]);
-                await this._waitForResponse(link, haveReqId, 10000);
+                await this._waitForResponse(link, haveReqId);
                 console.log("[retichat] 📬 [4/4] Purge complete");
             } else {
                 console.log("[retichat] 📬 [4/4] Nothing to purge");
@@ -1347,8 +1346,16 @@ const RnsClient = {
         }
     },
 
-    /** Wait for a response matching requestId on the given link. */
-    _waitForResponse(link, requestId, timeoutMs) {
+    /** Wait for a response matching requestId on the given link.
+     *
+     *  The timeout defaults to the RNS reference budget scaled from the link's
+     *  measured RTT (rfedRequestTimeoutMs — RNS/Link.py:509), the same rule
+     *  the RFed request paths use since the flat-10s rework. The propagation
+     *  callers used to pass flat 10–15s here, which is *below* that budget on
+     *  this transport (rtt 2.3s → ~25s): the same discarded-success bug the
+     *  rework removed, surviving on this path. Pass an explicit timeoutMs only
+     *  for a wait that genuinely has a different contract than a link request. */
+    _waitForResponse(link, requestId, timeoutMs = rfedRequestTimeoutMs(link)) {
         return new Promise((resolve) => {
             const timer = setTimeout(() => { link.off("response", handler); resolve(null); }, timeoutMs);
             const handler = (resp) => {
