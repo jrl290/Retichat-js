@@ -40,6 +40,7 @@ import {
     rfedDeliveryDestHash,
 } from "./lib/rns/reticulum.js";
 import MsgPack from "./lib/rns/msgpack.js";
+import Cryptography from "./lib/rns/cryptography.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js";
 import DistroManager from "./lib/distro.js";
 
@@ -130,6 +131,44 @@ const RESPONSE_MAX_GRACE_MS = 10_000;
 //
 // So nothing re-attempts on a schedule. A failed operation waits for evidence
 // that the service is back, exactly like the reference waits for a path.
+// ── rfed.link: one link for all of RFed ──────────────────────────────────
+//
+// RFed-spec/Link.md. Every legacy destination is also reachable on the
+// single `rfed.link` destination, addressed by request path instead of by
+// destination hash: the aspect chain with `.` → `/`, plus the verb when the
+// chain does not already name it. Payloads and responses are byte-identical;
+// only the routing differs. This map is the client's copy of the node's
+// `link_session::paths` table — NEVER rename an entry in place, a path is
+// hashed into the wire request and a rename is a silent 404 against every
+// deployed node.
+//
+// Migration (Link.md "Migration"): a node that has announced `rfed.link` gets
+// every control-plane request on that one link; a node that has not gets the
+// legacy per-aspect links, unchanged. So this client works against both.
+const RFED_LINK_PATHS = {
+    "channel:/rfed/subscribe":                "/channel/subscribe",
+    "channel:/rfed/unsubscribe":              "/channel/unsubscribe",
+    "channel.pull:/rfed/pull":                "/channel/pull",
+    "channel.stream:/rfed/channel/stream/open": "/channel/stream/open",
+    "distro.register:/rfed/distro/register":  "/distro/register",
+    "distro.register:/rfed/distro/announce":  "/distro/announce",
+    "distro.register:/rfed/pull":             "/distro/pull",
+    "distro.unregister:/rfed/distro/unregister": "/distro/unregister",
+    "distro.list:/rfed/distro/list":          "/distro/list",
+};
+// Node → client paths, pushed as REQUESTS on the bound link. The client's
+// response is the node's delivery proof. Both delivery paths start with a
+// 16-byte hash meaning different things: the PATH is the discriminator.
+const RFED_LINK_PUSH_DELIVERY = "/delivery";
+const RFED_LINK_PUSH_LXMF = "/lxmf/delivery";
+const RFED_LINK_PUSH_NOTIFY = "/notify";
+// A REQUEST carries truncated_hash(path), not the path (RNS/Link.py request()).
+const RFED_LINK_PUSH_HASHES = {
+    delivery: Cryptography.truncatedHash(Buffer.from(RFED_LINK_PUSH_DELIVERY, "utf8")).toString("hex"),
+    lxmf:     Cryptography.truncatedHash(Buffer.from(RFED_LINK_PUSH_LXMF, "utf8")).toString("hex"),
+    notify:   Cryptography.truncatedHash(Buffer.from(RFED_LINK_PUSH_NOTIFY, "utf8")).toString("hex"),
+};
+
 const RFED_LINK_IDLE = "idle";
 const RFED_LINK_ESTABLISHING = "establishing";
 const RFED_LINK_ESTABLISHED = "established";
@@ -984,6 +1023,7 @@ const RnsClient = {
         // register request was never sent — the distro device never reached
         // the RFed.  (Bug found 2026-08-08: only channel* were subscribed.)
         for (const aspects of [
+            ["link"],
             ["channel"], ["channel", "stream"], ["channel", "pull"],
             ["distro", "register"], ["distro", "unregister"], ["distro", "list"],
         ]) {
@@ -2204,7 +2244,7 @@ const RnsClient = {
         // 2026-08-09 01:12, where RFed had announced at 01:11 (restart) and the
         // client, opened at 01:12:12, waited out the whole 15-minute service
         // refresh interval with every distro call unusable.
-        for (const aspects of [["channel"], ["channel", "stream"], ["channel", "pull"], ["distro", "register"]]) {
+        for (const aspects of [["link"], ["channel"], ["channel", "stream"], ["channel", "pull"], ["distro", "register"]]) {
             const rfedIdBytes = Buffer.from(this._cfg.rfedNodeHash, "hex");
             const hash = Destination.hash({hash: rfedIdBytes}, "rfed", ...aspects).toString("hex");
             this._rns.transport.requestPath(hash);
@@ -2401,6 +2441,23 @@ const RnsClient = {
             link.on("resource", ({data}) => {
                 if (key === "channel.stream") this._handleChannelPacket(data);
             });
+            if (key === "link") {
+                // Bind this link for live pushes as soon as it is up (Link.md
+                // "Binding the link for push"). Channel pushes are bound by
+                // _openChannelStream when there are subscriptions; the distro
+                // fan-out is bound here, by lxmf.delivery hash.
+                link.on("established", () => { this._bindRfedLinkForDistroPush(); });
+                // Node → client pushes arrive as REQUESTS on the bound link
+                // (Link.md "Path map — node → client"). Our response is the
+                // node's delivery proof: an unanswered push goes to the
+                // deferred queue and reaches us via /channel/pull — a change
+                // of tier, not a loss. So answer only what was actually
+                // handled. The path is the discriminator; both delivery
+                // payloads start with a 16-byte hash meaning different things.
+                link.on("request", ({requestId, path, data}) => {
+                    this._onRfedLinkPush(link, requestId, path, data);
+                });
+            }
             link.on("close", () => {
                 // The janitor, mirroring LXMRouter.jobs(): a CLOSED link is
                 // cleared so the next attempt starts from scratch, and the
@@ -2416,7 +2473,92 @@ const RnsClient = {
         return promise;
     },
 
+    /**
+     * `/propagation/stream/open` on rfed.link: tell the node to push live
+     * LXMF for this device's lxmf.delivery hash down this link. That is the
+     * distro fan-out's first delivery tier; without it every fan-out goes to
+     * the deferred queue and waits for the next /distro/pull — on staging,
+     * 40 s later. Payload: `[bin(16 delivery_hash), pubkey, sign(hash)]`
+     * (LXMFProp.md). Re-sent on every link (re)establishment, since the
+     * binding lives on the link.
+     */
+    async _bindRfedLinkForDistroPush() {
+        if (!DistroManager.has || !this._rfedLinkAvailable()) return;
+        // Once per link: the binding lives on the link, and a second open on
+        // the same one is refused as `already_open`.
+        const link = this._rfedLinks.get("link");
+        if (link && link._retichatDistroBound) return;
+        if (link) link._retichatDistroBound = true; // claim before the round trip
+        const deliveryHash = Destination.hash(IdMgr.id, "lxmf", "delivery");
+        const payload = MsgPack.pack([deliveryHash, IdMgr.id.getPublicKey(), IdMgr.id.sign(deliveryHash)]);
+        try {
+            const response = await this._rfedRequest(["link"], "/propagation/stream/open", payload);
+            if (!Array.isArray(response) || response[0] !== true) {
+                if (link) link._retichatDistroBound = false;
+                console.warn(`[retichat] rfed.link push binding refused: ${JSON.stringify(response)}`);
+                return;
+            }
+            console.log("[retichat] rfed.link bound for live distro pushes");
+        } catch (e) {
+            if (link) link._retichatDistroBound = false;
+            console.warn(`[retichat] rfed.link push binding failed: ${e.message}`);
+        }
+    },
+
+    /** A push from the node on the rfed.link link. */
+    _onRfedLinkPush(link, requestId, pathHash, data) {
+        if (!requestId || !Buffer.isBuffer(pathHash)) {
+            console.warn(`[retichat] rfed.link push with no request id or a non-binary path (${typeof pathHash}) — ignored`);
+            return;
+        }
+        const hex = pathHash.toString("hex");
+        console.log(`[retichat] rfed.link push path=${hex.slice(0, 12)} bytes=${data?.length ?? "?"}`);
+        const payload = Buffer.isBuffer(data) ? data : (data instanceof Uint8Array ? Buffer.from(data) : null);
+        if (hex === RFED_LINK_PUSH_HASHES.delivery) {
+            if (!payload) return;
+            this._handleChannelPacket(payload);
+            link.sendResponse(requestId, true);
+        } else if (hex === RFED_LINK_PUSH_HASHES.notify) {
+            // A wake for a client that is already here: nothing to do but
+            // acknowledge it, so the node does not count it as missed.
+            link.sendResponse(requestId, true);
+        } else if (hex === RFED_LINK_PUSH_HASHES.lxmf) {
+            // A live LXMF push for this device's lxmf.delivery — for this
+            // client that is a distro fan-out (the node's distro tier 1),
+            // carrying the bare blob `[dest_hash(16) | encrypted]` that
+            // /distro/pull would otherwise return. Same handler, same dedup.
+            if (!payload || payload.length < 48) return;
+            Harness.event("distro-link-push", { bytes: payload.length });
+            this._handleDistroBlob(payload.slice(0, 16), payload);
+            link.sendResponse(requestId, true);
+        } else {
+            console.warn(`[retichat] unknown push path ${hex.slice(0, 12)} on rfed.link — not acknowledged`);
+        }
+    },
+
+    /** True once the node has announced `rfed.link`. */
+    _rfedLinkAvailable() {
+        return this._rfedServiceReady.has("link");
+    },
+
     async _rfedRequest(aspects, path, packedValue) {
+        // Prefer the single rfed.link; fall back to the legacy per-aspect
+        // destination for a node that has not announced it.
+        //
+        // At startup neither may have announced yet. Deciding "legacy" then
+        // would open a per-aspect link on a node that supports rfed.link — the
+        // first request of every session did exactly that on staging, 4 s
+        // before the rfed.link announce arrived. So wait for whichever of the
+        // two announces lands first (both are path-requested at startup), and
+        // decide on the evidence. No timer: an announce is the event.
+        const mapped = RFED_LINK_PATHS[`${aspects.join(".")}:${path}`];
+        if (mapped && !this._rfedLinkAvailable() && !this._rfedServiceReady.has(aspects.join("."))) {
+            await Promise.race([this._waitForRfedService(["link"]), this._waitForRfedService(aspects)]);
+        }
+        if (mapped && this._rfedLinkAvailable()) {
+            aspects = ["link"];
+            path = mapped;
+        }
         const link = await this._ensureRfedLink(aspects);
         return new Promise((resolve, reject) => {
             const startedAt = Date.now();
@@ -2671,7 +2813,8 @@ const RnsClient = {
                 const payload = MsgPack.pack([devicePubKey, distroPubKey, sig]);
                 const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/register", payload);
                 if (response === true || (Array.isArray(response) && response[0] === true)) {
-                    console.log(`[distro] ✅ Registered device with RFed (distro=${DistroManager.hash.slice(0,12)}...)`);
+                    this._bindRfedLinkForDistroPush();
+                console.log(`[distro] ✅ Registered device with RFed (distro=${DistroManager.hash.slice(0,12)}...)`);
                     // Registration must land first: RFed refuses an announce for
                     // a distro with no registered device, since it would be
                     // advertising a route it cannot serve.
