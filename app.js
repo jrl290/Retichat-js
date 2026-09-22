@@ -2557,6 +2557,11 @@ const RnsClient = {
                 // cleared so the next attempt starts from scratch, and the
                 // outcome is recorded as a state rather than vanishing.
                 if (this._rfedLinks.get(key) === link) this._rfedLinks.delete(key);
+                // Link.md: the binding dies with the link. The channel-stream
+                // memo is per channel, not per link, so it must be dropped
+                // here or the next link never re-sends /channel/stream/open
+                // and every /delivery silently goes to the deferred queue.
+                if (key === "link" || key === "channel.stream") this._rfedStreamPromises.clear();
                 this._rfedLinkPromises.delete(key);
                 this._rfedLinkState.set(key, established ? RFED_LINK_IDLE : RFED_LINK_FAILED);
                 if (!established) reject(new Error(`RFed ${key} link closed before establishment`));
@@ -2608,10 +2613,11 @@ const RnsClient = {
         const hex = pathHash.toString("hex");
         console.log(`[retichat] rfed.link push path=${hex.slice(0, 12)} bytes=${data?.length ?? "?"}`);
         const payload = Buffer.isBuffer(data) ? data : (data instanceof Uint8Array ? Buffer.from(data) : null);
+        // Link.md "The response is the delivery proof": true means we hold
+        // the blob; false is a refusal the node records instead of deferring.
         if (hex === RFED_LINK_PUSH_HASHES.delivery) {
-            if (!payload) return;
-            this._handleChannelPacket(payload);
-            link.sendResponse(requestId, true);
+            if (!payload) { link.sendResponse(requestId, false); return; }
+            link.sendResponse(requestId, this._handleChannelPacket(payload) === true);
         } else if (hex === RFED_LINK_PUSH_HASHES.notify) {
             // A wake for a client that is already here: nothing to do but
             // acknowledge it, so the node does not count it as missed.
@@ -2621,10 +2627,9 @@ const RnsClient = {
             // client that is a distro fan-out (the node's distro tier 1),
             // carrying the bare blob `[dest_hash(16) | encrypted]` that
             // /distro/pull would otherwise return. Same handler, same dedup.
-            if (!payload || payload.length < 48) return;
+            if (!payload || payload.length < 48) { link.sendResponse(requestId, false); return; }
             Harness.event("distro-link-push", { bytes: payload.length });
-            this._handleDistroBlob(payload.slice(0, 16), payload);
-            link.sendResponse(requestId, true);
+            link.sendResponse(requestId, this._handleDistroBlob(payload.slice(0, 16), payload) === true);
         } else {
             console.warn(`[retichat] unknown push path ${hex.slice(0, 12)} on rfed.link — not acknowledged`);
         }
@@ -2755,10 +2760,17 @@ const RnsClient = {
 
     /** Handle an incoming channel packet (DATA on rfed.delivery).
      *  Deduplicates by (sourceHash, tsMs) per the spec security requirements. */
+    /**
+     * Returns true when the blob was kept (stored, or already held), false
+     * when it was dropped. Link.md "The response is the delivery proof": the
+     * push acknowledgement must say what actually happened, so callers ack
+     * only a true. Until 2026-09-22 every push was acknowledged, including
+     * ones dropped for an unknown channel or a bad signature.
+     */
     _handleChannelPacket(packetData) {
         try {
             const data = Buffer.from(packetData || []);
-            if (!data || data.length < 16 + 32) return;
+            if (!data || data.length < 16 + 32) return false;
 
             // First 16 bytes are the channel identity hash (routing prefix)
             const channelIdPrefix = data.slice(0, 16).toString("hex");
@@ -2768,21 +2780,20 @@ const RnsClient = {
             // bare lxmf_blob, so strip the extra routing prefix before unwrapping.
             if (DistroManager.has && channelIdPrefix === DistroManager.lxmfDeliveryHash) {
                 Harness.event("distro-push", { distro: channelIdPrefix.slice(0, 12), bytes: data.length });
-                this._handleDistroBlob(data.slice(0, 16), data.slice(16));
-                return;
+                return this._handleDistroBlob(data.slice(0, 16), data.slice(16));
             }
 
             const ch = ChannelStore.getByHash(channelIdPrefix);
             if (!ch) {
                 console.log(`[retichat] 📡 Channel blob for unknown channel ${channelIdPrefix.slice(0,12)}..., ignoring`);
-                return;
+                return false;
             }
 
             // Unpack the channel message
             const result = channelLxmUnpack(ch.channelName, data);
             if (!result) {
                 console.warn(`[retichat] 📡 Channel unpack failed for ${ch.channelName}`);
-                return;
+                return false;
             }
 
             const { sourceHash, tsMs, content, senderPubKey } = result;
@@ -2801,7 +2812,7 @@ const RnsClient = {
                     console.log(`[retichat] 📡 Channel publish accepted by RFed: ${dedupKey.slice(0,20)}...`);
                 }
                 console.log(`[retichat] 📡 Channel dedup: already seen ${srcHashHex.slice(0,8)} ts=${tsMs}`);
-                return;
+                return true; // already held
             }
             this._chanSeenIds.add(dedupKey);
             // Cap the set size to prevent unbounded growth
@@ -2829,8 +2840,10 @@ const RnsClient = {
 
             this._onMsg.forEach(fn => fn({kind: "channel-receive"}, ch.channelName));
             console.log(`[retichat] 📡 Channel message on #${ch.channelName}: "${content.slice(0,60)}" from ${srcHashHex.slice(0,12)}`);
+            return true;
         } catch(e) {
             console.warn("[retichat] 📡 Channel packet handler error:", e.message);
+            return false;
         }
     },
 
@@ -3075,24 +3088,25 @@ const RnsClient = {
     },
 
     /** Handle a distro blob from PULL. */
+    /** Returns true when the blob was kept (or already held), false when dropped. */
     _handleDistroBlob(distroHash, blob) {
         try {
             const data = Buffer.from(blob);
-            if (data.length < 48) return;
+            if (data.length < 48) return false;
             // blob format: [dest_hash(16) | EC_encrypted(lxmf_data)]
             const destHash = data.slice(0, 16);
             const myLxmfHash = DistroManager.lxmfDeliveryHash;
             if (!destHash.equals(Buffer.from(myLxmfHash, "hex"))) {
                 console.log(`[distro] Blob not for us: ${destHash.toString("hex").slice(0,12)}`);
-                return;
+                return false;
             }
             // Decrypt with distro identity
             const decrypted = DistroManager.identity.decrypt(data.slice(16));
-            if (!decrypted || decrypted.length < 80) return;
+            if (!decrypted || decrypted.length < 80) return false;
             const srcHash = decrypted.slice(0, 16);
             const payloadBytes = decrypted.slice(80);
             const payload = MsgPack.unpack(payloadBytes);
-            if (!Array.isArray(payload) || payload.length < 3) return;
+            if (!Array.isArray(payload) || payload.length < 3) return false;
             const [ts, titleBin, contentBin, fieldsMap] = payload;
             const content = Buffer.from(contentBin || []).toString();
             const srcHashHex = srcHash.toString("hex");
@@ -3104,7 +3118,7 @@ const RnsClient = {
             if (DistroSeen.check(dedupKey)) {
                 Harness.event("distro-dup", { src: srcHashHex.slice(0, 12), ts });
                 console.log(`[distro] ↩︎ duplicate, ignoring (${srcHashHex.slice(0,12)} ts=${ts})`);
-                return;
+                return true; // already held
             }
 
             // Delivery notifications now arrive here too. Since we send as the
@@ -3123,7 +3137,7 @@ const RnsClient = {
                 } else {
                     console.log(`[distro] delivery notification for an unknown ticket ${ticket.slice(0,8)}…`);
                 }
-                return;
+                return true; // consumed
             }
 
             console.log(`[distro] 📥 Message from ${srcHashHex.slice(0,12)}: "${content.slice(0,60)}"`);
@@ -3137,8 +3151,10 @@ const RnsClient = {
             // a proof-only event and only repaint status ticks, so a distro
             // message used to land in storage without ever reaching the UI.
             this._onMsg.forEach(fn => fn(stored, srcHashHex));
+            return true;
         } catch(e) {
             console.error(`[distro] Failed to handle blob:`, e);
+            return false;
         }
     },
 
@@ -3202,6 +3218,20 @@ const RnsClient = {
                 "/rfed/pull",
                 MsgPack.pack(Buffer.from(key, "hex"))
             );
+            // Link.md "Identify": ERROR_NO_IDENTITY (0xF0) means the node saw no
+            // LINKIDENTIFY on this link. Close it; the next pull establishes a
+            // fresh link and identifies on it (same rule as /distro/pull).
+            if (typeof response === "number") {
+                const names = {0xF0:"NO_IDENTITY",0xF1:"NO_ACCESS",0xF3:"INVALID_KEY",0xF4:"INVALID_DATA"};
+                console.warn(`[retichat] 📡 channel PULL refused: 0x${response.toString(16)} (${names[response]||"unknown"})`);
+                if (response === 0xF0 || response === 0xF1) {
+                    for (const linkKey of ["link", "channel.pull"]) {
+                        const l = this._rfedLinks.get(linkKey);
+                        if (l) { console.warn(`[retichat] 📡 Tearing down ${linkKey} link — next pull re-identifies`); l.close(); }
+                    }
+                }
+                throw new Error(`channel pull refused: 0x${response.toString(16)}`);
+            }
             if (!Array.isArray(response) || !Array.isArray(response[0])) {
                 throw new Error("Malformed RFed pull response");
             }
