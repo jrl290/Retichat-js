@@ -998,6 +998,16 @@ const RnsClient = {
                     this._cfg.propagationNodePubKey = pk;
                     sSet("propagationNodePubKey", pk);
                     console.log(`[retichat] 📡 Learned propagation node pub key from announce: ${pk.slice(0,12)}...`);
+                    // LXMF/LXMRouter.py get_outbound_propagation_cost(): the
+                    // stamp cost is read from the node's announce, not assumed.
+                    const costs = this._parsePropagationNodeAnnounce(event.announce.appData);
+                    if (costs) {
+                        this._cfg.propagationStampCost = costs.stampCost;
+                        this._cfg.propagationStampFlexibility = costs.flexibility;
+                        sSet("propagationStampCost", String(costs.stampCost));
+                        sSet("propagationStampFlexibility", String(costs.flexibility));
+                        console.log(`[retichat] 📡 Propagation node stamp cost ${costs.stampCost} (flexibility ${costs.flexibility}) from announce`);
+                    }
                     // Defer link establishment — follow same pattern as channel init
                     this._initPropagation();
                 }
@@ -1126,9 +1136,45 @@ const RnsClient = {
         return MsgPack.pack([Date.now() / 1000, [lxmfData]]);
     },
 
+    /**
+     * The propagation node's announce (LXMF/LXMRouter.py
+     * get_propagation_node_app_data, validated by LXMF.pn_announce_data_is_valid):
+     * msgpack [legacy(false), timebase, node_state, per_transfer_limit,
+     * per_sync_limit, [stamp_cost, flexibility, peering_cost], metadata].
+     * Returns {stampCost, flexibility} or null when the data is not a valid
+     * propagation-node announce.
+     */
+    _parsePropagationNodeAnnounce(appData) {
+        if (!appData || appData.length === 0) return null;
+        let data;
+        try { data = MsgPack.unpack(Buffer.from(appData)); } catch (e) { return null; }
+        if (!Array.isArray(data) || data.length < 7) return null;
+        const costs = data[5];
+        if (!Array.isArray(costs) || costs.length < 2) return null;
+        const stampCost = Number(costs[0]);
+        const flexibility = Number(costs[1]);
+        if (!Number.isInteger(stampCost) || !Number.isInteger(flexibility) || stampCost < 0 || flexibility < 0) return null;
+        return { stampCost, flexibility };
+    },
+
+    /** The stamp target for a propagated message: the node's announced
+     *  stamp cost (LXMF mines to the announced cost and the node accepts
+     *  cost - flexibility). Until 2026-09-22 this was a hard-coded 13 -
+     *  rfed's default cost 16 minus flexibility 3 - which only worked while
+     *  the node's policy matched that guess. */
+    _propagationStampTarget() {
+        const known = this._cfg.propagationStampCost ?? sGet("propagationStampCost");
+        // Number(null) is 0, which would mean "no work" for an unknown node.
+        if (known !== null && known !== undefined && known !== "") {
+            const cost = Number(known);
+            if (Number.isInteger(cost) && cost >= 0) return cost;
+        }
+        return 16; // rfed's default policy, until the node's announce says otherwise
+    },
+
     /** Compute a 32-byte PoW stamp for propagation.
      *  Returns a Promise that resolves to a 32-byte Buffer or null on failure.
-     *  Target: >= 13 leading zero bits (rfed default cost=16, flex=3). */
+     *  Target: the node's announced stamp cost (see _propagationStampTarget). */
     async _computePropagationStamp(lxmfData) {
         try {
             const { sha256 } = await import("@noble/hashes/sha256");
@@ -1164,8 +1210,12 @@ const RnsClient = {
             const workblock = Buffer.concat(workblockParts);
 
             // Step 3: mine a 32-byte stamp where sha256(workblock || stamp)
-            // has >= 13 leading zero bits (stamp_valid uses Identity.full_hash = single SHA256)
-            const TARGET_ZERO_BITS = 13;
+            // has >= target leading zero bits (stamp_valid uses Identity.full_hash = single SHA256)
+            const TARGET_ZERO_BITS = this._propagationStampTarget();
+            if (TARGET_ZERO_BITS === 0) {
+                console.log(`[retichat] 🔨 Propagation node stamp cost is 0 — no work required`);
+                return Buffer.alloc(32);
+            }
             const STAMP_SIZE = 32;
             let attempts = 0;
             const stamp = Buffer.alloc(STAMP_SIZE);
