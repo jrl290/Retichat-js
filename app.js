@@ -1293,6 +1293,20 @@ const RnsClient = {
                 // Build and send propagation_packed
                 try {
                     const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
+                    const markPropagated = () => {
+                        MsgStore.updateStatus(contactHash, msg.id, "propagated");
+                        console.log(`[retichat] ✓ Propagation proof for ${contactHash.slice(0,8)}`);
+                        this._onMsg.forEach(fn => fn(null, contactHash));
+                    };
+                    // Same rule as the live send path: over the MDU the upload
+                    // is a Resource on the propagation link (LXMF/LXMRouter.py).
+                    if (propagationPacked.length > Link.MDU) {
+                        console.log(`[retichat] 📡 Propagation flush of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
+                        link.sendResource(propagationPacked)
+                            .then(markPropagated)
+                            .catch(error => console.warn(`[retichat] Propagation resource flush failed for ${contactHash.slice(0,8)}:`, error.message));
+                        continue;
+                    }
                     const pkt = new Packet();
                     pkt.headerType = Packet.HEADER_1;
                     pkt.packetType = Packet.DATA;
@@ -1309,11 +1323,7 @@ const RnsClient = {
                     this._pendingPacketHashes.set(truncatedHex, {
                         contactHash: contactHash,
                         messageId: msg.id,
-                        onProof: (msgId) => {
-                            MsgStore.updateStatus(contactHash, msgId, "propagated");
-                            console.log(`[retichat] ✓ Propagation proof for ${contactHash.slice(0,8)}`);
-                            this._onMsg.forEach(fn => fn(null, contactHash));
-                        }
+                        onProof: markPropagated,
                     });
 
                     this._rns.sendData(raw, link.attachedInterface);
@@ -1531,6 +1541,29 @@ const RnsClient = {
 
             // Build propagation_packed: msgpack([timestamp, [[dest_hash | EC_encrypted(rest) | stamp]]])
             const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
+            const markPropagated = () => {
+                if (!directProofReceived) {
+                    MsgStore.updateStatus(contact.destHash, outMsg.id, "propagated");
+                    console.log(`[retichat] ✓ Propagation proof for ${contact.destHash.slice(0,8)}`);
+                    this._onMsg.forEach(fn => fn(null, contact.destHash));
+                }
+            };
+            // LXMF/LXMRouter.py propagation transfer: an upload that fits one
+            // link packet is a packet, anything larger is a Resource on the
+            // propagation link, and the resource's own proof is the evidence.
+            // Until 2026-09-22 every upload was built as one packet, whose
+            // pack() threw over the MDU inside this timer — silently, so a
+            // long message to a distro address never left the browser.
+            if (propagationPacked.length > Link.MDU) {
+                console.log(`[retichat] 📡 Propagation upload of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
+                link.sendResource(propagationPacked)
+                    .then(markPropagated)
+                    .catch(error => console.warn(`[retichat] ⚠️ Propagation resource failed for ${contact.destHash.slice(0,8)}:`, error.message));
+                if (contact.reachable !== false) {
+                    ContactStore.setReachable(contact.destHash, false);
+                }
+                return;
+            }
 
             // Build a LINK-type DATA packet. Packet.pack() handles link encryption
             // via this.destination.encrypt(), so do NOT pre-encrypt here.
@@ -1551,13 +1584,7 @@ const RnsClient = {
             this._pendingPacketHashes.set(truncatedHex, {
                 contactHash: contact.destHash,
                 messageId: outMsg.id,
-                onProof: (msgId) => {
-                    if (!directProofReceived) {
-                        MsgStore.updateStatus(contact.destHash, msgId, "propagated");
-                        console.log(`[retichat] ✓ Propagation proof for ${contact.destHash.slice(0,8)}`);
-                        this._onMsg.forEach(fn => fn(null, contact.destHash));
-                    }
-                }
+                onProof: markPropagated,
             });
 
             this._rns.sendData(raw, link.attachedInterface);
@@ -2025,6 +2052,12 @@ const RnsClient = {
                         memberHash,
                     );
                     if (evidence.settled) return;
+                    if (propagationPacket === null) {
+                        // A Resource upload resolves on its proof (see
+                        // _sendGroupPropagationFallback).
+                        fulfill("propagation");
+                        return;
+                    }
                     propagationProofKey = propagationPacket.packetHash.slice(0, 16).toString("hex");
                     this._pendingPacketHashes.set(propagationProofKey, {
                         contactHash: memberHash,
@@ -2090,9 +2123,20 @@ const RnsClient = {
         ContactStore._save();
     },
 
+    /**
+     * Returns the packet whose proof is the delivery evidence, or null when the
+     * upload went as a Resource (over the MDU, LXMF/LXMRouter.py propagation
+     * transfer) — in that case the Resource's own proof has already arrived
+     * by the time this resolves.
+     */
     async _sendGroupPropagationFallback(fullLxmfBytes, publicKeyHex, memberHash) {
         const link = await this._ensurePropagationLink();
         const propagationPacked = await this._buildPropagationPacked(fullLxmfBytes, publicKeyHex);
+        if (propagationPacked.length > Link.MDU) {
+            console.log(`[retichat] 👥 Group propagation fallback of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
+            await link.sendResource(propagationPacked);
+            return null;
+        }
         const packet = link.send(propagationPacked);
         console.log(`[retichat] 👥 Group propagation fallback dispatched for ${memberHash.slice(0,8)} packet=${packet.packetHash.slice(0,6).toString("hex")}`);
         return packet;

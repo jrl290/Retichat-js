@@ -58,6 +58,11 @@ function makeSendRequestPacked(captured) {
             captured.context = context;
             return { getTruncatedHash: () => Buffer.alloc(16, 0xcd) };
         },
+        // The MDU split (packet vs request Resource) has its own test in
+        // link_request_resource.test.mjs; here every request is one packet.
+        _sendRequestPayload(payload) {
+            return this._sendWithContext(payload, Packet.REQUEST).getTruncatedHash();
+        },
     };
     const fn = new Function(
         "path", "packedData", "Cryptography", "MsgPack", "Packet", "Buffer",
