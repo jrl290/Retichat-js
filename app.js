@@ -1100,9 +1100,9 @@ const RnsClient = {
             return;
         }
         try {
-            const ownShort = RnsClient.ownHash?.slice(0,12) ?? IdMgr.shortHash ?? "";
-            const name = this._cfg.displayName + (ownShort ? ` (${ownShort})` : "");
-            this._lxmfRouter.announce(Buffer.from(name));
+            // No name in the announce (DESIGN_PRINCIPLES.md); the router
+            // announces [nil, nil, []].
+            this._lxmfRouter.announce();
             // Re-announce rfed.delivery alongside lxmf.delivery so the RFed's
             // path back to us stays fresh (the distro fanout + deferred flush
             // depend on it).  See _initChannels().
