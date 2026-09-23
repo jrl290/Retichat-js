@@ -2641,20 +2641,20 @@ const RnsClient = {
     },
 
     async _rfedRequest(aspects, path, packedValue) {
-        // Prefer the single rfed.link; fall back to the legacy per-aspect
-        // destination for a node that has not announced it.
-        //
-        // At startup neither may have announced yet. Deciding "legacy" then
-        // would open a per-aspect link on a node that supports rfed.link — the
-        // first request of every session did exactly that on staging, 4 s
-        // before the rfed.link announce arrived. So wait for whichever of the
-        // two announces lands first (both are path-requested at startup), and
-        // decide on the evidence. No timer: an announce is the event.
+        // Every mapped control request goes over the single rfed.link
+        // (RFed-spec/Link.md: one link per subscriber; the legacy per-aspect
+        // destinations are kept for pre-split clients, not for this one).
+        // Until 2026-09-23 this raced the rfed.link announce against the
+        // legacy aspect's and took whichever landed first, so on a node whose
+        // rfed.link announce arrived a second later the client opened a
+        // per-aspect link as well and held two links. Now it waits for the
+        // rfed.link announce (path-requested at startup) - an event, not a
+        // timer - and never falls back to a legacy link for a mapped path.
         const mapped = RFED_LINK_PATHS[`${aspects.join(".")}:${path}`];
-        if (mapped && !this._rfedLinkAvailable() && !this._rfedServiceReady.has(aspects.join("."))) {
-            await Promise.race([this._waitForRfedService(["link"]), this._waitForRfedService(aspects)]);
-        }
-        if (mapped && this._rfedLinkAvailable()) {
+        if (mapped) {
+            if (!this._rfedLinkAvailable()) {
+                await this._waitForRfedService(["link"]);
+            }
             aspects = ["link"];
             path = mapped;
         }
