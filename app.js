@@ -1678,12 +1678,28 @@ const RnsClient = {
         msg.content = content;
         msg.fields = new Map();
         msg.fields.set(FIELD_TICKET, ticket);
-        const packed = msg.pack(sender.identity, true);
+        // The full packing: destination hash, source hash, signature, payload.
+        // A packet to the destination sends it without the destination hash
+        // (the packet header carries it); a link packet or Resource sends it
+        // whole. Reference: LXMessage.py __as_packet / __as_resource.
+        const packed = msg.pack(sender.identity, false);
+        const plan = LXMessage.deliveryPlan(packed);
 
         this._pendingTickets.set(ticket, { contactHash, messageId, onProof });
 
+        if (plan.method === LXMessage.DIRECT) {
+            // Until 2026-09-23 every direct message left as one packet to the
+            // destination whatever its size; the MTU check in Packet.pack() is
+            // disabled, so a message over 295 bytes went out as an oversized
+            // packet that every hop dropped without a word. LXMF sends those
+            // over a link: a link packet up to 319 bytes of content, a
+            // Resource above that.
+            this._sendOverPeerLink(contactHash, publicKeyHex, packed, plan.representation, messageId, onProof, onError);
+            return;
+        }
+
         try {
-            const sentPacketHash = dest.send(packed);
+            const sentPacketHash = dest.send(packed.subarray(LXMessage.DESTINATION_LENGTH));
             if (sentPacketHash) {
                 const truncatedHex = sentPacketHash.slice(0, 16).toString("hex");
                 this._pendingPacketHashes.set(truncatedHex, { contactHash, messageId, onProof });
@@ -1693,6 +1709,33 @@ const RnsClient = {
             if (onError) onError(messageId);
             throw e;
         }
+    },
+
+    /**
+     * Deliver a packed LXMF message over a link to the peer's delivery
+     * destination (LXMessage.DIRECT). The link is the same per-peer delivery
+     * link group delivery uses. A link packet is proved like any packet and
+     * matched in _pendingPacketHashes; a Resource is proved by its own
+     * transfer, so its completion is the delivery evidence.
+     */
+    _sendOverPeerLink(contactHash, publicKeyHex, packed, representation, messageId, onProof, onError) {
+        const fail = (what, error) => {
+            console.warn(`[retichat] ⚠️ Direct ${what} to ${contactHash.slice(0,8)} failed:`, error.message);
+            if (onError) onError(messageId);
+        };
+        this._ensureGroupLink(contactHash, publicKeyHex).then(({ link }) => {
+            if (representation === LXMessage.RESOURCE) {
+                console.log(`[retichat] ✉️ Direct message of ${packed.length} B to ${contactHash.slice(0,8)} exceeds the link MDU — sending as a resource`);
+                link.sendResource(packed)
+                    .then(() => { if (onProof) onProof(messageId); })
+                    .catch(error => fail("resource", error));
+                return;
+            }
+            console.log(`[retichat] ✉️ Direct message of ${packed.length} B to ${contactHash.slice(0,8)} — sending as a link packet`);
+            const packet = link.send(packed);
+            const truncatedHex = packet.packetHash.slice(0, 16).toString("hex");
+            this._pendingPacketHashes.set(truncatedHex, { contactHash, messageId, onProof });
+        }).catch(error => fail("link", error));
     },
 
     // =========================================================================
