@@ -821,6 +821,7 @@ const RnsClient = {
     _groupPathsRequested: new Set(),
     _groupFallbacks: new GroupFallbackRegistry(),
     _propLinkPromise: null,
+    _propLinkUpWaiters: [],      // _whenPropagationLinkUp: {resolve, reject}
     _channelsInitialized: false,
     _channelsResubscribed: false,
     _pendingTickets: new Map(),  // ticket → {contactHash, messageId}
@@ -1282,6 +1283,8 @@ const RnsClient = {
             this._propLinkPromise = null;
             this._propLinkResolve = null;
             this._propLinkReject = null;
+            const upWaiters = this._propLinkUpWaiters.splice(0);
+            upWaiters.forEach(waiter => waiter.resolve(link));
             // Flush any messages that missed the propagation window while
             // the link was still being established.
             this._flushPropagation();
@@ -1557,6 +1560,24 @@ const RnsClient = {
             );
         }
 
+        // RFed SPEC §17.11: a message sent AS the distro is also copied to the
+        // distro, so every other device of the distro shows it as sent. Only
+        // once M's dispatch has returned without throwing — a send that
+        // throws never leaves, so siblings must not show it (Android sends
+        // after messageSendViaAppLinks accepts M, iOS after M is submitted).
+        // Once per user message: this function runs once per composer send,
+        // and neither the direct attempt, the propagation fallback below nor
+        // _flushPropagation() comes back through it, so a DIRECT attempt plus
+        // a propagated fallback of the same message still yields ONE copy.
+        // Fire-and-forget: the copy never touches outMsg's status.
+        const sender = this.sendingIdentity();
+        if (sender.isDistro && contact.destHash !== sender.hash) {
+            this._sendDistroSentCopy(contact.destHash, "", content).catch(error => {
+                console.warn(`[distro] ⚠️ Sent-copy to the distro for ${contact.destHash.slice(0,8)} failed:`, error.message);
+                Harness.error("distro-sent-copy", error);
+            });
+        }
+
         // After propagation delay, if no direct proof, also send to propagation node
         const delaySec = ContactStore.propagationDelay(contact.destHash);
         setTimeout(async () => {
@@ -1665,6 +1686,65 @@ const RnsClient = {
         this._pendingTimeouts.set(outMsg.id, timeoutId);
 
         return outMsg;
+    },
+
+    /**
+     * Propagate the RFed SPEC §17.11 sent-copy of a message this device just
+     * sent as the distro D to `recipientHex`: destination D, source D, signed
+     * with D's key, title and content identical to the original, and
+     *   0xFB FIELD_CUSTOM_TYPE = "rfed.distro.sent"
+     *   0xFC FIELD_CUSTOM_DATA = the recipient's address (32 lowercase hex)
+     *   0xFD FIELD_CUSTOM_META = this device's own lxmf.delivery address.
+     * It goes PROPAGATED at once, like every distro-addressed message
+     * (ContactStore.propagationDelay): RFed intercepts it on lxmf.propagation
+     * and fans it out to every registered device of D, this one included —
+     * _handleDistroBlob drops that echo by 0xFD. No ticket, so no delivery
+     * notification comes back, and no bubble is created here. Mirrors the
+     * Android and iOS send paths.
+     */
+    async _sendDistroSentCopy(recipientHex, title, content) {
+        const distroHash = DistroManager.lxmfDeliveryHash;
+        const deviceHash = this.ownHash;
+        if (!DistroManager.has || !distroHash) return;
+        // A message to the distro itself already reaches every device.
+        if (recipientHex === distroHash) return;
+        if (!deviceHash) throw new Error("own lxmf.delivery address unavailable for 0xFD");
+
+        const msg = new LXMessage();
+        msg.sourceHash = Buffer.from(distroHash, "hex");
+        msg.destinationHash = Buffer.from(distroHash, "hex");
+        msg.title = title;
+        msg.content = content;
+        msg.fields = new Map();
+        msg.fields.set(LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_SENT_TYPE);
+        msg.fields.set(LXMF.FIELD_CUSTOM_DATA, recipientHex.toLowerCase());
+        msg.fields.set(LXMF.FIELD_CUSTOM_META, deviceHash.toLowerCase());
+        // Non-opportunistic: the propagation node reads dest_hash (D) in
+        // cleartext from offset 0 — that is how RFed recognises a distro.
+        const packed = msg.pack(DistroManager.identity, false);
+        const distroPubKey = DistroManager.pubKey;
+
+        // Wait for the propagation link, never start it: its "established"
+        // handler runs _flushPropagation(), which would re-propagate the
+        // original message while its direct attempt is still in flight, and
+        // the recipient would get it twice. The link is kept up by
+        // _initPropagation / _retryPropagationLink and by M's own
+        // propagation timer, so the copy rides the next one.
+        const link = await this._whenPropagationLinkUp(recipientHex);
+        const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
+        const dispatched = (how) => {
+            console.log(`[distro] 📤 Sent-copy for ${recipientHex.slice(0,8)} propagated to the distro as a ${how} (§17.11)`);
+            Harness.event("distro-sent-copy", { to: recipientHex.slice(0, 12), how });
+        };
+        // Same size rule as every propagation upload (LXMF/LXMRouter.py).
+        if (propagationPacked.length > Link.MDU) {
+            console.log(`[distro] 📤 Sent-copy of ${propagationPacked.length} B for ${recipientHex.slice(0,8)} exceeds the MDU — sending as a resource`);
+            await link.sendResource(propagationPacked);
+            dispatched("resource");
+            return;
+        }
+        link.send(propagationPacked);
+        dispatched("packet");
     },
 
     /** Core packet send: packs, sends, tracks proof, calls back. */
@@ -2240,6 +2320,19 @@ const RnsClient = {
         const packet = link.send(propagationPacked);
         console.log(`[retichat] 👥 Group propagation fallback dispatched for ${memberHash.slice(0,8)} packet=${packet.packetHash.slice(0,6).toString("hex")}`);
         return packet;
+    },
+
+    /** The propagation link once it is ACTIVE, without starting it (unlike
+     *  _ensurePropagationLink). Used by the §17.11 sent-copy, which must not
+     *  change when the original message is propagated. Resolved by the
+     *  link's "established" handler, rejected by disconnect(). */
+    _whenPropagationLinkUp(recipientHex) {
+        if (this._propLink?.status === Link.ACTIVE) return Promise.resolve(this._propLink);
+        if (!this._cfg.propagationNodePubKey || !this._cfg.propagationNodeHash) {
+            return Promise.reject(new Error("Propagation node identity is not ready"));
+        }
+        console.log(`[distro] Sent-copy for ${recipientHex.slice(0,8)} waits for the propagation link (§17.11)`);
+        return new Promise((resolve, reject) => this._propLinkUpWaiters.push({ resolve, reject }));
     },
 
     _ensurePropagationLink() {
@@ -3175,6 +3268,60 @@ const RnsClient = {
                 return true; // already held
             }
 
+            // RFed SPEC §17.11 sent-message sync: another device of this
+            // distro sent a message as the distro and propagated a copy here.
+            // It is "me" talking, so it belongs in the conversation with the
+            // recipient (0xFC) as an OUTGOING bubble, not as a message from
+            // the distro address. Mirrors Retichat-android / Retichat-ios,
+            // which read the same marker through distro.rs sent_to / sent_by.
+            // Dedupe above already recorded it (same src:ts key as every
+            // fan-out message), so a copy that arrives by stream and by PULL
+            // is stored once, and an own echo stays dropped on re-delivery.
+            const sentCopy = LXMF.distroSentCopyFromFields(fieldsMap);
+            if (sentCopy) {
+                if (srcHashHex !== myLxmfHash) {
+                    console.warn(`[distro] ⚠️ Sent-copy marker from ${srcHashHex.slice(0,12)}, not our distro — ignored (§17.11)`);
+                    return true; // consumed: not ours to store
+                }
+                if (sentCopy.byHex === (this.ownHash ?? ownLxmfDestinationHash())) {
+                    console.log(`[distro] ↩︎ own sent-copy echo for ${sentCopy.toHex?.slice(0,12) ?? "?"} — dropped (§17.11)`);
+                    return true;
+                }
+                if (!sentCopy.toHex) {
+                    console.warn(`[distro] ⚠️ Sent-copy with a malformed 0xFC recipient from device ${sentCopy.byHex.slice(0,12) || "?"} — dropped (§17.11)`);
+                    return true;
+                }
+                // Stored as "me", so the source must really be the distro's
+                // key, not just its address: anyone can encrypt to D's
+                // announced public key and claim source D. LXMF signs
+                // dest | src | payload | SHA-256(dest | src | payload).
+                const hashedPart = Buffer.concat([destHash, srcHash, payloadBytes]);
+                const signature = decrypted.slice(16, 80);
+                if (!DistroManager.identity.validate(signature, Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)]))) {
+                    console.warn(`[distro] ⚠️ Sent-copy for ${sentCopy.toHex.slice(0,12)} fails the distro signature — dropped (§17.11)`);
+                    return true;
+                }
+                const recipientHex = sentCopy.toHex;
+                // No contact request and no stranger filter: this device's own
+                // side of a conversation opens it. No notification either —
+                // nobody is told about their own message.
+                if (!ContactStore.isContact(recipientHex)) {
+                    ContactStore.add(recipientHex);
+                }
+                // "sent", never "proved"/"delivered": this device holds no
+                // evidence of delivery, only that the distro said it.
+                const stored = MsgStore.add(recipientHex, {
+                    dir: "out", content, status: "sent",
+                    srcHash: myLxmfHash, destHash: recipientHex, via: "distro",
+                    timestamp: Number.isFinite(Number(ts)) ? Math.round(Number(ts) * 1000) : Date.now(),
+                });
+                ContactStore.touch(recipientHex);
+                console.log(`[distro] 📤 Synced sent message to ${recipientHex.slice(0,12)} from device ${sentCopy.byHex.slice(0,12)}: "${content.slice(0,60)}"`);
+                Harness.event("distro-sent-sync", { to: recipientHex.slice(0, 12), by: sentCopy.byHex.slice(0, 12) });
+                this._onMsg.forEach(fn => fn(stored, recipientHex));
+                return true;
+            }
+
             // Delivery notifications now arrive here too. Since we send as the
             // distro, the recipient's ticket reply is addressed to the distro
             // and reaches us fanned out rather than direct. It carries a ticket
@@ -3515,6 +3662,7 @@ const RnsClient = {
         this._groupPathsRequested.clear();
         this._groupFallbacks.clear();
         this._propLinkReject?.(new Error("Disconnected before propagation link became active"));
+        this._propLinkUpWaiters.splice(0).forEach(waiter => waiter.reject(new Error("Disconnected before propagation link became active")));
         this._propLinkPromise = null;
         this._propLinkResolve = null;
         this._propLinkReject = null;
