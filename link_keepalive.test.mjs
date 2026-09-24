@@ -163,3 +163,33 @@ test("inbound traffic refreshes lastInbound before any handler can return", asyn
         "otherwise a link carrying nothing but keepalives is declared stale",
     );
 });
+
+test("a STALE link that hears its peer is ACTIVE again and says so, once", async () => {
+    // Recovery is the one STALE -> ACTIVE transition. Before 2026-09-24 it
+    // emitted nothing, so anything waiting for ACTIVE (the §17.11 sent-copy's
+    // _whenPropagationLinkUp) stayed queued until a teardown and a fresh
+    // "established" that might never come. It is the same link, so
+    // "established" must NOT fire: its handlers identify, flush and pull.
+    const link = new Link();
+    link.initiator = true;
+    link.status = Link.STALE;
+    link.staleSince = Date.now();
+    const seen = [];
+    for (const event of ["recovered", "established", "close"]) {
+        link.on(event, () => seen.push(event));
+    }
+    const pong = { context: Packet.KEEPALIVE, data: Buffer.from([0xFE]) };
+    // Listeners run on a later macrotask (utils/events.js), before this one.
+    const afterLinkEvents = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    link.onPacket(pong);
+    assert.equal(link.status, Link.ACTIVE);
+    assert.equal(link.staleSince, null);
+    await afterLinkEvents();
+    assert.deepEqual(seen, ["recovered"]);
+
+    // Traffic on a link that is already ACTIVE is not a recovery.
+    link.onPacket(pong);
+    await afterLinkEvents();
+    assert.deepEqual(seen, ["recovered"], "only the STALE -> ACTIVE transition emits");
+});

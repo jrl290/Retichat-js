@@ -1299,6 +1299,24 @@ const RnsClient = {
             }
         });
 
+        // A STALE link that hears from the PN again is ACTIVE without being
+        // re-established (Link.onPacket), so "established" above never fires
+        // for it. A §17.11 sent-copy that queued in _whenPropagationLinkUp
+        // while it was STALE is released here, or it would wait for a teardown
+        // and re-establishment that may never come, and die with the tab.
+        link.on("recovered", () => {
+            const upWaiters = this._propLinkUpWaiters;
+            if (this._propLink !== link || link.status !== Link.ACTIVE) {
+                // Events are delivered a tick late: the link may have been
+                // replaced or closed since. The waiters stay queued for the
+                // next link's "established".
+                if (upWaiters.length) console.log(`[retichat] 🔗 Propagation link recovered but no longer current — ${upWaiters.length} waiter(s) stay queued`);
+                return;
+            }
+            if (upWaiters.length) console.log(`[retichat] 🔗 Propagation link recovered from STALE — releasing ${upWaiters.length} waiter(s)`);
+            upWaiters.splice(0).forEach(waiter => waiter.resolve(link));
+        });
+
         link.on("close", () => {
             console.log("[retichat] Propagation link closed");
             this._propLinkReject?.(new Error("Propagation link closed before establishment"));
@@ -2325,7 +2343,8 @@ const RnsClient = {
     /** The propagation link once it is ACTIVE, without starting it (unlike
      *  _ensurePropagationLink). Used by the §17.11 sent-copy, which must not
      *  change when the original message is propagated. Resolved by the
-     *  link's "established" handler, rejected by disconnect(). */
+     *  link's "established" or "recovered" (STALE -> ACTIVE) handler,
+     *  rejected by disconnect(). */
     _whenPropagationLinkUp(recipientHex) {
         if (this._propLink?.status === Link.ACTIVE) return Promise.resolve(this._propLink);
         if (!this._cfg.propagationNodePubKey || !this._cfg.propagationNodeHash) {
@@ -3279,26 +3298,38 @@ const RnsClient = {
             // is stored once, and an own echo stays dropped on re-delivery.
             const sentCopy = LXMF.distroSentCopyFromFields(fieldsMap);
             if (sentCopy) {
+                // SPEC §17.11 receive rules, in order; the first drop ends it.
+                // Rule 1, source.
                 if (srcHashHex !== myLxmfHash) {
-                    console.warn(`[distro] ⚠️ Sent-copy marker from ${srcHashHex.slice(0,12)}, not our distro — ignored (§17.11)`);
+                    console.warn(`[distro] ⚠️ Sent-copy marker from ${srcHashHex.slice(0,12)}, not our distro — ignored (§17.11 rule 1)`);
                     return true; // consumed: not ours to store
                 }
-                if (sentCopy.byHex === (this.ownHash ?? ownLxmfDestinationHash())) {
-                    console.log(`[distro] ↩︎ own sent-copy echo for ${sentCopy.toHex?.slice(0,12) ?? "?"} — dropped (§17.11)`);
-                    return true;
-                }
-                if (!sentCopy.toHex) {
-                    console.warn(`[distro] ⚠️ Sent-copy with a malformed 0xFC recipient from device ${sentCopy.byHex.slice(0,12) || "?"} — dropped (§17.11)`);
-                    return true;
-                }
-                // Stored as "me", so the source must really be the distro's
-                // key, not just its address: anyone can encrypt to D's
-                // announced public key and claim source D. LXMF signs
-                // dest | src | payload | SHA-256(dest | src | payload).
-                const hashedPart = Buffer.concat([destHash, srcHash, payloadBytes]);
+                // Rule 2, signature. Stored as "me", so the source must really
+                // be the distro's key, not just its address: anyone can
+                // encrypt to D's announced public key and claim source D.
+                // LXMF signs dest | src | payload | SHA-256(dest | src | payload)
+                // over the four-element payload; a fifth element (a stamp) is
+                // appended after signing, so it is left out here as
+                // LXMessage.unpack_from_bytes leaves it out.
+                const signedPayload = (Array.isArray(payload) && payload.length > 4)
+                    ? Buffer.from(MsgPack.pack(payload.slice(0, 4)))
+                    : payloadBytes;
+                const hashedPart = Buffer.concat([destHash, srcHash, signedPayload]);
                 const signature = decrypted.slice(16, 80);
                 if (!DistroManager.identity.validate(signature, Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)]))) {
-                    console.warn(`[distro] ⚠️ Sent-copy for ${sentCopy.toHex.slice(0,12)} fails the distro signature — dropped (§17.11)`);
+                    console.warn(`[distro] ⚠️ Sent-copy for ${sentCopy.toHex?.slice(0,12) ?? "?"} fails the distro signature — dropped (§17.11 rule 2)`);
+                    return true;
+                }
+                // Rule 3, own echo.
+                if (sentCopy.byHex === (this.ownHash ?? ownLxmfDestinationHash())) {
+                    console.log(`[distro] ↩︎ own sent-copy echo for ${sentCopy.toHex?.slice(0,12) ?? "?"} — dropped (§17.11 rule 3)`);
+                    return true;
+                }
+                // Rule 4, recipient: 32 hex and never D itself (no copy is
+                // sent for a message to D; filing one would open a chat with
+                // the distro address).
+                if (!sentCopy.toHex || sentCopy.toHex === myLxmfHash) {
+                    console.warn(`[distro] ⚠️ Sent-copy with a malformed 0xFC recipient from device ${sentCopy.byHex.slice(0,12) || "?"} — dropped (§17.11 rule 4)`);
                     return true;
                 }
                 const recipientHex = sentCopy.toHex;
