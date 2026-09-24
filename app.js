@@ -310,6 +310,12 @@ const ContactStore = {
                 if (n) c.displayName = n;
             } catch(e) {}
         }
+        // The lxmf.delivery announce is the source of truth for "distro"
+        // (RFed SPEC §17.10): SF_RFED_DISTRO in supported_functionality.
+        // No app_data says nothing, so leave the flag as it is.
+        if (announce.appData && announce.appData.length > 0) {
+            c.isDistro = LXMF.distroFromAppData(announce.appData);
+        }
         if (!c.publicKey && announce.identity) {
             c.publicKey = announce.identity.getPublicKey()?.toString("hex") ?? null;
         }
@@ -919,11 +925,12 @@ const RnsClient = {
             if (!srcHash) return;
 
             // ---- Distro identity transfer detection ----
-            // Check for FIELD_DISTRO_ID (0x0D) BEFORE the ticket check.
-            const FIELD_DISTRO_ID = 0x0D;
-            const distroEncryptedHex = lxmfMsg.fields?.get(FIELD_DISTRO_ID);
-            if (distroEncryptedHex) {
-                this._handleDistroIdentityTransfer(lxmfMsg, srcHash, distroEncryptedHex);
+            // FIELD_CUSTOM_TYPE == "rfed.distro.transfer", key in
+            // FIELD_CUSTOM_DATA (RFed SPEC §17.9). Checked BEFORE the ticket
+            // check. Field 0x0D is upstream FIELD_EVENT and is not read.
+            const distroKeyHex = LXMF.distroTransferKeyFromFields(lxmfMsg.fields);
+            if (distroKeyHex !== null) {
+                this._handleDistroIdentityTransfer(lxmfMsg, srcHash, distroKeyHex);
                 return;
             }
 
@@ -1742,7 +1749,7 @@ const RnsClient = {
     //  GROUP PROTOCOL — handle incoming group messages + send group operations
     // =========================================================================
 
-    /** Handle incoming distro identity transfer (FIELD_DISTRO_ID). */
+    /** Handle incoming distro identity transfer (FIELD_CUSTOM_TYPE "rfed.distro.transfer"). */
     _handleDistroIdentityTransfer(lxmfMsg, srcHash, privateKeyHex) {
         console.log(`[distro] 📥 Received distro identity transfer from ${srcHash.slice(0,12)}...`);
         try {
@@ -3020,7 +3027,11 @@ const RnsClient = {
             const distroDestination = new Destination(
                 this._rns, distroIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery",
             );
-            const { announceData, contextFlag } = distroDestination.buildAnnounceData(null);
+            // app_data = [nil, nil, [SF_RFED_DISTRO]] (RFed SPEC §17.10): no
+            // name, no stamp cost, no compression claim — the SF_RFED_DISTRO
+            // flag is how every reader recognises a distro address.
+            const distroAppData = MsgPack.pack([null, null, [LXMF.SF_RFED_DISTRO]]);
+            const { announceData, contextFlag } = distroDestination.buildAnnounceData(distroAppData);
 
             // value = flags(1) ‖ announceData; bit 0 signals a ratchet, which
             // shifts where the signature starts when RFed parses it.
@@ -5015,7 +5026,6 @@ const App = {
         // Build LXMF message with the private key in fields (LXMF encrypts the whole message)
         const recipientIdentity = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
         const contactDest = RnsClient._rns.registerDestination(recipientIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
-        const FIELD_DISTRO_ID = 0x0D; // Custom field for distro identity transfer
         // Deliberately signed as this DEVICE, not as the distro: the recipient
         // is being handed the distro key and can only judge the offer by which
         // of their known contacts sent it. Signing as the distro would have the
@@ -5026,7 +5036,9 @@ const App = {
         msg.title = "Distro Identity";
         msg.content = "Import this distro identity to receive messages on all your devices.";
         msg.fields = new Map();
-        msg.fields.set(FIELD_DISTRO_ID, privateKeyHex);
+        // RFed SPEC §17.9: upstream's custom-field pair, never 0x0D (FIELD_EVENT).
+        msg.fields.set(LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_TRANSFER_TYPE);
+        msg.fields.set(LXMF.FIELD_CUSTOM_DATA, privateKeyHex);
         const packed = msg.pack(IdMgr.id, true);
 
         // Send directly
@@ -5051,13 +5063,13 @@ const App = {
         const doAdd = () => {
             const raw = inputValue.trim();
             if (!raw) { alert("Enter a destination hash."); return; }
-            let isDistro = false;
             let publicKey = null;
             let hash = raw.toLowerCase();
 
-            // Parse lxma:// URI (contains public key)
+            // Parse lxma:// URI (contains public key). This carries a key
+            // only — it is NOT a distro indicator; only the announce's
+            // SF_RFED_DISTRO flag is (RFed SPEC §17.10).
             if (hash.startsWith("lxma://")) {
-                isDistro = true;
                 hash = hash.slice(7); // Remove "lxma://"
                 const colonIdx = hash.indexOf(":");
                 if (colonIdx > -1) {
@@ -5078,7 +5090,7 @@ const App = {
                 return;
             }
             try {
-                ContactStore.add(hash, isDistro, publicKey);
+                ContactStore.add(hash, false, publicKey);
                 this._requestPathForContact(hash);
                 this.state.showAddContact = false;
                 this.render();
@@ -5323,13 +5335,13 @@ const App = {
         const doAdd = () => {
             const raw = inputValue.trim();
             if (!raw) return;
-            let isDistro = false;
             let publicKey = null;
             let hash = raw.toLowerCase();
 
-            // Parse lxma:// URI (contains public key)
+            // Parse lxma:// URI (contains public key). This carries a key
+            // only — it is NOT a distro indicator; only the announce's
+            // SF_RFED_DISTRO flag is (RFed SPEC §17.10).
             if (hash.startsWith("lxma://")) {
-                isDistro = true;
                 hash = hash.slice(7); // Remove "lxma://"
                 const colonIdx = hash.indexOf(":");
                 if (colonIdx > -1) {
@@ -5347,7 +5359,7 @@ const App = {
             hash = hash.replace(/[^0-9a-f]/g, "");
             if (hash.length !== 32) { alert("Destination hash must be exactly 32 hex characters."); return; }
             try {
-                ContactStore.add(hash, isDistro, publicKey);
+                ContactStore.add(hash, false, publicKey);
                 this._requestPathForContact(hash);
                 this.state.showNewConversation = false;
                 this.render();
