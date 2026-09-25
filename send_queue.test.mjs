@@ -144,7 +144,7 @@ const contactFor = (identity) => ({ destHash: lxmfHash(identity), publicKey: ide
 
 // ── A/B: queued until initialization finishes ──────────────────────────────
 
-const QUEUE_METHODS = ["sendMessage(contact, content)", "_dispatchQueued()", "_onExchangeRegistered()"];
+const QUEUE_METHODS = ["sendMessage(contact, content)", "_dispatchQueued()", "_onExchangeRegistered()", "_exchangeIsDown()"];
 
 function makeQueueClient(options) {
     const c = makeClient({ methods: QUEUE_METHODS, ...options });
@@ -269,8 +269,12 @@ test("a group message sent before initialization is queued and fanned out once w
 });
 
 test("a registration from an interface disconnect() stopped does not initialize the connection", () => {
-    const connect = extractMethod("async connect()");
-    assert.match(connect, /iface\.on\("registered", \(\) => \{\s*if \(this\._rns\?\.interfaces\?\.includes\(iface\)\) this\._onExchangeRegistered\(\);/);
+    // The hooks live in _followExchange() since 2026-09-25 (U6); they are
+    // driven for real in exchange_truth.test.mjs.
+    assert.match(extractMethod("async connect()"), /this\._followExchange\(iface\);\s*this\._rns\.addInterface\(iface\);/);
+    const follow = extractMethod("_followExchange(iface)");
+    assert.match(follow, /const current = \(\) => this\._rns\?\.interfaces\?\.includes\(iface\);/);
+    assert.match(follow, /iface\.on\("registered", \(\) => \{\s*if \(current\(\)\) this\._onExchangeRegistered\(\);/);
     assert.match(extractMethod("disconnect()"), /this\._initialized = false;/);
 });
 

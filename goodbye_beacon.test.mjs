@@ -57,7 +57,10 @@ test("goodbye is a no-op before registration and falls back to a keepalive fetch
 });
 
 test("connect hooks goodbye to pagehide once, and disconnect sends it", () => {
-    assert.match(method("async connect()"), /addEventListener\('pagehide', this\._goodbyeHook\)/);
-    assert.match(method("async connect()"), /if \(!this\._goodbyeHook/, "hooked once, not per reconnect");
+    // The page hooks live in _hookPage() since 2026-09-25 (U6); what they do
+    // on each event is driven for real in exchange_truth.test.mjs.
+    assert.match(method("async connect()"), /this\._hookPage\(\)/);
+    assert.match(method("_hookPage()"), /if \(this\._pageHooks/, "hooked once, not per reconnect");
+    assert.match(method("_hookPage()"), /\[window, 'pagehide', \(event\) => \{ if \(!event\?\.persisted\) this\.goodbye\(\); \}\]/);
     assert.match(method("disconnect()"), /this\.goodbye\(\)/);
 });

@@ -92,9 +92,12 @@ async function init(exchangeUrl) {
   });
 
   var iface = new PostInterface('debug', exchangeUrl, identHash, 1);
+  // addInterface() connects it; a second connect() would clear the
+  // registration in flight. The interface id arrives with the registration.
+  iface.on('registered', function() { log('Interface: ' + iface._interfaceId); });
+  iface.on('up', function() { log('Exchange up', 'ok'); });
+  iface.on('down', function(reason) { log('Exchange down: ' + reason, 'err'); });
   rns.addInterface(iface);
-  await iface.connect();
-  log('Interface: ' + (iface._interfaceId || '?'));
 
   // Set up LXMF router for receiving messages
   lxmfRouter = new LXMRouter(rns, ident);

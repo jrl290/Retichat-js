@@ -43,6 +43,7 @@ import MsgPack from "./lib/rns/msgpack.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js";
 import DistroManager from "./lib/distro.js";
+import { TabLock } from "./lib/tab_lock.js";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -851,7 +852,7 @@ const ChannelMsgStore = {
 const RnsClient = {
     _rns: null, _lxmfRouter: null, _cfg: null,
     _status: "offline", _connType: "none", // "direct" | "websocket" | "none"
-    _annTimer: null, _monTimer: null,
+    _annTimer: null,
     _rfedLinks: new Map(),
     _rfedLinkPromises: new Map(),
     _rfedServiceReady: new Set(),
@@ -882,7 +883,7 @@ const RnsClient = {
     _channelsInitialized: false,
     _channelsResubscribed: false,
     _pendingTickets: new Map(),  // ticket → {contactHash, messageId}
-    _pendingPacketHashes: new Map(),  // provedPacketHash (hex) → {contactHash, messageId}
+    _pendingPacketHashes: new Map(),  // provedPacketHash (hex) → {contactHash, messageId, onProof?, dm?}
     _pendingTimeouts: new Map(),  // messageId → timeoutId
     // The initialization-complete signal (DESIGN_PRINCIPLES §5): false until
     // this connection's exchange interface has registered, reset by
@@ -945,9 +946,42 @@ const RnsClient = {
         this._onStatus.forEach(fn => fn(s));
     },
 
+    /**
+     * What this connection takes from its exchange interface, hooked before
+     * addInterface() connects it. Each event counts only while `iface` is
+     * this connection's: one that lands after disconnect() belongs to the
+     * stopped interface.
+     */
+    _followExchange(iface) {
+        const current = () => this._rns?.interfaces?.includes(iface);
+        iface.on("registered", () => {
+            if (current()) this._onExchangeRegistered();
+        });
+        // The status dot follows the exchange itself (U6): "up" on its first
+        // 200 after a registration or a failure, "down" on a failure. Until
+        // 2026-09-25 a 2 s monitor showed online whenever the interface held
+        // credentials, so a dead exchange stayed green.
+        iface.on("up", () => {
+            if (current()) this._setStatus("online");
+        });
+        iface.on("down", () => {
+            if (current()) this._setStatus("offline");
+        });
+        iface.on("lost", (lost) => {
+            if (current()) this._onPacketsLost(lost);
+        });
+    },
+
     async connect() {
         if (!IdMgr.has) throw new Error("No identity");
+        // D11: only the tab holding this identity's lock registers with the
+        // exchange. A second registration rotates the node's session token
+        // and knocks the other tab's session out.
+        if (!ActiveTab.held) throw new Error("Retichat is active in another tab");
         this._cfg = await loadConfig();
+        // Taken over while the config loaded: disconnect() has already run
+        // and the lock is gone, so this connection must not start.
+        if (!ActiveTab.held) return;
 
         // Resolve propagation node hash: explicit override, or derive from RFed.
         if (this._cfg.lxmfPropagationOverride) {
@@ -977,11 +1011,7 @@ const RnsClient = {
             this._cfg.exchangeUrl,
             IdMgr.hash
         );
-        // A registration that lands after disconnect() belongs to the stopped
-        // interface; it must not initialize this connection.
-        iface.on("registered", () => {
-            if (this._rns?.interfaces?.includes(iface)) this._onExchangeRegistered();
-        });
+        this._followExchange(iface);
         this._rns.addInterface(iface);
         this._connType = "exchange";
 
@@ -1163,21 +1193,6 @@ const RnsClient = {
             this._annTimer = setInterval(() => this._announce(), this._cfg.announceIntervalMs);
         }
 
-        // Status monitor — checks every 2s if any interface is ready
-        this._monTimer = setInterval(() => {
-            const ifaces = this._rns?.interfaces || [];
-            let anyReady = false;
-            for (const iface of ifaces) {
-                // HTTP exchange: ready once registered
-                if (iface.isRegistered) { anyReady = true; break; }
-                // Direct Sockets / WebSocket
-                const ws = iface.websocket || iface.socket;
-                if (ws && (ws.readyState === 1 || (ws.readable && ws.writable))) { anyReady = true; break; }
-            }
-            if (anyReady && this._status !== "online") this._setStatus("online");
-            else if (!anyReady && ifaces.length > 0 && this._status !== "offline") this._setStatus("offline");
-        }, 2000);
-
         console.log(`[rns] Connecting via ${this._connType} (${(this._rns?.interfaces || []).length} interface(s))...`);
     },
 
@@ -1186,8 +1201,9 @@ const RnsClient = {
         // Check if any interface is ready
         const ifaces = this._rns?.interfaces || [];
         const anyReady = ifaces.some(iface => {
-            // HTTP exchange: always ready once registered
-            if (iface.isRegistered) return true;
+            // HTTP exchange: ready once registered, unless its last exchange
+            // failed (a down interface drops what it is given).
+            if (iface.isRegistered) return !iface.isDown;
             // Direct Sockets / WebSocket: check socket state
             const ws = iface.websocket || iface.socket;
             return ws && (ws.readyState === 1 || (ws.readable && ws.writable));
@@ -1624,7 +1640,8 @@ const RnsClient = {
      * disconnect() — so it is stored "queued" (waitFor "init") and
      * _dispatchQueued() sends it when the signal fires. It lives in
      * localStorage, so a reload keeps it and the next initialization sends
-     * it. Returns the stored record.
+     * it. After initialization, one sent while the exchange is down is
+     * stored "failed" and never sent. Returns the stored record.
      */
     sendMessage(contact, content) {
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
@@ -1645,6 +1662,18 @@ const RnsClient = {
             }
             console.log(`[retichat] ⏳ Queued for ${contact.destHash.slice(0,8)} until initialization finishes`);
             return queued;
+        }
+        // D3 (James, 2026-09-25): a send is an immediate act; "it should fail
+        // in front of the user and be considered dead". Outside the
+        // initialization hold above, a DM with no exchange to leave through
+        // fails now, and nothing sends it later.
+        if (this._exchangeIsDown()) {
+            const failed = MsgStore.add(contact.destHash, {
+                dir: "out", content, status: "failed",
+                srcHash: this.sendingIdentity().hash, destHash: contact.destHash,
+            });
+            console.warn(`[retichat] ✗ Not sent to ${contact.destHash.slice(0,8)}: the exchange is down`);
+            return failed;
         }
         const outMsg = MsgStore.add(contact.destHash, {
             dir: "out", content, status: "sending",
@@ -1733,17 +1762,20 @@ const RnsClient = {
     /**
      * Upload the propagated copy of a stored outgoing DM: from the fallback
      * timer in _dispatchMessage, and from _flushPropagation for a copy
-     * parked earlier. Nothing goes once the message is proved or
-     * propagated. With no link to upload on — the node's identity is not
-     * known yet, or the attempt closed before establishment — the copy is
-     * parked rather than dropped: "queued", waitFor "propagation",
-     * persisted. The link's next "established" uploads it, and the 30 s
-     * ceiling, which fails only "sending", leaves it alone meanwhile.
+     * parked earlier. Nothing goes once the message is proved, propagated
+     * or failed (D3: a failed send is dead). With no link to upload on —
+     * the node's identity is not known yet, or the attempt closed before
+     * establishment — the copy is parked rather than dropped: "queued",
+     * waitFor "propagation", persisted. The link's next "established"
+     * uploads it, and the 30 s ceiling, which fails only "sending", leaves
+     * it alone meanwhile.
      */
     async _propagateMessage(contact, outMsg) {
         const stored = () => MsgStore.get(contact.destHash).find(m => m.id === outMsg.id);
-        // Gone, proved or propagated: nothing left to upload.
-        const settled = (m) => !m || m.status === "proved" || m.status === "propagated";
+        // Gone, proved or propagated: nothing left to upload. Failed: the
+        // user was shown it failed (a lost batch, _onPacketsLost), and a
+        // copy now would be a re-send of a message they saw fail (D3).
+        const settled = (m) => !m || m.status === "proved" || m.status === "propagated" || m.status === "failed";
         const park = (why) => {
             if (settled(stored())) return;
             MsgStore.update(contact.destHash, outMsg.id, { status: "queued", waitFor: "propagation" });
@@ -1856,6 +1888,7 @@ const RnsClient = {
             contactHash: contact.destHash,
             messageId: outMsg.id,
             onProof: markPropagated,
+            dm: true,
         });
 
         this._rns.sendData(raw, link.attachedInterface);
@@ -1886,6 +1919,41 @@ const RnsClient = {
         if (msg?.status !== "sending") return;
         MsgStore.updateStatus(contactHash, msgId, "failed");
         this._onMsg.forEach(fn => fn(null, contactHash));
+    },
+
+    /** True while this connection's exchange is down: its last exchange or
+     *  registration failed and nothing has succeeded since (PostInterface
+     *  isDown). Not while it is still starting, nor after a registration
+     *  whose first exchange has yet to answer. */
+    _exchangeIsDown() {
+        return (this._rns?.interfaces ?? []).some(iface => iface.isDown === true);
+    },
+
+    /**
+     * PostInterface "lost": an exchange failed (or a check abandoned it) and
+     * took these packets with it, or they were sent while it was down. Until
+     * 2026-09-25 they vanished unseen and a DM among them showed "sending"
+     * until the 30 s ceiling. D3: a DM whose packet was lost fails now, in
+     * front of the user, and nothing sends it again — a failed record is
+     * settled for the propagated copy (_propagateMessage). The proof entry
+     * stays: the node may have taken the batch before the exchange failed,
+     * and a proof that still arrives is the truth and outranks the failure.
+     * Link keepalives, proofs and requests are left to the link protocol.
+     */
+    _onPacketsLost({ packetHashes, reason }) {
+        for (const packetHash of packetHashes) {
+            const pending = this._pendingPacketHashes.get(packetHash.slice(0, 32));
+            if (!pending?.dm) continue;
+            const { contactHash, messageId } = pending;
+            const msg = MsgStore.get(contactHash).find(m => m.id === messageId);
+            if (msg?.status !== "sending") continue;
+            clearTimeout(this._pendingTimeouts.get(messageId));
+            this._pendingTimeouts.delete(messageId);
+            MsgStore.updateStatus(contactHash, messageId, "failed");
+            console.warn(`[retichat] ✗ DM ${messageId.slice(0,8)} to ${contactHash.slice(0,8)} failed: its packet was lost (${reason})`);
+            Harness.event("dm-lost", { to: contactHash.slice(0, 12), id: messageId, reason });
+            this._onMsg.forEach(fn => fn(null, contactHash));
+        }
     },
 
     /**
@@ -2040,7 +2108,7 @@ const RnsClient = {
             const sentPacketHash = dest.send(packed.subarray(LXMessage.DESTINATION_LENGTH));
             if (sentPacketHash) {
                 const truncatedHex = sentPacketHash.slice(0, 16).toString("hex");
-                this._pendingPacketHashes.set(truncatedHex, { contactHash, messageId, onProof });
+                this._pendingPacketHashes.set(truncatedHex, { contactHash, messageId, onProof, dm: true });
             }
         } catch (e) {
             this._pendingTickets.delete(ticket);
@@ -2072,7 +2140,7 @@ const RnsClient = {
             console.log(`[retichat] ✉️ Direct message of ${packed.length} B to ${contactHash.slice(0,8)} — sending as a link packet`);
             const packet = link.send(packed);
             const truncatedHex = packet.packetHash.slice(0, 16).toString("hex");
-            this._pendingPacketHashes.set(truncatedHex, { contactHash, messageId, onProof });
+            this._pendingPacketHashes.set(truncatedHex, { contactHash, messageId, onProof, dm: true });
         }).catch(error => fail("link", error));
     },
 
@@ -2298,9 +2366,12 @@ const RnsClient = {
 
         // Add outgoing message to group store
         const queued = !this._initialized;
+        // D3: outside the initialization hold, a send with the exchange down
+        // fails now and is never sent (see sendMessage).
+        const down = !queued && this._exchangeIsDown();
         const outMsg = GroupMsgStore.add(groupId, queued
             ? { dir: "out", content, status: "queued", waitFor: "init", srcHash: this.ownHash }
-            : { dir: "out", content, status: "sending", srcHash: this.ownHash });
+            : { dir: "out", content, status: down ? "failed" : "sending", srcHash: this.ownHash });
         group.lastActivity = Date.now();
         GroupStore._save();
         if (queued) {
@@ -2308,6 +2379,10 @@ const RnsClient = {
                 throw new Error("Could not store the group message to send when connected (storage full?)");
             }
             console.log(`[retichat] ⏳ Group message for ${groupId.slice(0,8)} queued until initialization finishes`);
+            return outMsg;
+        }
+        if (down) {
+            console.warn(`[retichat] ✗ Group message for ${groupId.slice(0,8)} not sent: the exchange is down`);
             return outMsg;
         }
         return this._dispatchGroupMessage(groupId, outMsg);
@@ -3806,6 +3881,19 @@ const RnsClient = {
     async sendChannelMessage(channelName, content) {
         if (!IdMgr.has) throw new Error("No identity");
 
+        // D3: a post with the exchange down fails now and is never sent
+        // (see sendMessage).
+        if (this._exchangeIsDown()) {
+            const failed = ChannelMsgStore.add(channelName, {
+                dir: "out", content, status: "failed",
+                srcHash: IdMgr.hash,
+            });
+            ChannelStore.touch(channelName);
+            console.warn(`[retichat] ✗ Post to #${channelName} not sent: the exchange is down`);
+            this._onMsg.forEach(fn => fn({kind: "channel-send-complete"}, channelName));
+            return failed;
+        }
+
         // Add outgoing message optimistically
         const outMsg = ChannelMsgStore.add(channelName, {
             dir: "out", content, status: "sending",
@@ -3918,7 +4006,6 @@ const RnsClient = {
 
     disconnect() {
         if (this._annTimer) { clearInterval(this._annTimer); this._annTimer = null; }
-        if (this._monTimer) { clearInterval(this._monTimer); this._monTimer = null; }
         this._pendingTickets.clear();
         this._pendingPacketHashes.clear();
         for (const tid of this._pendingTimeouts.values()) clearTimeout(tid);
@@ -4054,6 +4141,117 @@ function avatarHue(name) {
 }
 
 // =========================================================================
+//  ONE ACTIVE TAB PER IDENTITY (D11)
+// =========================================================================
+/**
+ * Only one tab per identity connects; lib/tab_lock.js has the mechanism. A
+ * tab that finds another active says so and offers "Use here". The tab it
+ * takes over from stops, says it was opened in another tab, and offers the
+ * same. RnsClient.connect() refuses without the lock, so no tab registers
+ * with the exchange before it holds it.
+ *
+ * "Use here" reloads the page with a takeover flag in sessionStorage, and
+ * the reloaded page takes over as it starts. The other tab may have changed
+ * contacts, groups and messages since this one read them into memory, and a
+ * reload reads every store again.
+ */
+const ActiveTab = {
+    TAKEOVER_KEY: "retichat_takeover",
+    _lock: null,
+    _connect: null,
+    _overlay: null,
+
+    /** This tab holds the identity's lock (or runs where it cannot be arbitrated). */
+    get held() { return this._lock?.held ?? false; },
+
+    /** Run `connect` once this tab is the active tab for the identity. */
+    async start(connect) {
+        this._connect = connect;
+        this._lock = new TabLock(`retichat:tab:${IdMgr.hash}`, { onTakenOver: () => this._takenOver() });
+        let takeover = false;
+        try {
+            takeover = sessionStorage.getItem(this.TAKEOVER_KEY) === "1";
+            sessionStorage.removeItem(this.TAKEOVER_KEY);
+        } catch (e) {}
+        if (takeover) this._show("taking-over");
+        const held = takeover ? await this._lock.takeOver() : await this._lock.tryAcquire();
+        if (!held) {
+            console.log("[retichat] Retichat is active in another tab — this tab does not connect");
+            Harness.event("tab", { state: "blocked" });
+            this._show("blocked");
+            return;
+        }
+        await this._activate();
+    },
+
+    /** The "Use here" button, in every state of the pop-up. */
+    async useHere() {
+        // Already queued for the lock ("Taking over…"): ask the active tab
+        // again. Its first request can go unheard — two tabs pressed at once
+        // and this one's reached the other before the lock did, or the
+        // active tab never handled it — and only the active tab letting go
+        // ends the wait.
+        if (this._lock?.waiting) {
+            this._lock.takeOver();
+            return;
+        }
+        try {
+            sessionStorage.setItem(this.TAKEOVER_KEY, "1");
+            location.reload();
+            return;
+        } catch (e) {
+            // No sessionStorage to carry the flag across a reload: take over in place.
+        }
+        this._show("taking-over");
+        if (await this._lock.takeOver()) await this._activate();
+    },
+
+    async _activate() {
+        this._hide();
+        console.log("[retichat] This tab is the active tab for its identity");
+        Harness.event("tab", { state: "active" });
+        try { await this._connect(); } catch (e) { console.error("RNS connect failed", e); }
+    },
+
+    /** TabLock onTakenOver: stop exchanging before the lock is released. */
+    _takenOver() {
+        console.log("[retichat] Retichat was opened in another tab — stopping here");
+        RnsClient.disconnect();
+        Harness.event("tab", { state: "taken-over" });
+        this._show("taken-over");
+    },
+
+    _show(kind) {
+        // Every state keeps "Use here": while taking over it asks again (useHere).
+        const [title, text] = {
+            "blocked": ["Retichat is open in another tab",
+                "Only one tab can be connected for this identity at a time. Use it here, and the other tab stops."],
+            "taken-over": ["Retichat was opened in another tab",
+                "This tab has stopped. Use it here, and the other tab stops instead."],
+            "taking-over": ["Taking over from the other tab…",
+                "Waiting for the other tab to stop. If nothing happens, press Use here again."],
+        }[kind];
+        this._hide();
+        const body = h("div", { className: "modal-body" },
+            h("p", { style: { fontSize: "15px", lineHeight: "1.5" } }, text),
+            h("div", { className: "btn-row", style: { marginTop: "20px" } },
+                h("button", { className: "btn btn-primary", onClick: () => this.useHere() }, "Use here")));
+        this._overlay = h("div", { className: "modal-overlay", style: { zIndex: 10001 }, "data-tab-state": kind },
+            h("div", { className: "modal-sheet", role: "alertdialog" },
+                h("div", { className: "modal-header" }, h("h2", {}, title)),
+                body));
+        // The overlay covers the composer; keystrokes must not reach it either.
+        document.activeElement?.blur?.();
+        document.body.appendChild(this._overlay);
+    },
+
+    _hide() {
+        this._overlay?.remove();
+        this._overlay = null;
+    },
+};
+
+// =========================================================================
 //  APP STATE
 // =========================================================================
 const App = {
@@ -4094,9 +4292,9 @@ const App = {
         GroupStore.migrateOwnMemberHash();
         this.state.view = "main";
         this.render();
-        try { await RnsClient.connect(); } catch(e) { console.error("RNS connect failed", e); }
         this._wire();
         this._listenResize();
+        await ActiveTab.start(() => RnsClient.connect());
     },
 
     _listenResize() {
@@ -5108,8 +5306,8 @@ const App = {
     async _enterApp() {
         this.state.view = "main";
         this.render();
-        try { await RnsClient.connect(); } catch(e) { console.error(e); }
         this._wire();
+        await ActiveTab.start(() => RnsClient.connect());
     },
 
     // ===== MODALS =====
@@ -6355,6 +6553,12 @@ window.RetichatTest = {
     registerDistro() { return RnsClient._registerDistro(); },
     pullDistro() { return RnsClient._pullDistroMessages(); },
 
+    // ---- One active tab (D11) ----
+    /** "active" when this tab holds the identity's lock, else "inactive". */
+    tab() { return ActiveTab.held ? "active" : "inactive"; },
+    /** Press "Use here" (reloads the page, which then takes over). */
+    useHere() { return ActiveTab.useHere(); },
+
     help() {
         console.log(`
 RetichatTest commands:
@@ -6373,6 +6577,8 @@ Harness (headless):
   .addPeer(h,pk)  — seed a peer's public key
   .distro()       — distro identity state
   .generateDistro() / .adoptDistro(privHex) / .pullDistro()
+  .tab()          — "active" | "inactive" (one active tab per identity)
+  .useHere()      — take over from the active tab (reloads this one)
         `);
     },
 
@@ -6384,6 +6590,8 @@ Harness (headless):
             lxmfDest: RnsClient._lxmfRouter?.destination?.hash?.toString("hex"),
             interface: RnsClient._rns?.interfaces?.[0]?._interfaceId?.slice(0,12),
             registered: RnsClient._rns?.interfaces?.[0]?.isRegistered,
+            exchange: RnsClient._rns?.interfaces?.[0]?.isUp ? "up" : RnsClient._rns?.interfaces?.[0]?.isDown ? "down" : "starting",
+            tab: ActiveTab.held ? "active" : "inactive",
             contacts: ContactStore.getAll().length,
             // Link state per RFed aspect, and anything parked waiting for the
             // next announce. A failed link used to be invisible; this is the
@@ -6434,6 +6642,7 @@ Harness (headless):
         try {
             const stored = RnsClient.sendMessage(contact, content || 'E2E test ' + Date.now());
             if (stored.status === 'queued') return 'Queued — sends when initialization finishes';
+            if (stored.status === 'failed') return 'Failed — the exchange is down';
             return 'Sent — check console';
         } catch(e) {
             console.error('Send failed:', e.message);
