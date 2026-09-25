@@ -500,6 +500,49 @@ const DistroSeen = {
 DistroSeen.init();
 
 // =========================================================================
+//  LXMF MESSAGE DEDUPE
+//
+//  A DM whose direct delivery is not proved in time is also propagated, and
+//  since 2026-09-24 the propagated copy is the same LXMF message — same
+//  timestamp, title, content and fields, so the same message hash — from
+//  every client (_propagateMessage here, LXMF-rust propagated_copy on
+//  Android and iOS). A recipient can get both: direct, then from the node
+//  on its next fetch. LXMF keeps one (LXMRouter.py has_message, LXMF-rust
+//  lxmf_delivery), and so does this client: every message the router hands
+//  over is keyed on its hash. Persisted, because the propagated copy of a
+//  message received before a reload is still waiting on the node after it.
+//  Bounded: the oldest hashes are dropped past LIMIT.
+// =========================================================================
+const LxmfSeen = {
+    _keys: new Set(),
+    _order: [],
+    LIMIT: 2000,
+
+    init() {
+        const stored = sGet("lxmf_seen");
+        if (Array.isArray(stored)) {
+            this._order = stored.slice(-this.LIMIT);
+            this._keys = new Set(this._order);
+        }
+    },
+
+    /** True if the message hash `hashHex` has been handled before. Records it either way. */
+    check(hashHex) {
+        if (this._keys.has(hashHex)) return true;
+        this._keys.add(hashHex);
+        this._order.push(hashHex);
+        if (this._order.length > this.LIMIT) {
+            for (const k of this._order.splice(0, this._order.length - this.LIMIT)) {
+                this._keys.delete(k);
+            }
+        }
+        sSet("lxmf_seen", this._order);
+        return false;
+    },
+};
+LxmfSeen.init();
+
+// =========================================================================
 //  GROUP STORE — group chat state matching iOS GroupChatManager + ChatRepository
 // =========================================================================
 const GroupStore = {
@@ -875,6 +918,14 @@ const RnsClient = {
         }
         return { identity: IdMgr.id, hash: this.ownHash, isDistro: false };
     },
+    /** The identity whose LXMF delivery hash is `srcHash`, if this client
+     *  still holds it: the current sender, or the device under a distro. */
+    _signerFor(srcHash) {
+        const current = this.sendingIdentity();
+        if (current.hash === srcHash) return current;
+        if (srcHash && srcHash === this.ownHash) return { identity: IdMgr.id, hash: this.ownHash, isDistro: false };
+        return null;
+    },
     get cfg() { return this._cfg || DEFAULT_CONFIG; },
 
     onStatus(fn) { this._onStatus.push(fn); },
@@ -947,6 +998,21 @@ const RnsClient = {
             console.log(`[retichat]   ownHash=${RnsClient.ownHash?.slice(0,12)} msg.destHash=${lxmfMsg.destinationHash?.toString("hex")?.slice(0,12)}`);
 
             if (!srcHash) return;
+
+            // ---- Duplicate message ----
+            // The same LXMF message can arrive twice: direct, then as the
+            // propagated copy fetched from the node (see LxmfSeen). The second
+            // is dropped here, before anything reads it, or a transfer, a group
+            // action, a proof or a bubble would run twice. A message without a
+            // hash cannot be checked and is processed, never dropped.
+            const lxmfHashHex = lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null;
+            if (!lxmfHashHex) {
+                console.log(`[retichat] RX message from ${srcHash.slice(0,12)} has no LXMF hash — processed without the duplicate check`);
+            } else if (LxmfSeen.check(lxmfHashHex)) {
+                console.log(`[retichat] ↩︎ duplicate LXMF message ${lxmfHashHex.slice(0,12)} from ${srcHash.slice(0,12)} ignored`);
+                Harness.event("lxmf-dup", { src: srcHash.slice(0, 12), hash: lxmfHashHex.slice(0, 12) });
+                return;
+            }
 
             // ---- Distro identity transfer detection ----
             // FIELD_CUSTOM_TYPE == "rfed.distro.transfer", key in
@@ -1496,8 +1562,11 @@ const RnsClient = {
                     const content = Buffer.from(contentBin || []).toString();
                     console.log(`[retichat] 📬 [3/4] ✅ ${tidHex} from ${srcHash.toString("hex").slice(0,12)}: "${content.slice(0,60)}"`);
 
+                    // The hash the router gives the same message on the direct
+                    // paths, so a copy of one already received is recognised.
                     this._lxmfRouter.emit("message", {
                         sourceHash: srcHash, destinationHash: destHash,
+                        hash: LXMessage.hashOf(destHash, srcHash, payloadBytes),
                         title: Buffer.from(titleBin || []).toString(),
                         content, fields: fieldsMap, timestamp: ts,
                     });
@@ -1598,7 +1667,21 @@ const RnsClient = {
         MsgStore.update(contact.destHash, outMsg.id, { status: "sending", srcHash: this.sendingIdentity().hash });
         if (outMsg.status !== "sending") this._onMsg.forEach(fn => fn(null, contact.destHash));
 
+        // The propagated copy goes once: at once when the direct attempt
+        // fails (as on Android and iOS, a DIRECT failure starts the copy and
+        // is not the bubble's outcome), otherwise after the propagation delay
+        // if no proof came. Until 2026-09-24 a direct failure showed the
+        // message failed while its copy was still to go.
+        let propagationStarted = false;
+        const propagate = () => {
+            if (propagationStarted) return;
+            propagationStarted = true;
+            this._propagateMessage(contact, outMsg).catch(error =>
+                console.warn(`[retichat] ⚠️ Propagation for ${contact.destHash.slice(0,8)} failed:`, error.message));
+        };
+
         // Send directly to the destination (skip for distro — always use propagation)
+        let directDispatched = false;
         if (!contact.isDistro) {
             this._sendPacket(contact.destHash, contact.publicKey, content, outMsg.id,
                 (msgId) => {
@@ -1609,11 +1692,15 @@ const RnsClient = {
                     this._onMsg.forEach(fn => fn(null, contact.destHash));
                 },
                 (msgId) => {
-                    // Direct send error. A copy parked for the propagation
-                    // link, or a delivery already made, outranks it.
-                    this._failSending(contact.destHash, msgId);
+                    // Direct send error after the dispatch returned (the
+                    // link or resource failed): the copy goes now. One that
+                    // throws out of _sendPacket never left, and fails as
+                    // before (see the §17.11 note below).
+                    if (directDispatched) propagate();
+                    else this._failSending(contact.destHash, msgId);
                 }
             );
+            directDispatched = true;
         }
 
         // RFed SPEC §17.11: a message sent AS the distro is also copied to the
@@ -1637,10 +1724,7 @@ const RnsClient = {
 
         // After propagation delay, if no direct proof, also send to propagation node
         const delaySec = ContactStore.propagationDelay(contact.destHash);
-        setTimeout(() => {
-            this._propagateMessage(contact, outMsg).catch(error =>
-                console.warn(`[retichat] ⚠️ Propagation for ${contact.destHash.slice(0,8)} failed:`, error.message));
-        }, delaySec * 1000);
+        setTimeout(propagate, delaySec * 1000);
 
         // 30-second total timeout — mark as failed if no proof at all
         this._armSendCeiling(contact.destHash, outMsg.id);
@@ -1689,12 +1773,26 @@ const RnsClient = {
         const contactPeerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
         const contactDest = this._rns.registerDestination(contactPeerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
         const FIELD_TICKET = 0x0C;
-        const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
+        // The copy is the direct message itself: its timestamp and ticket
+        // from the record (_sendPacket), with the same title, content and
+        // fields, give it the same LXMF hash, so a recipient that got the
+        // direct message drops this one as a duplicate (LxmfSeen). Until
+        // 2026-09-24 the copy had its own timestamp and ticket — a second
+        // message — and a recipient that got both showed it twice. A record
+        // never sent direct (a distro address) has neither and gets its own.
+        // Signed by the identity the direct message was signed with: the
+        // source is part of the hash, and a parked copy can wait across a
+        // distro being imported or removed. If that identity is gone, the
+        // copy is a new message from the current sender.
+        const record = stored();
+        const sender = this._signerFor(record.srcHash) ?? this.sendingIdentity();
+        const sameMessage = sender.hash === record.srcHash;
+        const ticket = (sameMessage && record.lxmfTicket) || Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
 
-        const sender = this.sendingIdentity();
         const msg = new LXMessage();
         msg.sourceHash = Buffer.from(sender.hash, "hex");
         msg.destinationHash = contactDest.hash;
+        if (sameMessage && typeof record.lxmfTimestamp === "number") msg.timestamp = record.lxmfTimestamp;
         msg.title = "";
         msg.content = outMsg.content;
         msg.fields = new Map();
@@ -1920,6 +2018,10 @@ const RnsClient = {
         // whole. Reference: LXMessage.py __as_packet / __as_resource.
         const packed = msg.pack(sender.identity, false);
         const plan = LXMessage.deliveryPlan(packed);
+        // Kept on the record, so the propagated copy (_propagateMessage) —
+        // one parked across a reload too — is rebuilt as this same message
+        // with this same hash, and a recipient that gets both keeps one.
+        MsgStore.update(contactHash, messageId, { lxmfTimestamp: msg.timestamp, lxmfTicket: ticket });
 
         this._pendingTickets.set(ticket, { contactHash, messageId, onProof });
 

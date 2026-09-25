@@ -277,7 +277,7 @@ test("a registration from an interface disconnect() stopped does not initialize 
 // ── C: the propagated copy is parked, never dropped ─────────────────────────
 
 const PROPAGATION_METHODS = [
-    "async _propagateMessage(contact, outMsg)", "async _flushPropagation()",
+    "async _propagateMessage(contact, outMsg)", "async _flushPropagation()", "_signerFor(srcHash)",
     "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
 ];
 
@@ -423,6 +423,47 @@ test("a direct failure after the copy was parked leaves it parked for the flush"
     directFailed();
     assert.deepEqual(c.MsgStore.get(alice.destHash).map((r) => [r.status, r.waitFor]), [["queued", "propagation"]],
         "a failed flag here would make the flush skip it, and the copy would be lost");
+});
+
+test("a direct failure starts the copy at once, once, and does not show the message failed", async () => {
+    // As on Android and iOS: the DIRECT failure is not the bubble's outcome,
+    // the copy is. Until 2026-09-24 the web client showed ✗ and only sent
+    // the copy when the propagation delay ran out.
+    const alice = contactFor(peer);
+    const c = makePropagationClient({ nodeKnown: true, contacts: [alice] });
+    c.self._dispatchMessage = compile("_dispatchMessage(contact, outMsg)", {
+        MsgStore: c.MsgStore, ContactStore: { propagationDelay: () => 5, setReachable() {} }, Harness: {},
+        console: { log() {}, warn() {} }, setTimeout: (fn, ms) => { c.timers.push({ fn, ms }); return c.timers.length; },
+    })(c.self);
+    const started = [];
+    c.self._propagateMessage = async (contact, msg) => { started.push(msg.id); };
+    let directFailed;
+    c.self._sendPacket = (hash, key, content, id, onProof, onError) => { directFailed = () => onError(id); };
+    const m = sendingRecord(c, alice, "the link failed");
+    c.self._dispatchMessage(alice, m);
+    directFailed();
+    assert.deepEqual(started, [m.id], "the copy went at the failure, not after the delay");
+    assert.equal(c.MsgStore.get(alice.destHash)[0].status, "sending", "not shown failed while the copy goes");
+    await c.timers.find((t) => t.ms === 5000).fn();
+    assert.deepEqual(started, [m.id], "the delay does not send a second copy");
+});
+
+test("a direct send that throws is failed and sends no copy, as before", () => {
+    // It never left: the error reaches the composer, and the §17.11 rule
+    // (a send that throws never leaves) holds.
+    const alice = contactFor(peer);
+    const c = makePropagationClient({ nodeKnown: true, contacts: [alice] });
+    c.self._dispatchMessage = compile("_dispatchMessage(contact, outMsg)", {
+        MsgStore: c.MsgStore, ContactStore: { propagationDelay: () => 5, setReachable() {} }, Harness: {},
+        console: { log() {}, warn() {} }, setTimeout: (fn, ms) => { c.timers.push({ fn, ms }); return c.timers.length; },
+    })(c.self);
+    const started = [];
+    c.self._propagateMessage = async (contact, msg) => { started.push(msg.id); };
+    c.self._sendPacket = (hash, key, content, id, onProof, onError) => { onError(id); throw new Error("send refused"); };
+    const m = sendingRecord(c, alice, "refused at once");
+    assert.throws(() => c.self._dispatchMessage(alice, m), /send refused/);
+    assert.equal(c.MsgStore.get(alice.destHash)[0].status, "failed");
+    assert.deepEqual(started, []);
 });
 
 test("a propagation proof never downgrades a direct proof", async () => {
