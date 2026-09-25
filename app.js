@@ -436,6 +436,13 @@ const MsgStore = {
         if (m) { m.status = newStatus; sSet("msg_"+hash, msgs); }
         return m;
     },
+    /** Merge `changes` (status, waitFor, …) into a stored message and persist it. */
+    update(hash, msgId, changes) {
+        const msgs = this.get(hash);
+        const m = msgs.find(x => x.id === msgId);
+        if (m) { Object.assign(m, changes); sSet("msg_"+hash, msgs); }
+        return m;
+    },
     remove(hash) {
         sSet("msg_"+hash, []);
     },
@@ -654,6 +661,13 @@ const GroupMsgStore = {
         if (m) { m.status = newStatus; sSet("gmsg_"+groupId, msgs); }
         return m;
     },
+    /** Merge `changes` (status, waitFor, …) into a stored message and persist it. */
+    update(groupId, msgId, changes) {
+        const msgs = this.get(groupId);
+        const m = msgs.find(x => x.id === msgId);
+        if (m) { Object.assign(m, changes); sSet("gmsg_"+groupId, msgs); }
+        return m;
+    },
     addSystem(groupId, text) {
         return this.add(groupId, { dir: "system", content: text, status: "delivered" });
     },
@@ -827,6 +841,11 @@ const RnsClient = {
     _pendingTickets: new Map(),  // ticket → {contactHash, messageId}
     _pendingPacketHashes: new Map(),  // provedPacketHash (hex) → {contactHash, messageId}
     _pendingTimeouts: new Map(),  // messageId → timeoutId
+    // The initialization-complete signal (DESIGN_PRINCIPLES §5): false until
+    // this connection's exchange interface has registered, reset by
+    // disconnect(). A DM or group message sent before it is stored "queued"
+    // (waitFor "init") and dispatched by _dispatchQueued() when it flips.
+    _initialized: false,
     _onStatus: [], _onMsg: [],
 
     get status() { return this._status; },
@@ -907,7 +926,11 @@ const RnsClient = {
             this._cfg.exchangeUrl,
             IdMgr.hash
         );
-        iface.on("registered", () => this._onExchangeRegistered());
+        // A registration that lands after disconnect() belongs to the stopped
+        // interface; it must not initialize this connection.
+        iface.on("registered", () => {
+            if (this._rns?.interfaces?.includes(iface)) this._onExchangeRegistered();
+        });
         this._rns.addInterface(iface);
         this._connType = "exchange";
 
@@ -1285,8 +1308,8 @@ const RnsClient = {
             this._propLinkReject = null;
             const upWaiters = this._propLinkUpWaiters.splice(0);
             upWaiters.forEach(waiter => waiter.resolve(link));
-            // Flush any messages that missed the propagation window while
-            // the link was still being established.
+            // Propagate the copies parked while there was no link to upload
+            // on (_propagateMessage), including ones parked before a reload.
             this._flushPropagation();
             // Identify ourselves so the PN can authorize /get requests.
             // Small delay to let the link settle before sending.
@@ -1318,6 +1341,15 @@ const RnsClient = {
         });
 
         link.on("close", () => {
+            if (this._propLink !== link) {
+                // A superseded link: a STALE one replaced by a new attempt
+                // (this function overwrites _propLink), or one disconnect()
+                // or _retryPropagationLink closed. The attempt, the link and
+                // the retry are the current link's; the same guard as
+                // "recovered" above.
+                console.log("[retichat] Superseded propagation link closed");
+                return;
+            }
             console.log("[retichat] Propagation link closed");
             this._propLinkReject?.(new Error("Propagation link closed before establishment"));
             this._propLinkPromise = null;
@@ -1333,82 +1365,51 @@ const RnsClient = {
         console.log(`[retichat] 🔗 Establishing propagation link to ${this._cfg.propagationNodeHash.slice(0,12)}...`);
     },
 
-    /** Flush any pending messages that need propagation now that the link is up. */
+    /**
+     * Propagate the DMs whose propagated copy was parked because the link
+     * was unavailable when their fallback fired (_propagateMessage: status
+     * "queued", waitFor "propagation"). Runs from the link's "established"
+     * handler. Parked records are persisted, so ones parked before a reload
+     * go too. A record that was proved, propagated or failed meanwhile is
+     * skipped, and one still "sending" is never touched: it is inside its
+     * direct window or already being propagated by its own fallback, and a
+     * second upload from here would deliver it twice.
+     */
     async _flushPropagation() {
         const link = this._propLink;
         if (!link || link.status !== Link.ACTIVE) return;
 
-        // Track which messages we've already propagated to avoid double-sends
-        if (!this._propagatedMsgIds) this._propagatedMsgIds = new Set();
-
-        for (const [contactHash, msgs] of MsgStore._messages || []) {
-            const contact = ContactStore.get(contactHash);
-            if (!contact || !contact.publicKey) continue;
-            for (const msg of msgs) {
-                if (msg.dir !== "out" || msg.status !== "sending") continue;
-                if (this._propagatedMsgIds.has(msg.id)) continue;
-                this._propagatedMsgIds.add(msg.id);
-
-                console.log(`[retichat] 📡 Flush propagation for ${contactHash.slice(0,8)} msg=${msg.id.slice(0,8)}`);
-
-                // Build LXMF message addressed to the contact
-                const contactPeerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
-                const contactDest = this._rns.registerDestination(contactPeerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
-                const FIELD_TICKET = 0x0C;
-                const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
-
-                const sender = this.sendingIdentity();
-                const lxmfMsg = new LXMessage();
-                lxmfMsg.sourceHash = Buffer.from(sender.hash, "hex");
-                lxmfMsg.destinationHash = contactDest.hash;
-                lxmfMsg.title = "";
-                lxmfMsg.content = msg.content;
-                lxmfMsg.fields = new Map();
-                lxmfMsg.fields.set(FIELD_TICKET, ticket);
-                // Non-opportunistic: dest_hash at offset 0 for propagation node to read
-                const packed = lxmfMsg.pack(sender.identity, false);
-
-                // Build and send propagation_packed
-                try {
-                    const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
-                    const markPropagated = () => {
-                        MsgStore.updateStatus(contactHash, msg.id, "propagated");
-                        console.log(`[retichat] ✓ Propagation proof for ${contactHash.slice(0,8)}`);
-                        this._onMsg.forEach(fn => fn(null, contactHash));
-                    };
-                    // Same rule as the live send path: over the MDU the upload
-                    // is a Resource on the propagation link (LXMF/LXMRouter.py).
-                    if (propagationPacked.length > Link.MDU) {
-                        console.log(`[retichat] 📡 Propagation flush of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
-                        link.sendResource(propagationPacked)
-                            .then(markPropagated)
-                            .catch(error => console.warn(`[retichat] Propagation resource flush failed for ${contactHash.slice(0,8)}:`, error.message));
-                        continue;
-                    }
-                    const pkt = new Packet();
-                    pkt.headerType = Packet.HEADER_1;
-                    pkt.packetType = Packet.DATA;
-                    pkt.transportType = 0;
-                    pkt.context = Packet.NONE;
-                    pkt.contextFlag = Packet.FLAG_UNSET;
-                    pkt.destination = link;
-                    pkt.destinationHash = link.hash;
-                    pkt.destinationType = Destination.LINK;
-                    pkt.data = propagationPacked;
-                    const raw = pkt.pack();
-
-                    const truncatedHex = pkt.packetHash.slice(0, 16).toString("hex");
-                    this._pendingPacketHashes.set(truncatedHex, {
-                        contactHash: contactHash,
-                        messageId: msg.id,
-                        onProof: markPropagated,
-                    });
-
-                    this._rns.sendData(raw, link.attachedInterface);
-                    console.log(`[retichat] 📡 Flushed propagation for ${contactHash.slice(0,8)}`);
-                } catch (e) {
-                    console.warn(`[retichat] Propagation flush failed for ${contactHash.slice(0,8)}:`, e.message);
-                }
+        const parked = [];
+        for (const contact of ContactStore.getAll()) {
+            for (const msg of MsgStore.get(contact.destHash)) {
+                if (msg.dir === "out" && msg.waitFor === "propagation") parked.push({ contact, msg });
+            }
+        }
+        parked.sort((a, b) => a.msg.timestamp - b.msg.timestamp);
+        for (const { contact, msg } of parked) {
+            // Only while the link that fired "established" is up. Once it has
+            // closed or been replaced, the rest stay parked for the next
+            // "established": uploading them now would start a link attempt
+            // per record (_propagateMessage), a retry loop (§3).
+            if (this._propLink !== link || link.status !== Link.ACTIVE) {
+                console.log(`[retichat] ⏳ Propagation link gone mid-flush — the remaining parked copies wait for the next one`);
+                break;
+            }
+            // Re-read: a proof, or a flush from a later "established", may
+            // have settled or claimed it while an earlier upload was mined.
+            const stored = MsgStore.get(contact.destHash).find(m => m.id === msg.id);
+            if (stored?.waitFor !== "propagation") continue;
+            if (stored.status === "proved" || stored.status === "propagated" || stored.status === "failed") continue;
+            // Claimed and persisted before the upload, so neither a second
+            // "established" nor a reload can propagate it again.
+            MsgStore.update(contact.destHash, msg.id, { status: "sending", waitFor: null });
+            this._onMsg.forEach(fn => fn(null, contact.destHash));
+            this._armSendCeiling(contact.destHash, msg.id);
+            console.log(`[retichat] 📡 Flush propagation for ${contact.destHash.slice(0,8)} msg=${msg.id.slice(0,8)}`);
+            try {
+                await this._propagateMessage(contact, stored);
+            } catch (e) {
+                console.warn(`[retichat] Propagation flush failed for ${contact.destHash.slice(0,8)}:`, e.message);
             }
         }
     },
@@ -1546,34 +1547,71 @@ const RnsClient = {
         });
     },
 
+    /**
+     * Send a DM. The record is stored first, whatever the connection is
+     * doing. Until initialization has finished (_initialized: this
+     * connection's exchange interface has registered) there is nothing to
+     * send it through — before connect(), during loadConfig(), after
+     * disconnect() — so it is stored "queued" (waitFor "init") and
+     * _dispatchQueued() sends it when the signal fires. It lives in
+     * localStorage, so a reload keeps it and the next initialization sends
+     * it. Returns the stored record.
+     */
     sendMessage(contact, content) {
-        if (!this._rns || !this._lxmfRouter) throw new Error("Not connected");
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
 
         console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"`);
 
         // Create the outgoing message record
         ContactStore.touch(contact.destHash);
+        if (!this._initialized) {
+            const queued = MsgStore.add(contact.destHash, {
+                dir: "out", content, status: "queued", waitFor: "init",
+                srcHash: this.sendingIdentity().hash, destHash: contact.destHash,
+            });
+            // sSet swallows a failed write (storage full): a queued message
+            // exists only in storage, so throw and keep it in the composer.
+            if (!MsgStore.get(contact.destHash).some(m => m.id === queued.id)) {
+                throw new Error("Could not store the message to send when connected (storage full?)");
+            }
+            console.log(`[retichat] ⏳ Queued for ${contact.destHash.slice(0,8)} until initialization finishes`);
+            return queued;
+        }
         const outMsg = MsgStore.add(contact.destHash, {
             dir: "out", content, status: "sending",
             srcHash: this.sendingIdentity().hash, destHash: contact.destHash,
         });
+        this._dispatchMessage(contact, outMsg);
+        return outMsg;
+    },
+
+    /**
+     * Dispatch a stored outgoing DM: the direct attempt, the §17.11
+     * sent-copy, the propagation fallback and the 30 s ceiling. Runs once
+     * per user message — from sendMessage once initialized, or from
+     * _dispatchQueued for one queued before that.
+     */
+    _dispatchMessage(contact, outMsg) {
+        const content = outMsg.content;
+        // Signed as whoever sends it now, which a record queued before
+        // connect() could not know.
+        MsgStore.update(contact.destHash, outMsg.id, { status: "sending", srcHash: this.sendingIdentity().hash });
+        if (outMsg.status !== "sending") this._onMsg.forEach(fn => fn(null, contact.destHash));
 
         // Send directly to the destination (skip for distro — always use propagation)
-        let directProofReceived = false;
         if (!contact.isDistro) {
             this._sendPacket(contact.destHash, contact.publicKey, content, outMsg.id,
                 (msgId) => {
                     // Direct proof callback
-                    directProofReceived = true;
                     MsgStore.updateStatus(contact.destHash, msgId, "proved");
                     ContactStore.setReachable(contact.destHash, true);
                     console.log(`[retichat] ✅ Direct proof for ${contact.destHash.slice(0,8)}`);
                     this._onMsg.forEach(fn => fn(null, contact.destHash));
                 },
                 (msgId) => {
-                    // Direct send error
-                    MsgStore.updateStatus(contact.destHash, msgId, "failed");
+                    // Direct send error. A copy parked for the propagation
+                    // link, or a delivery already made, outranks it.
+                    this._failSending(contact.destHash, msgId);
                 }
             );
         }
@@ -1583,10 +1621,11 @@ const RnsClient = {
         // once M's dispatch has returned without throwing — a send that
         // throws never leaves, so siblings must not show it (Android sends
         // after messageSendViaAppLinks accepts M, iOS after M is submitted).
-        // Once per user message: this function runs once per composer send,
-        // and neither the direct attempt, the propagation fallback below nor
-        // _flushPropagation() comes back through it, so a DIRECT attempt plus
-        // a propagated fallback of the same message still yields ONE copy.
+        // Once per user message: this function runs once per composer send
+        // (directly, or from the queue), and neither the direct attempt, the
+        // propagation fallback below nor _flushPropagation() comes back
+        // through it, so a DIRECT attempt plus a propagated fallback of the
+        // same message still yields ONE copy.
         // Fire-and-forget: the copy never touches outMsg's status.
         const sender = this.sendingIdentity();
         if (sender.isDistro && contact.destHash !== sender.hash) {
@@ -1598,112 +1637,201 @@ const RnsClient = {
 
         // After propagation delay, if no direct proof, also send to propagation node
         const delaySec = ContactStore.propagationDelay(contact.destHash);
-        setTimeout(async () => {
-            if (directProofReceived) return;
-            // Wait for the link instead of sampling its status. A distro send
-            // always propagates, so it can reach this point while the link is
-            // still being established (observed: B started its link 6s before
-            // the send and was still handshaking), and dropping here loses the
-            // message outright. _ensurePropagationLink() resolves on the
-            // in-flight attempt rather than starting a competing one.
-            let link;
-            try {
-                link = await this._ensurePropagationLink();
-            } catch (e) {
-                console.log(`[retichat] ⚠️ Propagation link unavailable, cannot propagate: ${e.message}`);
-                return;
-            }
-            const reason = contact.isDistro ? "distro address" : `direct proof not received in ${delaySec}s`;
-            console.log(`[retichat] 📡 Propagating via link to ${this._cfg.propagationNodeHash.slice(0,12)}... (${reason})`);
-
-            // Build LXMF message addressed to the contact's delivery destination
-            const contactPeerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
-            const contactDest = this._rns.registerDestination(contactPeerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
-            const FIELD_TICKET = 0x0C;
-            const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
-
-            const sender = this.sendingIdentity();
-            const msg = new LXMessage();
-            msg.sourceHash = Buffer.from(sender.hash, "hex");
-            msg.destinationHash = contactDest.hash;
-            msg.title = "";
-            msg.content = content;
-            msg.fields = new Map();
-            msg.fields.set(FIELD_TICKET, ticket);
-            // Pack non-opportunistic so destinationHash is at offset 0.
-            // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
-            // to identify the final recipient.
-            const packed = msg.pack(sender.identity, false);
-
-            // Build propagation_packed: msgpack([timestamp, [[dest_hash | EC_encrypted(rest) | stamp]]])
-            const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
-            const markPropagated = () => {
-                if (!directProofReceived) {
-                    MsgStore.updateStatus(contact.destHash, outMsg.id, "propagated");
-                    console.log(`[retichat] ✓ Propagation proof for ${contact.destHash.slice(0,8)}`);
-                    this._onMsg.forEach(fn => fn(null, contact.destHash));
-                }
-            };
-            // LXMF/LXMRouter.py propagation transfer: an upload that fits one
-            // link packet is a packet, anything larger is a Resource on the
-            // propagation link, and the resource's own proof is the evidence.
-            // Until 2026-09-22 every upload was built as one packet, whose
-            // pack() threw over the MDU inside this timer — silently, so a
-            // long message to a distro address never left the browser.
-            if (propagationPacked.length > Link.MDU) {
-                console.log(`[retichat] 📡 Propagation upload of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
-                link.sendResource(propagationPacked)
-                    .then(markPropagated)
-                    .catch(error => console.warn(`[retichat] ⚠️ Propagation resource failed for ${contact.destHash.slice(0,8)}:`, error.message));
-                if (contact.reachable !== false) {
-                    ContactStore.setReachable(contact.destHash, false);
-                }
-                return;
-            }
-
-            // Build a LINK-type DATA packet. Packet.pack() handles link encryption
-            // via this.destination.encrypt(), so do NOT pre-encrypt here.
-            const pkt = new Packet();
-            pkt.headerType = Packet.HEADER_1;
-            pkt.packetType = Packet.DATA;
-            pkt.transportType = 0;  // BROADCAST
-            pkt.context = Packet.NONE;
-            pkt.contextFlag = Packet.FLAG_UNSET;
-            pkt.destination = link;
-            pkt.destinationHash = link.hash;
-            pkt.destinationType = Destination.LINK;
-            pkt.data = propagationPacked;
-            const raw = pkt.pack();
-
-            // Track packet hash for proof matching
-            const truncatedHex = pkt.packetHash.slice(0, 16).toString("hex");
-            this._pendingPacketHashes.set(truncatedHex, {
-                contactHash: contact.destHash,
-                messageId: outMsg.id,
-                onProof: markPropagated,
-            });
-
-            this._rns.sendData(raw, link.attachedInterface);
-
-            // Mark as likely offline
-            if (contact.reachable !== false) {
-                ContactStore.setReachable(contact.destHash, false);
-            }
+        setTimeout(() => {
+            this._propagateMessage(contact, outMsg).catch(error =>
+                console.warn(`[retichat] ⚠️ Propagation for ${contact.destHash.slice(0,8)} failed:`, error.message));
         }, delaySec * 1000);
 
         // 30-second total timeout — mark as failed if no proof at all
-        const timeoutId = setTimeout(() => {
-            const msgs = MsgStore.get(contact.destHash);
-            const msg = msgs.find(m => m.id === outMsg.id);
-            if (msg && msg.status === "sending") {
-                MsgStore.updateStatus(contact.destHash, outMsg.id, "failed");
-                this._onMsg.forEach(fn => fn(null, contact.destHash));
-            }
-            this._pendingTimeouts.delete(outMsg.id);
-        }, 30000);
-        this._pendingTimeouts.set(outMsg.id, timeoutId);
+        this._armSendCeiling(contact.destHash, outMsg.id);
+    },
 
-        return outMsg;
+    /**
+     * Upload the propagated copy of a stored outgoing DM: from the fallback
+     * timer in _dispatchMessage, and from _flushPropagation for a copy
+     * parked earlier. Nothing goes once the message is proved or
+     * propagated. With no link to upload on — the node's identity is not
+     * known yet, or the attempt closed before establishment — the copy is
+     * parked rather than dropped: "queued", waitFor "propagation",
+     * persisted. The link's next "established" uploads it, and the 30 s
+     * ceiling, which fails only "sending", leaves it alone meanwhile.
+     */
+    async _propagateMessage(contact, outMsg) {
+        const stored = () => MsgStore.get(contact.destHash).find(m => m.id === outMsg.id);
+        // Gone, proved or propagated: nothing left to upload.
+        const settled = (m) => !m || m.status === "proved" || m.status === "propagated";
+        const park = (why) => {
+            if (settled(stored())) return;
+            MsgStore.update(contact.destHash, outMsg.id, { status: "queued", waitFor: "propagation" });
+            console.log(`[retichat] ⏳ Propagation link unavailable (${why}) — ${contact.destHash.slice(0,8)} msg=${outMsg.id.slice(0,8)} parked until it is established`);
+            this._onMsg.forEach(fn => fn(null, contact.destHash));
+        };
+        if (settled(stored())) return;
+        // Wait for the link instead of sampling its status. A distro send
+        // always propagates, so it can reach this point while the link is
+        // still being established (observed: B started its link 6s before
+        // the send and was still handshaking), and dropping here loses the
+        // message outright. _ensurePropagationLink() resolves on the
+        // in-flight attempt rather than starting a competing one.
+        let link;
+        try {
+            link = await this._ensurePropagationLink();
+        } catch (e) {
+            park(e.message);
+            return;
+        }
+        // A direct proof may have landed while the link came up.
+        if (settled(stored())) return;
+        const reason = contact.isDistro ? "distro address" : "no direct proof";
+        console.log(`[retichat] 📡 Propagating via link to ${this._cfg.propagationNodeHash.slice(0,12)}... (${reason})`);
+
+        // Build LXMF message addressed to the contact's delivery destination
+        const contactPeerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
+        const contactDest = this._rns.registerDestination(contactPeerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+        const FIELD_TICKET = 0x0C;
+        const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
+
+        const sender = this.sendingIdentity();
+        const msg = new LXMessage();
+        msg.sourceHash = Buffer.from(sender.hash, "hex");
+        msg.destinationHash = contactDest.hash;
+        msg.title = "";
+        msg.content = outMsg.content;
+        msg.fields = new Map();
+        msg.fields.set(FIELD_TICKET, ticket);
+        // Pack non-opportunistic so destinationHash is at offset 0.
+        // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
+        // to identify the final recipient.
+        const packed = msg.pack(sender.identity, false);
+
+        // Build propagation_packed: msgpack([timestamp, [[dest_hash | EC_encrypted(rest) | stamp]]])
+        const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
+        // Mining the stamp yields, and can take seconds: a direct proof may
+        // have landed, or the link closed, meanwhile. An upload onto a closed
+        // link is never proved, so the copy is parked for the next one.
+        if (settled(stored())) return;
+        if (link.status !== Link.ACTIVE) {
+            park("the link closed while the stamp was mined");
+            return;
+        }
+        const markPropagated = () => {
+            // Delivery outranks everything: a direct proof keeps its ✓✓.
+            if (stored()?.status === "proved") return;
+            MsgStore.updateStatus(contact.destHash, outMsg.id, "propagated");
+            console.log(`[retichat] ✓ Propagation proof for ${contact.destHash.slice(0,8)}`);
+            this._onMsg.forEach(fn => fn(null, contact.destHash));
+        };
+        // LXMF/LXMRouter.py propagation transfer: an upload that fits one
+        // link packet is a packet, anything larger is a Resource on the
+        // propagation link, and the resource's own proof is the evidence.
+        // Until 2026-09-22 every upload was built as one packet, whose
+        // pack() threw over the MDU inside the fallback timer — silently, so a
+        // long message to a distro address never left the browser.
+        if (propagationPacked.length > Link.MDU) {
+            console.log(`[retichat] 📡 Propagation upload of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
+            link.sendResource(propagationPacked)
+                .then(markPropagated)
+                .catch(error => console.warn(`[retichat] ⚠️ Propagation resource failed for ${contact.destHash.slice(0,8)}:`, error.message));
+            if (contact.reachable !== false) {
+                ContactStore.setReachable(contact.destHash, false);
+            }
+            return;
+        }
+
+        // Build a LINK-type DATA packet. Packet.pack() handles link encryption
+        // via this.destination.encrypt(), so do NOT pre-encrypt here.
+        const pkt = new Packet();
+        pkt.headerType = Packet.HEADER_1;
+        pkt.packetType = Packet.DATA;
+        pkt.transportType = 0;  // BROADCAST
+        pkt.context = Packet.NONE;
+        pkt.contextFlag = Packet.FLAG_UNSET;
+        pkt.destination = link;
+        pkt.destinationHash = link.hash;
+        pkt.destinationType = Destination.LINK;
+        pkt.data = propagationPacked;
+        const raw = pkt.pack();
+
+        // Track packet hash for proof matching
+        const truncatedHex = pkt.packetHash.slice(0, 16).toString("hex");
+        this._pendingPacketHashes.set(truncatedHex, {
+            contactHash: contact.destHash,
+            messageId: outMsg.id,
+            onProof: markPropagated,
+        });
+
+        this._rns.sendData(raw, link.attachedInterface);
+
+        // Mark as likely offline
+        if (contact.reachable !== false) {
+            ContactStore.setReachable(contact.destHash, false);
+        }
+    },
+
+    /** The 30 s ceiling on a DM send: a record still "sending" when it
+     *  expires has failed. Re-arming (a parked copy being flushed) replaces
+     *  the earlier ceiling. */
+    _armSendCeiling(contactHash, msgId) {
+        clearTimeout(this._pendingTimeouts.get(msgId));
+        const timeoutId = setTimeout(() => {
+            this._pendingTimeouts.delete(msgId);
+            this._failSending(contactHash, msgId);
+        }, 30000);
+        this._pendingTimeouts.set(msgId, timeoutId);
+    },
+
+    /** Fail a DM send that is still "sending". Anything else outranks the
+     *  failure: a delivery (proved, propagated), or a copy parked for the
+     *  propagation link ("queued"), which _flushPropagation still sends. */
+    _failSending(contactHash, msgId) {
+        const msg = MsgStore.get(contactHash).find(m => m.id === msgId);
+        if (msg?.status !== "sending") return;
+        MsgStore.updateStatus(contactHash, msgId, "failed");
+        this._onMsg.forEach(fn => fn(null, contactHash));
+    },
+
+    /**
+     * Dispatch every message stored "queued" until initialization finished
+     * (waitFor "init"): DMs and group messages, oldest first. Each record is
+     * claimed — waitFor cleared and persisted — before it is dispatched, so
+     * a second "registered" (a 401 re-registration) or a reload mid-dispatch
+     * cannot send it twice. A DM whose contact has no public key stays
+     * queued for the next initialization.
+     */
+    _dispatchQueued() {
+        const queued = [];
+        const isQueued = (m) => m.dir === "out" && m.status === "queued" && m.waitFor === "init";
+        for (const contact of ContactStore.getAll()) {
+            for (const msg of MsgStore.get(contact.destHash).filter(isQueued)) {
+                queued.push({ msg, dispatch: () => {
+                    if (!contact.publicKey) {
+                        console.warn(`[retichat] ⏳ Queued message ${msg.id.slice(0,8)} to ${contact.destHash.slice(0,8)} stays queued: no public key for this contact yet`);
+                        return;
+                    }
+                    MsgStore.update(contact.destHash, msg.id, { waitFor: null });
+                    this._dispatchMessage(contact, msg);
+                }});
+            }
+        }
+        for (const group of GroupStore.getAll()) {
+            for (const msg of GroupMsgStore.get(group.groupId).filter(isQueued)) {
+                queued.push({ msg, dispatch: () => {
+                    GroupMsgStore.update(group.groupId, msg.id, { waitFor: null });
+                    this._dispatchGroupMessage(group.groupId, msg).catch(error =>
+                        console.warn(`[retichat] 👥 Queued group send to ${group.groupId.slice(0,8)} failed:`, error.message));
+                }});
+            }
+        }
+        if (queued.length) console.log(`[retichat] ⏳ Initialization finished — dispatching ${queued.length} queued message(s)`);
+        queued.sort((a, b) => a.msg.timestamp - b.msg.timestamp);
+        for (const { msg, dispatch } of queued) {
+            try {
+                dispatch();
+            } catch (error) {
+                console.warn(`[retichat] ⚠️ Queued message ${msg.id.slice(0,8)} failed to dispatch:`, error.message);
+                Harness.error("queued-dispatch", error);
+            }
+        }
     },
 
     /**
@@ -1742,11 +1870,14 @@ const RnsClient = {
         const packed = msg.pack(DistroManager.identity, false);
         const distroPubKey = DistroManager.pubKey;
 
-        // Wait for the propagation link, never start it: its "established"
-        // handler runs _flushPropagation(), which would re-propagate the
-        // original message while its direct attempt is still in flight, and
-        // the recipient would get it twice. The link is kept up by
-        // _initPropagation / _retryPropagationLink and by M's own
+        // Wait for the propagation link, never start it: when M's link comes
+        // up is decided by M's own propagation timer, not by its copy. The
+        // link's "established" handler runs _flushPropagation(), which
+        // uploads only copies _propagateMessage parked (waitFor
+        // "propagation") and never a record still "sending", so starting
+        // the link no longer re-propagates M inside its direct window — the
+        // double delivery this rule first guarded against. The link is kept
+        // up by _initPropagation / _retryPropagationLink and by M's own
         // propagation timer, so the copy rides the next one.
         const link = await this._whenPropagationLinkUp(recipientHex);
         const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
@@ -2056,21 +2187,42 @@ const RnsClient = {
         }
     },
 
-    /** Send a group chat message (fanout to all accepted members). */
+    /** Send a group chat message (fanout to all accepted members). Before
+     *  initialization has finished it is stored "queued" (waitFor "init"),
+     *  like a DM, and _dispatchQueued() fans it out when the signal fires. */
     async sendGroupMessage(groupId, content) {
         const group = GroupStore.get(groupId);
         if (!group) throw new Error("Group not found");
-        const ownHash = this.ownHash;
 
         // Add outgoing message to group store
-        const outMsg = GroupMsgStore.add(groupId, { dir: "out", content, status: "sending", srcHash: ownHash });
+        const queued = !this._initialized;
+        const outMsg = GroupMsgStore.add(groupId, queued
+            ? { dir: "out", content, status: "queued", waitFor: "init", srcHash: this.ownHash }
+            : { dir: "out", content, status: "sending", srcHash: this.ownHash });
         group.lastActivity = Date.now();
         GroupStore._save();
+        if (queued) {
+            if (!GroupMsgStore.get(groupId).some(m => m.id === outMsg.id)) {
+                throw new Error("Could not store the group message to send when connected (storage full?)");
+            }
+            console.log(`[retichat] ⏳ Group message for ${groupId.slice(0,8)} queued until initialization finishes`);
+            return outMsg;
+        }
+        return this._dispatchGroupMessage(groupId, outMsg);
+    },
+
+    /** Fan a stored outgoing group message out to every accepted member. */
+    async _dispatchGroupMessage(groupId, outMsg) {
+        const group = GroupStore.get(groupId);
+        if (!group) return outMsg;
+        const ownHash = this.ownHash;
+        GroupMsgStore.update(groupId, outMsg.id, { status: "sending", srcHash: ownHash });
+        if (outMsg.status !== "sending") this._onMsg.forEach(fn => fn(null, groupId));
 
         const targets = [...group.members.entries()]
             .filter(([hash, status]) => hash !== ownHash && status === "accepted")
             .map(([hash]) => hash);
-        const delivery = await this._fanoutGroupEnvelope(targets, content, {
+        const delivery = await this._fanoutGroupEnvelope(targets, outMsg.content, {
             groupId,
             groupName: group.groupName,
             groupSender: ownHash,
@@ -2470,6 +2622,14 @@ const RnsClient = {
     _onExchangeRegistered() {
         this._announce();
         this._requestPropagationPath();
+        // The first registration after connect() finishes initialization
+        // (§5): messages sent before it were stored "queued" and go now. A
+        // 401 re-registration fires "registered" again; the flag keeps that
+        // from re-running the queue.
+        if (!this._initialized) {
+            this._initialized = true;
+            this._dispatchQueued();
+        }
         if (!this._cfg.rfedNodeHash) return;
         const rfedIdBytes = Buffer.from(this._cfg.rfedNodeHash, "hex");
         const nodeHash = Destination.hash({hash: rfedIdBytes}, "rfed", "node").toString("hex");
@@ -2534,6 +2694,9 @@ const RnsClient = {
     /** Retry propagation link establishment with exponential backoff.
      *  Closes any stale PENDING link before creating a new one. */
     _retryPropagationLink(delayMs) {
+        // Disconnected: the attempt this follows was rejected by disconnect(),
+        // and there is nothing to establish a link on until connect().
+        if (!this._rns) return;
         // Already active — done
         if (this._propLink?.status === Link.ACTIVE) return;
 
@@ -3697,6 +3860,16 @@ const RnsClient = {
         this._propLinkPromise = null;
         this._propLinkResolve = null;
         this._propLinkReject = null;
+        // The propagation link is bound to the interface being stopped. Left
+        // in place, reconnect() would hand the old ACTIVE link to every
+        // upload, and they would queue into a dead interface until it went
+        // STALE. Nulled before close() so its "close" is a superseded one.
+        if (this._propRetryTimer) { clearTimeout(this._propRetryTimer); this._propRetryTimer = null; }
+        const propLink = this._propLink;
+        this._propLink = null;
+        try { propLink?.close(); } catch(e) {}
+        this._propagationInitialized = false;
+        this._initialized = false;
         this._channelsInitialized = false;
         this._channelsResubscribed = false;
         // Disconnect all interfaces
@@ -4752,6 +4925,7 @@ const App = {
     /** Returns the icon character for a given message status. */
     _statusIcon(status) {
         switch (status) {
+            case "queued":      return "⏳";  // hourglass — waiting for initialization or the propagation link
             case "sending":     return "●";   // filled dot — awaiting proof
             case "propagated":  return "✓";   // single check — stored at propagation node
             case "proved":      return "✓✓";  // double check — direct proof received
@@ -6156,7 +6330,8 @@ Harness (headless):
         if (!contact) return `Contact ${destHash.slice(0,12)}... not found. Add it first.`;
         if (!contact.publicKey) return `No public key for ${destHash.slice(0,12)}.... Wait for announce.`;
         try {
-            RnsClient.sendMessage(contact, content || 'E2E test ' + Date.now());
+            const stored = RnsClient.sendMessage(contact, content || 'E2E test ' + Date.now());
+            if (stored.status === 'queued') return 'Queued — sends when initialization finishes';
             return 'Sent — check console';
         } catch(e) {
             console.error('Send failed:', e.message);

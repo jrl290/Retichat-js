@@ -87,19 +87,27 @@ test("other custom types and non-maps carry no marker", () => {
 
 // ── send ────────────────────────────────────────────────────────────────────
 
-test("sendMessage sends the copy once, only when sending as the distro to someone else", () => {
-    const body = extractMethod(app, "sendMessage(contact, content)");
+test("a DM's dispatch sends the copy once, only when sending as the distro to someone else", () => {
+    // _dispatchMessage holds the send path since sends made before
+    // initialization are queued: sendMessage dispatches at once when it can,
+    // _dispatchQueued dispatches each queued record once when it can't.
+    const body = extractMethod(app, "_dispatchMessage(contact, outMsg)");
     const calls = body.match(/_sendDistroSentCopy\(/g) || [];
-    assert.equal(calls.length, 1, "exactly one call site in sendMessage");
+    assert.equal(calls.length, 1, "exactly one call site in _dispatchMessage");
     assert.match(body, /if \(sender\.isDistro && contact\.destHash !== sender\.hash\) \{\s*this\._sendDistroSentCopy\(contact\.destHash, "", content\)/);
     const copyAt = body.indexOf("_sendDistroSentCopy(");
     assert.ok(copyAt < body.indexOf("setTimeout("), "sent before, not inside, the propagation fallback timer");
     // After, not before, M's dispatch: a _sendPacket that throws ends
-    // sendMessage before the copy starts, so siblings never show a message
-    // that never left.
+    // _dispatchMessage before the copy starts, so siblings never show a
+    // message that never left.
     assert.ok(copyAt > body.indexOf("this._sendPacket("), "sent only after the direct dispatch returned");
+    // One dispatch per user message, from either entry point.
+    for (const sig of ["sendMessage(contact, content)", "_dispatchQueued()"]) {
+        assert.equal((extractMethod(app, sig).match(/this\._dispatchMessage\(/g) || []).length, 1, `${sig} dispatches once`);
+    }
     // No other path that can re-send the same message may copy it again.
-    for (const sig of ["async _flushPropagation()", "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
+    for (const sig of ["sendMessage(contact, content)", "_dispatchQueued()", "async _propagateMessage(contact, outMsg)",
+        "async _flushPropagation()", "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
         "_sendOverPeerLink(contactHash, publicKeyHex, packed, representation, messageId, onProof, onError)", "_sendDistroViaLxmf()"]) {
         assert.doesNotMatch(extractMethod(app, sig), /_sendDistroSentCopy|DISTRO_SENT_TYPE/, `${sig} must not copy`);
     }
@@ -151,8 +159,9 @@ test("the copy is D→D, signed by D, with 0xFB/0xFC/0xFD, propagated to D", asy
 });
 
 test("the copy waits for the propagation link and never starts it", () => {
-    // Starting the link runs _flushPropagation(), which would re-propagate
-    // the original message while its direct attempt is still in flight.
+    // When M's propagation link comes up is M's own fallback timer's call.
+    // (Starting it once meant a flush that re-propagated M inside its direct
+    // window; _flushPropagation now uploads only parked copies.)
     const body = extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)");
     assert.doesNotMatch(body, /_ensurePropagationLink|_establishPropagationLink/);
     assert.match(body, /await this\._whenPropagationLinkUp\(recipientHex\)/);

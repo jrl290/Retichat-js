@@ -34,8 +34,10 @@ function uploadSites() {
     return sites;
 }
 
-test("all four propagation upload sites exist", () => {
-    assert.equal(uploadSites().length, 4, "the live send path, the deferred flush path, the group fallback, and the RFed SPEC §17.11 distro sent-copy");
+test("all three propagation upload sites exist", () => {
+    // The live send path and the deferred flush both upload a DM's copy
+    // through _propagateMessage, so one site covers both.
+    assert.equal(uploadSites().length, 3, "the DM propagated copy (_propagateMessage), the group fallback, and the RFed SPEC §17.11 distro sent-copy");
 });
 
 test("each propagation upload sends over the MDU as a Resource, before any packet is built", () => {
@@ -48,8 +50,8 @@ test("each propagation upload sends over the MDU as a Resource, before any packe
         const window = source.slice(site, Math.min(...candidates));
         assert.match(window, /propagationPacked\.length > Link\.MDU/, `site at ${site}: no MDU branch before the packet`);
         assert.match(window, /link\.sendResource\(propagationPacked\)/, `site at ${site}: the over-MDU branch must use link.sendResource`);
-        // The branch must leave the packet path: return in the send path, the group
-        // fallback and the §17.11 sent-copy, continue in the flush loop.
-        assert.match(window, /\n\s+(return( null)?|continue);\n/, `site at ${site}: the Resource branch must not fall through to the packet`);
+        // The branch must leave the packet path: return in the DM copy, the
+        // group fallback and the §17.11 sent-copy.
+        assert.match(window, /\n\s+return( null)?;\n/, `site at ${site}: the Resource branch must not fall through to the packet`);
     }
 });
