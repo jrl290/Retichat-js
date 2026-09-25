@@ -1381,6 +1381,12 @@ const RnsClient = {
             this._propLinkResolve = resolve;
             this._propLinkReject = reject;
         });
+        // Nobody may be waiting on this attempt (_initPropagation starts it
+        // and moves on), and disconnect() rejects it all the same: that must
+        // not surface as an uncaught error, which it did on every takeover by
+        // another tab while the link was coming up (2026-09-25). Callers of
+        // _ensurePropagationLink still get the rejection.
+        this._propLinkPromise.catch(() => {});
 
         link.on("established", () => {
             console.log(`[retichat] 🔗 Propagation link established, rtt=${link.rtt}ms`);

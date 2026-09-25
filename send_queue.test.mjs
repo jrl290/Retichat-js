@@ -581,6 +581,29 @@ test("a queued message storage cannot keep is refused, so it stays in the compos
     assert.throws(() => c.self.sendMessage(alice, "not kept"), /Could not store the message/);
 });
 
+test("an attempt nobody awaits is not an uncaught error when disconnect rejects it", async () => {
+    const c = makePropagationClient({ nodeKnown: true, contacts: [] });
+    const unhandled = [];
+    const onUnhandled = (e) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+        c.self._establishPropagationLink(); // started and left, as _initPropagation does
+        c.self._propLinkReject(new Error("Disconnected before propagation link became active"));
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+        assert.deepEqual(unhandled.map(String), [], "no uncaught rejection");
+    } finally {
+        process.off("unhandledRejection", onUnhandled);
+    }
+});
+
+test("a sender waiting on the attempt still hears the disconnect", async () => {
+    const c = makePropagationClient({ nodeKnown: true, contacts: [] });
+    const waiting = c.self._ensurePropagationLink();
+    c.self._propLinkReject(new Error("Disconnected before propagation link became active"));
+    await assert.rejects(waiting, /Disconnected before propagation link became active/);
+});
+
 test("a superseded propagation link's close leaves the current attempt alone", async () => {
     const c = makePropagationClient({ nodeKnown: true, contacts: [] });
     c.self._ensurePropagationLink();
