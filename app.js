@@ -3235,7 +3235,14 @@ const RnsClient = {
             const deliveryDest = this._rns.registerDestination(
                 IdMgr.id, Destination.IN, Destination.SINGLE, "rfed", "delivery"
             );
-            deliveryDest.on("packet", ({data}) => this._handleChannelPacket(data));
+            // Prove every packet RFed delivers here, as the native apps'
+            // PROVE_ALL rfed.delivery does, so RFed counts a delivery only when
+            // it is proved and queues and pushes the rest (RFed SPEC §7). Until
+            // 2026-09-26 nothing was proved.
+            deliveryDest.on("packet", ({packet, data}) => {
+                try { packet.prove(); } catch (e) { console.warn("[retichat] rfed.delivery proof failed", e.message); }
+                this._handleChannelPacket(data);
+            });
             // ANNOUNCE rfed.delivery so the RFed learns a path back to us.
             // The distro fanout checks has_path(rfed.delivery) and the deferred
             // flush fires on an rfed.delivery announce — but we never announced
