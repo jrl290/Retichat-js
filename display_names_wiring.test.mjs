@@ -997,8 +997,8 @@ test("§5.2 a group member with no row still gets its name: a hidden row, named 
     r.deliver(lxm(carol, me, "", groupFields("Carol", "accept", [[GROUP_FIELDS.GROUP_SENDER, C]]), carol, t));
     const row = r.ContactStore.get(C);
     assert.ok(row, "the name has somewhere to live");
-    assert.deepEqual([row.messageName, row.messageNameAt, row.hidden], ["Carol", t, true],
-        "source unknown (no key yet): the name fills the empty slot");
+    assert.deepEqual([row.messageName, row.messageNameAt, row.hidden], ["Carol", null, true],
+        "source unknown (no key yet): the name fills the empty slot without recording its time");
     assert.equal(r.systemText(r.notices.at(-1)), "Carol joined the group", "the system notice");
     assert.equal(r.ContactStore.name(C), "Carol", "the member list's resolver");
     assert.equal(r.ContactStore.isContact(C), false, "not a contact");

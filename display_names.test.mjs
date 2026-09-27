@@ -220,8 +220,14 @@ test("§5.2 order: a 0xD1 counts only from a message newer than the one that las
     assert.equal(accept(a, nameState("B"), I, 300), null, "invalid is ignored, the timestamp included");
     assert.equal(accept(a, nameState("B"), U, 300), null, "unknown never replaces a name");
     assert.equal(accept(a, CLEAR, U, 300), null, "unknown never clears");
-    assert.deepEqual(accept(empty, nameState("B"), U, 300), { messageName: "B", messageNameAt: 300, legacyName: null },
-        "unknown fills an empty name");
+    assert.deepEqual(accept(empty, nameState("B"), U, 300), { messageName: "B", messageNameAt: null, legacyName: null },
+        "unknown fills an empty name without recording its (unverifiable) time");
+    const forged = accept(empty, nameState("Mallory"), U, 4e9);
+    assert.deepEqual(accept(forged, nameState("Real"), V, 1790000000), { messageName: "Real", messageNameAt: 1790000000, legacyName: null },
+        "a far-future source-unknown name never locks out the real sender's validated name");
+    const cleared = { messageName: null, messageNameAt: 200, legacyName: null };
+    assert.deepEqual(accept(cleared, nameState("B"), U, 300), { messageName: "B", messageNameAt: 200, legacyName: null },
+        "a fill after a validated clear keeps the clear's time");
     assert.equal(accept(empty, nameState("B"), V, undefined), null, "no timestamp: cannot be ordered");
     assert.equal(accept(empty, nameState("B"), V, NaN), null);
     assert.deepEqual(accept(empty, nameState("B"), V, 1700000000.25).messageNameAt, 1700000000.25, "float seconds kept");
