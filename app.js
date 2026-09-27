@@ -46,9 +46,10 @@ import DistroManager from "./lib/distro.js";
 import { TabLock } from "./lib/tab_lock.js";
 import {
     clean as cleanDisplayName,
+    cleanAnnounce as cleanAnnounceName,
     decodePayload as decodeDisplayName,
     applyToFields as applyDisplayName,
-    acceptMessageName,
+    acceptMessageNameAt,
     contactName,
     channelPosterName,
     shortHash,
@@ -253,7 +254,10 @@ const OwnNames = {
     _legacy: null,
 
     init() {
-        this.announce = cleanDisplayName(sGet("announceDisplayName"));
+        // §3: the announce name is cleaned with the announce rules, so
+        // "Anonymous Peer" (MeshChatX's and Columba's placeholder) is never
+        // broadcast as a name: it is no name, as in LXMF-rust.
+        this.announce = cleanAnnounceName(sGet("announceDisplayName"));
         this.channel = cleanDisplayName(sGet("channelDisplayName"));
         const message = sGet("messageDisplayName");
         const legacy = sGet("displayName");
@@ -280,7 +284,7 @@ const OwnNames = {
     },
 
     setAnnounce(raw) {
-        this.announce = cleanDisplayName(raw ?? "");
+        this.announce = cleanAnnounceName(raw ?? "");
         sSet("announceDisplayName", this.announce ?? "");
         RnsClient.applyAnnounceName();
         return this.announce;
@@ -355,25 +359,37 @@ function shouldProcessGroupMessage(groupAction, inviterKnown, groupExists) {
 }
 
 // =========================================================================
-//  CONTACT STORE — only explicitly added contacts, not public peers
+//  CONTACT STORE — the peers this client holds a row for
+//
+//  A row is either a contact the user has (added by hand, or a DM
+//  conversation) or a hidden row (`hidden: true`) kept only to hold what
+//  the client learned about a peer it has not added: a group member's or
+//  channel poster's public key, and the names DISPLAY_NAMES.md §5.1 stores
+//  for any sender, so group labels, member lists and system notices can
+//  name them (as iOS and Android keep a plain contact row). Hidden rows are
+//  never listed (chat list, contacts, group picker: audit L4); adding the
+//  contact or a DM with it lists the row, names and key included.
 // =========================================================================
 const ContactStore = {
     _contacts: new Map(),
     _listeners: [],
 
     /**
-     * Contacts hold three names (DISPLAY_NAMES.md §5.1): localName (the
-     * user's own), messageName (from 0xD1) and announceName (from the
-     * contact's announce). None is ever a placeholder; the label on screen is
-     * resolved by name(). Records stored before 2026-09-27 had one
-     * displayName plus nameCustomized and are migrated as they load (§5.4).
+     * Contacts hold the names of DISPLAY_NAMES.md §5.1: localName (the
+     * user's own), messageName (from 0xD1, with messageNameAt, the LXMF
+     * timestamp of the message that last set or cleared it), announceName
+     * (from the contact's announce) and legacyName (migrated, origin
+     * unknown). None is ever a placeholder; the label on screen is resolved
+     * by name(). Records stored before 2026-09-27 had one displayName plus
+     * nameCustomized, and the first three-slot build had no legacyName; both
+     * are migrated as they load (§5.4).
      */
     init() {
         const data = sGet("contacts_v2");
         let migrated = false;
         if (Array.isArray(data)) for (const stored of data) {
             const c = migrateContact(stored);
-            if ("displayName" in stored || "nameCustomized" in stored || !("localName" in stored)) migrated = true;
+            if ("displayName" in stored || "nameCustomized" in stored || !("localName" in stored) || !("legacyName" in stored)) migrated = true;
             this._contacts.set(c.destHash, c);
         }
         if (migrated) this._save();
@@ -383,8 +399,21 @@ const ContactStore = {
     _notify() { const all = this.getAll(); this._listeners.forEach(fn => fn(all)); },
 
     /** Add a contact by destination hash. Returns the contact. Adding one
-     *  that exists keeps everything it holds, names and key included. */
+     *  that exists keeps everything it holds, names and key included, and
+     *  lists a hidden row. */
     add(destHash, isDistro = false, publicKey = null) {
+        return this._put(destHash, isDistro, publicKey, false);
+    },
+
+    /** The row for a peer the user has not added (a group member, a channel
+     *  poster, the sender of a name): created hidden when there is none,
+     *  returned as it is when there is one. Returns the row. */
+    keep(destHash, publicKey = null) {
+        const existing = this.get(destHash);
+        return existing ?? this._put(destHash, false, publicKey, true);
+    },
+
+    _put(destHash, isDistro, publicKey, hidden) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         if (destHash.length !== 32) throw new Error("Destination hash must be exactly 32 hex characters");
         const existing = this._contacts.get(destHash);
@@ -392,12 +421,15 @@ const ContactStore = {
             destHash,
             localName: existing?.localName ?? null,
             messageName: existing?.messageName ?? null,
+            messageNameAt: existing?.messageNameAt ?? null,
             announceName: existing?.announceName ?? null,
+            legacyName: existing?.legacyName ?? null,
             publicKey: existing?.publicKey ?? publicKey,
             addedAt: existing?.addedAt ?? Date.now(),
             lastSeen: existing?.lastSeen ?? 0,
             reachable: existing?.reachable ?? null,
             isDistro: existing?.isDistro ?? isDistro,
+            hidden,
         };
         this._contacts.set(destHash, contact);
         this._save();
@@ -413,6 +445,8 @@ const ContactStore = {
         if (!c) return;
 
         c.announceName = LXMF.displayNameFromAppData(announce.appData);
+        // §5.1: an announce carrying a name replaces a migrated legacyName.
+        if (c.announceName !== null) c.legacyName = null;
         // The lxmf.delivery announce is the source of truth for "distro"
         // (RFed SPEC §17.10): SF_RFED_DISTRO in supported_functionality.
         // No app_data says nothing, so leave the flag as it is.
@@ -427,7 +461,15 @@ const ContactStore = {
         this._notify();
     },
 
-    isContact(destHash) { return this._contacts.has(destHash); },
+    /** A contact the user has: a listed row, not a hidden one. */
+    isContact(destHash) {
+        const c = this._contacts.get(destHash);
+        return !!c && !c.hidden;
+    },
+
+    /** Any row, hidden or listed: a peer this client knows (its key, its
+     *  names). */
+    known(destHash) { return this._contacts.has(destHash); },
 
     /** The label every surface shows for `destHash` (§5.3):
      *  localName ?? messageName ?? announceName ?? 8-hex short hash. */
@@ -437,7 +479,7 @@ const ContactStore = {
      *  localName): what the rename field falls back to when left empty. */
     providedName(destHash) {
         const c = this._contacts.get(destHash);
-        return c?.messageName ?? c?.announceName ?? shortHash(destHash);
+        return c?.messageName ?? c?.announceName ?? c?.legacyName ?? shortHash(destHash);
     },
 
     /** The user's own name for a contact (§5.1). Cleaned; an empty value
@@ -451,18 +493,22 @@ const ContactStore = {
         return c.localName;
     },
 
-    /** Apply a received 0xD1 to the contact's messageName under the §5.2
-     *  table. Returns true when the name changed. A sender that is not a
-     *  contact is left alone: nothing is created to hold a name. */
-    acceptMessageName(destHash, field, signatureState) {
+    /** Apply a received 0xD1 to the row's messageName under the §5.2 table
+     *  and order rule: only from a message whose LXMF `timestamp` (seconds)
+     *  is newer than messageNameAt, which an accepted one advances, a repeat
+     *  included; accepting one drops legacyName (§5.1). Only rows that
+     *  exist: a sender with none gets one (keep) where its message is
+     *  processed. Returns true when the shown name may have changed. */
+    acceptMessageName(destHash, field, signatureState, timestamp) {
         const c = this._contacts.get(destHash);
         if (!c) return false;
-        const next = acceptMessageName(c.messageName ?? null, field, signatureState);
-        if (next === (c.messageName ?? null)) return false;
-        c.messageName = next;
+        const next = acceptMessageNameAt(c, field, signatureState, timestamp);
+        if (next === null) return false;
+        const changed = next.messageName !== (c.messageName ?? null) || (c.legacyName ?? null) !== null;
+        Object.assign(c, next);
         this._save();
-        this._notify();
-        return true;
+        if (changed) this._notify();
+        return changed;
     },
 
     setReachable(destHash, reachable) {
@@ -498,7 +544,11 @@ const ContactStore = {
     },
 
     get(destHash) { return this._contacts.get(destHash) ?? null; },
+    /** Every row, hidden ones included: for work over stored conversations. */
     getAll() { return [...this._contacts.values()].sort((a,b) => b.lastSeen - a.lastSeen); },
+    /** The user's contacts, for the surfaces that list them (chat list,
+     *  contacts, group picker): hidden rows are left out. */
+    listed() { return this.getAll().filter(c => !c.hidden); },
 
     _save() { sSet("contacts_v2", [...this._contacts.values()]); },
 };
@@ -1233,13 +1283,17 @@ const RnsClient = {
             // signature — validated sets or clears it, a source whose key is
             // not known yet only fills an empty name, an invalid signature
             // changes nothing. The message itself is kept either way, as the
-            // reference and the native clients keep it.
+            // reference and the native clients keep it. Only a message newer
+            // than the one that last set or cleared the name counts (§5.2
+            // order: a propagated copy can land after a later direct one).
+            // A sender with no row yet gets one where its message is kept:
+            // the DM below, a group message in _handleGroupMessage.
             const nameField = lxmfMsg.displayName; // read from the payload bytes by LXMessage.fromBytes
             const signatureState = lxmfMsg.signatureState ?? "invalid";
             if (!lxmfMsg.signatureValidated) {
                 console.log(`[retichat] RX message from ${srcHash.slice(0,12)}: signature ${signatureState}`);
             }
-            ContactStore.acceptMessageName(srcHash, nameField, signatureState);
+            ContactStore.acceptMessageName(srcHash, nameField, signatureState, lxmfMsg.timestamp);
 
             // ---- Distro identity transfer detection ----
             // FIELD_CUSTOM_TYPE == "rfed.distro.transfer", key in
@@ -1285,14 +1339,17 @@ const RnsClient = {
             //     return;
             // }
 
-            // Auto-create contact for unknown senders so messages appear in UI
+            // Auto-create contact for unknown senders so messages appear in
+            // UI; a hidden row (a group member's, a channel poster's) is
+            // listed now that there is a conversation.
             if (!ContactStore.isContact(srcHash)) {
                 console.log(`[rns] 📇 Auto-adding contact: ${srcHash.slice(0,12)}...`);
                 ContactStore.add(srcHash);
                 // Its name, under the same §5.2 rule as above: a new contact
                 // has no key yet, so the source is unknown and the name only
-                // fills the empty slot.
-                ContactStore.acceptMessageName(srcHash, nameField, signatureState);
+                // fills the empty slot. (A row that existed already took it
+                // above; this same timestamp is then not newer, a no-op.)
+                ContactStore.acceptMessageName(srcHash, nameField, signatureState, lxmfMsg.timestamp);
             }
 
             MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash, via: "direct" });
@@ -2526,7 +2583,10 @@ const RnsClient = {
 
         const group = GroupStore.get(groupId);
         const actualSender = groupSender || srcHash;
-        if (!shouldProcessGroupMessage(groupAction, ContactStore.isContact(srcHash), !!group)) {
+        // Any row counts as known to the inviter check, hidden ones (group
+        // members, channel posters) included, as when every such row was a
+        // listed contact.
+        if (!shouldProcessGroupMessage(groupAction, ContactStore.known(srcHash), !!group)) {
             console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for unknown group ${groupId.slice(0,8)}`);
             return;
         }
@@ -2540,6 +2600,18 @@ const RnsClient = {
         this._groupSeenIds.add(dedupKey);
         if (this._groupSeenIds.size > 2000) {
             this._groupSeenIds = new Set([...this._groupSeenIds].slice(-1000));
+        }
+
+        // DISPLAY_NAMES.md §5.2 for a sender this client holds no row for (a
+        // member who joined after the invite, an accept from someone never
+        // added): the router's handler could not store its 0xD1, so a hidden
+        // row is kept for it now that the message is processed, and the name
+        // taken by the same table. Group labels, the member list and system
+        // notices then name it; the contact list does not show it.
+        if (!ContactStore.known(srcHash) && srcHash !== (this.ownHash ?? ownLxmfDestinationHash())) {
+            ContactStore.keep(srcHash);
+            ContactStore.acceptMessageName(srcHash, lxmfMsg.displayName,
+                lxmfMsg.signatureState ?? "invalid", lxmfMsg.timestamp);
         }
 
         switch (groupAction) {
@@ -2766,8 +2838,7 @@ const RnsClient = {
     },
 
     async _sendGroupEnvelope(memberHash, content, fields) {
-        let contact = ContactStore.get(memberHash);
-        if (!contact) contact = ContactStore.add(memberHash);
+        let contact = ContactStore.keep(memberHash);
         if (!contact.publicKey) {
             this._requestGroupPeer(memberHash);
             await this._waitForGroupPeer(memberHash);
@@ -2902,7 +2973,7 @@ const RnsClient = {
                     console.warn(`[retichat] 👥 Ignored mismatched member key for ${hash.slice(0,8)}`);
                     continue;
                 }
-                const contact = ContactStore.get(hash) || ContactStore.add(hash);
+                const contact = ContactStore.keep(hash);
                 contact.publicKey = publicKey.toString("hex");
             } catch (error) {
                 console.warn(`[retichat] 👥 Ignored invalid member key for ${hash.slice(0,8)}:`, error.message);
@@ -3026,8 +3097,7 @@ const RnsClient = {
         const links = [...group.members.keys()]
             .filter(hash => hash !== ownHash)
             .map(async hash => {
-                let contact = ContactStore.get(hash);
-                if (!contact) contact = ContactStore.add(hash);
+                let contact = ContactStore.keep(hash);
                 if (!contact.publicKey) {
                     this._requestGroupPeer(hash);
                     await this._waitForGroupPeer(hash);
@@ -3600,9 +3670,10 @@ const RnsClient = {
             // replaced from a channel post.
             // This device's own posts (fetched history, echoes) never make it
             // a contact of itself (audit L4).
+            // A poster the user has not added gets a hidden row, never a
+            // listed contact (audit L4).
             if (senderPubKey && srcHashHex !== ownLxmfDestinationHash()) {
-                if (!ContactStore.isContact(srcHashHex)) ContactStore.add(srcHashHex);
-                const contact = ContactStore.get(srcHashHex);
+                const contact = ContactStore.keep(srcHashHex);
                 if (contact && !contact.publicKey) {
                     contact.publicKey = Buffer.from(senderPubKey).toString("hex");
                     ContactStore._save();
@@ -3612,7 +3683,9 @@ const RnsClient = {
             // §5.2: the post's 0xD1 (reported only after the binding and the
             // signature passed) sets or clears this sender's Channel Display
             // Name in this channel. It never becomes the contact's name.
-            ChannelSenderNamesStore.apply(ch.channelName, srcHashHex, displayName);
+            // Only a post newer than the one that last set or cleared it
+            // counts (§5.2 order), so history pulled late cannot undo it.
+            ChannelSenderNamesStore.apply(ch.channelName, srcHashHex, displayName, tsMs);
             // §4.2 rule 2: a sender not seen here before means our next post
             // carries our Channel Display Name again.
             ChannelPostNamesStore.noteSender(ch.channelName, srcHashHex, ownLxmfDestinationHash(), Date.now());
@@ -4014,7 +4087,7 @@ const RnsClient = {
             const signatureState = signature.validated ? "validated"
                 : signature.unverifiedReason === LXMessage.SOURCE_UNKNOWN ? "unknown" : "invalid";
             if (!signature.validated) console.log(`[distro] Message from ${srcHashHex.slice(0,12)}: signature ${signatureState}`);
-            ContactStore.acceptMessageName(srcHashHex, decodeDisplayName(payloadBytes), signatureState);
+            ContactStore.acceptMessageName(srcHashHex, decodeDisplayName(payloadBytes), signatureState, ts);
             const stored = MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex, via: "distro" });
             ContactStore.touch(srcHashHex);
             // Pass the stored message, not null: listeners read a null `msg` as
@@ -4983,7 +5056,7 @@ const App = {
     // ===== SIDEBAR CONTENT =====
 
     _buildSidebarContent() {
-        const contacts = ContactStore.getAll();
+        const contacts = ContactStore.listed();
         const groups = GroupStore.getAll();
         const channels = ChannelStore.getAll();
 
@@ -5591,7 +5664,9 @@ const App = {
         GroupStore.accept(groupId);
         for (const memberHash of group.members.keys()) {
             if (memberHash === RnsClient.ownHash) continue;
-            if (!ContactStore.isContact(memberHash)) ContactStore.add(memberHash);
+            // Members are kept (their key, their names), not listed as
+            // contacts (audit L4).
+            ContactStore.keep(memberHash);
             RnsClient._requestGroupPeer(memberHash);
         }
         GroupMsgStore.addSystem(groupId, `You joined "${group.groupName}"`);
@@ -6464,7 +6539,7 @@ const App = {
             ),
         );
 
-        const contacts = ContactStore.getAll();
+        const contacts = ContactStore.listed();
         if (contacts.length > 0) {
             scroll.appendChild(
                 h("div", { className: "settings-section" },
@@ -6523,7 +6598,7 @@ const App = {
             ),
         );
 
-        const contacts = ContactStore.getAll();
+        const contacts = ContactStore.listed();
         scroll.appendChild(
             h("div", { className: "settings-section" },
                 h("h3", {}, "Members"),
@@ -7069,6 +7144,7 @@ Harness (headless):
             destHash: c.destHash.slice(0,12) + '...',
             displayName: ContactStore.name(c.destHash),
             localName: c.localName, messageName: c.messageName, announceName: c.announceName,
+            legacyName: c.legacyName, hidden: !!c.hidden,
             hasPublicKey: !!c.publicKey,
             pkPreview: c.publicKey?.slice(0,12) + '...' || 'NONE',
             lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',

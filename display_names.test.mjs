@@ -201,21 +201,89 @@ test("§5.2 accepting a 0xD1", () => {
     assert.equal(accept("B", ABSENT, DN.SIG_VALIDATED), "B");
 });
 
+test("§5.2 order: a 0xD1 counts only from a message newer than the one that last set or cleared the name", () => {
+    const { acceptMessageNameAt: accept, nameState, CLEAR, ABSENT, SIG_VALIDATED: V, SIG_UNKNOWN: U, SIG_INVALID: I } = DN;
+    const empty = { messageName: null, messageNameAt: null, legacyName: null };
+    assert.deepEqual(accept(empty, nameState("A"), V, 100), { messageName: "A", messageNameAt: 100, legacyName: null });
+    const a = { messageName: "A", messageNameAt: 100, legacyName: null };
+    assert.equal(accept(a, nameState("Old"), V, 99), null, "an older message (a propagated copy landing late) is ignored");
+    assert.equal(accept(a, CLEAR, V, 50), null, "an older clear too");
+    assert.equal(accept(a, nameState("B"), V, 100), null, "the same timestamp is not newer");
+    assert.deepEqual(accept(a, nameState("A"), V, 150), { messageName: "A", messageNameAt: 150, legacyName: null },
+        "a repeat of the current name advances the timestamp");
+    assert.equal(accept({ messageName: "A", messageNameAt: 150 }, nameState("Old"), V, 120), null,
+        "so an older name after the repeat still loses");
+    assert.deepEqual(accept(a, CLEAR, V, 200), { messageName: null, messageNameAt: 200, legacyName: null });
+    assert.equal(accept({ messageName: null, messageNameAt: 200 }, nameState("A"), V, 150), null,
+        "a clear is not undone by an older name");
+    assert.equal(accept(a, ABSENT, V, 300), null, "absent records nothing");
+    assert.equal(accept(a, nameState("B"), I, 300), null, "invalid is ignored, the timestamp included");
+    assert.equal(accept(a, nameState("B"), U, 300), null, "unknown never replaces a name");
+    assert.equal(accept(a, CLEAR, U, 300), null, "unknown never clears");
+    assert.deepEqual(accept(empty, nameState("B"), U, 300), { messageName: "B", messageNameAt: 300, legacyName: null },
+        "unknown fills an empty name");
+    assert.equal(accept(empty, nameState("B"), V, undefined), null, "no timestamp: cannot be ordered");
+    assert.equal(accept(empty, nameState("B"), V, NaN), null);
+    assert.deepEqual(accept(empty, nameState("B"), V, 1700000000.25).messageNameAt, 1700000000.25, "float seconds kept");
+});
+
+test("§5.1 an accepted 0xD1 drops legacyName; one that is ignored keeps it", () => {
+    const { acceptMessageNameAt: accept, nameState, CLEAR } = DN;
+    const legacy = { messageName: null, messageNameAt: null, legacyName: "Old Bob" };
+    assert.deepEqual(accept(legacy, nameState("Bob"), DN.SIG_VALIDATED, 10), { messageName: "Bob", messageNameAt: 10, legacyName: null });
+    assert.deepEqual(accept(legacy, CLEAR, DN.SIG_VALIDATED, 10), { messageName: null, messageNameAt: 10, legacyName: null },
+        "a validated clear is accepted and drops it too");
+    assert.deepEqual(accept(legacy, nameState("Bob"), DN.SIG_UNKNOWN, 10).legacyName, null, "unknown filling the empty messageName");
+    assert.equal(accept(legacy, nameState("Bob"), DN.SIG_INVALID, 10), null, "an invalid one changes nothing");
+    assert.equal(accept(legacy, CLEAR, DN.SIG_UNKNOWN, 10), null);
+});
+
 test("§5.1 channel names are per (channel, sender) and clearable", () => {
     const storage = memoryStorage();
     const names = new ChannelSenderNames(storage);
-    assert.equal(names.apply("c1", "s", DN.nameState("Pseud")), true);
+    assert.equal(names.apply("c1", "s", DN.nameState("Pseud"), 1000), true);
     assert.equal(new ChannelSenderNames(storage).get("c1", "s"), "Pseud");
     assert.equal(names.get("c2", "s"), null, "another channel does not share it");
-    assert.equal(names.apply("c1", "s", DN.ABSENT), false);
-    assert.equal(names.apply("c1", "s", DN.CLEAR), true);
+    assert.equal(names.apply("c1", "s", DN.ABSENT, 2000), false);
+    assert.equal(names.apply("c1", "s", DN.CLEAR, 3000), true);
     assert.equal(names.get("c1", "s"), null);
 });
 
-test("§5.3 resolver: local > message > announce > 8-hex short hash; channel label with secondary hash", () => {
+test("§5.2 channel order: an older post pulled late never undoes a newer name or clear", () => {
+    const storage = memoryStorage();
+    const names = new ChannelSenderNames(storage);
+    names.apply("c", "s", DN.nameState("New"), 5000);
+    assert.equal(names.apply("c", "s", DN.nameState("Old"), 4000), false, "history pulled after the newer post");
+    assert.equal(names.get("c", "s"), "New");
+    assert.equal(names.apply("c", "s", DN.CLEAR, 4500), false, "an older clear");
+    assert.equal(names.get("c", "s"), "New");
+    assert.equal(names.apply("c", "s", DN.nameState("New"), 6000), false, "a newer repeat changes no name…");
+    assert.equal(names.entry("c", "s").at, 6000, "…but advances the timestamp");
+    assert.equal(names.apply("c", "s", DN.nameState("Mid"), 5500), false, "so a post between the two loses");
+    assert.equal(names.get("c", "s"), "New");
+    assert.equal(names.apply("c", "s", DN.CLEAR, 7000), true);
+    assert.equal(names.apply("c", "s", DN.nameState("New"), 6500), false, "a clear is not undone by an older name");
+    assert.equal(names.get("c", "s"), null);
+    assert.equal(new ChannelSenderNames(storage).entry("c", "s").at, 7000, "the timestamp is persisted");
+    assert.equal(names.apply("c", "s", DN.nameState("X"), undefined), false, "a post with no time cannot be ordered");
+
+    // Stored by the build before the order rule: a bare name of unknown age.
+    const old = memoryStorage();
+    old.set("channel_sender_names_v1", { c: { s: "Stored" } });
+    const loaded = new ChannelSenderNames(old);
+    assert.equal(loaded.get("c", "s"), "Stored");
+    assert.equal(loaded.apply("c", "s", DN.nameState("Next"), 1), true, "any post is newer than an unknown time");
+    assert.equal(loaded.apply("c", "s", DN.nameState("Stored"), 0), false);
+});
+
+test("§5.3 resolver: local > message > announce > legacy > 8-hex short hash; channel label with secondary hash", () => {
     const h = "0123456789abcdef0123456789abcdef";
     assert.equal(DN.shortHash(h), "01234567…");
     assert.equal(DN.contactName(null, h), "01234567…");
+    assert.equal(DN.contactName({ destHash: h, legacyName: "Legacy" }, h), "Legacy");
+    assert.equal(DN.contactName({ destHash: h, legacyName: "Legacy", announceName: "Ann" }, h), "Ann",
+        "a current announce name outranks a migrated one");
+    assert.deepEqual(DN.channelPosterName(null, { legacyName: "Legacy" }, h), { label: "Legacy", secondary: null });
     assert.equal(DN.contactName({ destHash: h, announceName: "Ann" }, h), "Ann");
     assert.equal(DN.contactName({ destHash: h, announceName: "Ann", messageName: "Msg" }, h), "Msg");
     assert.equal(DN.contactName({ destHash: h, announceName: "Ann", messageName: "Msg", localName: "Mine" }, h), "Mine");
@@ -224,19 +292,42 @@ test("§5.3 resolver: local > message > announce > 8-hex short hash; channel lab
     assert.deepEqual(DN.channelPosterName(null, null, h), { label: "01234567…", secondary: null });
 });
 
-test("§5.4 contact migration: nameCustomized → local, otherwise message, ?hash dropped", () => {
+test("§5.4 contact migration: nameCustomized → local, otherwise legacy, placeholders dropped", () => {
     const h = "0123456789abcdef0123456789abcdef";
     const base = { destHash: h, publicKey: null, lastSeen: 1 };
-    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob", nameCustomized: true }),
-        { ...base, localName: "Bob", messageName: null, announceName: null });
-    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob", nameCustomized: false }),
-        { ...base, localName: null, messageName: "Bob", announceName: null });
-    assert.deepEqual(DN.migrateContact({ ...base, displayName: "?01234567", nameCustomized: false }),
-        { ...base, localName: null, messageName: null, announceName: null });
-    assert.deepEqual(DN.migrateContact({ ...base, displayName: "?01234567", nameCustomized: true }),
-        { ...base, localName: null, messageName: null, announceName: null }, "a cleared rename");
-    const migrated = { ...base, localName: null, messageName: "M", announceName: "A" };
+    const slots = (localName, legacyName) => ({ ...base, localName, messageName: null, messageNameAt: null, announceName: null, legacyName });
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob", nameCustomized: true }), slots("Bob", null));
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob", nameCustomized: false }), slots(null, "Bob"),
+        "legacyName, not messageName: it may have come from an announce");
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "?01234567", nameCustomized: false }), slots(null, null));
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "?01234567", nameCustomized: true }), slots(null, null),
+        "a rename saved with the pre-filled placeholder");
+    for (const placeholder of ["Retichat", "retichat web", "ANONYMOUS PEER", "0123456789abcdef", "01234567…", "?0123456789ABCDEF0123456789abcdef"]) {
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: placeholder, nameCustomized: false }), slots(null, null), placeholder);
+    }
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bea", nameCustomized: true }), slots("Bea", null),
+        "a short all-hex name is not a hash form");
+    const migrated = slots("L", "Leg");
     assert.deepEqual(DN.migrateContact(migrated), migrated, "idempotent");
+
+    // Rows from the first three-slot build put migrated names in messageName.
+    assert.deepEqual(DN.migrateContact({ ...base, localName: null, messageName: "M", announceName: "A" }),
+        { ...base, localName: null, messageName: null, messageNameAt: null, announceName: "A", legacyName: "M" });
+    assert.deepEqual(DN.migrateContact({ ...base, localName: "L", messageName: "Retichat", announceName: null }),
+        { ...base, localName: "L", messageName: null, messageNameAt: null, announceName: null, legacyName: null },
+        "a placeholder there is dropped");
+});
+
+test("§5.4 one placeholder list: hash forms, \"Retichat\", \"Retichat Web\", \"Anonymous Peer\", any case", () => {
+    for (const p of ["0123abcd", "0123ABCD…", "?0123abcd", "?0123abcd…", "0123456789abcdef0123456789abcdef",
+        "?0123456789abcdef0123456789abcdef…", "Retichat", "RETICHAT", "Retichat Web", "retichat WEB",
+        "Anonymous Peer", "anonymous peer", "  Retichat  "]) {
+        assert.equal(DN.isPlaceholderName(p), true, p);
+    }
+    for (const n of ["0123abc", "0123456789abcdef0123456789abcdef0", "Bob", "Retichat User", "Anonymous", "cafe", "?Bob",
+        "0123abcd...x", null, undefined]) {
+        assert.equal(DN.isPlaceholderName(n), false, String(n));
+    }
 });
 
 test("§5.4 own name: the old display name becomes the Message Display Name, placeholders empty", () => {

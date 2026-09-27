@@ -109,7 +109,7 @@ function contactStore(storage) {
     const store = build("ContactStore", {
         sGet: storage.sGet, sSet: storage.sSet, LXMF, Date,
         migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
-        cleanDisplayName: DN.clean, acceptMessageName: DN.acceptMessageName,
+        cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
     });
     store.init();
     return store;
@@ -118,21 +118,43 @@ const msgStore = (storage) => build("MsgStore", { sGet: storage.sGet, sSet: stor
 
 // ── §5.4 / §5.1 contacts ───────────────────────────────────────────────────
 
-test("§5.4 contacts migrate as they load: nameCustomized → localName, else messageName, ?hash dropped", () => {
+test("§5.4 contacts migrate as they load: nameCustomized → localName, else legacyName, placeholders dropped", () => {
     const s = memory();
-    const a = "a".repeat(32), b = "b".repeat(32), c = "c".repeat(32);
+    const a = "a".repeat(32), b = "b".repeat(32), c = "c".repeat(32), d = "d".repeat(32), e = "e".repeat(32), f = "f".repeat(32);
     s.sSet("contacts_v2", [
-        { destHash: a, displayName: "My Al", nameCustomized: true, publicKey: null, lastSeen: 3 },
-        { destHash: b, displayName: "Bobby", nameCustomized: false, publicKey: null, lastSeen: 2 },
-        { destHash: c, displayName: "?cccccccc", nameCustomized: false, publicKey: null, lastSeen: 1 },
+        { destHash: a, displayName: "My Al", nameCustomized: true, publicKey: null, lastSeen: 6 },
+        { destHash: b, displayName: "Bobby", nameCustomized: false, publicKey: null, lastSeen: 5 },
+        { destHash: c, displayName: "?cccccccc", nameCustomized: false, publicKey: null, lastSeen: 4 },
+        { destHash: d, displayName: "Retichat", nameCustomized: false, publicKey: null, lastSeen: 3 },
+        { destHash: e, displayName: "Anonymous Peer", nameCustomized: false, publicKey: null, lastSeen: 2 },
+        // Migrated by the first three-slot build: the name went to messageName.
+        { destHash: f, localName: null, messageName: "Fred", announceName: null, publicKey: null, lastSeen: 1 },
     ]);
     const store = contactStore(s);
-    assert.deepEqual([store.get(a).localName, store.get(a).messageName], ["My Al", null]);
-    assert.deepEqual([store.get(b).localName, store.get(b).messageName], [null, "Bobby"]);
-    assert.deepEqual([store.get(c).localName, store.get(c).messageName], [null, null]);
+    const slots = (h) => [store.get(h).localName, store.get(h).messageName, store.get(h).legacyName];
+    assert.deepEqual(slots(a), ["My Al", null, null]);
+    assert.deepEqual(slots(b), [null, null, "Bobby"], "legacyName: its origin is unknown");
+    assert.deepEqual(slots(c), [null, null, null]);
+    assert.deepEqual(slots(d), [null, null, null], "the unnamed Android sender's placeholder");
+    assert.deepEqual(slots(e), [null, null, null], "MeshChatX's, Columba's and lxmd's placeholder");
+    assert.deepEqual(slots(f), [null, null, "Fred"], "moved out of messageName");
+    assert.equal(store.name(b), "Bobby", "a legacy name still shows");
     assert.equal(store.name(c), "cccccccc…", "the placeholder is gone; the resolver's short hash shows");
+    assert.equal(store.name(d), "dddddddd…");
     const saved = s.sGet("contacts_v2");
-    assert.ok(saved.every((x) => !("displayName" in x) && !("nameCustomized" in x)), "persisted in the new shape");
+    assert.ok(saved.every((x) => !("displayName" in x) && !("nameCustomized" in x) && "legacyName" in x), "persisted in the new shape");
+    assert.equal(store.listed().length, 6, "migrated rows stay listed");
+
+    // §5.1: legacyName is dropped by a named announce, and by an accepted
+    // 0xD1 — and then the contact's own names win over it.
+    store.updateFromAnnounce(b, { appData: MsgPack.pack([null, null, []]) });
+    assert.equal(store.get(b).legacyName, "Bobby", "an announce without a name keeps it");
+    store.updateFromAnnounce(b, { appData: MsgPack.pack([Buffer.from("Robert"), 8]) });
+    assert.deepEqual([store.get(b).legacyName, store.name(b)], [null, "Robert"], "a named announce drops it");
+    assert.equal(store.acceptMessageName(f, DN.nameState("Fred"), "invalid", nowSecs()), false);
+    assert.equal(store.get(f).legacyName, "Fred", "an ignored 0xD1 keeps it");
+    assert.equal(store.acceptMessageName(f, DN.CLEAR, "validated", nowSecs()), true);
+    assert.deepEqual([store.get(f).legacyName, store.name(f)], [null, "ffffffff…"], "an accepted clear drops it");
 });
 
 test("§5.1 announce names are replaced on every announce and cleared by a nameless one", () => {
@@ -153,7 +175,7 @@ test("§5.1 rename: the field holds only the local name, Save untouched changes 
     const store = contactStore(memory());
     const h = "e".repeat(32);
     store.add(h);
-    store.acceptMessageName(h, DN.nameState("Provided"), "validated");
+    store.acceptMessageName(h, DN.nameState("Provided"), "validated", nowSecs());
     assert.match(methodBody("_renderContactInfoModal()"), /value: c\.localName \?\? "",/,
         "the field is pre-filled with the local name only, never the provided one");
     const save = compile("_saveContactInfo()", {
@@ -232,8 +254,15 @@ function makeReceiver(me) {
     return { ContactStore, MsgStore, self, deliver };
 }
 
-function lxm(from, to, content, fields, signer = from) {
+/** LXMF timestamps (seconds) that always move forward: §5.2 takes a name
+ *  only from a message newer than the last, and two messages packed in the
+ *  same millisecond would otherwise tie. */
+let clock = Date.now() / 1000;
+const tick = () => (clock += 1);
+
+function lxm(from, to, content, fields, signer = from, timestamp = tick()) {
     const m = new LXMessage();
+    m.timestamp = timestamp;
     m.sourceHash = Buffer.from(lxmfHash(from), "hex");
     m.destinationHash = Buffer.from(lxmfHash(to), "hex");
     m.title = "";
@@ -283,12 +312,13 @@ test("§5.2 group messages name the LXMF source before the group branch (audit H
     assert.equal(r.MsgStore.get(B).length, 0, "and not stored as a DM");
 });
 
-test("§5.2 a group member who is not a contact gets no contact just to hold a name", () => {
+test("§5.2 the router's handler creates no row for a sender it has none for; the group branch decides", () => {
     const me = Identity.create(), carol = Identity.create();
     const r = makeReceiver(me);
     const fields = new Map([[0xD1, Buffer.from("Carol")], [GROUP_FIELDS.GROUP_ID, "9".repeat(32)]]);
     r.deliver(lxm(carol, me, "group hello", fields));
-    assert.equal(r.ContactStore.get(lxmfHash(carol)), null);
+    assert.equal(r.self.groups.length, 1);
+    assert.equal(r.ContactStore.get(lxmfHash(carol)), null, "a message the group branch may still drop plants nothing");
 });
 
 // ── §5.3 the resolver on every surface ─────────────────────────────────────
@@ -306,14 +336,14 @@ test("§5.3 group labels and system notices are resolved when shown, and follow 
     const post = { dir: "in", content: "x", srcHash: h };
     assert.equal(systemText(notice), "ffffffff… joined the group");
     assert.deepEqual(groupLabel(post), { label: "ffffffff…", secondary: null });
-    store.acceptMessageName(h, DN.nameState("Fay"), "validated");
+    store.acceptMessageName(h, DN.nameState("Fay"), "validated", nowSecs());
     assert.equal(systemText(notice), "Fay joined the group", "the stored notice never froze a name");
     assert.deepEqual(groupLabel(post), { label: "Fay", secondary: null });
     assert.equal(systemText({ dir: "system", content: "You joined \"G\"" }), "You joined \"G\"");
     assert.equal(groupLabel({ dir: "out", srcHash: h }), null, "own messages carry no label");
 
     assert.deepEqual(channelLabel("public.x", post), { label: "Fay", secondary: null }, "contact chain");
-    channelNames.apply("public.x", h, DN.nameState("Pseud"));
+    channelNames.apply("public.x", h, DN.nameState("Pseud"), Date.now());
     assert.deepEqual(channelLabel("public.x", post), { label: "Pseud", secondary: "ffffffff…" },
         "the channel name, with the short hash beside it");
     assert.deepEqual(channelLabel("public.y", post), { label: "Fay", secondary: null }, "per channel");
@@ -342,7 +372,7 @@ test("the group invite notice and the distro import prompt name the sender throu
 function ownNames(storage, rns = { applyAnnounceName() {} }) {
     const names = build("OwnNames", {
         sGet: storage.sGet, sSet: storage.sSet, RnsClient: rns,
-        cleanDisplayName: DN.clean, migrateOwnDisplayName: DN.migrateOwnDisplayName,
+        cleanDisplayName: DN.clean, cleanAnnounceName: DN.cleanAnnounce, migrateOwnDisplayName: DN.migrateOwnDisplayName,
     });
     names.init();
     return names;
@@ -517,7 +547,7 @@ test("§4.1 group envelopes (invites included) carry the name per member; only a
     const storage = memory();
     const ledger = new NameLedger({ get: storage.sGet, set: storage.sSet });
     const env = {
-        ContactStore: { get: () => contact, add: () => contact },
+        ContactStore: { get: () => contact, add: () => contact, keep: () => contact },
         Identity, Buffer, Destination, LXMessage, GROUP_FIELDS, GroupDeliveryEvidence, Link, console: quiet,
         IdMgr: { id: me }, applyDisplayName: DN.applyToFields, NameLedgerStore: ledger, OwnNames: { message: "Me" },
     };
@@ -571,8 +601,9 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
     };
     const run = new Function(...Object.keys(env), "self", "distroHash", "blob", body);
     const self = { ownHash: "e".repeat(32), _pendingTickets: new Map(), _onMsg: [], _ticketFromFields: () => null };
-    const blob = (signer, name) => {
+    const blob = (signer, name, timestamp = tick()) => {
         const m = new LXMessage();
+        m.timestamp = timestamp;
         m.sourceHash = Buffer.from(A, "hex"); m.destinationHash = D; m.title = ""; m.content = "via distro";
         m.fields = named(name);
         const packed = m.pack(signer, false);
@@ -582,6 +613,14 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
     assert.equal(ContactStore.get(A).messageName, "Alice", "validated");
     assert.equal(run(...Object.values(env), self, null, blob(mallory, "Mallory")), true);
     assert.equal(ContactStore.get(A).messageName, "Alice", "a forged signature is ignored");
+
+    // §5.2 order on the distro path: the LXMF timestamp of the unwrapped
+    // message, not the time it was pulled.
+    const t = tick() + 1000;
+    run(...Object.values(env), self, null, blob(alice, "Alicia", t));
+    assert.deepEqual([ContactStore.get(A).messageName, ContactStore.get(A).messageNameAt], ["Alicia", t]);
+    run(...Object.values(env), self, null, blob(alice, "Alice again", t - 500));
+    assert.equal(ContactStore.get(A).messageName, "Alicia", "an older message pulled late does not undo a newer name");
 });
 
 // ── channels: §2.3 binding, §5.2 channel names, §4.2 posting ───────────────
@@ -689,7 +728,7 @@ test("§5.3 the open DM's header follows a name that arrives while it is open (a
     let notified = 0;
     store.onChange(() => { notified++; sync(); });
     notified = 0;
-    store.acceptMessageName(h, DN.nameState("Zed"), "validated");
+    store.acceptMessageName(h, DN.nameState("Zed"), "validated", nowSecs());
     assert.equal(notified, 1, "a new name notifies the store's listeners");
     assert.equal(header[".header-name"].textContent, "Zed");
     assert.equal(header[".header-avatar"].textContent, "Z");
@@ -701,8 +740,8 @@ test("§5.3 the open DM's header follows a name that arrives while it is open (a
 
 /** A signed LXMF message whose fields map is `fieldsBytes`, raw: msgpackr
  *  cannot write a str holding invalid UTF-8, a foreign packer can. */
-function rawLxm(from, toHash, fieldsBytes, signer = from) {
-    const payload = Buffer.concat([Buffer.from([0x94]), MsgPack.pack(Date.now() / 1000),
+function rawLxm(from, toHash, fieldsBytes, signer = from, timestamp = tick()) {
+    const payload = Buffer.concat([Buffer.from([0x94]), MsgPack.pack(timestamp),
         MsgPack.pack(Buffer.alloc(0)), MsgPack.pack(Buffer.from("raw")), fieldsBytes]);
     const hashed = Buffer.concat([Buffer.from(toHash, "hex"), Buffer.from(lxmfHash(from), "hex"), payload]);
     const signature = signer.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
@@ -784,6 +823,15 @@ test("§5.2 a message fetched from the propagation node is verified and named by
     await fetchAll([rawLxm(alice, lxmfHash(me), strName(ALICE_BAD))]);
     assert.equal(r.ContactStore.get(A).messageName, "Alice", "an invalid-UTF-8 str is absent");
     assert.equal(r.MsgStore.get(A).filter((m) => m.dir === "in").length, 3);
+
+    // §5.2 order: a propagated copy that lands after a later direct message
+    // does not bring the old name back.
+    const t = tick() + 1000;
+    r.deliver(lxm(alice, me, "direct, later", named("Alicia"), alice, t));
+    assert.equal(r.ContactStore.get(A).messageName, "Alicia");
+    await fetchAll([lxm(alice, me, "sent earlier, stored at the node", named("Alice"), alice, t - 60)]);
+    assert.equal(r.ContactStore.get(A).messageName, "Alicia");
+    assert.equal(r.ContactStore.get(A).messageNameAt, t);
 });
 
 // ── audit L4: this device is never its own contact ────────────────────────
@@ -825,7 +873,7 @@ test("§5.3 an open Group Info modal relabels its members when a name arrives", 
     self._groupMemberLabel = compile("_groupMemberLabel(hash)", env)(self);
     self._paintMemberAvatar = compile("_paintMemberAvatar(avatar, name)", env)(self);
     const refresh = compile("_refreshGroupInfoNames()", env)(self);
-    store.acceptMessageName(h, DN.nameState("Zoe"), "validated");
+    store.acceptMessageName(h, DN.nameState("Zoe"), "validated", nowSecs());
     refresh();
     assert.equal(rows[0].parts[".member-name"].textContent, "Zoe");
     assert.equal(rows[0].parts[".member-avatar"].textContent, "Z");
@@ -839,7 +887,7 @@ test("§5.3 system notices stored with a frozen name get an actor when the membe
     const store = contactStore(memory());
     const alice = "a1b2c3d4".repeat(4), bob = "b0b0b0b0".repeat(4), carol = "c0c0c0c0".repeat(4), carl = "c0c0c0c0" + "d".repeat(24);
     store.add(bob);
-    store.acceptMessageName(bob, DN.nameState("Bob"), "validated");
+    store.acceptMessageName(bob, DN.nameState("Bob"), "validated", nowSecs());
     const nameOf = (h) => store.name(h);
     const legacy = fn("legacyNoticeActor", "content, memberHashes, nameOf", {});
     const members = [alice, bob, carol, carl];
@@ -866,4 +914,232 @@ test("§5.3 system notices stored with a frozen name get an actor when the membe
     assert.equal(third.actor, undefined, "only system notices");
     assert.match(app, /\nGroupMsgStore\.migrateLegacyNotices\(GroupStore\.getAll\(\), \(hash\) => ContactStore\.name\(hash\)\);\n/,
         "run as the page loads");
+});
+
+// ── §5.2 order on the direct path ──────────────────────────────────────────
+
+test("§5.2 order: a name is taken only from a message newer than the one that last set or cleared it", () => {
+    const me = Identity.create(), alice = Identity.create();
+    const r = makeReceiver(me);
+    const A = lxmfHash(alice);
+    r.ContactStore.add(A, false, alice.getPublicKey().toString("hex"));
+    const t = tick() + 1000;
+    r.deliver(lxm(alice, me, "newer", named("New"), alice, t));
+    assert.deepEqual([r.ContactStore.get(A).messageName, r.ContactStore.get(A).messageNameAt], ["New", t]);
+    r.deliver(lxm(alice, me, "older, arriving late", named("Old"), alice, t - 10));
+    assert.equal(r.ContactStore.get(A).messageName, "New");
+    r.deliver(lxm(alice, me, "older clear", new Map([[0xD1, Buffer.alloc(0)]]), alice, t - 5));
+    assert.equal(r.ContactStore.get(A).messageName, "New", "an older clear is ignored too");
+    r.deliver(lxm(alice, me, "repeat", named("New"), alice, t + 10));
+    assert.equal(r.ContactStore.get(A).messageNameAt, t + 10, "a repeat of the current name advances the timestamp");
+    r.deliver(lxm(alice, me, "between", named("Mid"), alice, t + 5));
+    assert.equal(r.ContactStore.get(A).messageName, "New", "so one older than the repeat loses");
+    r.deliver(lxm(alice, me, "clear", new Map([[0xD1, Buffer.alloc(0)]]), alice, t + 20));
+    assert.equal(r.ContactStore.get(A).messageName, null);
+    r.deliver(lxm(alice, me, "old name after the clear", named("New"), alice, t + 15));
+    assert.equal(r.ContactStore.get(A).messageName, null, "the clear stands");
+    assert.equal(r.ContactStore.get(A).messageNameAt, t + 20, "persisted with the row");
+    assert.equal(JSON.parse(JSON.stringify(r.ContactStore.get(A))).messageNameAt, t + 20);
+});
+
+// ── §5.2 senders with no row: kept hidden, named everywhere ───────────────
+
+const GROUP = "9".repeat(32);
+
+/** The router's handler with the real _handleGroupMessage behind it. */
+function makeGroupReceiver(me, memberHashes) {
+    const r = makeReceiver(me);
+    const groups = new Map([[GROUP, {
+        groupId: GROUP, groupName: "G", groupStatus: "active", lastActivity: 0,
+        members: new Map([[lxmfHash(me), "accepted"], ...memberHashes.map((h) => [h, "invited"])]),
+    }]]);
+    const notices = [];
+    const posts = [];
+    const GroupStore = {
+        get: (id) => groups.get(id) ?? null,
+        addPending: (id, groupName, inviter, members) => groups.set(id, {
+            groupId: id, groupName, groupStatus: "pending", members: new Map(members.map((h) => [h, "invited"])) }),
+        updateMember: (id, h, status) => groups.get(id).members.set(h, status),
+        _save() {},
+    };
+    const GroupMsgStore = {
+        addSystem: (id, content, actor) => notices.push({ dir: "system", content, actor }),
+        add: (id, m) => posts.push(m),
+    };
+    const own = () => lxmfHash(me);
+    r.self.ownHash = own();
+    r.self._performGroupRelay = () => {};
+    r.self._rememberGroupMemberKeys = compile("_rememberGroupMemberKeys(memberKeys)", {
+        Buffer, Identity, Destination, ContactStore: r.ContactStore, console: quiet, ownLxmfDestinationHash: own,
+    })(r.self);
+    r.self._handleGroupMessage = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
+        GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, ownLxmfDestinationHash: own,
+        shouldProcessGroupMessage: fn("shouldProcessGroupMessage", "groupAction, inviterKnown, groupExists", {}),
+    })(r.self);
+    const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
+    const groupLabel = fn("groupSenderLabel", "m", { ContactStore: r.ContactStore });
+    return { ...r, groups, notices, posts, systemText, groupLabel };
+}
+const groupFields = (name, action = null, extra = []) => new Map([
+    ...(name === null ? [] : [[0xD1, Buffer.from(name)]]),
+    [GROUP_FIELDS.GROUP_ID, GROUP],
+    ...(action ? [[GROUP_FIELDS.GROUP_ACTION, action]] : []),
+    ...extra,
+]);
+
+test("§5.2 a group member with no row still gets its name: a hidden row, named on every group surface", () => {
+    const me = Identity.create(), carol = Identity.create();
+    const C = lxmfHash(carol);
+    const r = makeGroupReceiver(me, [C]);
+    assert.equal(r.ContactStore.get(C), null, "a member the web user has never added and holds no key for");
+
+    const t = tick() + 1000;
+    r.deliver(lxm(carol, me, "", groupFields("Carol", "accept", [[GROUP_FIELDS.GROUP_SENDER, C]]), carol, t));
+    const row = r.ContactStore.get(C);
+    assert.ok(row, "the name has somewhere to live");
+    assert.deepEqual([row.messageName, row.messageNameAt, row.hidden], ["Carol", t, true],
+        "source unknown (no key yet): the name fills the empty slot");
+    assert.equal(r.systemText(r.notices.at(-1)), "Carol joined the group", "the system notice");
+    assert.equal(r.ContactStore.name(C), "Carol", "the member list's resolver");
+    assert.equal(r.ContactStore.isContact(C), false, "not a contact");
+    assert.equal(r.ContactStore.listed().some((c) => c.destHash === C), false, "not in the contact list (audit L4)");
+
+    // The key arrives: later messages are validated and rename her, in order.
+    r.ContactStore.get(C).publicKey = carol.getPublicKey().toString("hex");
+    r.deliver(lxm(carol, me, "hi all", groupFields("Caz", null, [[GROUP_FIELDS.GROUP_SENDER, C]]), carol, t + 10));
+    assert.deepEqual(r.groupLabel(r.posts.at(-1)), { label: "Caz", secondary: null }, "the group sender label");
+    r.deliver(lxm(carol, me, "old, relayed late", groupFields("Carol", null, [[GROUP_FIELDS.GROUP_SENDER, C]]), carol, t + 5));
+    assert.equal(r.ContactStore.name(C), "Caz", "an older group message does not undo it");
+
+    // A DM from her makes her a contact, with what the row already holds.
+    r.deliver(lxm(carol, me, "a DM", new Map(), carol, t + 20));
+    assert.equal(r.ContactStore.isContact(C), true);
+    assert.equal(r.ContactStore.listed().some((c) => c.destHash === C), true, "listed now there is a conversation");
+    assert.equal(r.ContactStore.name(C), "Caz");
+    assert.equal(r.ContactStore.get(C).publicKey, carol.getPublicKey().toString("hex"));
+});
+
+test("§5.2 a message the group branch drops creates no row; a hidden row still counts as known to invites", () => {
+    const me = Identity.create(), dave = Identity.create(), bob = Identity.create();
+    const r = makeGroupReceiver(me, []);
+    const D = lxmfHash(dave), B = lxmfHash(bob);
+    const other = "8".repeat(32);
+    r.deliver(lxm(dave, me, "", new Map([[0xD1, Buffer.from("Dave")], [GROUP_FIELDS.GROUP_ID, other],
+        [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${D},${lxmfHash(me)}`]])));
+    assert.equal(r.groups.has(other), false, "a stranger's invite is dropped, as before");
+    assert.equal(r.ContactStore.get(D), null, "and leaves no row, so a second invite from him is dropped too");
+    r.deliver(lxm(dave, me, "to an unknown group", new Map([[0xD1, Buffer.from("Dave")], [GROUP_FIELDS.GROUP_ID, other]])));
+    assert.equal(r.ContactStore.get(D), null);
+
+    // Bob is a member of another group: his key arrived with its invite, so
+    // he has a hidden row. An invite from him is processed, as when every
+    // such row was a listed contact.
+    r.self._rememberGroupMemberKeys([[B, bob.getPublicKey().toString("base64")]]);
+    assert.equal(r.ContactStore.get(B).hidden, true);
+    r.deliver(lxm(bob, me, "", new Map([[0xD1, Buffer.from("Bob")], [GROUP_FIELDS.GROUP_ID, other],
+        [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${B},${lxmfHash(me)}`]])));
+    assert.equal(r.groups.get(other)?.groupStatus, "pending", "the invite from a known member arrives");
+    assert.equal(r.systemText(r.notices.at(-1)), "Bob invited you to \"Group\"", "named by the validated 0xD1");
+});
+
+test("audit L4: group members and channel posters are kept as hidden rows, never listed as contacts", () => {
+    const me = Identity.create(), bob = Identity.create(), alice = Identity.create();
+    const B = lxmfHash(bob), A = lxmfHash(alice);
+    const store = contactStore(memory());
+    compile("_rememberGroupMemberKeys(memberKeys)", {
+        Buffer, Identity, Destination, ContactStore: store, console: quiet, ownLxmfDestinationHash: () => lxmfHash(me),
+    })({ ownHash: lxmfHash(me) })([[B, bob.getPublicKey().toString("base64")]]);
+    assert.equal(store.get(B).hidden, true, "a group member's key");
+    assert.equal(store.isContact(B), false);
+    assert.deepEqual(store.listed(), []);
+
+    // Accepting an invite keeps every member (their keys, their names)
+    // without adding them as contacts.
+    const accept = compile("_acceptGroupInvite(groupId)", {
+        GroupStore: { get: () => ({ groupName: "G", members: new Map([[B, "accepted"], [A, "invited"], [lxmfHash(me), "invited"]]) }), accept() {} },
+        ContactStore: store, GroupMsgStore: { addSystem() {} }, console: quiet,
+        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, sendGroupAccept: async () => {} },
+        alert: () => assert.fail("keys are all there"),
+    });
+    store.keep(A, alice.getPublicKey().toString("hex"));
+    accept({ render() {} })(GROUP);
+    assert.deepEqual([store.get(A).hidden, store.get(B).hidden], [true, true]);
+    assert.equal(store.get(lxmfHash(me)), null, "never this device");
+    assert.deepEqual(store.listed(), []);
+
+    const c = makeChannelReceiver(me);
+    assert.equal(c.handle(channelLxmPack(CHANNEL, alice, "a post", DN.nameState("Pseud")).wire), true);
+    assert.equal(c.ContactStore.get(A).hidden, true, "a channel poster's bound key");
+    assert.equal(c.ContactStore.get(A).publicKey, alice.getPublicKey().toString("hex"));
+    assert.deepEqual(c.ContactStore.listed(), []);
+
+    // Adding the contact by hand lists the row, names and key included.
+    store.acceptMessageName(A, DN.nameState("Alice"), "validated", nowSecs());
+    store.add(A);
+    assert.equal(store.isContact(A), true);
+    assert.deepEqual(store.listed().map((x) => x.destHash), [A]);
+    assert.deepEqual([store.get(A).messageName, store.get(A).publicKey], ["Alice", alice.getPublicKey().toString("hex")]);
+    assert.equal(store.keep(A).hidden, false, "keeping a contact leaves it a contact");
+
+    // Rows stored before the flag existed are contacts.
+    const s = memory();
+    s.sSet("contacts_v2", [{ destHash: B, localName: null, messageName: null, announceName: null, legacyName: null, lastSeen: 1 }]);
+    assert.equal(contactStore(s).isContact(B), true);
+
+    for (const method of ["_buildSidebarContent()", "_renderDirectForm(top, scroll, footer)", "_renderGroupForm(top, scroll, footer)"]) {
+        const body = methodBody(method);
+        assert.match(body, /ContactStore\.listed\(\)/, `${method} lists contacts only`);
+        assert.doesNotMatch(body, /ContactStore\.getAll\(\)/, method);
+    }
+    for (const method of ["async _sendGroupEnvelope(memberHash, content, fields)", "async openGroupConversation(groupId)",
+        "_rememberGroupMemberKeys(memberKeys)", "_handleChannelPacket(packetData)", "_acceptGroupInvite(groupId)"]) {
+        assert.doesNotMatch(methodBody(method), /ContactStore\.add\(/, `${method} never adds a contact`);
+    }
+});
+
+// ── §5.2 order on channel posts ────────────────────────────────────────────
+
+test("§5.2 channel order: history pulled late never undoes a poster's newer channel name", () => {
+    const me = Identity.create(), alice = Identity.create();
+    const r = makeChannelReceiver(me);
+    const A = lxmfHash(alice);
+    const post = (fields, timestamp) => {
+        const destHash = channelDeliveryHash(CHANNEL);
+        const packed = rawLxm(alice, destHash.toString("hex"), MsgPack.pack(fields), alice, timestamp);
+        const plain = Buffer.concat([Buffer.from("RTID"), alice.getPublicKey(), packed.subarray(16)]);
+        const { identity, hash } = channelIdentity(CHANNEL);
+        return Buffer.concat([hash, identity.encrypt(plain)]);
+    };
+    const t = tick() + 1000;
+    assert.equal(r.handle(post(named("New"), t)), true);
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New");
+    assert.equal(r.handle(post(named("Old"), t - 100)), true, "the older post is still shown");
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New", "but its name does not win");
+    assert.equal(r.handle(post(new Map([[0xD1, Buffer.alloc(0)]]), t - 50)), true);
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New", "nor does an older clear");
+    assert.equal(r.handle(post(named("New"), t + 100)), true);
+    assert.equal(r.ChannelSenderNamesStore.entry(CHANNEL, A).at, Math.round((t + 100) * 1000), "a newer repeat advances it");
+    assert.equal(r.handle(post(named("Mid"), t + 50)), true);
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New");
+    assert.equal(r.handle(post(new Map([[0xD1, Buffer.alloc(0)]]), t + 200)), true);
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), null, "a newer clear");
+});
+
+// ── §3 the own announce name ───────────────────────────────────────────────
+
+test("§3 the own Announce Display Name is cleaned with the announce rules: \"Anonymous Peer\" is never broadcast", () => {
+    let applied = 0;
+    const s = memory();
+    const names = ownNames(s, { applyAnnounceName: () => applied++ });
+    assert.equal(names.setAnnounce("  anonymous   PEER "), null, "no name, as LXMF-rust's clean_announce");
+    assert.equal(names.announce, null);
+    assert.equal(applied, 1, "the router is told at once");
+    assert.equal(s.sGet("announceDisplayName"), "");
+    assert.equal(names.setAnnounce("Anonymous Peers"), "Anonymous Peers", "only the exact placeholder");
+    assert.equal(names.setMessage("Anonymous Peer"), "Anonymous Peer", "the Message Display Name is not an announce name");
+
+    const stored = memory();
+    stored.sSet("announceDisplayName", "Anonymous Peer"); // saved by the build that cleaned it with clean()
+    assert.equal(ownNames(stored).announce, null, "a stored one loads as no name");
+    assert.match(methodBody("applyAnnounceName()"), /setAnnounceName\(OwnNames\.announce\)/, "what the router announces");
 });

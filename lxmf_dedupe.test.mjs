@@ -488,7 +488,7 @@ test("the group propagation fallback uploads the exact direct envelope, so the s
     const memberHash = lxmfHash(member);
     const contact = { destHash: memberHash, publicKey: member.getPublicKey().toString("hex") };
     const env = {
-        ContactStore: { get: () => contact, add: () => contact },
+        ContactStore: { get: () => contact, add: () => contact, keep: () => contact },
         Identity, Buffer, Destination, LXMessage, GROUP_FIELDS, GroupDeliveryEvidence, Link,
         IdMgr: { id: me },
         console: { log() {}, warn() {} },
