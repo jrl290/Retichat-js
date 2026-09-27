@@ -57,6 +57,10 @@ import {
 } from "./lib/display_name.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
+import {
+    applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
+    regenerateRoot, validateChannelName, visibilityHint,
+} from "./lib/channel_name.js";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -6645,65 +6649,108 @@ const App = {
         );
     },
 
-    /** Channel tab: sub-picker Public|Private + name input (top),
-     *  info (scroll), Join button (footer). */
+    /** Channel tab: name input + sub-picker Public|Private (top),
+     *  info (scroll), Join button (footer).
+     *
+     *  One field holds the full "<root>.<name>". Public uses the root
+     *  "public"; a private root defaults to 16 random hex characters
+     *  (crypto.getRandomValues) and stays editable, so a shared private name
+     *  can be typed or pasted whole. The rules live in lib/channel_name.js and
+     *  match the iOS and Android forms. */
     _renderChannelForm(top, scroll, footer) {
-        let channelNameInput = "public.";
-
         const rfedNodeHash = RnsClient.cfg?.rfedNodeHash || "";
         const hasRfed = rfedNodeHash.length === 32;
         const vis = this.state.channelVis || "public";
+        const mode = () => this.state.channelVis || "public";
 
-        const genPrivatePrefix = () => {
-            return [...Array(8)].map(() => Math.floor(Math.random()*16).toString(16)).join('') + ".";
+        let inp, hintEl, errorEl, regenBtn, joinBtn;
+
+        /** Re-derive the hint, the error line and Join from the field. */
+        const refresh = () => {
+            if (!inp) return;
+            const m = mode();
+            const v = validateChannelName(inp.value, m);
+            if (hintEl) hintEl.textContent = visibilityHint(m);
+            if (errorEl) {
+                // An untouched "public." or "<root>." needs no scolding.
+                const bare = inp.value.endsWith(".") && inp.value.indexOf(".") === inp.value.length - 1;
+                errorEl.textContent = v.ok || (bare && !v.error.startsWith("\"public\"")) ? "" : v.error;
+                errorEl.style.display = errorEl.textContent ? "" : "none";
+            }
+            if (regenBtn) regenBtn.style.display = m === "private" ? "" : "none";
+            if (joinBtn) joinBtn.disabled = !hasRfed || !v.ok;
         };
 
-        const applyPrefix = (mode) => {
-            this.state.channelVis = mode;
-            const inp = document.getElementById("nc-channel-name");
-            if (!inp) return;
-            // Preserve anything after the first dot segment
-            const current = inp.value;
-            const dotIdx = current.indexOf(".");
-            const suffix = dotIdx >= 0 ? current.slice(dotIdx + 1) : "";
-            if (mode === "public") {
-                inp.value = suffix ? "public." + suffix : "public.";
-            } else {
-                const key = genPrivatePrefix();
-                inp.value = suffix ? key + suffix : key;
-            }
-            channelNameInput = inp.value;
-            // Update sub-picker buttons
+        const setValue = (value, caret = value.length) => {
+            inp.value = value;
+            try { inp.setSelectionRange(caret, caret); } catch (_) {}
+            refresh();
+        };
+
+        const applyPrefix = (m) => {
+            this.state.channelVis = m;
+            if (inp) setValue(applyVisibility(inp.value, m));
             const subPicker = document.querySelector(".channel-vis-picker");
             if (subPicker) {
                 subPicker.querySelectorAll(".seg-btn").forEach(btn => {
-                    const isActive = btn.getAttribute("data-vis") === mode;
+                    const isActive = btn.getAttribute("data-vis") === m;
                     btn.className = "seg-btn" + (isActive ? " active" : "");
                 });
             }
+            refresh();
         };
 
         const doJoin = () => {
-            const inp = document.getElementById("nc-channel-name");
-            const name = (inp?.value || channelNameInput).trim();
-            if (!name) { alert("Enter a channel name."); return; }
-            RnsClient.joinChannel(name).then((channel) => {
+            if (!inp) return;
+            const v = validateChannelName(inp.value, mode());
+            if (!v.ok) { refresh(); return; }
+            RnsClient.joinChannel(v.name).then((channel) => {
                 this.state.showNewConversation = false;
                 this.openChat(channel.channelName, false);
             }).catch(e => alert("Failed to join channel: " + e.message));
         };
 
+        inp = h("input", {
+            id: "nc-channel-name", type: "text",
+            value: initialChannelValue(vis),
+            placeholder: vis === "private" ? "root.general…" : "public.general…",
+            autocapitalize: "off", autocomplete: "off", spellcheck: "false",
+            onInput: (e) => {
+                // The character rule: lowercase a-z, 0-9, "." and "-".
+                const el = e.target;
+                const filtered = filterChannelChars(el.value);
+                if (filtered !== el.value) {
+                    const caretFrom = el.selectionStart ?? el.value.length;
+                    const caret = filterChannelChars(el.value.slice(0, caretFrom)).length;
+                    setValue(filtered, caret);
+                } else {
+                    refresh();
+                }
+            },
+            onPaste: (e) => {
+                const text = e.clipboardData?.getData("text");
+                if (text == null) return;
+                e.preventDefault();
+                const el = e.target;
+                const r = pasteChannelName({
+                    value: el.value,
+                    selStart: el.selectionStart,
+                    selEnd: el.selectionEnd,
+                    pasted: text,
+                    mode: mode(),
+                });
+                setValue(r.value, r.caret);
+            },
+            onKeydown: (e) => { if (e.key === "Enter") doJoin(); },
+        });
+        // The value property, not only the attribute: setValue/refresh read it.
+        inp.value = inp.getAttribute("value");
+
         // Channel name input
         top.appendChild(
             h("div", { className: "settings-field" },
                 h("label", { htmlFor: "nc-channel-name" }, "Channel Name"),
-                h("input", {
-                    id: "nc-channel-name", type: "text",
-                    value: "public.",
-                    placeholder: "public.general…",
-                    onInput: (e) => { channelNameInput = e.target.value; },
-                    onKeydown: (e) => { if (e.key === "Enter") doJoin(); },
-                }),
+                inp,
             ),
         );
 
@@ -6721,6 +6768,15 @@ const App = {
             ),
         );
 
+        hintEl = h("div", { className: "field-hint" }, visibilityHint(vis));
+        errorEl = h("div", { className: "field-hint", style: { color: "var(--danger)", display: "none" } });
+        regenBtn = h("button", {
+            className: "btn btn-sm",
+            style: { display: vis === "private" ? "" : "none", marginTop: "6px" },
+            onClick: () => setValue(regenerateRoot(inp.value)),
+        }, "Regenerate prefix");
+        top.appendChild(h("div", {}, hintEl, errorEl, regenBtn));
+
         if (hasRfed) {
             scroll.appendChild(
                 h("div", { className: "settings-field" },
@@ -6730,11 +6786,11 @@ const App = {
             );
         }
 
-        footer.appendChild(
-            h("button", { className: "btn btn-primary btn-block", onClick: doJoin,
-                disabled: !hasRfed, title: hasRfed ? "" : "Configure an RFed node in Settings first" },
-                "Join / Create"),
-        );
+        joinBtn = h("button", { className: "btn btn-primary btn-block", onClick: doJoin,
+            disabled: true, title: hasRfed ? "" : "Configure an RFed node in Settings first" },
+            "Join / Create");
+        footer.appendChild(joinBtn);
+        refresh();
     },
 
     /** Group Info modal — shows members, allow accept/decline/leave */
