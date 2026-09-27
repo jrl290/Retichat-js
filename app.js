@@ -3942,11 +3942,9 @@ const RnsClient = {
                 // LXMF signs dest | src | payload | SHA-256(dest | src | payload)
                 // over the four-element payload; a fifth element (a stamp) is
                 // appended after signing, so it is left out here as
-                // LXMessage.unpack_from_bytes leaves it out.
-                const signedPayload = (Array.isArray(payload) && payload.length > 4)
-                    ? Buffer.from(MsgPack.pack(payload.slice(0, 4)))
-                    : payloadBytes;
-                const hashedPart = Buffer.concat([destHash, srcHash, signedPayload]);
+                // LXMessage.unpack_from_bytes leaves it out
+                // (LXMessage.signedPayload, from the received bytes).
+                const hashedPart = Buffer.concat([destHash, srcHash, LXMessage.signedPayload(payloadBytes)]);
                 const signature = decrypted.slice(16, 80);
                 if (!DistroManager.identity.validate(signature, Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)]))) {
                     console.warn(`[distro] ⚠️ Sent-copy for ${sentCopy.toHex?.slice(0,12) ?? "?"} fails the distro signature — dropped (§17.11 rule 2)`);
@@ -4012,7 +4010,7 @@ const RnsClient = {
             // DISPLAY_NAMES.md §5.2 on the distro path too: the sender's 0xD1,
             // taken according to the LXMF signature, checked here exactly as
             // the router checks the direct paths (LXMessage.verify).
-            const signature = LXMessage.verify(destHash, srcHash, decrypted.slice(16, 80), payloadBytes, undefined, payload);
+            const signature = LXMessage.verify(destHash, srcHash, decrypted.slice(16, 80), payloadBytes);
             const signatureState = signature.validated ? "validated"
                 : signature.unverifiedReason === LXMessage.SOURCE_UNKNOWN ? "unknown" : "invalid";
             if (!signature.validated) console.log(`[distro] Message from ${srcHashHex.slice(0,12)}: signature ${signatureState}`);

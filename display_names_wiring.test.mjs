@@ -567,7 +567,7 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
         LXMF, Cryptography, ownLxmfDestinationHash: () => "e".repeat(32), decodeDisplayName: DN.decodePayload,
         console: quiet,
         LXMessage: new Proxy(LXMessage, { get: (t, k) => (k === "verify"
-            ? (d, s, sig, p, _r, u) => LXMessage.verify(d, s, sig, p, recall, u) : t[k]) }),
+            ? (d, s, sig, p) => LXMessage.verify(d, s, sig, p, recall) : t[k]) }),
     };
     const run = new Function(...Object.keys(env), "self", "distroHash", "blob", body);
     const self = { ownHash: "e".repeat(32), _pendingTickets: new Map(), _onMsg: [], _ticketFromFields: () => null };
