@@ -60,6 +60,7 @@ import { applyGroupFields } from "./lib/retichat_field.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
     regenerateRoot, typeChannelName, validateChannelName, visibilityHint,
+    channelShareText, channelShareHint,
 } from "./lib/channel_name.js";
 
 // Initialize DistroManager after Buffer polyfill is available
@@ -6935,11 +6936,31 @@ const App = {
 
         const body = h("div", { className: "modal-body" });
 
-        // Channel name
+        // Channel name. The full "<root>.<name>" is how a channel is shared
+        // (for a private channel it is the invite), so it is shown whole and
+        // selectable, with Copy and Share; the hash cannot be joined by and
+        // stays secondary. Rules: lib/channel_name.js channelShareText/Hint.
+        const fullName = channelShareText(ch.channelName);
+        const copyBtn = h("button", { className: "btn btn-secondary btn-sm channel-copy-name",
+            title: "Copy the full channel name" }, "⧉ Copy name");
+        copyBtn.addEventListener("click", () => {
+            navigator.clipboard.writeText(fullName).then(() => {
+                copyBtn.classList.add("copied");
+                copyBtn.textContent = "✓ Copied";
+                setTimeout(() => { copyBtn.classList.remove("copied"); copyBtn.textContent = "⧉ Copy name"; }, 1200);
+            }).catch(() => alert("Could not copy. Select the name and copy it instead."));
+        });
+        const shareBtn = typeof navigator.share === "function"
+            ? h("button", { className: "btn btn-secondary btn-sm channel-share-name",
+                title: "Share the full channel name",
+                onClick: () => { navigator.share({ text: fullName }).catch(() => {}); } }, "↗ Share")
+            : null;
         body.appendChild(
             h("div", { style: { marginBottom: "16px" } },
-                h("div", { style: { fontSize: "18px", fontWeight: 700 } }, "#" + ch.channelName),
-                h("div", { style: { fontSize: "12px", color: "var(--text-muted)", fontFamily: "var(--font-mono)", marginTop: "4px", wordBreak: "break-all" } },
+                h("div", { className: "channel-full-name" }, fullName),
+                h("div", { className: "channel-share-hint" }, channelShareHint(fullName)),
+                h("div", { className: "btn-row channel-name-actions" }, copyBtn, shareBtn),
+                h("div", { style: { fontSize: "12px", color: "var(--text-muted)", fontFamily: "var(--font-mono)", marginTop: "8px", wordBreak: "break-all" } },
                     `Hash: ${ch.channelHash}`),
             ),
         );
