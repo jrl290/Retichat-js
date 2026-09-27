@@ -32,7 +32,6 @@ import {
     LXMRouter,
     LXMF,
     PostInterface,
-    GROUP_FIELDS,
     channelIdentity,
     channelLxmPack,
     channelLxmUnpack,
@@ -57,6 +56,7 @@ import {
     migrateOwnDisplayName,
 } from "./lib/display_name.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
+import { applyGroupFields } from "./lib/retichat_field.js";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -2597,7 +2597,8 @@ const RnsClient = {
         document.body.appendChild(overlay);
     },
 
-    /** Handle an incoming group message (detected by GROUP_FIELDS.GROUP_ID). */
+    /** Handle an incoming group message (detected by its group id, key 1 of
+     *  0xD1 or the old 0xA0: LXMessage.extractGroupFields). */
     _handleGroupMessage(lxmfMsg, srcHash, content, groupInfo) {
         const { groupId, groupName, groupAction, groupSender, members, relaySeen, memberKeys } = groupInfo;
         console.log(`[retichat] 👥 Group message: groupId=${groupId.slice(0,8)} action=${groupAction || "message"} from=${srcHash.slice(0,12)}`);
@@ -2888,15 +2889,10 @@ const RnsClient = {
         const sourceHex = msg.sourceHash.toString("hex");
         const nameState = this._decideMessageName(sourceHex, memberHash);
         applyDisplayName(msg.fields, nameState);
-        msg.fields.set(GROUP_FIELDS.GROUP_ID, fields.groupId);
-        if (fields.groupMembers) msg.fields.set(GROUP_FIELDS.GROUP_MEMBERS, fields.groupMembers);
-        if (fields.groupName) msg.fields.set(GROUP_FIELDS.GROUP_NAME, fields.groupName);
-        if (fields.groupAction) msg.fields.set(GROUP_FIELDS.GROUP_ACTION, fields.groupAction);
-        if (fields.groupSender) msg.fields.set(GROUP_FIELDS.GROUP_SENDER, fields.groupSender);
-        if (fields.groupRelaySeen) msg.fields.set(GROUP_FIELDS.GROUP_RELAY_SEEN, fields.groupRelaySeen);
-        if (fields.groupRelayFor) msg.fields.set(GROUP_FIELDS.GROUP_RELAY_FOR, fields.groupRelayFor);
-        if (fields.groupRelayDone != null) msg.fields.set(GROUP_FIELDS.GROUP_RELAY_DONE, fields.groupRelayDone);
-        if (fields.groupMemberKey) msg.fields.set(GROUP_FIELDS.GROUP_MEMBER_KEYS, fields.groupMemberKey);
+        // DISPLAY_NAMES.md §10: the group entries, in the old top-level
+        // fields 0xA0-0xA8 or in the Retichat field 0xD1 beside the name, as
+        // GROUP_ENTRIES_IN_RETICHAT_FIELD selects (false until the switch).
+        applyGroupFields(msg.fields, fields);
         const packed = msg.pack(IdMgr.id, true);
         return this._deliverGroupEnvelope(
             memberHash,

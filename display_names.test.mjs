@@ -63,7 +63,7 @@ test("§3 rule 1 on received str: every clean vector as a str 0xD1 and a str ann
     for (const v of vectors.clean) {
         const raw = hex(v.input_hex);
         for (const [type, value] of [["str", rawStr(raw)], ["bin", Buffer.concat([Buffer.from([0xc4, raw.length]), raw])]]) {
-            const got = DN.decodePayload(payloadWith(Buffer.concat([hex("81ccd1"), value])));
+            const got = DN.decodePayload(payloadWith(Buffer.concat([hex("81ccd18100"), value])));
             const want = raw.length === 0 ? "clear" : v.expected === null ? "absent" : "name";
             assert.equal(got.state, want, `${v.name} (${type})`);
             if (want === "name") assert.equal(got.name, v.expected, `${v.name} (${type})`);
@@ -73,24 +73,24 @@ test("§3 rule 1 on received str: every clean vector as a str 0xD1 and a str ann
         const appData = Buffer.concat([hex("93"), rawStr(hex(v.input_hex)), hex("c090")]);
         assert.equal(DN.announceNameFromAppData(appData), v.expected, `${v.name} (str)`);
     }
-    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a6416c696365ed"))).state, "absent", "Alice + a stray 0xED");
-    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a1ff"))).state, "absent", "a lone 0xFF");
-    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a2c0af"))).state, "absent", "overlong '/'");
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd18100a6416c696365ed"))).state, "absent", "Alice + a stray 0xED");
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd18100a1ff"))).state, "absent", "a lone 0xFF");
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd18100a2c0af"))).state, "absent", "overlong '/'");
     assert.equal(DN.announceNameFromAppData(hex("92a6416c696365edc0")), null, "announce: Alice + a stray 0xED");
 });
 
 test("decodePayload walks every msgpack type before the fields and inside them", () => {
     const fields = MsgPack.pack(new Map([
         [1, [1.5, -3, 70000, -70000, 2 ** 40, null, true, false, "s".repeat(40), Buffer.alloc(300)]],
-        [2, new Map([["k", new Map([[0xD1, Buffer.from("not this one")]])]])],
-        [0xD1, Buffer.from("Alice")],
+        [2, new Map([["k", new Map([[0xD1, new Map([[0, Buffer.from("not this one")]])]])]])],
+        [0xD1, new Map([[0, Buffer.from("Alice")]])],
     ]));
     assert.deepEqual(DN.decodePayload(payloadWith(fields)), DN.nameState("Alice"));
-    const stamped = Buffer.concat([hex("95cb41d9d7a4b8000000c400c400"), MsgPack.pack(new Map([[0xD1, Buffer.from("Bob")]])), hex("c420"), Buffer.alloc(32)]);
+    const stamped = Buffer.concat([hex("95cb41d9d7a4b8000000c400c400"), MsgPack.pack(new Map([[0xD1, new Map([[0, Buffer.from("Bob")]])]])), hex("c420"), Buffer.alloc(32)]);
     assert.deepEqual(DN.decodePayload(stamped), DN.nameState("Bob"), "a fifth element (a stamp) is fine");
-    assert.deepEqual(DN.decodePayload(payloadWith(hex("82cd00d1a3426f62ccd1a3457665"))), DN.nameState("Bob"),
+    assert.deepEqual(DN.decodePayload(payloadWith(hex("82cd00d18100a3426f62ccd18100a3457665"))), DN.nameState("Bob"),
         "any integer width for the key, and the first 0xD1 counts, as in LXMF-rust");
-    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a5416c"))).state, "absent", "truncated");
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd18100a5416c"))).state, "absent", "truncated");
     assert.equal(DN.decodePayload(hex("93cb41d9d7a4b8000000c400c400")).state, "absent", "no fields element");
     assert.equal(DN.decodePayload(null).state, "absent");
 });
@@ -111,9 +111,9 @@ test("M8: a Map at 0xD1 (MeshChatX/Columba dicts) never becomes a name, and 0x10
 
 test("§2.1 the value sent is bin (a Buffer), never a JS string", () => {
     const fields = DN.applyToFields(new Map(), DN.nameState("Alice"));
-    assert.ok(Buffer.isBuffer(fields.get(0xD1)));
-    assert.equal(MsgPack.pack(fields).toString("hex"), "81ccd1c405416c696365");
-    assert.equal(MsgPack.pack(DN.applyToFields(new Map(), DN.CLEAR)).toString("hex"), "81ccd1c400");
+    assert.ok(Buffer.isBuffer(fields.get(0xD1).get(0)));
+    assert.equal(MsgPack.pack(fields).toString("hex"), "81ccd18100c405416c696365");
+    assert.equal(MsgPack.pack(DN.applyToFields(new Map(), DN.CLEAR)).toString("hex"), "81ccd18100c400");
     assert.equal(DN.applyToFields(new Map(), DN.ABSENT).size, 0);
 });
 

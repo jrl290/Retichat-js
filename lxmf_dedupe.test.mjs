@@ -35,6 +35,7 @@ import Packet from "./lib/rns/packet.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
 import { applyToFields as applyDisplayName, decodePayload as decodeDisplayName, ABSENT } from "./lib/display_name.js";
+import { applyGroupFields } from "./lib/retichat_field.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -489,7 +490,7 @@ test("the group propagation fallback uploads the exact direct envelope, so the s
     const contact = { destHash: memberHash, publicKey: member.getPublicKey().toString("hex") };
     const env = {
         ContactStore: { get: () => contact, add: () => contact, keep: () => contact },
-        Identity, Buffer, Destination, LXMessage, GROUP_FIELDS, GroupDeliveryEvidence, Link,
+        Identity, Buffer, Destination, LXMessage, applyGroupFields, GroupDeliveryEvidence, Link,
         IdMgr: { id: me },
         console: { log() {}, warn() {} },
         applyDisplayName, NameLedgerStore: { recordDelivered() {} },

@@ -5,10 +5,12 @@
  * bodies, extracted and compiled over stubs), with real identities, real
  * LXMF packing, real channel envelopes and the real name stores:
  *
- *   §4.1  DMs and group envelopes carry 0xD1 as bin under the ledger; the
- *         decision is made once and kept on the record, so the direct send
- *         and the propagated copy are the same bytes; a delivery proof
- *         records it, a propagation never does.
+ *   §4.1  DMs and group envelopes carry the name (key 0 of the 0xD1 map)
+ *         as bin under the ledger; the decision is made once and kept on
+ *         the record, so the direct send and the propagated copy are the
+ *         same bytes; a delivery proof records it, a propagation never does.
+ *   §10   group envelopes carry the group entries in the form
+ *         GROUP_ENTRIES_IN_RETICHAT_FIELD selects; the app reads both.
  *   §4.2  channel posts carry the Channel Display Name by the channel rule.
  *   §5.1  contacts hold localName / messageName / announceName.
  *   §5.2  a received name is taken by the signature table, on the direct,
@@ -37,6 +39,8 @@ import {
     channelLxmPack, channelLxmUnpack, channelIdentity, channelDeliveryHash, channelComputeStamp,
 } from "./lib/rns/rfed_channel.js";
 import * as DN from "./lib/display_name.js";
+import * as RF from "./lib/retichat_field.js";
+const { applyGroupFields } = RF;
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -270,7 +274,7 @@ function lxm(from, to, content, fields, signer = from, timestamp = tick()) {
     m.fields = fields;
     return m.pack(signer, false);
 }
-const named = (name) => new Map([[0xD1, Buffer.from(name)]]);
+const named = (name) => new Map([[0xD1, new Map([[0, Buffer.from(name)]])]]);
 
 test("§5.2 direct messages: validated sets and clears, unknown fills only an empty name, invalid is ignored", () => {
     const me = Identity.create(), alice = Identity.create(), mallory = Identity.create();
@@ -282,7 +286,7 @@ test("§5.2 direct messages: validated sets and clears, unknown fills only an em
     assert.equal(r.ContactStore.get(A).messageName, "Alice", "unknown source fills the empty name");
     r.deliver(lxm(alice, me, "hi again", named("Alicia")));
     assert.equal(r.ContactStore.get(A).messageName, "Alice", "unknown source never replaces one");
-    r.deliver(lxm(alice, me, "clear?", new Map([[0xD1, Buffer.alloc(0)]])));
+    r.deliver(lxm(alice, me, "clear?", new Map([[0xD1, new Map([[0, Buffer.alloc(0)]])]])));
     assert.equal(r.ContactStore.get(A).messageName, "Alice", "unknown source never clears");
 
     // The key arrives (announce or path response): now validated.
@@ -294,7 +298,7 @@ test("§5.2 direct messages: validated sets and clears, unknown fills only an em
     assert.equal(r.MsgStore.get(A).filter((m) => m.dir === "in").length, 5, "every message is still kept, as the reference keeps it");
     r.deliver(lxm(alice, me, "no field", new Map()));
     assert.equal(r.ContactStore.get(A).messageName, "Alicia", "absent changes nothing");
-    r.deliver(lxm(alice, me, "clear", new Map([[0xD1, Buffer.alloc(0)]])));
+    r.deliver(lxm(alice, me, "clear", new Map([[0xD1, new Map([[0, Buffer.alloc(0)]])]])));
     assert.equal(r.ContactStore.get(A).messageName, null, "validated clear");
     r.deliver(lxm(alice, me, "dict", new Map([[0xD1, new Map([["x", 1]])], [0x10, "Old"]])));
     assert.equal(r.ContactStore.get(A).messageName, null, "a Map is never a name; 0x10 is not read");
@@ -305,7 +309,7 @@ test("§5.2 group messages name the LXMF source before the group branch (audit H
     const r = makeReceiver(me);
     const B = lxmfHash(bob);
     r.ContactStore.add(B, false, bob.getPublicKey().toString("hex"));
-    const fields = new Map([[0xD1, Buffer.from("Bob")], [GROUP_FIELDS.GROUP_ID, "9".repeat(32)], [GROUP_FIELDS.GROUP_SENDER, B]]);
+    const fields = new Map([[0xD1, new Map([[0, Buffer.from("Bob")]])], [GROUP_FIELDS.GROUP_ID, "9".repeat(32)], [GROUP_FIELDS.GROUP_SENDER, B]]);
     r.deliver(lxm(bob, me, "group hello", fields));
     assert.equal(r.self.groups.length, 1, "handed to the group handler");
     assert.equal(r.ContactStore.get(B).messageName, "Bob");
@@ -315,7 +319,7 @@ test("§5.2 group messages name the LXMF source before the group branch (audit H
 test("§5.2 the router's handler creates no row for a sender it has none for; the group branch decides", () => {
     const me = Identity.create(), carol = Identity.create();
     const r = makeReceiver(me);
-    const fields = new Map([[0xD1, Buffer.from("Carol")], [GROUP_FIELDS.GROUP_ID, "9".repeat(32)]]);
+    const fields = new Map([[0xD1, new Map([[0, Buffer.from("Carol")]])], [GROUP_FIELDS.GROUP_ID, "9".repeat(32)]]);
     r.deliver(lxm(carol, me, "group hello", fields));
     assert.equal(r.self.groups.length, 1);
     assert.equal(r.ContactStore.get(lxmfHash(carol)), null, "a message the group branch may still drop plants nothing");
@@ -483,7 +487,9 @@ test("§4.1 a DM carries the Message Display Name as bin until a delivery confir
     const s = makeSender({ me });
     s.send(contact, "first");
     assert.deepEqual(nameIn(s.direct[0]), DN.nameState("Alice"));
-    assert.equal(MsgPack.unpack(s.direct[0].subarray(96))[3].get(0xD1).constructor.name, "Buffer", "bin, not str");
+    assert.equal(MsgPack.unpack(s.direct[0].subarray(96))[3].get(0xD1).get(0).constructor.name, "Buffer", "bin, not str");
+    assert.equal(s.direct[0].subarray(-11).toString("hex"), "ccd18100c405416c696365",
+        "the payload ends with the Retichat field after the ticket: {0xD1: {0: bin}}, one-byte key 0");
     s.send(contact, "second, before any proof");
     assert.deepEqual(nameIn(s.direct[1]), DN.nameState("Alice"), "nothing confirmed yet: still sent");
     s.prove();
@@ -548,7 +554,7 @@ test("§4.1 group envelopes (invites included) carry the name per member; only a
     const ledger = new NameLedger({ get: storage.sGet, set: storage.sSet });
     const env = {
         ContactStore: { get: () => contact, add: () => contact, keep: () => contact },
-        Identity, Buffer, Destination, LXMessage, GROUP_FIELDS, GroupDeliveryEvidence, Link, console: quiet,
+        Identity, Buffer, Destination, LXMessage, applyGroupFields, GroupDeliveryEvidence, Link, console: quiet,
         IdMgr: { id: me }, applyDisplayName: DN.applyToFields, NameLedgerStore: ledger, OwnNames: { message: "Me" },
     };
     const direct = [];
@@ -578,6 +584,60 @@ test("§4.1 group envelopes (invites included) carry the name per member; only a
     assert.equal(nameIn(direct[1]).state, "absent");
     assert.match(methodBody("_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)"),
         /if \(method === "direct" && onDelivered\) onDelivered\(\);/, "never on a propagation fulfil");
+});
+
+test("§10 the group envelope: old fields now, the 0xD1 map after the switch; the app reads both back the same", async () => {
+    const me = Identity.create(), member = Identity.create();
+    const memberHash = lxmfHash(member);
+    const contact = { destHash: memberHash, publicKey: member.getPublicKey().toString("hex") };
+    const sendWith = async (groupFields) => {
+        const storage = memory();
+        const env = {
+            ContactStore: { get: () => contact, add: () => contact, keep: () => contact },
+            Identity, Buffer, Destination, LXMessage, applyGroupFields: groupFields, GroupDeliveryEvidence, Link,
+            console: quiet, IdMgr: { id: me }, applyDisplayName: DN.applyToFields,
+            NameLedgerStore: new NameLedger({ get: storage.sGet, set: storage.sSet }), OwnNames: { message: "Me" },
+        };
+        const direct = [];
+        const self = {
+            _pendingPacketHashes: new Map(),
+            _lxmfRouter: { destination: { hash: Destination.hash(me, "lxmf", "delivery") } },
+            _rns: { registerDestination: (identity) => ({ hash: Destination.hash(identity, "lxmf", "delivery") }) },
+            _groupFallbacks: { schedule() { return true; }, prove() {} },
+            _ensureGroupLink: async () => ({ link: { send: (bytes) => { direct.push(bytes); return { packetHash: Buffer.alloc(32, direct.length) }; } } }),
+        };
+        for (const signature of [
+            "async _sendGroupEnvelope(memberHash, content, fields)",
+            "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
+            "_decideMessageName(sourceHex, recipientHex)",
+        ]) self[methodName(signature)] = compile(signature, env)(self);
+        self._sendGroupEnvelope(memberHash, "", {
+            groupId: "9".repeat(32), groupAction: "relay_req", groupSender: lxmfHash(me),
+            groupRelaySeen: `${"1".repeat(32)},${"2".repeat(32)}`, groupRelayDone: false,
+        });
+        await new Promise((r) => setTimeout(r, 0));
+        const received = LXMessage.fromBytes(direct[0].subarray(16), direct[0].subarray(0, 16), () => me);
+        assert.equal(received.signatureValidated, true);
+        return received;
+    };
+    const oldForm = await sendWith((fields, group) => RF.applyGroupFields(fields, group, false));
+    assert.deepEqual([...oldForm.fields.keys()], [0xD1, 0xA0, 0xA3, 0xA4, 0xA5, 0xA7], "the fields released apps read");
+    assert.deepEqual([...RF.retichatMap(oldForm.fields).keys()], [0], "only the name in the map");
+    const newForm = await sendWith((fields, group) => RF.applyGroupFields(fields, group, true));
+    assert.deepEqual([...newForm.fields.keys()], [0xD1], "no old fields after the switch");
+    assert.deepEqual([...RF.retichatMap(newForm.fields).keys()], [0, 1, 4, 5, 6, 8], "one map, ascending keys");
+    const shipped = await sendWith(applyGroupFields);
+    assert.deepEqual([...shipped.fields.keys()], [...(RF.GROUP_ENTRIES_IN_RETICHAT_FIELD ? newForm : oldForm).fields.keys()],
+        "the app sends the form GROUP_ENTRIES_IN_RETICHAT_FIELD selects (false until the switch)");
+    for (const received of [oldForm, newForm, shipped]) {
+        assert.deepEqual(received.displayName, DN.nameState("Me"));
+        const g = LXMessage.extractGroupFields(received.fields);
+        assert.equal(g.groupId, "9".repeat(32));
+        assert.equal(g.groupAction, "relay_req");
+        assert.equal(g.groupSender, lxmfHash(me));
+        assert.deepEqual(g.relaySeen, ["1".repeat(32), "2".repeat(32)]);
+        assert.equal(g.relayDone, false);
+    }
 });
 
 // ── §5.2 the distro path ───────────────────────────────────────────────────
@@ -747,7 +807,7 @@ function rawLxm(from, toHash, fieldsBytes, signer = from, timestamp = tick()) {
     const signature = signer.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
     return Buffer.concat([hashed.subarray(0, 32), signature, payload]);
 }
-const strName = (hexBytes) => Buffer.from(`81ccd1${(0xa0 | (hexBytes.length / 2)).toString(16)}${hexBytes}`, "hex");
+const strName = (hexBytes) => Buffer.from(`81ccd18100${(0xa0 | (hexBytes.length / 2)).toString(16)}${hexBytes}`, "hex");
 const ALICE_BAD = "416c696365ed";   // "Alice" + a stray 0xED
 const ALICIA_STR = "416c69636961";  // "Alicia", valid UTF-8, as str
 
@@ -928,13 +988,13 @@ test("§5.2 order: a name is taken only from a message newer than the one that l
     assert.deepEqual([r.ContactStore.get(A).messageName, r.ContactStore.get(A).messageNameAt], ["New", t]);
     r.deliver(lxm(alice, me, "older, arriving late", named("Old"), alice, t - 10));
     assert.equal(r.ContactStore.get(A).messageName, "New");
-    r.deliver(lxm(alice, me, "older clear", new Map([[0xD1, Buffer.alloc(0)]]), alice, t - 5));
+    r.deliver(lxm(alice, me, "older clear", new Map([[0xD1, new Map([[0, Buffer.alloc(0)]])]]), alice, t - 5));
     assert.equal(r.ContactStore.get(A).messageName, "New", "an older clear is ignored too");
     r.deliver(lxm(alice, me, "repeat", named("New"), alice, t + 10));
     assert.equal(r.ContactStore.get(A).messageNameAt, t + 10, "a repeat of the current name advances the timestamp");
     r.deliver(lxm(alice, me, "between", named("Mid"), alice, t + 5));
     assert.equal(r.ContactStore.get(A).messageName, "New", "so one older than the repeat loses");
-    r.deliver(lxm(alice, me, "clear", new Map([[0xD1, Buffer.alloc(0)]]), alice, t + 20));
+    r.deliver(lxm(alice, me, "clear", new Map([[0xD1, new Map([[0, Buffer.alloc(0)]])]]), alice, t + 20));
     assert.equal(r.ContactStore.get(A).messageName, null);
     r.deliver(lxm(alice, me, "old name after the clear", named("New"), alice, t + 15));
     assert.equal(r.ContactStore.get(A).messageName, null, "the clear stands");
@@ -981,7 +1041,7 @@ function makeGroupReceiver(me, memberHashes) {
     return { ...r, groups, notices, posts, systemText, groupLabel };
 }
 const groupFields = (name, action = null, extra = []) => new Map([
-    ...(name === null ? [] : [[0xD1, Buffer.from(name)]]),
+    ...(name === null ? [] : [[0xD1, new Map([[0, Buffer.from(name)]])]]),
     [GROUP_FIELDS.GROUP_ID, GROUP],
     ...(action ? [[GROUP_FIELDS.GROUP_ACTION, action]] : []),
     ...extra,
@@ -1024,11 +1084,11 @@ test("§5.2 a message the group branch drops creates no row; a member's hidden r
     const r = makeGroupReceiver(me, []);
     const D = lxmfHash(dave), B = lxmfHash(bob);
     const other = "8".repeat(32);
-    r.deliver(lxm(dave, me, "", new Map([[0xD1, Buffer.from("Dave")], [GROUP_FIELDS.GROUP_ID, other],
+    r.deliver(lxm(dave, me, "", new Map([[0xD1, new Map([[0, Buffer.from("Dave")]])], [GROUP_FIELDS.GROUP_ID, other],
         [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${D},${lxmfHash(me)}`]])));
     assert.equal(r.groups.has(other), false, "a stranger's invite is dropped, as before");
     assert.equal(r.ContactStore.get(D), null, "and leaves no row, so a second invite from him is dropped too");
-    r.deliver(lxm(dave, me, "to an unknown group", new Map([[0xD1, Buffer.from("Dave")], [GROUP_FIELDS.GROUP_ID, other]])));
+    r.deliver(lxm(dave, me, "to an unknown group", new Map([[0xD1, new Map([[0, Buffer.from("Dave")]])], [GROUP_FIELDS.GROUP_ID, other]])));
     assert.equal(r.ContactStore.get(D), null);
 
     // Bob is a member of another group: his key arrived with its invite, so
@@ -1036,7 +1096,7 @@ test("§5.2 a message the group branch drops creates no row; a member's hidden r
     // such row was a listed contact.
     r.self._rememberGroupMemberKeys([[B, bob.getPublicKey().toString("base64")]]);
     assert.equal(r.ContactStore.get(B).hidden, true);
-    r.deliver(lxm(bob, me, "", new Map([[0xD1, Buffer.from("Bob")], [GROUP_FIELDS.GROUP_ID, other],
+    r.deliver(lxm(bob, me, "", new Map([[0xD1, new Map([[0, Buffer.from("Bob")]])], [GROUP_FIELDS.GROUP_ID, other],
         [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${B},${lxmfHash(me)}`]])));
     assert.equal(r.groups.get(other)?.groupStatus, "pending", "the invite from a known member arrives");
     assert.equal(r.systemText(r.notices.at(-1)), "Bob invited you to \"Group\"", "named by the validated 0xD1");
@@ -1047,7 +1107,7 @@ test("§5.2 a row created only for a group sender's name never lets that sender 
     const r = makeGroupReceiver(me, []);
     const Z = lxmfHash(zed);
     const other = "8".repeat(32), third = "7".repeat(32);
-    const invite = (groupId, t) => lxm(zed, me, "", new Map([[0xD1, Buffer.from("Zed")], [GROUP_FIELDS.GROUP_ID, groupId],
+    const invite = (groupId, t) => lxm(zed, me, "", new Map([[0xD1, new Map([[0, Buffer.from("Zed")]])], [GROUP_FIELDS.GROUP_ID, groupId],
         [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${Z},${lxmfHash(me)}`]]), zed, t);
 
     // Zed is no member and has no row, but knows the id of a group the user
@@ -1157,13 +1217,13 @@ test("§5.2 channel order: history pulled late never undoes a poster's newer cha
     assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New");
     assert.equal(r.handle(post(named("Old"), t - 100)), true, "the older post is still shown");
     assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New", "but its name does not win");
-    assert.equal(r.handle(post(new Map([[0xD1, Buffer.alloc(0)]]), t - 50)), true);
+    assert.equal(r.handle(post(new Map([[0xD1, new Map([[0, Buffer.alloc(0)]])]]), t - 50)), true);
     assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New", "nor does an older clear");
     assert.equal(r.handle(post(named("New"), t + 100)), true);
     assert.equal(r.ChannelSenderNamesStore.entry(CHANNEL, A).at, Math.round((t + 100) * 1000), "a newer repeat advances it");
     assert.equal(r.handle(post(named("Mid"), t + 50)), true);
     assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "New");
-    assert.equal(r.handle(post(new Map([[0xD1, Buffer.alloc(0)]]), t + 200)), true);
+    assert.equal(r.handle(post(new Map([[0xD1, new Map([[0, Buffer.alloc(0)]])]]), t + 200)), true);
     assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), null, "a newer clear");
 });
 

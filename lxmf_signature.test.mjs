@@ -77,7 +77,7 @@ test("a flipped signature byte, or a forger claiming a contact's hash, is SIGNAT
     const forged = new LXMessage();
     forged.sourceHash = lxmfHash(alice);
     forged.destinationHash = lxmfHash(bob);
-    forged.title = ""; forged.content = "it's me, Alice"; forged.fields = new Map([[0xD1, Buffer.from("Alice")]]);
+    forged.title = ""; forged.content = "it's me, Alice"; forged.fields = new Map([[0xD1, new Map([[0, Buffer.from("Alice")]])]]);
     const f = forged.pack(mallory, false);
     assert.equal(LXMessage.fromBytes(f.subarray(16), f.subarray(0, 16), store(alice)).signatureState, "invalid");
 });
@@ -183,7 +183,7 @@ test("a post whose prelude key does not produce the claimed source is rejected",
     // key in the prelude: the signature verifies against the prelude, so only
     // the binding check stops it planting Mallory's key under Alice's hash.
     const destHash = channelDeliveryHash(CHANNEL);
-    const payload = MsgPack.pack([Date.now() / 1000, Buffer.alloc(0), Buffer.from("I am Alice"), new Map([[0xD1, Buffer.from("Alice")]])]);
+    const payload = MsgPack.pack([Date.now() / 1000, Buffer.alloc(0), Buffer.from("I am Alice"), new Map([[0xD1, new Map([[0, Buffer.from("Alice")]])]])]);
     const hashed = Buffer.concat([destHash, lxmfHash(alice), payload]);
     const signature = mallory.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
     const plain = Buffer.concat([Buffer.from("RTID"), mallory.getPublicKey(), lxmfHash(alice), signature, payload]);
@@ -199,7 +199,15 @@ test("§2.3 channel posts carry 0xD1 as bin, only when told to, and it round-tri
     const alice = Identity.create();
     const named = channelLxmUnpack(CHANNEL, channelLxmPack(CHANNEL, alice, "x", nameState("Alice")).wire);
     assert.deepEqual(named.displayName, { state: "name", name: "Alice" });
-    assert.ok(Buffer.isBuffer(named.fields.get(0xD1)), "bin on the wire");
+    assert.ok(Buffer.isBuffer(named.fields.get(0xD1).get(0)), "bin on the wire");
+    // The bytes, pinned as LXMF-rust channel::pack pins them: the payload
+    // ends with the fields map {0xD1: {0: bin}} (after the RTID prelude,
+    // the source hash and the signature, inside the channel encryption).
+    const { identity: ch } = channelIdentity(CHANNEL);
+    const sealed = (state) => ch.decrypt(channelLxmPack(CHANNEL, alice, "hi", state).wire.subarray(16));
+    assert.equal(sealed(nameState("Bob")).subarray(-14).toString("hex"), "c4026869" + "81ccd18100c403426f62");
+    assert.equal(sealed(CLEAR).subarray(-11).toString("hex"), "c4026869" + "81ccd18100c400");
+    assert.equal(sealed(undefined).subarray(-5).toString("hex"), "c4026869" + "80");
     const cleared = channelLxmUnpack(CHANNEL, channelLxmPack(CHANNEL, alice, "x", CLEAR).wire);
     assert.equal(cleared.displayName.state, "clear");
     const plain = channelLxmUnpack(CHANNEL, channelLxmPack(CHANNEL, alice, "x").wire);
