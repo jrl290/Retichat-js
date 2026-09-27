@@ -15,8 +15,8 @@ import test from "node:test";
 import {
     PUBLIC_ROOT, PRIVATE_ROOT_HEX_LEN,
     genPrivateRoot, filterChannelChars, splitChannelName, applyVisibility,
-    initialChannelValue, regenerateRoot, pasteChannelName, validateChannelName,
-    visibilityHint,
+    initialChannelValue, regenerateRoot, pasteChannelName, typeChannelName,
+    validateChannelName, visibilityHint,
 } from "./lib/channel_name.js";
 
 const fixedRoot = () => "0123456789abcdef";
@@ -44,11 +44,89 @@ test("the default root never comes from Math.random", () => {
     }
 });
 
-test("the character rule: lowercase a-z, 0-9, '.' and '-'", () => {
+test("the character rule: lowercase letters, digits, '.' and '-'", () => {
     assert.equal(filterChannelChars("My Chan_nel!.Foo-9"), "mychannel.foo-9");
     assert.equal(filterChannelChars("  4cdc4115.nametest-096499\n"), "4cdc4115.nametest-096499");
     assert.deepEqual(splitChannelName("a.b.c"), { root: "a", name: "b.c", hasDot: true });
     assert.deepEqual(splitChannelName("abc"), { root: "", name: "abc", hasDot: false });
+});
+
+// ── review fixes (F1-F4) ────────────────────────────────────────────────────
+
+test("F3: letters and digits are Unicode, as on iOS and Android", () => {
+    // Native: iOS c.isLetter || c.isNumber, Android isLetterOrDigit.
+    assert.equal(filterChannelChars("public.Café"), "public.café");
+    assert.equal(filterChannelChars("public.cafe\u0301"), "public.caf\u00e9", "NFC");
+    assert.equal(filterChannelChars("Équipe.日本-2"), "équipe.日本-2");
+    assert.equal(filterChannelChars("a_b!c d.é"), "abcd.é");
+    assert.equal(validateChannelName("public.café", "public").ok, true);
+    assert.equal(validateChannelName("équipe.日本", "private").ok, true);
+    assert.equal(validateChannelName("ro_ot.général", "private").ok, false);
+    assert.equal(validateChannelName("équipe.Général", "private").ok, false, "uppercase");
+});
+
+test("F1: a full name pasted over the selected root leaves no stray '.'", () => {
+    const cur = "abcd1234abcd1234.";
+    const r = pasteChannelName({ value: cur, selStart: 0, selEnd: 16,
+        pasted: "4cdc4115.nametest-096499", mode: "private", genRoot: fixedRoot });
+    assert.deepEqual(r, { value: "4cdc4115.nametest-096499", caret: 24 });
+    const pub = pasteChannelName({ value: "public.", selStart: 0, selEnd: 6,
+        pasted: "public.foo", mode: "public" });
+    assert.equal(pub.value, "public.foo");
+    // An existing name part is kept after the pasted one, never glued on.
+    const kept = pasteChannelName({ value: "abc.old", selStart: 0, selEnd: 3,
+        pasted: "x.y", mode: "private", genRoot: fixedRoot });
+    assert.equal(kept.value, "x.y.old");
+    const endsDot = pasteChannelName({ value: "abc.old", selStart: 0, selEnd: 3,
+        pasted: "x.", mode: "private", genRoot: fixedRoot });
+    assert.equal(endsDot.value, "x.old");
+});
+
+test("F1: a name with an empty segment is refused", () => {
+    for (const v of ["4cdc4115.nametest-096499.", "a..b", "a.b..c", "public.foo."]) {
+        const r = validateChannelName(v, v.startsWith("public.") ? "public" : "private");
+        assert.equal(r.ok, false, v);
+        assert.equal(r.code, "name-segment", v);
+    }
+    const lead = pasteChannelName({ value: "myroot.", selStart: 7, selEnd: 7, pasted: ".foo",
+        mode: "private", genRoot: fixedRoot });
+    assert.equal(lead.value, "myroot..foo", "a leading '.' must not wipe the root");
+    assert.equal(validateChannelName(lead.value, "private").ok, false);
+});
+
+test("F2: Private: typing a '.' into the name part moves its root into the root", () => {
+    let v = "abcd1234abcd1234.";
+    for (const ch of "4cdc4115.nametest-096499") {
+        const r = typeChannelName({ old: v, value: v + ch, caret: v.length + 1, mode: "private" });
+        assert.equal(r.caret, r.value.length);
+        v = r.value;
+    }
+    assert.equal(v, "4cdc4115.nametest-096499");
+    // One input event carrying the whole name (autofill, drag-and-drop).
+    assert.deepEqual(typeChannelName({ old: "abcd.", value: "abcd.4cdc4115.x", caret: 15, mode: "private" }),
+        { value: "4cdc4115.x", caret: 10 });
+    // A name part that already holds a "." is edited in place.
+    assert.equal(typeChannelName({ old: "r.team.ops", value: "r.team.ops.x", mode: "private" }).value,
+        "r.team.ops.x");
+    // A "." at the start of the name part has no root before it.
+    assert.equal(typeChannelName({ old: "r.ab", value: "r..ab", caret: 3, mode: "private" }).value, "r..ab");
+    // Edits of the root are only filtered.
+    assert.equal(typeChannelName({ old: "abc.x", value: "aBc-d.x", mode: "private" }).value, "abc-d.x");
+});
+
+test("F2: Public: a typed name part starting public. drops it; other x.y stays", () => {
+    assert.deepEqual(typeChannelName({ old: "public.", value: "public.public.foo", caret: 17, mode: "public" }),
+        { value: "public.foo", caret: 10 });
+    assert.equal(typeChannelName({ old: "public.abc", value: "public.abc.def", mode: "public" }).value,
+        "public.abc.def");
+});
+
+test("F4: Public mode joins only the root public", () => {
+    const r = validateChannelName("abc.foo", "public");
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "root-not-public");
+    assert.match(r.error, /Choose Private/);
+    assert.equal(validateChannelName("abc.foo", "private").ok, true);
 });
 
 test("the form opens with public. or a fresh 16-hex root", () => {
@@ -147,7 +225,7 @@ test("Join: the root public is refused in Private mode, allowed in Public", () =
     assert.equal(priv.ok, false);
     assert.match(priv.error, /public/);
     assert.deepEqual(validateChannelName("public.general", "public"),
-        { ok: true, name: "public.general", error: "" });
+        { ok: true, name: "public.general", error: "", code: "" });
 });
 
 test("Join: typed roots, including an old 8-hex root, are accepted", () => {
@@ -246,11 +324,15 @@ async function renderForm({ vis = "public" } = {}) {
     const join = footer.children[0];
     const btn = (label) => [...top.walk()].find((e) => e.tagName === "BUTTON" && e.textContent === label);
     const type = (v) => { inp.value = v; inp.selectionStart = inp.selectionEnd = v.length; inp.fire("input"); };
+    const typeChar = (ch) => {
+        const v = inp.value + ch;
+        inp.value = v; inp.selectionStart = inp.selectionEnd = v.length; inp.fire("input");
+    };
     const paste = (text, s = inp.value.length, e = s) => {
         inp.selectionStart = s; inp.selectionEnd = e;
         inp.fire("paste", { clipboardData: { getData: () => text } });
     };
-    return { self, inp, join, btn, type, paste, joined, top };
+    return { self, inp, join, btn, type, typeChar, paste, joined, top };
 }
 
 test("form: opens Public with public. and Join disabled until a name is typed", async () => {
@@ -299,6 +381,35 @@ test("form: Private refuses the root public and an empty root", async () => {
     f.join.fire("click");
     f.type(".general");
     assert.equal(f.join.disabled, true);
+    f.join.fire("click");
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(f.joined, []);
+});
+
+test("form F2: typing a shared private name after the default root joins it", async () => {
+    const f = await renderForm({ vis: "private" });
+    for (const ch of "4cdc4115.nametest-096499") f.typeChar(ch);
+    assert.equal(f.inp.value, "4cdc4115.nametest-096499");
+    assert.equal(f.join.disabled, false);
+    f.join.fire("click");
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(f.joined, ["4cdc4115.nametest-096499"]);
+});
+
+test("form F1: a full name pasted over the selected root joins that channel", async () => {
+    const f = await renderForm({ vis: "private" });
+    f.paste("4cdc4115.nametest-096499", 0, 16);
+    assert.equal(f.inp.value, "4cdc4115.nametest-096499");
+    f.join.fire("click");
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(f.joined, ["4cdc4115.nametest-096499"]);
+});
+
+test("form F4: Public refuses a root other than public, and says why", async () => {
+    const f = await renderForm();
+    f.type("team.foo");
+    assert.equal(f.join.disabled, true);
+    assert.match(f.top.textContent, /Public channels use the root "public"/);
     f.join.fire("click");
     await new Promise((r) => setImmediate(r));
     assert.deepEqual(f.joined, []);

@@ -59,7 +59,7 @@ import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_led
 import { applyGroupFields } from "./lib/retichat_field.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
-    regenerateRoot, validateChannelName, visibilityHint,
+    regenerateRoot, typeChannelName, validateChannelName, visibilityHint,
 } from "./lib/channel_name.js";
 
 // Initialize DistroManager after Buffer polyfill is available
@@ -6664,6 +6664,9 @@ const App = {
         const mode = () => this.state.channelVis || "public";
 
         let inp, hintEl, errorEl, regenBtn, joinBtn;
+        // The field as the form last left it: typeChannelName compares an
+        // input event's value with it to see what was typed where.
+        let prevValue = "";
 
         /** Re-derive the hint, the error line and Join from the field. */
         const refresh = () => {
@@ -6673,8 +6676,7 @@ const App = {
             if (hintEl) hintEl.textContent = visibilityHint(m);
             if (errorEl) {
                 // An untouched "public." or "<root>." needs no scolding.
-                const bare = inp.value.endsWith(".") && inp.value.indexOf(".") === inp.value.length - 1;
-                errorEl.textContent = v.ok || (bare && !v.error.startsWith("\"public\"")) ? "" : v.error;
+                errorEl.textContent = v.ok || v.code === "name-empty" ? "" : v.error;
                 errorEl.style.display = errorEl.textContent ? "" : "none";
             }
             if (regenBtn) regenBtn.style.display = m === "private" ? "" : "none";
@@ -6683,6 +6685,7 @@ const App = {
 
         const setValue = (value, caret = value.length) => {
             inp.value = value;
+            prevValue = value;
             try { inp.setSelectionRange(caret, caret); } catch (_) {}
             refresh();
         };
@@ -6716,14 +6719,16 @@ const App = {
             placeholder: vis === "private" ? "root.general…" : "public.general…",
             autocapitalize: "off", autocomplete: "off", spellcheck: "false",
             onInput: (e) => {
-                // The character rule: lowercase a-z, 0-9, "." and "-".
+                // The character rule (letters, digits, "." and "-"), and a
+                // "." typed into a Private name part moves its root out.
                 const el = e.target;
-                const filtered = filterChannelChars(el.value);
-                if (filtered !== el.value) {
-                    const caretFrom = el.selectionStart ?? el.value.length;
-                    const caret = filterChannelChars(el.value.slice(0, caretFrom)).length;
-                    setValue(filtered, caret);
+                const caretFrom = el.selectionStart ?? el.value.length;
+                const caret = filterChannelChars(el.value.slice(0, caretFrom)).length;
+                const r = typeChannelName({ old: prevValue, value: el.value, caret, mode: mode() });
+                if (r.value !== el.value) {
+                    setValue(r.value, r.caret);
                 } else {
+                    prevValue = el.value;
                     refresh();
                 }
             },
@@ -6745,6 +6750,7 @@ const App = {
         });
         // The value property, not only the attribute: setValue/refresh read it.
         inp.value = inp.getAttribute("value");
+        prevValue = inp.value;
 
         // Channel name input
         top.appendChild(
