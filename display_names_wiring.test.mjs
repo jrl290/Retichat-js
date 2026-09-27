@@ -670,3 +670,29 @@ test("§4.2 own posts carry the Channel Display Name by the channel rule, record
     await post(CHANNEL, "fifth");
     assert.equal(nameOf(sent[4]).state, "absent");
 });
+
+test("§5.3 the open DM's header follows a name that arrives while it is open (audit L3)", () => {
+    const store = contactStore(memory());
+    const h = "a1".repeat(16);
+    store.add(h);
+    const el = () => ({ textContent: "" });
+    const header = { ".header-name": el(), ".header-avatar": el(), ".header-hash": el() };
+    const view = { querySelector: (q) => header[q] ?? null };
+    const self = {
+        state: { activeHash: h },
+        root: { querySelector: () => view },
+        _refreshNameLabels() { assert.fail("a DM has no sender labels"); },
+    };
+    const sync = compile("_syncOpenChatChrome()", {
+        ContactStore: store, GroupStore: { isGroupChat: () => false }, ChannelStore: { get: () => null },
+    })(self);
+    let notified = 0;
+    store.onChange(() => { notified++; sync(); });
+    notified = 0;
+    store.acceptMessageName(h, DN.nameState("Zed"), "validated");
+    assert.equal(notified, 1, "a new name notifies the store's listeners");
+    assert.equal(header[".header-name"].textContent, "Zed");
+    assert.equal(header[".header-avatar"].textContent, "Z");
+    assert.match(methodBody("_wire()"), /ContactStore\.onChange\(\(\) => \{[\s\S]*?this\._syncOpenChatChrome\(\);/,
+        "the app wires the store to the header");
+});

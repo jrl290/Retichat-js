@@ -4827,6 +4827,9 @@ const App = {
         const name = ContactStore.name(c.destHash);
         const nameEl = view.querySelector(".header-name");
         if (nameEl && nameEl.textContent !== name) nameEl.textContent = name;
+        const avatarEl = view.querySelector(".header-avatar");
+        const initial = name.charAt(0).toUpperCase();
+        if (avatarEl && avatarEl.textContent !== initial) avatarEl.textContent = initial;
 
         const hashText = c.destHash + (c.publicKey ? "" : " — waiting for public key…");
         const hashEl = view.querySelector(".header-hash");
