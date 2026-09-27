@@ -224,7 +224,7 @@ function makeReceiver(me) {
     const handle = messageHandler({
         Buffer, LxmfSeen: { check: () => false }, Harness, console: quiet,
         RnsClient: { ownHash: lxmfHash(me) }, LXMF, LXMessage, ContactStore, MsgStore,
-        decodeDisplayName: DN.decodeField,
+        decodeDisplayName: DN.decodePayload,
     })(self);
     const recall = recallFor({ contacts: ContactStore, device: me });
     /** Deliver `packed` (full packing) as the router would. */
@@ -564,7 +564,7 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
     const env = {
         DistroManager: { has: true, identity: distro, lxmfDeliveryHash: lxmfHash(distro) },
         MsgPack, Buffer, DistroSeen: { check: () => false }, Harness, ContactStore, MsgStore: msgStore(storage),
-        LXMF, Cryptography, ownLxmfDestinationHash: () => "e".repeat(32), decodeDisplayName: DN.decodeField,
+        LXMF, Cryptography, ownLxmfDestinationHash: () => "e".repeat(32), decodeDisplayName: DN.decodePayload,
         console: quiet,
         LXMessage: new Proxy(LXMessage, { get: (t, k) => (k === "verify"
             ? (d, s, sig, p, _r, u) => LXMessage.verify(d, s, sig, p, recall, u) : t[k]) }),
@@ -695,4 +695,114 @@ test("§5.3 the open DM's header follows a name that arrives while it is open (a
     assert.equal(header[".header-avatar"].textContent, "Z");
     assert.match(methodBody("_wire()"), /ContactStore\.onChange\(\(\) => \{[\s\S]*?this\._syncOpenChatChrome\(\);/,
         "the app wires the store to the header");
+});
+
+// ── §3 rule 1 on received str values (review JS-DN-1) ──────────────────────
+
+/** A signed LXMF message whose fields map is `fieldsBytes`, raw: msgpackr
+ *  cannot write a str holding invalid UTF-8, a foreign packer can. */
+function rawLxm(from, toHash, fieldsBytes, signer = from) {
+    const payload = Buffer.concat([Buffer.from([0x94]), MsgPack.pack(Date.now() / 1000),
+        MsgPack.pack(Buffer.alloc(0)), MsgPack.pack(Buffer.from("raw")), fieldsBytes]);
+    const hashed = Buffer.concat([Buffer.from(toHash, "hex"), Buffer.from(lxmfHash(from), "hex"), payload]);
+    const signature = signer.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
+    return Buffer.concat([hashed.subarray(0, 32), signature, payload]);
+}
+const strName = (hexBytes) => Buffer.from(`81ccd1${(0xa0 | (hexBytes.length / 2)).toString(16)}${hexBytes}`, "hex");
+const ALICE_BAD = "416c696365ed";   // "Alice" + a stray 0xED
+const ALICIA_STR = "416c69636961";  // "Alicia", valid UTF-8, as str
+
+test("§3 rule 1: a str 0xD1 holding invalid UTF-8 is absent on the direct path; a valid str is a name", () => {
+    const me = Identity.create(), alice = Identity.create();
+    const r = makeReceiver(me);
+    const A = lxmfHash(alice);
+    r.deliver(rawLxm(alice, lxmfHash(me), strName(ALICE_BAD)));
+    assert.equal(r.ContactStore.get(A).messageName, null, "unknown source, but nothing to fill: the value is absent");
+    r.ContactStore.get(A).publicKey = alice.getPublicKey().toString("hex");
+    r.deliver(rawLxm(alice, lxmfHash(me), strName(ALICIA_STR)));
+    assert.equal(r.ContactStore.get(A).messageName, "Alicia", "a str name is accepted (§2.1)");
+    r.deliver(rawLxm(alice, lxmfHash(me), strName(ALICE_BAD)));
+    assert.equal(r.ContactStore.get(A).messageName, "Alicia", "validated, but absent changes nothing — never \"Alice\\uFFFD\"");
+    assert.equal(r.MsgStore.get(A).filter((m) => m.dir === "in").length, 3, "the messages themselves are kept");
+});
+
+test("§3 rule 1 on channel posts: an invalid str 0xD1 sets no channel name", () => {
+    const me = Identity.create(), alice = Identity.create();
+    const r = makeChannelReceiver(me);
+    const A = lxmfHash(alice);
+    const post = (fieldsBytes) => {
+        const destHash = channelDeliveryHash(CHANNEL);
+        const packed = rawLxm(alice, destHash.toString("hex"), fieldsBytes);
+        const plain = Buffer.concat([Buffer.from("RTID"), alice.getPublicKey(), packed.subarray(16)]);
+        const { identity, hash } = channelIdentity(CHANNEL);
+        return Buffer.concat([hash, identity.encrypt(plain)]);
+    };
+    assert.equal(r.handle(post(strName(ALICIA_STR))), true);
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "Alicia");
+    assert.equal(r.handle(post(strName(ALICE_BAD))), true);
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "Alicia", "absent: unchanged");
+});
+
+// ── §5.2 the propagated-fetch path ─────────────────────────────────────────
+
+test("§5.2 a message fetched from the propagation node is verified and named by the same table", async () => {
+    const me = Identity.create(), alice = Identity.create(), mallory = Identity.create();
+    const r = makeReceiver(me);
+    const A = lxmfHash(alice);
+    const myHash = Buffer.from(lxmfHash(me), "hex");
+    r.ContactStore.add(A, false, alice.getPublicKey().toString("hex"));
+    const recall = recallFor({ contacts: r.ContactStore, device: me });
+    const handle = messageHandler({
+        Buffer, LxmfSeen: { check: () => false }, Harness, console: quiet,
+        RnsClient: { ownHash: lxmfHash(me) }, LXMF, LXMessage, ContactStore: r.ContactStore, MsgStore: r.MsgStore,
+        decodeDisplayName: DN.decodePayload,
+    })(r.self);
+    const ACTIVE = 2;
+    const fetchAll = async (packedMessages) => {
+        const stored = packedMessages.map((p) => Buffer.concat([myHash, me.encrypt(p.subarray(16))]));
+        const ids = stored.map((_, i) => Buffer.from([i]));
+        const link = { status: ACTIVE, sendRequest: (path, data) => data };
+        const self = {
+            _propLink: link,
+            _lxmfRouter: { destination: { hash: myHash }, emit: (event, message) => handle(message) },
+            async _waitForResponse(l, request) {
+                if (request[0] === null && request[1] === null) return ids;
+                if (request[0]) return [stored[request[0][0][0]]];
+                return true; // purge
+            },
+        };
+        await compile("async _fetchPropagatedMessages()", {
+            Link: { ACTIVE }, Buffer, MsgPack, console: quiet, IdMgr: { id: me },
+            LXMessage: new Proxy(LXMessage, { get: (t, k) => (k === "fromBytes"
+                ? (d, h) => LXMessage.fromBytes(d, h, recall) : t[k]) }),
+        })(self)();
+    };
+    await fetchAll([lxm(alice, me, "stored for you", named("Alice"))]);
+    assert.equal(r.ContactStore.get(A).messageName, "Alice", "validated");
+    await fetchAll([lxm(alice, me, "forged", named("Mallory"), mallory)]);
+    assert.equal(r.ContactStore.get(A).messageName, "Alice", "an invalid signature is ignored");
+    await fetchAll([rawLxm(alice, lxmfHash(me), strName(ALICE_BAD))]);
+    assert.equal(r.ContactStore.get(A).messageName, "Alice", "an invalid-UTF-8 str is absent");
+    assert.equal(r.MsgStore.get(A).filter((m) => m.dir === "in").length, 3);
+});
+
+// ── audit L4: this device is never its own contact ────────────────────────
+
+test("audit L4: group member keys and own channel posts never add this device as a contact", () => {
+    const me = Identity.create(), bob = Identity.create();
+    const store = contactStore(memory());
+    const remember = compile("_rememberGroupMemberKeys(memberKeys)", {
+        Buffer, Identity, Destination, ContactStore: store, console: quiet, ownLxmfDestinationHash: () => lxmfHash(me),
+    })({ ownHash: lxmfHash(me) });
+    remember([
+        [lxmfHash(me), me.getPublicKey().toString("base64")],
+        [lxmfHash(bob), bob.getPublicKey().toString("base64")],
+    ]);
+    assert.equal(store.get(lxmfHash(me)), null, "no yourself row");
+    assert.equal(store.get(lxmfHash(bob)).publicKey, bob.getPublicKey().toString("hex"), "other members still get their key");
+
+    const r = makeChannelReceiver(me);
+    assert.equal(r.handle(channelLxmPack(CHANNEL, me, "my own post", DN.ABSENT).wire), true);
+    assert.equal(r.ContactStore.get(lxmfHash(me)), null, "an own post from the channel history");
+    assert.equal(r.posts.length, 1, "the post itself is still shown");
 });

@@ -34,7 +34,7 @@ import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
-import { applyToFields as applyDisplayName, decodeField as decodeDisplayName, ABSENT } from "./lib/display_name.js";
+import { applyToFields as applyDisplayName, decodePayload as decodeDisplayName, ABSENT } from "./lib/display_name.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 

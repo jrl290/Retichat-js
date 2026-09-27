@@ -26,7 +26,7 @@ import LXMessage from "./lib/rns/lxmf/lxmf_message.js";
 import LXMF from "./lib/rns/lxmf/lxmf.js";
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
-import { decodeField as decodeDisplayName } from "./lib/display_name.js";
+import { decodePayload as decodeDisplayName } from "./lib/display_name.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 

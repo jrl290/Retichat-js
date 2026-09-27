@@ -46,7 +46,7 @@ import DistroManager from "./lib/distro.js";
 import { TabLock } from "./lib/tab_lock.js";
 import {
     clean as cleanDisplayName,
-    decodeField as decodeDisplayName,
+    decodePayload as decodeDisplayName,
     applyToFields as applyDisplayName,
     acceptMessageName,
     contactName,
@@ -1212,7 +1212,7 @@ const RnsClient = {
             // not known yet only fills an empty name, an invalid signature
             // changes nothing. The message itself is kept either way, as the
             // reference and the native clients keep it.
-            const nameField = decodeDisplayName(lxmfMsg.fields);
+            const nameField = lxmfMsg.displayName; // read from the payload bytes by LXMessage.fromBytes
             const signatureState = lxmfMsg.signatureState ?? "invalid";
             if (!lxmfMsg.signatureValidated) {
                 console.log(`[retichat] RX message from ${srcHash.slice(0,12)}: signature ${signatureState}`);
@@ -2865,7 +2865,12 @@ const RnsClient = {
     },
 
     _rememberGroupMemberKeys(memberKeys) {
+        // The member list includes this device. Its own hash is never a
+        // contact: it would show as a "yourself" row in the chat list, the
+        // contacts and the group picker (audit L4).
+        const ownHash = this.ownHash ?? ownLxmfDestinationHash();
         for (const [hash, encodedPublicKey] of memberKeys || []) {
+            if (hash === ownHash) continue;
             try {
             const publicKey = Buffer.from(encodedPublicKey, "base64");
             if (publicKey.length !== 64) continue;
@@ -3571,7 +3576,9 @@ const RnsClient = {
             // bound to srcHashHex (checked in channelLxmUnpack), so it may
             // fill a contact's missing key; one already held is never
             // replaced from a channel post.
-            if (senderPubKey) {
+            // This device's own posts (fetched history, echoes) never make it
+            // a contact of itself (audit L4).
+            if (senderPubKey && srcHashHex !== ownLxmfDestinationHash()) {
                 if (!ContactStore.isContact(srcHashHex)) ContactStore.add(srcHashHex);
                 const contact = ContactStore.get(srcHashHex);
                 if (contact && !contact.publicKey) {
@@ -3987,7 +3994,7 @@ const RnsClient = {
             const signatureState = signature.validated ? "validated"
                 : signature.unverifiedReason === LXMessage.SOURCE_UNKNOWN ? "unknown" : "invalid";
             if (!signature.validated) console.log(`[distro] Message from ${srcHashHex.slice(0,12)}: signature ${signatureState}`);
-            ContactStore.acceptMessageName(srcHashHex, decodeDisplayName(fieldsMap), signatureState);
+            ContactStore.acceptMessageName(srcHashHex, decodeDisplayName(payloadBytes), signatureState);
             const stored = MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex, via: "distro" });
             ContactStore.touch(srcHashHex);
             // Pass the stored message, not null: listeners read a null `msg` as

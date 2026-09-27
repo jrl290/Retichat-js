@@ -41,14 +41,58 @@ test("§3 clean_announce: every shared vector", () => {
     }
 });
 
-test("§3 decode of 0xD1: every shared vector, through the client's own msgpack", () => {
+/** A packed LXMF payload [timestamp, title, content, <fields bytes>]. */
+const payloadWith = (fieldsBytes) => Buffer.concat([hex("94cb41d9d7a4b8000000c400c400"), fieldsBytes]);
+/** msgpack str header + the raw bytes, valid UTF-8 or not. */
+const rawStr = (bytes) => Buffer.concat([
+    bytes.length < 32 ? Buffer.from([0xa0 | bytes.length]) : Buffer.from([0xd9, bytes.length]), bytes]);
+
+test("§3 decode of 0xD1: every shared vector, read from the payload bytes", () => {
     assert.ok(vectors.decode_field.length >= 15);
     for (const v of vectors.decode_field) {
-        const fields = MsgPack.unpack(hex(v.fields_msgpack_hex));
-        const got = DN.decodeField(fields);
+        const got = DN.decodePayload(payloadWith(hex(v.fields_msgpack_hex)));
         assert.equal(got.state, v.state, v.name);
         assert.equal(got.state === "name" ? got.name : null, v.display_name, v.name);
     }
+});
+
+test("§3 rule 1 on received str: every clean vector as a str 0xD1 and a str announce name", () => {
+    // msgpackr rewrites a str holding invalid UTF-8 before any JS sees it
+    // (U+FFFD under Node; "ÿ" for 0xFF, "/" for overlong C0 AF in its
+    // browser decoder), so a received name must be read from the bytes.
+    for (const v of vectors.clean) {
+        const raw = hex(v.input_hex);
+        for (const [type, value] of [["str", rawStr(raw)], ["bin", Buffer.concat([Buffer.from([0xc4, raw.length]), raw])]]) {
+            const got = DN.decodePayload(payloadWith(Buffer.concat([hex("81ccd1"), value])));
+            const want = raw.length === 0 ? "clear" : v.expected === null ? "absent" : "name";
+            assert.equal(got.state, want, `${v.name} (${type})`);
+            if (want === "name") assert.equal(got.name, v.expected, `${v.name} (${type})`);
+        }
+    }
+    for (const v of vectors.clean_announce) {
+        const appData = Buffer.concat([hex("93"), rawStr(hex(v.input_hex)), hex("c090")]);
+        assert.equal(DN.announceNameFromAppData(appData), v.expected, `${v.name} (str)`);
+    }
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a6416c696365ed"))).state, "absent", "Alice + a stray 0xED");
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a1ff"))).state, "absent", "a lone 0xFF");
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a2c0af"))).state, "absent", "overlong '/'");
+    assert.equal(DN.announceNameFromAppData(hex("92a6416c696365edc0")), null, "announce: Alice + a stray 0xED");
+});
+
+test("decodePayload walks every msgpack type before the fields and inside them", () => {
+    const fields = MsgPack.pack(new Map([
+        [1, [1.5, -3, 70000, -70000, 2 ** 40, null, true, false, "s".repeat(40), Buffer.alloc(300)]],
+        [2, new Map([["k", new Map([[0xD1, Buffer.from("not this one")]])]])],
+        [0xD1, Buffer.from("Alice")],
+    ]));
+    assert.deepEqual(DN.decodePayload(payloadWith(fields)), DN.nameState("Alice"));
+    const stamped = Buffer.concat([hex("95cb41d9d7a4b8000000c400c400"), MsgPack.pack(new Map([[0xD1, Buffer.from("Bob")]])), hex("c420"), Buffer.alloc(32)]);
+    assert.deepEqual(DN.decodePayload(stamped), DN.nameState("Bob"), "a fifth element (a stamp) is fine");
+    assert.deepEqual(DN.decodePayload(payloadWith(hex("82cd00d1a3426f62ccd1a3457665"))), DN.nameState("Bob"),
+        "any integer width for the key, and the first 0xD1 counts, as in LXMF-rust");
+    assert.equal(DN.decodePayload(payloadWith(hex("81ccd1a5416c"))).state, "absent", "truncated");
+    assert.equal(DN.decodePayload(hex("93cb41d9d7a4b8000000c400c400")).state, "absent", "no fields element");
+    assert.equal(DN.decodePayload(null).state, "absent");
 });
 
 test("§4.1 digest: every shared vector", () => {
@@ -74,13 +118,14 @@ test("§2.1 the value sent is bin (a Buffer), never a JS string", () => {
 });
 
 test("announce names: first element of the list, cleaned, Anonymous Peer as none", () => {
-    const unpack = (d) => MsgPack.unpack(d);
-    assert.equal(DN.announceNameFromAppData(MsgPack.pack([Buffer.from(" Alice\n"), 8]), unpack), "Alice");
-    assert.equal(DN.announceNameFromAppData(MsgPack.pack(["Bob", null, []]), unpack), "Bob");
-    assert.equal(DN.announceNameFromAppData(MsgPack.pack([null, null, [0xD0]]), unpack), null);
-    assert.equal(DN.announceNameFromAppData(MsgPack.pack([Buffer.from("anonymous peer"), 8]), unpack), null);
-    assert.equal(DN.announceNameFromAppData(Buffer.from("Carol"), unpack), "Carol", "original raw format");
-    assert.equal(DN.announceNameFromAppData(null, unpack), null);
+    assert.equal(DN.announceNameFromAppData(MsgPack.pack([Buffer.from(" Alice\n"), 8])), "Alice");
+    assert.equal(DN.announceNameFromAppData(MsgPack.pack(["Bob", null, []])), "Bob");
+    assert.equal(DN.announceNameFromAppData(MsgPack.pack([null, null, [0xD0]])), null);
+    assert.equal(DN.announceNameFromAppData(MsgPack.pack([Buffer.from("anonymous peer"), 8])), null);
+    assert.equal(DN.announceNameFromAppData(Buffer.from("Carol")), "Carol", "original raw format");
+    assert.equal(DN.announceNameFromAppData(null), null);
+    assert.equal(DN.announceNameFromAppData(hex("93a3426f62c0")), null, "a list that does not read whole is none, as rmpv");
+    assert.equal(DN.announceNameFromAppData(hex("90")), null);
 });
 
 test("§4.1 ledger decision", () => {
