@@ -34,6 +34,7 @@ import test from "node:test";
 import { Buffer } from "node:buffer";
 import { Reticulum, Identity, Destination, LXMessage, Link, Packet } from "./lib/rns/reticulum.js";
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
+import { applyToFields as applyDisplayName, ABSENT } from "./lib/display_name.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -550,11 +551,12 @@ function makeDmClient(iface) {
         setTimeout: (fn, ms) => { const timer = { fn, ms }; appTimers.push(timer); return timer; },
         clearTimeout: (timer) => { if (timer !== undefined) cleared.push(timer); },
         Identity, Buffer, Destination, LXMessage, Link, Packet, crypto: globalThis.crypto,
-        DistroManager: { has: false }, IdMgr: { id: me },
+        DistroManager: { has: false }, IdMgr: { id: me }, applyDisplayName,
     };
     const rns = new Reticulum();
     const self = {
         _rns: rns, _initialized: true, _onMsg: [],
+        _decideMessageName: () => ABSENT, _recordNameDelivered() {},
         _pendingTimeouts: new Map(), _pendingPacketHashes: new Map(), _pendingTickets: new Map(),
         _cfg: { propagationNodeHash: "b".repeat(32) },
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),

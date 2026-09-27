@@ -26,6 +26,7 @@ import LXMessage from "./lib/rns/lxmf/lxmf_message.js";
 import LXMF from "./lib/rns/lxmf/lxmf.js";
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
+import { decodeField as decodeDisplayName } from "./lib/display_name.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -282,7 +283,7 @@ function makeReceiver(distro, deviceHash) {
     const contacts = new Set();
     const seen = new Set();
     const MsgStore = { add: (hash, m) => { const s = { id: String(stored.length), timestamp: -1, ...m }; stored.push({ hash, msg: s }); return s; } };
-    const ContactStore = { isContact: (h) => contacts.has(h), add: (h) => contacts.add(h), touch() {} };
+    const ContactStore = { isContact: (h) => contacts.has(h), add: (h) => contacts.add(h), touch() {}, acceptMessageName() { return false; } };
     const DistroSeen = { check: (k) => { if (seen.has(k)) return true; seen.add(k); return false; } };
     const harness = [];
     const Harness = { event: (name, data) => harness.push({ name, data }), error() {} };
@@ -295,10 +296,10 @@ function makeReceiver(distro, deviceHash) {
         _ticketFromFields: () => null,
     };
     const fn = new Function("DistroManager", "MsgPack", "Buffer", "DistroSeen", "Harness", "ContactStore", "MsgStore",
-        "LXMF", "Cryptography", "ownLxmfDestinationHash", "self", "distroHash", "blob",
+        "LXMF", "Cryptography", "ownLxmfDestinationHash", "LXMessage", "decodeDisplayName", "self", "distroHash", "blob",
         `${body.replaceAll("this.", "self.")}`);
     const run = (blob) => fn(DistroManager, MsgPack, Buffer, DistroSeen, Harness, ContactStore, MsgStore,
-        LXMF, Cryptography, () => deviceHash, self, null, blob);
+        LXMF, Cryptography, () => deviceHash, LXMessage, decodeDisplayName, self, null, blob);
     return { run, stored, contacts, events, seen, harness };
 }
 

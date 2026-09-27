@@ -1137,6 +1137,15 @@ html, body {
     margin-bottom: 3px;
 }
 
+/* A channel sender's short hash beside the name the post chose for itself:
+   channel names are public and anyone can pick any name (DISPLAY_NAMES.md §5.3). */
+.msg-sender-hash {
+    font-weight: 400;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    margin-left: 4px;
+}
+
 /* Empty chat placeholder */
 .empty-chat {
     flex: 1;

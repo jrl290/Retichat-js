@@ -44,6 +44,18 @@ import Cryptography from "./lib/rns/cryptography.js";
 import { GroupDeliveryEvidence, GroupFallbackRegistry } from "./lib/rns/group_fallback.js";
 import DistroManager from "./lib/distro.js";
 import { TabLock } from "./lib/tab_lock.js";
+import {
+    clean as cleanDisplayName,
+    decodeField as decodeDisplayName,
+    applyToFields as applyDisplayName,
+    acceptMessageName,
+    contactName,
+    channelPosterName,
+    shortHash,
+    migrateContact,
+    migrateOwnDisplayName,
+} from "./lib/display_name.js";
+import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 
 // Initialize DistroManager after Buffer polyfill is available
 DistroManager.init();
@@ -72,7 +84,6 @@ const DEFAULT_CONFIG = {
     rfedNodePubKey: "",
 
     interfaceName: "Retichat Web",
-    displayName: "Retichat Web",
     announceIntervalMs: 300000,
 };
 // RFed-over-PostInterface can require multiple one-second exchange cycles.
@@ -189,19 +200,23 @@ function rfedRequestTimeoutMs(link) {
 }
 async function loadConfig() {
     const cfg = { ...DEFAULT_CONFIG };
+    let configDisplayName = null;
     try {
         const resp = await fetch("./config.json");
         if (resp.ok) {
             const json = await resp.json();
             if (json.exchangeUrl) cfg.exchangeUrl = json.exchangeUrl;
-            if (json.displayName) cfg.displayName = json.displayName;
+            // A node's config.json displayName was a default name for every
+            // user of that node. There are no placeholder names any more
+            // (DISPLAY_NAMES.md §1); it is read only to tell a pre-filled
+            // legacy name from one the user typed (OwnNames.finishMigration).
+            configDisplayName = typeof json.displayName === "string" ? json.displayName : null;
             if (typeof json.announceIntervalMs === "number") cfg.announceIntervalMs = json.announceIntervalMs;
         }
     } catch(e) {}
     const savedExchangeUrl = sGet("exchangeUrl");
     if (savedExchangeUrl) cfg.exchangeUrl = savedExchangeUrl;
-    const savedDisplayName = sGet("displayName");
-    if (savedDisplayName) cfg.displayName = savedDisplayName;
+    OwnNames.finishMigration(configDisplayName);
     const savedInterfaceName = sGet("interfaceName");
     if (savedInterfaceName) cfg.interfaceName = savedInterfaceName;
     cfg.rfedNodeHash = sGet("rfedNodeHash") || DEFAULT_CONFIG.rfedNodeHash;
@@ -217,6 +232,81 @@ async function loadConfig() {
 const PFX = "retichat_";
 function sGet(k) { try { const r = localStorage.getItem(PFX+k); return r ? JSON.parse(r) : null; } catch(e) { return null; } }
 function sSet(k, v) { try { localStorage.setItem(PFX+k, JSON.stringify(v)); } catch(e) {} }
+
+// =========================================================================
+//  OWN NAMES — LXMF-rust/DISPLAY_NAMES.md §1 and §6
+//
+//  Three independent names, all empty by default, none falling back to
+//  another, and no placeholder ("Retichat Web"): unset means unset.
+//    announce — Announce Display Name: public, in the lxmf.delivery announce
+//               (device and distro).
+//    message  — Message Display Name: field 0xD1 of messages, sent under the
+//               name ledger (§4.1).
+//    channel  — Channel Display Name: 0xD1 of channel posts (§4.2).
+//  Each is cleaned (§3) when saved, so Settings shows exactly what goes out,
+//  and a change takes effect at once, with no reconnect (§6).
+// =========================================================================
+const OwnNames = {
+    announce: null,
+    message: null,
+    channel: null,
+    _legacy: null,
+
+    init() {
+        this.announce = cleanDisplayName(sGet("announceDisplayName"));
+        this.channel = cleanDisplayName(sGet("channelDisplayName"));
+        const message = sGet("messageDisplayName");
+        const legacy = sGet("displayName");
+        if (message === null && typeof legacy === "string") {
+            // §5.4: the old display name becomes the Message Display Name.
+            // Provisional until the node's config.json default is known
+            // (finishMigration), which is dropped like "Retichat Web".
+            this._legacy = legacy;
+            this.message = migrateOwnDisplayName(legacy, null);
+        } else {
+            this.message = cleanDisplayName(message);
+        }
+    },
+
+    /** §5.4: settle the legacy name once config.json has been read. The
+     *  Settings field used to be pre-filled with "Retichat Web" or the
+     *  node's default, so either one saved means nothing was typed. */
+    finishMigration(configDefault) {
+        if (this._legacy === null) return;
+        this.message = migrateOwnDisplayName(this._legacy, configDefault);
+        this._legacy = null;
+        sSet("messageDisplayName", this.message ?? "");
+        sSet("displayName", null);
+    },
+
+    setAnnounce(raw) {
+        this.announce = cleanDisplayName(raw ?? "");
+        sSet("announceDisplayName", this.announce ?? "");
+        RnsClient.applyAnnounceName();
+        return this.announce;
+    },
+
+    setMessage(raw) {
+        this.message = cleanDisplayName(raw ?? "");
+        this._legacy = null;
+        sSet("messageDisplayName", this.message ?? "");
+        sSet("displayName", null);
+        return this.message;
+    },
+
+    setChannel(raw) {
+        this.channel = cleanDisplayName(raw ?? "");
+        sSet("channelDisplayName", this.channel ?? "");
+        return this.channel;
+    },
+};
+OwnNames.init();
+
+// The persistent name state of DISPLAY_NAMES.md §4.1, §4.2 and §5.1.
+const nameStorage = { get: sGet, set: sSet };
+const NameLedgerStore = new NameLedger(nameStorage);
+const ChannelPostNamesStore = new ChannelPostNames(nameStorage);
+const ChannelSenderNamesStore = new ChannelSenderNames(nameStorage);
 
 // =========================================================================
 //  IDENTITY MANAGER
@@ -271,24 +361,39 @@ const ContactStore = {
     _contacts: new Map(),
     _listeners: [],
 
+    /**
+     * Contacts hold three names (DISPLAY_NAMES.md §5.1): localName (the
+     * user's own), messageName (from 0xD1) and announceName (from the
+     * contact's announce). None is ever a placeholder; the label on screen is
+     * resolved by name(). Records stored before 2026-09-27 had one
+     * displayName plus nameCustomized and are migrated as they load (§5.4).
+     */
     init() {
         const data = sGet("contacts_v2");
-        if (Array.isArray(data)) for (const c of data) this._contacts.set(c.destHash, c);
+        let migrated = false;
+        if (Array.isArray(data)) for (const stored of data) {
+            const c = migrateContact(stored);
+            if ("displayName" in stored || "nameCustomized" in stored || !("localName" in stored)) migrated = true;
+            this._contacts.set(c.destHash, c);
+        }
+        if (migrated) this._save();
     },
 
     onChange(fn) { this._listeners.push(fn); fn(this.getAll()); },
     _notify() { const all = this.getAll(); this._listeners.forEach(fn => fn(all)); },
 
-    /** Add a contact by destination hash. Returns the contact. */
+    /** Add a contact by destination hash. Returns the contact. Adding one
+     *  that exists keeps everything it holds, names and key included. */
     add(destHash, isDistro = false, publicKey = null) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         if (destHash.length !== 32) throw new Error("Destination hash must be exactly 32 hex characters");
         const existing = this._contacts.get(destHash);
         const contact = {
             destHash,
-            displayName: existing?.displayName ?? ("?" + destHash.slice(0,8)),
+            localName: existing?.localName ?? null,
+            messageName: existing?.messageName ?? null,
+            announceName: existing?.announceName ?? null,
             publicKey: existing?.publicKey ?? publicKey,
-            nameCustomized: existing?.nameCustomized ?? false,
             addedAt: existing?.addedAt ?? Date.now(),
             lastSeen: existing?.lastSeen ?? 0,
             reachable: existing?.reachable ?? null,
@@ -300,17 +405,14 @@ const ContactStore = {
         return contact;
     },
 
-    /** Update contact info from an announce (display name, public key) */
+    /** Update contact info from an announce (announce name, distro flag,
+     *  public key). The announce name is replaced on every announce, and
+     *  cleared by one that carries none (§5.1). */
     updateFromAnnounce(destHash, announce) {
         const c = this._contacts.get(destHash);
         if (!c) return;
 
-        if (!c.nameCustomized && announce.appData) {
-            try {
-                const n = LXMF.displayNameFromAppData(announce.appData);
-                if (n) c.displayName = n;
-            } catch(e) {}
-        }
+        c.announceName = LXMF.displayNameFromAppData(announce.appData);
         // The lxmf.delivery announce is the source of truth for "distro"
         // (RFed SPEC §17.10): SF_RFED_DISTRO in supported_functionality.
         // No app_data says nothing, so leave the flag as it is.
@@ -327,9 +429,40 @@ const ContactStore = {
 
     isContact(destHash) { return this._contacts.has(destHash); },
 
-    setDisplayName(destHash, name) {
+    /** The label every surface shows for `destHash` (§5.3):
+     *  localName ?? messageName ?? announceName ?? 8-hex short hash. */
+    name(destHash) { return contactName(this._contacts.get(destHash), destHash); },
+
+    /** The name the contact provides, ignoring the user's own (§5.3 without
+     *  localName): what the rename field falls back to when left empty. */
+    providedName(destHash) {
         const c = this._contacts.get(destHash);
-        if (c) { c.displayName = name || ("?" + destHash.slice(0,8)); c.nameCustomized = true; this._save(); this._notify(); }
+        return c?.messageName ?? c?.announceName ?? shortHash(destHash);
+    },
+
+    /** The user's own name for a contact (§5.1). Cleaned; an empty value
+     *  clears it, so the provided name shows again. */
+    setLocalName(destHash, raw) {
+        const c = this._contacts.get(destHash);
+        if (!c) return null;
+        c.localName = cleanDisplayName(raw ?? "");
+        this._save();
+        this._notify();
+        return c.localName;
+    },
+
+    /** Apply a received 0xD1 to the contact's messageName under the §5.2
+     *  table. Returns true when the name changed. A sender that is not a
+     *  contact is left alone: nothing is created to hold a name. */
+    acceptMessageName(destHash, field, signatureState) {
+        const c = this._contacts.get(destHash);
+        if (!c) return false;
+        const next = acceptMessageName(c.messageName ?? null, field, signatureState);
+        if (next === (c.messageName ?? null)) return false;
+        c.messageName = next;
+        this._save();
+        this._notify();
+        return true;
     },
 
     setReachable(destHash, reachable) {
@@ -370,6 +503,24 @@ const ContactStore = {
     _save() { sSet("contacts_v2", [...this._contacts.values()]); },
 };
 ContactStore.init();
+
+/**
+ * The identity store LXMF signatures are checked against (DISPLAY_NAMES.md
+ * §7; the reference uses RNS.Identity.recall): this client's own device and
+ * distro identities, and every contact's stored public key — but only a key
+ * that produces the source hash as an lxmf.delivery destination, so a key
+ * pasted or learned under the wrong hash never validates anything.
+ */
+function recallLxmfIdentity(sourceHash) {
+    const hex = Buffer.from(sourceHash).toString("hex");
+    if (IdMgr.has && hex === ownLxmfDestinationHash()) return IdMgr.id;
+    if (DistroManager.has && hex === DistroManager.lxmfDeliveryHash) return DistroManager.identity;
+    const publicKey = ContactStore.get(hex)?.publicKey;
+    if (!publicKey || !/^[0-9a-f]{128}$/i.test(publicKey)) return null;
+    const identity = Identity.fromPublicKey(Buffer.from(publicKey, "hex"));
+    return Destination.hash(identity, "lxmf", "delivery").toString("hex") === hex ? identity : null;
+}
+LXMessage.recall = recallLxmfIdentity;
 
 // =========================================================================
 //  HARNESS — in-memory observation surface for headless E2E drivers.
@@ -712,17 +863,23 @@ const GroupMsgStore = {
         if (m) { Object.assign(m, changes); sSet("gmsg_"+groupId, msgs); }
         return m;
     },
-    addSystem(groupId, text) {
-        return this.add(groupId, { dir: "system", content: text, status: "delivered" });
+    /** A system notice. `actor`, when given, is the hash of the member it
+     *  is about: it is stored as a hash and named when shown
+     *  (systemMessageText), never frozen into the text (DISPLAY_NAMES.md
+     *  §5.3), so a name learned later, or a rename, reaches old notices. */
+    addSystem(groupId, text, actor = null) {
+        return this.add(groupId, actor
+            ? { dir: "system", content: text, actor, status: "delivered" }
+            : { dir: "system", content: text, status: "delivered" });
     },
     remove(groupId) {
         sSet("gmsg_"+groupId, []);
     },
-    preview(groupId) {
+    preview(groupId, systemText = (m) => m.content) {
         const msgs = this.get(groupId);
         if (!msgs.length) return null;
         const last = msgs[msgs.length-1];
-        if (last.dir === "system") return last.content?.slice(0,60) ?? "";
+        if (last.dir === "system") return systemText(last)?.slice(0,60) ?? "";
         return (last.dir === "out" ? "You: " : "") + (last.content?.slice(0,60) ?? "");
     },
 };
@@ -1015,8 +1172,10 @@ const RnsClient = {
         this._rns.addInterface(iface);
         this._connType = "exchange";
 
-        // Set up LXMF router
+        // Set up LXMF router, with the Announce Display Name its announces
+        // carry (DISPLAY_NAMES.md §2.2; nil until the user sets one).
         this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id);
+        this._lxmfRouter.setAnnounceName(OwnNames.announce);
         this._lxmfRouter.on("message", (lxmfMsg) => {
             const srcHash = lxmfMsg.sourceHash?.toString("hex");
             const content = lxmfMsg.content?.toString() ?? "";
@@ -1043,6 +1202,22 @@ const RnsClient = {
                 Harness.event("lxmf-dup", { src: srcHash.slice(0, 12), hash: lxmfHashHex.slice(0, 12) });
                 return;
             }
+
+            // ---- Display name (field 0xD1) ----
+            // DISPLAY_NAMES.md §5.2, on every path that yields an LXMF
+            // message, group messages included: the name belongs to the LXMF
+            // source (a relayed group message names the relayer, never
+            // GROUP_SENDER), and whether it is taken depends on the
+            // signature — validated sets or clears it, a source whose key is
+            // not known yet only fills an empty name, an invalid signature
+            // changes nothing. The message itself is kept either way, as the
+            // reference and the native clients keep it.
+            const nameField = decodeDisplayName(lxmfMsg.fields);
+            const signatureState = lxmfMsg.signatureState ?? "invalid";
+            if (!lxmfMsg.signatureValidated) {
+                console.log(`[retichat] RX message from ${srcHash.slice(0,12)}: signature ${signatureState}`);
+            }
+            ContactStore.acceptMessageName(srcHash, nameField, signatureState);
 
             // ---- Distro identity transfer detection ----
             // FIELD_CUSTOM_TYPE == "rfed.distro.transfer", key in
@@ -1092,18 +1267,10 @@ const RnsClient = {
             if (!ContactStore.isContact(srcHash)) {
                 console.log(`[rns] 📇 Auto-adding contact: ${srcHash.slice(0,12)}...`);
                 ContactStore.add(srcHash);
-            }
-
-            // Update display name from per-message FIELD_SENDER_NAME (0x10).
-            // This is privacy-preserving — only message recipients see it,
-            // unlike the old broadcast announce approach.
-            const senderName = LXMF.senderNameFromFields(lxmfMsg.fields);
-            if (senderName) {
-                const contact = ContactStore.get(srcHash);
-                if (contact && !contact.nameCustomized && contact.displayName !== senderName) {
-                    contact.displayName = senderName;
-                    ContactStore._save();
-                }
+                // Its name, under the same §5.2 rule as above: a new contact
+                // has no key yet, so the source is unknown and the name only
+                // fills the empty slot.
+                ContactStore.acceptMessageName(srcHash, nameField, signatureState);
             }
 
             MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash, via: "direct" });
@@ -1213,8 +1380,8 @@ const RnsClient = {
             return;
         }
         try {
-            // No name in the announce (DESIGN_PRINCIPLES.md); the router
-            // announces [nil, nil, []].
+            // [announce_name | nil, nil, []]: the Announce Display Name only
+            // when the user has set one (DISPLAY_NAMES.md §2.2).
             this._lxmfRouter.announce();
             // Re-announce rfed.delivery alongside lxmf.delivery so the RFed's
             // path back to us stays fresh (the distro fanout + deferred flush
@@ -1573,25 +1740,17 @@ const RnsClient = {
                 try {
                     const decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
                     if (!decrypted || decrypted.length < 80) { console.log(`[retichat] 📬 [3/4] ${tidHex} decrypt failed`); continue; }
-                    const srcHash = decrypted.slice(0, 16);
-                    const payloadBytes = decrypted.slice(80);
-
                     let payload;
-                    try { payload = MsgPack.unpack(payloadBytes); } catch(e) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
+                    try { payload = MsgPack.unpack(decrypted.slice(80)); } catch(e) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
                     if (!Array.isArray(payload) || payload.length < 3) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload shape`); continue; }
 
-                    const [ts, titleBin, contentBin, fieldsMap] = payload;
-                    const content = Buffer.from(contentBin || []).toString();
-                    console.log(`[retichat] 📬 [3/4] ✅ ${tidHex} from ${srcHash.toString("hex").slice(0,12)}: "${content.slice(0,60)}"`);
-
-                    // The hash the router gives the same message on the direct
-                    // paths, so a copy of one already received is recognised.
-                    this._lxmfRouter.emit("message", {
-                        sourceHash: srcHash, destinationHash: destHash,
-                        hash: LXMessage.hashOf(destHash, srcHash, payloadBytes),
-                        title: Buffer.from(titleBin || []).toString(),
-                        content, fields: fieldsMap, timestamp: ts,
-                    });
+                    // Parsed as the router parses the direct paths: the same
+                    // hash, so a copy of one already received is recognised,
+                    // and the same signature check against the identity store.
+                    const message = LXMessage.fromBytes(decrypted, destHash);
+                    if (!message) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
+                    console.log(`[retichat] 📬 [3/4] ✅ ${tidHex} from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
+                    this._lxmfRouter.emit("message", message);
                     this._propSeenIds.add(Buffer.from(tid).toString("hex"));
                     deliveredIds.push(tid);
                 } catch(e) {
@@ -1699,7 +1858,16 @@ const RnsClient = {
         const content = outMsg.content;
         // Signed as whoever sends it now, which a record queued before
         // connect() could not know.
-        MsgStore.update(contact.destHash, outMsg.id, { status: "sending", srcHash: this.sendingIdentity().hash });
+        const signer = this.sendingIdentity();
+        // DISPLAY_NAMES.md §4.1: whether this message carries the Message
+        // Display Name (0xD1) is decided here, once, for the source it is
+        // signed as, and kept on the record. The direct send (_sendPacket)
+        // and the propagated copy (_propagateMessage) both read it from
+        // there, so they carry identical bytes and one message hash — the
+        // copy of a message the recipient already has is still a duplicate
+        // (LxmfSeen).
+        const lxmfName = this._decideMessageName(signer.hash, contact.destHash);
+        MsgStore.update(contact.destHash, outMsg.id, { status: "sending", srcHash: signer.hash, lxmfName });
         if (outMsg.status !== "sending") this._onMsg.forEach(fn => fn(null, contact.destHash));
 
         // The propagated copy goes once: at once when the direct attempt
@@ -1720,8 +1888,10 @@ const RnsClient = {
         if (!contact.isDistro) {
             this._sendPacket(contact.destHash, contact.publicKey, content, outMsg.id,
                 (msgId) => {
-                    // Direct proof callback
+                    // Direct proof callback: the message is DELIVERED, so the
+                    // name it carried is now known to the recipient (§4.1).
                     MsgStore.updateStatus(contact.destHash, msgId, "proved");
+                    this._recordNameDelivered(contact.destHash, msgId);
                     ContactStore.setReachable(contact.destHash, true);
                     console.log(`[retichat] ✅ Direct proof for ${contact.destHash.slice(0,8)}`);
                     this._onMsg.forEach(fn => fn(null, contact.destHash));
@@ -1835,6 +2005,13 @@ const RnsClient = {
         msg.content = outMsg.content;
         msg.fields = new Map();
         msg.fields.set(FIELD_TICKET, ticket);
+        // The name decided for this message (_dispatchMessage), in the same
+        // place as in _sendPacket, so the bytes are the same. A copy that is
+        // a new message (the signer changed) gets its own decision, which
+        // is never recorded: a propagated copy is never confirmed (§4.1).
+        applyDisplayName(msg.fields, sameMessage
+            ? record.lxmfName
+            : this._decideMessageName(sender.hash, contact.destHash));
         // Pack non-opportunistic so destinationHash is at offset 0.
         // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
         // to identify the final recipient.
@@ -1902,6 +2079,40 @@ const RnsClient = {
         // Mark as likely offline
         if (contact.reachable !== false) {
             ContactStore.setReachable(contact.destHash, false);
+        }
+    },
+
+    /**
+     * DISPLAY_NAMES.md §4.1: the 0xD1 state of one outgoing message from
+     * `sourceHex` to `recipientHex` — the Message Display Name when the
+     * recipient has not had it confirmed in 30 days, an empty value once to
+     * clear a name it has, otherwise nothing. Every outgoing DM, group and
+     * group-control message goes through this, whatever its source (device
+     * or distro); distro sent-copies and identity transfers, which go to
+     * one's own devices, never do.
+     */
+    _decideMessageName(sourceHex, recipientHex) {
+        return NameLedgerStore.decideFor(OwnNames.message, sourceHex, recipientHex, Math.floor(Date.now() / 1000));
+    },
+
+    /** §4.1: a DM reached DELIVERED; record the name it carried, if any. */
+    _recordNameDelivered(contactHash, msgId) {
+        const record = MsgStore.get(contactHash).find(m => m.id === msgId);
+        if (!record?.srcHash) return;
+        NameLedgerStore.recordDelivered(record.srcHash, contactHash, record.lxmfName, Math.floor(Date.now() / 1000));
+    },
+
+    /**
+     * §2.2: a new Announce Display Name goes into the app_data of every
+     * delivery destination at once. The device's next announce carries it;
+     * the distro's announce is the one RFed replays, so it is handed over
+     * again now.
+     */
+    applyAnnounceName() {
+        this._lxmfRouter?.setAnnounceName(OwnNames.announce);
+        if (DistroManager.has && this._initialized) {
+            this._publishDistroAnnounce().catch(error =>
+                console.warn("[distro] Re-publishing the distro announce with the new name failed:", error.message));
         }
     },
 
@@ -2086,6 +2297,10 @@ const RnsClient = {
         msg.content = content;
         msg.fields = new Map();
         msg.fields.set(FIELD_TICKET, ticket);
+        // DISPLAY_NAMES.md §4.1: the 0xD1 decided once for this message and
+        // kept on its record (_dispatchMessage). None on a record without a
+        // decision.
+        applyDisplayName(msg.fields, MsgStore.get(contactHash).find(m => m.id === messageId)?.lxmfName);
         // The full packing: destination hash, source hash, signature, payload.
         // A packet to the destination sends it without the destination hash
         // (the packet header carries it); a link packet or Resource sends it
@@ -2162,7 +2377,11 @@ const RnsClient = {
                 console.warn(`[distro] Private key has wrong length: ${privateKeyHex?.length ?? 0}`);
                 return;
             }
-            const senderName = LXMF.senderNameFromFields(lxmfMsg.fields) || srcHash.slice(0,8);
+            // Named through the resolver (DISPLAY_NAMES.md §5.3): the user's
+            // own name for the sender when there is one, and a 0xD1 only as
+            // accepted under §5.2 — never the raw field, which anyone can
+            // set to a known contact's name (audit M14).
+            const senderName = ContactStore.name(srcHash);
 
             // Show custom modal instead of confirm() (which gets suppressed in background tabs)
             this._showDistroImportPrompt(senderName, privateKeyHex);
@@ -2306,26 +2525,26 @@ const RnsClient = {
                 this._rememberGroupMemberKeys(memberKeys);
                 // If we already have this group active, ignore
                 if (group && group.groupStatus === "active") return;
-                // Create pending group entry
-                const senderName = LXMF.senderNameFromFields(lxmfMsg.fields) || srcHash.slice(0,8);
+                // Create pending group entry. The inviter is named when the
+                // notice is shown, through the contact resolver: its 0xD1
+                // was already taken under §5.2 above, and the raw field is
+                // never shown as it arrived (audit M14).
                 GroupStore.addPending(groupId, groupName || "Group", srcHash, members || []);
-                if (!group) GroupMsgStore.addSystem(groupId, `${senderName} invited you to "${groupName || "Group"}"`);
+                if (!group) GroupMsgStore.addSystem(groupId, `invited you to "${groupName || "Group"}"`, srcHash);
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));  // trigger UI refresh with groupId
                 break;
             }
             case "accept": {
                 if (!group) return;
                 GroupStore.updateMember(groupId, actualSender, "accepted");
-                const senderName = ContactStore.get(actualSender)?.displayName || actualSender.slice(0,8);
-                GroupMsgStore.addSystem(groupId, `${senderName} joined the group`);
+                GroupMsgStore.addSystem(groupId, "joined the group", actualSender);
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
                 break;
             }
             case "leave": {
                 if (!group) return;
                 GroupStore.updateMember(groupId, actualSender, "left");
-                const senderName = ContactStore.get(actualSender)?.displayName || actualSender.slice(0,8);
-                GroupMsgStore.addSystem(groupId, `${senderName} left the group`);
+                GroupMsgStore.addSystem(groupId, "left the group", actualSender);
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
                 break;
             }
@@ -2351,9 +2570,11 @@ const RnsClient = {
                     return;
                 }
 
-                const senderName = ContactStore.get(actualSender)?.displayName || actualSender.slice(0,12);
+                // The author (GROUP_SENDER, or the LXMF source) is stored as a
+                // hash and named at render (groupSenderLabel), so the label follows
+                // names learned later.
                 const displayContent = content || "(empty)";
-                GroupMsgStore.add(groupId, { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender, senderName });
+                GroupMsgStore.add(groupId, { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender });
                 // Update group last activity
                 group.lastActivity = Date.now();
                 GroupStore._save();
@@ -2437,7 +2658,6 @@ const RnsClient = {
                 groupMemberKey,
                 groupAction: "invite",
                 groupSender: ownHash,
-                suppressSenderName: true,
             })
         ));
     },
@@ -2545,7 +2765,13 @@ const RnsClient = {
         msg.title = "";
         msg.content = content;
         msg.fields = new Map();
-        if (!fields.suppressSenderName) msg.fields.set(0x10, this._cfg.displayName || "Retichat Web");
+        // DISPLAY_NAMES.md §4.1: group messages and group control (invites
+        // included) carry the Message Display Name under the same ledger as
+        // DMs, per member. Recorded once this member's copy is delivered
+        // directly; a propagated copy is never confirmed.
+        const sourceHex = msg.sourceHash.toString("hex");
+        const nameState = this._decideMessageName(sourceHex, memberHash);
+        applyDisplayName(msg.fields, nameState);
         msg.fields.set(GROUP_FIELDS.GROUP_ID, fields.groupId);
         if (fields.groupMembers) msg.fields.set(GROUP_FIELDS.GROUP_MEMBERS, fields.groupMembers);
         if (fields.groupName) msg.fields.set(GROUP_FIELDS.GROUP_NAME, fields.groupName);
@@ -2559,11 +2785,12 @@ const RnsClient = {
         return this._deliverGroupEnvelope(
             memberHash,
             Buffer.concat([dest.hash, packed]),
-            contact.publicKey
+            contact.publicKey,
+            () => NameLedgerStore.recordDelivered(sourceHex, memberHash, nameState, Math.floor(Date.now() / 1000)),
         );
     },
 
-    _deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex) {
+    _deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null) {
         const deliveryKey = `${memberHash}:${crypto.randomUUID()}`;
         const evidence = new GroupDeliveryEvidence(memberHash);
         {
@@ -2571,6 +2798,7 @@ const RnsClient = {
             let propagationProofKey = null;
             const fulfill = method => {
                 if (!evidence.fulfill(method)) return;
+                if (method === "direct" && onDelivered) onDelivered();
                 this._groupFallbacks.prove(deliveryKey);
                 if (directProofKey) this._pendingPacketHashes.delete(directProofKey);
                 if (propagationProofKey) this._pendingPacketHashes.delete(propagationProofKey);
@@ -3304,14 +3532,17 @@ const RnsClient = {
                 return false;
             }
 
-            // Unpack the channel message
+            // Unpack the channel message. A post whose prelude key does not
+            // bind to its claimed source, or whose signature fails, is
+            // rejected there (DISPLAY_NAMES.md §2.3), before any key below
+            // is remembered.
             const result = channelLxmUnpack(ch.channelName, data);
             if (!result) {
                 console.warn(`[retichat] 📡 Channel unpack failed for ${ch.channelName}`);
                 return false;
             }
 
-            const { sourceHash, tsMs, content, senderPubKey } = result;
+            const { sourceHash, tsMs, content, senderPubKey, displayName } = result;
             const srcHashHex = sourceHash.toString("hex");
 
             // Dedup: track by (senderHash, tsMs) — per spec security requirements.
@@ -3336,9 +3567,12 @@ const RnsClient = {
                 this._chanSeenIds = new Set(arr.slice(-1000));
             }
 
-            // Register sender identity from the RTID prelude
-            if (senderPubKey && !ContactStore.isContact(srcHashHex)) {
-                ContactStore.add(srcHashHex);
+            // Register sender identity from the RTID prelude. The key is
+            // bound to srcHashHex (checked in channelLxmUnpack), so it may
+            // fill a contact's missing key; one already held is never
+            // replaced from a channel post.
+            if (senderPubKey) {
+                if (!ContactStore.isContact(srcHashHex)) ContactStore.add(srcHashHex);
                 const contact = ContactStore.get(srcHashHex);
                 if (contact && !contact.publicKey) {
                     contact.publicKey = Buffer.from(senderPubKey).toString("hex");
@@ -3346,10 +3580,20 @@ const RnsClient = {
                 }
             }
 
-            // Insert message
+            // §5.2: the post's 0xD1 (reported only after the binding and the
+            // signature passed) sets or clears this sender's Channel Display
+            // Name in this channel. It never becomes the contact's name.
+            ChannelSenderNamesStore.apply(ch.channelName, srcHashHex, displayName);
+            // §4.2 rule 2: a sender not seen here before means our next post
+            // carries our Channel Display Name again.
+            ChannelPostNamesStore.noteSender(ch.channelName, srcHashHex, ownLxmfDestinationHash(), Date.now());
+
+            // Insert message. The sender is stored as a hash and labelled at
+            // render (channelSenderLabel), so a name that arrives later
+            // relabels earlier posts.
             ChannelMsgStore.add(ch.channelName, {
                 dir: "in", content, status: "delivered",
-                srcHash: srcHashHex, senderName: srcHashHex.slice(0, 12),
+                srcHash: srcHashHex,
             });
             ChannelStore.touch(ch.channelName);
 
@@ -3492,10 +3736,16 @@ const RnsClient = {
             const distroDestination = new Destination(
                 this._rns, distroIdentity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery",
             );
-            // app_data = [nil, nil, [SF_RFED_DISTRO]] (RFed SPEC §17.10): no
-            // name, no stamp cost, no compression claim — the SF_RFED_DISTRO
-            // flag is how every reader recognises a distro address.
-            const distroAppData = MsgPack.pack([null, null, [LXMF.SF_RFED_DISTRO]]);
+            // app_data = [announce_name, nil, [SF_RFED_DISTRO]] (RFed SPEC
+            // §17.10, DISPLAY_NAMES.md §2.2): the Announce Display Name as bin
+            // or nil when unset, no stamp cost, no compression claim — the
+            // SF_RFED_DISTRO flag is how every reader recognises a distro
+            // address.
+            const distroAppData = MsgPack.pack([
+                OwnNames.announce ? Buffer.from(OwnNames.announce, "utf8") : null,
+                null,
+                [LXMF.SF_RFED_DISTRO],
+            ]);
             const { announceData, contextFlag } = distroDestination.buildAnnounceData(distroAppData);
 
             // value = flags(1) ‖ announceData; bit 0 signals a ratchet, which
@@ -3730,6 +3980,14 @@ const RnsClient = {
             if (!ContactStore.isContact(srcHashHex)) {
                 ContactStore.add(srcHashHex);
             }
+            // DISPLAY_NAMES.md §5.2 on the distro path too: the sender's 0xD1,
+            // taken according to the LXMF signature, checked here exactly as
+            // the router checks the direct paths (LXMessage.verify).
+            const signature = LXMessage.verify(destHash, srcHash, decrypted.slice(16, 80), payloadBytes, undefined, payload);
+            const signatureState = signature.validated ? "validated"
+                : signature.unverifiedReason === LXMessage.SOURCE_UNKNOWN ? "unknown" : "invalid";
+            if (!signature.validated) console.log(`[distro] Message from ${srcHashHex.slice(0,12)}: signature ${signatureState}`);
+            ContactStore.acceptMessageName(srcHashHex, decodeDisplayName(fieldsMap), signatureState);
             const stored = MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex, via: "distro" });
             ContactStore.touch(srcHashHex);
             // Pass the stored message, not null: listeners read a null `msg` as
@@ -3886,6 +4144,8 @@ const RnsClient = {
         this._rfedStreamPromises.delete(ch.channelHash);
         await this._configureChannelStream();
         ChannelMsgStore.remove(channelName);
+        ChannelSenderNamesStore.forget(channelName);
+        ChannelPostNamesStore.forget(channelName);
         ChannelStore.leave(channelName);
         this._onMsg.forEach(fn => fn({kind: "channel-left"}, channelName));
     },
@@ -3926,8 +4186,12 @@ const RnsClient = {
             await this._ensureChannelSubscribed(ch);
             await this._ensureChannelStreamConfigured(ch);
 
-            // Pack the channel message
-            const { wire, tsMs } = channelLxmPack(channelName, IdMgr.id, content);
+            // Pack the channel message, carrying the Channel Display Name
+            // when the channel rule says so (DISPLAY_NAMES.md §4.2). It
+            // never falls back to the Message Display Name.
+            const nameDecidedAt = Date.now();
+            const postName = ChannelPostNamesStore.decide(channelName, OwnNames.channel, nameDecidedAt);
+            const { wire, tsMs } = channelLxmPack(channelName, IdMgr.id, content, postName);
 
             // Compute PoW stamp (only if server requires one)
             const stampCost = ChannelStore.get(channelName)?.stampCost;
@@ -3966,8 +4230,10 @@ const RnsClient = {
                 ]);
             }
 
-            // Mark as sent
+            // Mark as sent. RFed has the post, so what it carried is recorded
+            // for the channel rule (§4.2).
             ChannelMsgStore.updateStatus(channelName, outMsg.id, "sent");
+            ChannelPostNamesStore.recordIncluded(channelName, postName, nameDecidedAt);
             console.log(`[retichat] 📡 Channel message proved to #${channelName} (${finalPayload.length}B, stamp=${!!stamp}, resource=${oversized})`);
         } catch(e) {
             ChannelMsgStore.updateStatus(channelName, outMsg.id, "failed");
@@ -4135,6 +4401,35 @@ function kvRow(key, value, opts = {}) {
     );
 }
 function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+/** A system notice as shown: a notice about a member stores that member's
+ *  hash (GroupMsgStore.addSystem) and names it now, through the resolver
+ *  (DISPLAY_NAMES.md §5.3). Older notices carry their text only. */
+function systemMessageText(m) {
+    return m.actor ? `${ContactStore.name(m.actor)} ${m.content}` : m.content;
+}
+
+/** The sender label of an incoming group message, resolved at render. */
+function groupSenderLabel(m) {
+    if (m.dir !== "in") return null;
+    if (m.srcHash) return { label: ContactStore.name(m.srcHash), secondary: null };
+    return m.senderName ? { label: m.senderName, secondary: null } : null;
+}
+
+/** The sender label of an incoming channel post (§5.3): the Channel Display
+ *  Name that sender chose in this channel, with its short hash beside it,
+ *  or else the contact chain. */
+function channelSenderLabel(channelName, m) {
+    if (m.dir !== "in") return null;
+    if (m.srcHash) {
+        return channelPosterName(
+            ChannelSenderNamesStore.get(channelName, m.srcHash),
+            ContactStore.get(m.srcHash),
+            m.srcHash,
+        );
+    }
+    return m.senderName ? { label: m.senderName, secondary: null } : null;
+}
 function fmtTime(ts) { return new Date(ts).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }
 function fmtDate(ts) {
     const d = new Date(ts);
@@ -4487,12 +4782,12 @@ const App = {
         let records, build;
         if (GroupStore.isGroupChat(id)) {
             records = GroupMsgStore.get(id);
-            build = (m) => m.dir === "system" ? this._buildSystemMsg(m) : this._buildMsgBubble(m);
+            build = (m) => m.dir === "system" ? this._buildSystemMsg(m) : this._buildMsgBubble(m, groupSenderLabel(m));
         } else if (ChannelStore.get(id)) {
             records = ChannelMsgStore.get(id);
             build = (m) => m.dir === "system"
                 ? this._buildSystemMsg(m)
-                : this._buildMsgBubble({ ...m, senderName: m.senderName || (m.dir === "in" ? m.srcHash?.slice(0,12) : null) });
+                : this._buildMsgBubble(m, channelSenderLabel(id, m));
         } else {
             records = MsgStore.get(id);
             build = (m) => this._buildMsgBubble(m);
@@ -4517,13 +4812,19 @@ const App = {
      *  message list or the draft being touched. */
     _syncOpenChatChrome() {
         const id = this.state.activeHash;
-        if (!id || GroupStore.isGroupChat(id) || ChannelStore.get(id)) return;
+        if (!id) return;
+        if (GroupStore.isGroupChat(id) || ChannelStore.get(id)) {
+            this._refreshNameLabels();
+            return;
+        }
         const c = ContactStore.get(id);
         if (!c) return;
         const view = this.root.querySelector(".detail .chat-view");
         if (!view) return;
 
-        const name = c.displayName || "?" + c.destHash.slice(0, 8);
+        // The header follows a name that arrives while the chat is open
+        // (a 0xD1, an announce, a rename): ContactStore notifies, this runs.
+        const name = ContactStore.name(c.destHash);
         const nameEl = view.querySelector(".header-name");
         if (nameEl && nameEl.textContent !== name) nameEl.textContent = name;
 
@@ -4538,6 +4839,33 @@ const App = {
         }
         const send = view.querySelector(".btn-send");
         if (send) send.disabled = !c.publicKey;
+    },
+
+    /** Re-resolve the sender labels and system notices of the open group or
+     *  channel in place: they are named at render (§5.3), so a name learned
+     *  since — a 0xD1, an announce, a channel name, a rename — relabels the
+     *  messages already on screen without rebuilding the list. */
+    _refreshNameLabels() {
+        const id = this.state.activeHash;
+        const list = document.getElementById("msg-list");
+        if (!id || !list) return;
+        const isGroup = GroupStore.isGroupChat(id);
+        const isChannel = !isGroup && !!ChannelStore.get(id);
+        if (!isGroup && !isChannel) return;
+        const records = new Map((isGroup ? GroupMsgStore.get(id) : ChannelMsgStore.get(id)).map(m => [m.id, m]));
+        for (const row of list.querySelectorAll("[data-msg-id]")) {
+            const m = records.get(row.getAttribute("data-msg-id"));
+            if (!m) continue;
+            if (m.dir === "system") {
+                const text = row.querySelector(".system-text");
+                const want = systemMessageText(m);
+                if (text && text.textContent !== want) text.textContent = want;
+                continue;
+            }
+            const el = row.querySelector(".msg-sender");
+            const sender = isGroup ? groupSenderLabel(m) : channelSenderLabel(id, m);
+            if (el && sender) el.replaceWith(this._buildSenderLabel(sender));
+        }
     },
 
     /** Rebuild only the detail pane, keeping the composer draft and the scroll
@@ -4615,14 +4943,14 @@ const App = {
         for (const c of contacts) {
             const msgs = MsgStore.get(c.destHash);
             const lastTs = msgs.length > 0 ? msgs[msgs.length-1].timestamp : c.lastSeen;
-            entries.push({ type: "dm", id: c.destHash, name: c.displayName || "?" + c.destHash.slice(0,8),
+            entries.push({ type: "dm", id: c.destHash, name: ContactStore.name(c.destHash),
                 lastTs, data: c, preview: MsgStore.preview(c.destHash) });
         }
         for (const g of groups) {
             const msgs = GroupMsgStore.get(g.groupId);
             const lastTs = msgs.length > 0 ? msgs[msgs.length-1].timestamp : g.lastActivity;
             entries.push({ type: "group", id: g.groupId, name: g.groupName,
-                lastTs, data: g, preview: GroupMsgStore.preview(g.groupId) });
+                lastTs, data: g, preview: GroupMsgStore.preview(g.groupId, systemMessageText) });
         }
         for (const ch of channels) {
             const msgs = ChannelMsgStore.get(ch.channelName);
@@ -4804,7 +5132,7 @@ const App = {
     },
 
     _buildContactItem(c) {
-        const name = c.displayName || "?" + c.destHash.slice(0, 8);
+        const name = ContactStore.name(c.destHash);
         const preview = MsgStore.preview(c.destHash);
         const msgs = MsgStore.get(c.destHash);
         const lastTs = msgs.length > 0 ? msgs[msgs.length - 1].timestamp : c.lastSeen;
@@ -4861,7 +5189,7 @@ const App = {
     _buildDmChatView() {
         const c = ContactStore.get(this.state.activeHash);
         if (!c) { this.state.activeHash = null; this.render(); return document.createDocumentFragment(); }
-        const name = c.displayName || "?" + c.destHash.slice(0, 8);
+        const name = ContactStore.name(c.destHash);
         const msgs = MsgStore.get(c.destHash);
         const hue = avatarHue(name);
 
@@ -4966,7 +5294,7 @@ const App = {
                         h("p", {}, isPending ? "Accept the invite to start chatting." : "No messages yet. Say hello!"))]
                     : msgs.map(m => m.dir === "system"
                         ? this._buildSystemMsg(m)
-                        : this._buildMsgBubble(m))),
+                        : this._buildMsgBubble(m, groupSenderLabel(m)))),
             ),
 
             // Composer (hidden for pending groups)
@@ -4999,18 +5327,29 @@ const App = {
             h("div", { className: "system-msg" },
                 h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
                 " ",
-                m.content,
+                h("span", { className: "system-text" }, systemMessageText(m)),
             ),
         );
     },
 
-    /** Build a single message bubble (used by both DM and group views). */
-    _buildMsgBubble(m) {
+    /** A sender label: the resolved name, and for a channel name the
+     *  sender's short hash beside it (§5.3). */
+    _buildSenderLabel(sender) {
+        return h("div", { className: "msg-sender" },
+            sender.label,
+            sender.secondary ? h("span", { className: "msg-sender-hash" }, sender.secondary) : null,
+        );
+    },
+
+    /** Build a single message bubble (DM, group and channel views). `sender`
+     *  is the resolved label of an incoming group or channel message
+     *  ({label, secondary}), null for DMs and own messages. */
+    _buildMsgBubble(m, sender = null) {
         const isOwn = m.dir === "out";
         const statusIcon = isOwn ? this._statusIcon(m.status) : "";
         return h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": m.id },
             h("div", { className: "msg-bubble" },
-                (!isOwn && m.senderName) ? h("div", { className: "msg-sender" }, m.senderName) : null,
+                (!isOwn && sender) ? this._buildSenderLabel(sender) : null,
                 m.content,
                 h("div", { className: "msg-meta" },
                     h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
@@ -5054,7 +5393,7 @@ const App = {
                         h("p", {}, "No messages yet. Be the first to speak!"))]
                     : msgs.map(m => m.dir === "system"
                         ? this._buildSystemMsg(m)
-                        : this._buildMsgBubble({ ...m, senderName: m.senderName || (m.dir === "in" ? m.srcHash?.slice(0,12) : null) }))),
+                        : this._buildMsgBubble(m, channelSenderLabel(ch.channelName, m)))),
             ),
 
             // Composer
@@ -5373,15 +5712,35 @@ const App = {
             ),
         );
 
-        // ---- Profile + Appearance ----
+        // ---- Names (DISPLAY_NAMES.md §6) ----
+        // Three independent names, all empty by default. Each is cleaned and
+        // takes effect as soon as the field is left (change event): no
+        // reconnect, and the field then shows exactly what goes out.
+        const nameField = (id, label, value, hint, save) => h("div", { className: "settings-field" },
+            h("label", { htmlFor: id }, label),
+            h("input", { id, type: "text", value: value ?? "", maxlength: "256",
+                onChange: (e) => { e.target.value = save(e.target.value) ?? ""; } }),
+            h("div", { className: "field-hint" }, hint),
+        );
         body.appendChild(
             h("div", { className: "settings-section compact" },
-                h("h3", {}, "Profile"),
-                h("div", { className: "settings-field" },
-                    h("label", { htmlFor: "cfg-name" }, "Display name"),
-                    h("input", { id: "cfg-name", type: "text", value: cfg.displayName || "" }),
-                    h("div", { className: "field-hint" }, "Shown in your announces on the network."),
-                ),
+                h("h3", {}, "Names"),
+                nameField("cfg-announce-name", "Announce Display Name", OwnNames.announce,
+                    "Public. Sent in your announces to the whole network, including other Reticulum apps. Leave empty to stay anonymous.",
+                    (v) => OwnNames.setAnnounce(v)),
+                nameField("cfg-message-name", "Message Display Name", OwnNames.message,
+                    "Sent inside your messages, only to the people you message.",
+                    (v) => OwnNames.setMessage(v)),
+                nameField("cfg-channel-name", "Channel Display Name", OwnNames.channel,
+                    "Shown on your channel posts. Anyone who can read a channel can see it. Leave empty to post without a name.",
+                    (v) => OwnNames.setChannel(v)),
+            ),
+        );
+
+        // ---- Appearance ----
+        body.appendChild(
+            h("div", { className: "settings-section compact" },
+                h("h3", {}, "Appearance"),
                 h("div", { className: "settings-row" },
                     h("span", { className: "row-label" },
                         this.state.theme === "dark" ? "🌙 Dark mode" : "☀️ Light mode"),
@@ -5609,11 +5968,16 @@ const App = {
 
     async _saveSettings() {
         const exchangeUrl = document.getElementById("cfg-exchange")?.value?.trim();
-        const name = document.getElementById("cfg-name")?.value?.trim();
+        // The names apply on their own, when each field changes (§6); a
+        // pending edit still in a focused field is applied here too.
+        const names = [["cfg-announce-name", "setAnnounce"], ["cfg-message-name", "setMessage"], ["cfg-channel-name", "setChannel"]];
+        for (const [id, setter] of names) {
+            const el = document.getElementById(id);
+            if (el) OwnNames[setter](el.value);
+        }
         const rfedHash = document.getElementById("cfg-rfed")?.value?.trim();
         const propOverride = document.getElementById("cfg-prop-override")?.value?.trim();
         if (exchangeUrl !== undefined) { RnsClient._cfg.exchangeUrl = exchangeUrl; sSet("exchangeUrl", exchangeUrl); }
-        if (name !== undefined) { RnsClient._cfg.displayName = name; sSet("displayName", name); }
         // rfedNodePubKey is deliberately not editable: it is learned from the
         // node's own announce (_catchRfedNodeAnnounce), and a hand-entered value
         // that disagrees with the announce silently breaks channel subscribe.
@@ -5807,7 +6171,8 @@ const App = {
     _renderContactInfoModal() {
         const c = ContactStore.get(this.state.contactInfoHash);
         if (!c) { this.state.showContactInfo = false; this.render(); return; }
-        const name = c.displayName || "?" + c.destHash.slice(0, 8);
+        const name = ContactStore.name(c.destHash);
+        const provided = ContactStore.providedName(c.destHash);
         const hue = avatarHue(name);
 
         const overlay = h("div", { className: "modal-overlay",
@@ -5843,19 +6208,23 @@ const App = {
             ),
         );
 
-        // Display Name (single editable field)
+        // Your own name for this contact (DISPLAY_NAMES.md §5.1). The field
+        // holds only that name, never the one the contact provides — which is
+        // the placeholder — so Save on an untouched field changes nothing, and
+        // an emptied field clears the local name.
         body.appendChild(
             h("div", { className: "settings-section" },
-                h("h3", {}, "Display Name"),
+                h("h3", {}, "Your name for this contact"),
                 h("div", { className: "settings-field" },
                     h("input", {
                         id: "ci-display-name",
                         type: "text",
-                        value: name === ("?" + c.destHash.slice(0,8)) ? "" : name,
-                        placeholder: name,
+                        maxlength: "256",
+                        value: c.localName ?? "",
+                        placeholder: provided,
                     }),
                     h("div", { className: "field-hint" },
-                        "A local name for this contact. Stored only on this device."),
+                        "Stored only on this device. Leave empty to show the name they provide."),
                 ),
             ),
         );
@@ -5892,14 +6261,14 @@ const App = {
     _saveContactInfo() {
         const hash = this.state.contactInfoHash;
         if (!hash) return;
-        const displayName = document.getElementById("ci-display-name")?.value?.trim();
-        if (displayName) ContactStore.setDisplayName(hash, displayName);
+        const field = document.getElementById("ci-display-name");
+        if (field) ContactStore.setLocalName(hash, field.value);
         this.state.showContactInfo = false;
         this.render();
     },
 
     _deleteContact(c) {
-        const name = c.displayName || c.destHash.slice(0,8);
+        const name = ContactStore.name(c.destHash);
         if (!confirm(`Delete conversation with "${name}" and all messages? This cannot be undone.`)) return;
         const hash = c.destHash;
         MsgStore.remove(hash);
@@ -6060,9 +6429,9 @@ const App = {
                             this.render();
                         },
                     },
-                        h("div", { className: "contact-avatar", style: { width: "32px", height: "32px", fontSize: "14px", flexShrink: 0, color: `hsl(${avatarHue(c.displayName||c.destHash)}, 50%, 65%)`, background: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 40%, 0.15)`, borderColor: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 65%, 0.2)` } }, (c.displayName||"?")[0].toUpperCase()),
+                        h("div", { className: "contact-avatar", style: { width: "32px", height: "32px", fontSize: "14px", flexShrink: 0, color: `hsl(${avatarHue(ContactStore.name(c.destHash))}, 50%, 65%)`, background: `hsla(${avatarHue(ContactStore.name(c.destHash))}, 50%, 40%, 0.15)`, borderColor: `hsla(${avatarHue(ContactStore.name(c.destHash))}, 50%, 65%, 0.2)` } }, ContactStore.name(c.destHash).charAt(0).toUpperCase()),
                         h("div", { style: { flex: 1 } },
-                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, c.displayName || "?" + c.destHash.slice(0,8)),
+                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, ContactStore.name(c.destHash)),
                             h("div", { style: { fontSize: "11px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" } }, c.destHash.slice(0,16) + "…"),
                         ),
                     )),
@@ -6114,9 +6483,9 @@ const App = {
                     ? [h("p", { style: { color: "var(--text-muted)", fontSize: "13px" } }, "No contacts yet. Add contacts first.")]
                     : contacts.map(c => h("label", { className: "group-member-row", style: { display: "flex", alignItems: "center", gap: "10px", padding: "8px 0", cursor: "pointer", borderBottom: "1px solid var(--border)" } },
                         h("input", { type: "checkbox", className: "group-member-check", value: c.destHash }),
-                        h("div", { className: "contact-avatar", style: { width: "32px", height: "32px", fontSize: "14px", flexShrink: 0, color: `hsl(${avatarHue(c.displayName||c.destHash)}, 50%, 65%)`, background: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 40%, 0.15)`, borderColor: `hsla(${avatarHue(c.displayName||c.destHash)}, 50%, 65%, 0.2)` } }, (c.displayName||"?")[0].toUpperCase()),
+                        h("div", { className: "contact-avatar", style: { width: "32px", height: "32px", fontSize: "14px", flexShrink: 0, color: `hsl(${avatarHue(ContactStore.name(c.destHash))}, 50%, 65%)`, background: `hsla(${avatarHue(ContactStore.name(c.destHash))}, 50%, 40%, 0.15)`, borderColor: `hsla(${avatarHue(ContactStore.name(c.destHash))}, 50%, 65%, 0.2)` } }, ContactStore.name(c.destHash).charAt(0).toUpperCase()),
                         h("div", { style: { flex: 1 } },
-                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, c.displayName || "?" + c.destHash.slice(0,8)),
+                            h("div", { style: { fontSize: "14px", fontWeight: 500 } }, ContactStore.name(c.destHash)),
                             h("div", { style: { fontSize: "11px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" } }, c.destHash.slice(0,16) + "…"),
                         ),
                         c.publicKey ? null : h("span", { style: { fontSize: "11px", color: "var(--warning)" } }, "⏳"),
@@ -6270,8 +6639,7 @@ const App = {
             h("div", { className: "settings-section" },
                 h("h3", {}, `Members (${g.members?.size ?? 0})`),
                 ...[...g.members.entries()].map(([hash, status]) => {
-                    const contact = ContactStore.get(hash);
-                    const displayName = contact?.displayName || (hash === ownLxmfDestinationHash() ? "You" : hash.slice(0,12) + "…");
+                    const displayName = hash === ownLxmfDestinationHash() ? "You" : ContactStore.name(hash);
                     const statusLabel = status === "accepted" ? "" :
                         status === "invited" ? " ⏳" :
                         status === "left" ? " 🚪" : "";
@@ -6459,6 +6827,9 @@ const App = {
             // and ordering. Both are safe with a modal open, so unlike before
             // a message arriving mid-dialog is no longer dropped from the UI.
             const appended = this._syncOpenChatMessages();
+            // A channel post can carry a new Channel Display Name for a
+            // sender whose earlier posts are on screen.
+            if (inActiveChat) this._refreshNameLabels();
             this._refreshSidebar();
             if (inActiveChat && appended) {
                 requestAnimationFrame(() => this._scrollChatBottom());
@@ -6620,7 +6991,8 @@ Harness (headless):
         const all = ContactStore.getAll();
         const rows = all.map(c => ({
             destHash: c.destHash.slice(0,12) + '...',
-            displayName: c.displayName,
+            displayName: ContactStore.name(c.destHash),
+            localName: c.localName, messageName: c.messageName, announceName: c.announceName,
             hasPublicKey: !!c.publicKey,
             pkPreview: c.publicKey?.slice(0,12) + '...' || 'NONE',
             lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',
@@ -6640,7 +7012,7 @@ Harness (headless):
         for (const c of all) {
             const msgs = MsgStore.get(c.destHash);
             if (msgs.length) {
-                console.log(`--- ${c.displayName} (${c.destHash.slice(0,12)}...) : ${msgs.length} msgs ---`);
+                console.log(`--- ${ContactStore.name(c.destHash)} (${c.destHash.slice(0,12)}...) : ${msgs.length} msgs ---`);
                 msgs.slice(-3).forEach(m => console.log(`  [${m.dir}] "${m.content?.slice(0,60)}"`));
             }
         }
@@ -6669,7 +7041,7 @@ Harness (headless):
         if (!c) return { error: 'not a contact', hint: 'Add this destHash as a contact first' };
         return {
             destHash: c.destHash.slice(0,12) + '...',
-            displayName: c.displayName,
+            displayName: ContactStore.name(c.destHash),
             hasPublicKey: !!c.publicKey,
             publicKey: c.publicKey?.slice(0,12) + '...' || null,
             lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',

@@ -34,6 +34,7 @@ import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
+import { applyToFields as applyDisplayName, decodeField as decodeDisplayName, ABSENT } from "./lib/display_name.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -188,8 +189,10 @@ function makeSender({ storage, me }) {
         IdMgr: { id: me },
         ContactStore: { setReachable() {} },
         console: { log() {}, warn() {} },
+        applyDisplayName,
     };
     const self = {
+        _decideMessageName: () => ABSENT,
         _onMsg: [],
         _pendingTickets: new Map(),
         _pendingPacketHashes: new Map(),
@@ -299,6 +302,7 @@ function makeRecipient({ me, storage = makeStorage() }) {
     const ContactStore = {
         isContact: (h) => contacts.has(h), add: (h) => { contacts.set(h, { destHash: h }); return contacts.get(h); },
         get: (h) => contacts.get(h) ?? null, touch() {}, setReachable() {}, _save() {},
+        acceptMessageName() { return false; },
     };
     const destination = new EventEmitter();
     destination.hash = Destination.hash(me, "lxmf", "delivery");
@@ -314,7 +318,7 @@ function makeRecipient({ me, storage = makeStorage() }) {
     self._handleGroupMessage = (...a) => self.groups.push(a);
     const handler = compileMessageHandler({
         Buffer, LxmfSeen, Harness, console: quiet, RnsClient: { ownHash: hex(destination.hash) },
-        LXMF, LXMessage, ContactStore, MsgStore,
+        LXMF, LXMessage, ContactStore, MsgStore, decodeDisplayName,
     })(self);
     const emitted = [];
     router.on("message", (m) => { emitted.push(m); handler(m); });
@@ -488,13 +492,14 @@ test("the group propagation fallback uploads the exact direct envelope, so the s
         Identity, Buffer, Destination, LXMessage, GROUP_FIELDS, GroupDeliveryEvidence, Link,
         IdMgr: { id: me },
         console: { log() {}, warn() {} },
+        applyDisplayName, NameLedgerStore: { recordDelivered() {} },
     };
     const direct = [];
     const uploaded = [];
     let fallback;
     const self = {
         _pendingPacketHashes: new Map(),
-        _cfg: { displayName: "Me" },
+        _decideMessageName: () => ABSENT,
         _lxmfRouter: { destination: { hash: Destination.hash(me, "lxmf", "delivery") } },
         _rns: { registerDestination: (identity) => ({ hash: Destination.hash(identity, "lxmf", "delivery") }) },
         _groupFallbacks: { schedule: (key, ms, fn) => { fallback = fn; return true; }, prove() {} },
@@ -504,7 +509,7 @@ test("the group propagation fallback uploads the exact direct envelope, so the s
     };
     for (const signature of [
         "async _sendGroupEnvelope(memberHash, content, fields)",
-        "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex)",
+        "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "async _sendGroupPropagationFallback(fullLxmfBytes, publicKeyHex, memberHash)",
     ]) self[methodName(signature)] = compile(signature, env)(self);
 

@@ -40,7 +40,7 @@
  *   ?distro=<128 hex>    pin the distro identity private key
  *   ?exchange=<url>      PostInterface exchange URL
  *   ?rfed=<hex>          RFed node identity hash
- *   ?name=<string>       display name
+ *   ?name=<string>       Message Display Name (DISPLAY_NAMES.md §1)
  *   ?iface=<string>      PostInterface name registered on the PHP node
  *   ?reset=1             clear all retichat_* keys before seeding
  * ------------------------------------------------------------------------- */
@@ -70,7 +70,7 @@
   if (rfed) put("rfedNodeHash", rfed.toLowerCase());
 
   var name = P.get("name");
-  if (name) put("displayName", name);
+  if (name) put("messageDisplayName", name);
 
   var iface = P.get("iface");
   if (iface) put("interfaceName", iface);

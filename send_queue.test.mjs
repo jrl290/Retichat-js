@@ -37,6 +37,7 @@ import Destination from "./lib/rns/destination.js";
 import LXMessage from "./lib/rns/lxmf/lxmf_message.js";
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
+import { applyToFields as applyDisplayName, ABSENT } from "./lib/display_name.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 const css = await readFile(new URL("./style.css", import.meta.url), "utf8");
@@ -125,7 +126,7 @@ function makeClient({ storage = makeStorage(), contacts = [], groups = [], metho
         MsgStore, GroupMsgStore, ContactStore, GroupStore, Harness, console: quiet,
         setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
         clearTimeout: (id) => { if (id !== undefined) cleared.push(id); },
-        Identity, Buffer, Destination, LXMessage, Link, Packet,
+        Identity, Buffer, Destination, LXMessage, Link, Packet, applyDisplayName,
         ...extra,
     };
     const self = {
@@ -133,6 +134,9 @@ function makeClient({ storage = makeStorage(), contacts = [], groups = [], metho
         _onMsg: [],
         _pendingTimeouts: new Map(),
         _pendingPacketHashes: new Map(),
+        // Display names (DISPLAY_NAMES.md §4.1) are pinned in display_names_wiring.test.mjs.
+        _decideMessageName: () => ABSENT,
+        _recordNameDelivered() {},
     };
     for (const signature of methods) self[methodName(signature)] = compile(signature, env)(self);
     return { self, MsgStore, GroupMsgStore, storage, logs, timers, cleared };

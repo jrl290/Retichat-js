@@ -90,7 +90,6 @@ Node A                               Node B
 ```json
 {
     "exchangeUrl": "https://your-node.example.com/reticulum",
-    "displayName": "Retichat Web",
     "announceIntervalMs": 300000
 }
 ```
