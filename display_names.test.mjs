@@ -201,3 +201,25 @@ test("§5.4 own name: the old display name becomes the Message Display Name, pla
     assert.equal(DN.migrateOwnDisplayName("  ", null), null);
     assert.equal(DN.migrateOwnDisplayName(null, null), null);
 });
+
+test("the name modules load in the browser's order: nothing hashes before app.js sets the global Buffer", async () => {
+    // In the browser "crypto" is lib/shims/crypto.js, which hashes into the
+    // global Buffer — and app.js installs that global only after every module
+    // it imports has been evaluated. A module-level digest (EMPTY_DIGEST was
+    // one) threw "Buffer is not defined" and left the page blank.
+    const { spawnSync } = await import("node:child_process");
+    const shim = new URL("./lib/shims/crypto.js", import.meta.url).href;
+    const hook = `export async function resolve(s, c, n) { return s === "crypto" ? { url: ${JSON.stringify(shim)}, shortCircuit: true } : n(s, c); }`;
+    const modules = ["./lib/display_name.js", "./lib/name_ledger.js", "./lib/rns/lxmf/lxmf.js",
+        "./lib/rns/lxmf/lxmf_message.js", "./lib/rns/lxmf/lxmf_router.js", "./lib/rns/rfed_channel.js"]
+        .map((m) => new URL(m, import.meta.url).href);
+    const script = `
+        import { register } from "node:module";
+        register("data:text/javascript," + encodeURIComponent(${JSON.stringify(hook)}));
+        delete globalThis.Buffer;
+        for (const m of ${JSON.stringify(modules)}) await import(m);
+        console.log("loaded");`;
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /loaded/);
+});
