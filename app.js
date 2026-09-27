@@ -882,7 +882,29 @@ const GroupMsgStore = {
         if (last.dir === "system") return systemText(last)?.slice(0,60) ?? "";
         return (last.dir === "out" ? "You: " : "") + (last.content?.slice(0,60) ?? "");
     },
+    /** Notices stored before 2026-09-27 had the member's name frozen into the
+     *  text ("?1a2b3c4d joined the group"). Give each one whose member can be
+     *  identified an actor hash, so it is named when shown like a new one
+     *  (§5.3). One pass per page load; a notice that cannot be matched to
+     *  exactly one member keeps its text. */
+    migrateLegacyNotices(groups, nameOf) {
+        for (const g of groups) {
+            const members = [...g.members.keys()];
+            const msgs = this.get(g.groupId);
+            let changed = false;
+            for (const m of msgs) {
+                if (m.dir !== "system" || m.actor) continue;
+                const found = legacyNoticeActor(m.content, members, nameOf);
+                if (!found) continue;
+                m.actor = found.actor;
+                m.content = found.content;
+                changed = true;
+            }
+            if (changed) sSet("gmsg_"+g.groupId, msgs);
+        }
+    },
 };
+GroupMsgStore.migrateLegacyNotices(GroupStore.getAll(), (hash) => ContactStore.name(hash));
 
 // =========================================================================
 //  CHANNEL STORE — RFed channel subscriptions matching iOS ChannelEntity
@@ -4412,6 +4434,25 @@ function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 /** A system notice as shown: a notice about a member stores that member's
  *  hash (GroupMsgStore.addSystem) and names it now, through the resolver
  *  (DISPLAY_NAMES.md §5.3). Older notices carry their text only. */
+/**
+ * A pre-2026-09-27 system notice's frozen name, matched to one group member:
+ * "<name> joined the group", "<name> left the group" or "<name> invited you
+ * to …", where <name> was the member's old name, a "?hash8" placeholder, or 8/12 hex.
+ * A hash form matches the member whose hash starts with it; a name matches
+ * the member it resolves to today. Returns { actor, content } (the text
+ * without the name) or null when not exactly one member matches.
+ */
+function legacyNoticeActor(content, memberHashes, nameOf) {
+    const match = /^(.+?) (joined the group|left the group|invited you to ".*")$/s.exec(content ?? "");
+    if (!match) return null;
+    const [, who, rest] = match;
+    const hex = /^\??([0-9a-f]{8,32})$/.exec(who);
+    const candidates = hex
+        ? memberHashes.filter(h => h.startsWith(hex[1]))
+        : memberHashes.filter(h => nameOf(h) === who);
+    return candidates.length === 1 ? { actor: candidates[0], content: rest } : null;
+}
+
 function systemMessageText(m) {
     return m.actor ? `${ContactStore.name(m.actor)} ${m.content}` : m.content;
 }
@@ -6601,6 +6642,32 @@ const App = {
     },
 
     /** Group Info modal — shows members, allow accept/decline/leave */
+    /** A Group Info member row's label (§5.3): the resolver, "You" for this device. */
+    _groupMemberLabel(hash) {
+        return hash === ownLxmfDestinationHash() ? "You" : ContactStore.name(hash);
+    },
+
+    _paintMemberAvatar(avatar, name) {
+        avatar.textContent = name.charAt(0).toUpperCase();
+        avatar.style.color = `hsl(${avatarHue(name)}, 50%, 65%)`;
+        avatar.style.background = `hsla(${avatarHue(name)}, 50%, 40%, 0.15)`;
+        avatar.style.borderColor = `hsla(${avatarHue(name)}, 50%, 65%, 0.2)`;
+    },
+
+    /** Relabel the open Group Info modal's member rows in place when a name
+     *  arrives (a 0xD1, an announce, a rename) while it is open (§5.3). */
+    _refreshGroupInfoNames() {
+        if (!this.state.showGroupInfo) return;
+        for (const row of this.root.querySelectorAll(".modal-sheet [data-member-hash]")) {
+            const name = this._groupMemberLabel(row.getAttribute("data-member-hash"));
+            const label = row.querySelector(".member-name");
+            if (!label || label.textContent === name) continue;
+            label.textContent = name;
+            const avatar = row.querySelector(".member-avatar");
+            if (avatar) this._paintMemberAvatar(avatar, name);
+        }
+    },
+
     _renderGroupInfoModal() {
         const g = GroupStore.get(this.state.groupInfoId);
         if (!g) { this.state.showGroupInfo = false; this.render(); return; }
@@ -6649,22 +6716,22 @@ const App = {
             h("div", { className: "settings-section" },
                 h("h3", {}, `Members (${g.members?.size ?? 0})`),
                 ...[...g.members.entries()].map(([hash, status]) => {
-                    const displayName = hash === ownLxmfDestinationHash() ? "You" : ContactStore.name(hash);
+                    const displayName = this._groupMemberLabel(hash);
                     const statusLabel = status === "accepted" ? "" :
                         status === "invited" ? " ⏳" :
                         status === "left" ? " 🚪" : "";
+                    const avatar = h("div", {
+                        className: "contact-avatar member-avatar",
+                        style: { width: "28px", height: "28px", fontSize: "12px" },
+                    });
+                    this._paintMemberAvatar(avatar, displayName);
                     return h("div", {
+                        "data-member-hash": hash,
                         style: { display: "flex", alignItems: "center", gap: "10px", padding: "6px 0", borderBottom: "1px solid var(--border)" },
                     },
-                        h("div", {
-                            className: "contact-avatar",
-                            style: { width: "28px", height: "28px", fontSize: "12px",
-                                color: `hsl(${avatarHue(displayName)}, 50%, 65%)`,
-                                background: `hsla(${avatarHue(displayName)}, 50%, 40%, 0.15)`,
-                                borderColor: `hsla(${avatarHue(displayName)}, 50%, 65%, 0.2)` },
-                        }, displayName.charAt(0).toUpperCase()),
+                        avatar,
                         h("div", { style: { flex: 1, fontSize: "13px" } },
-                            displayName + statusLabel),
+                            h("span", { className: "member-name" }, displayName), statusLabel),
                         h("div", { style: { fontSize: "10px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" } },
                             hash.slice(0,10) + "…"),
                     );
@@ -6853,6 +6920,7 @@ const App = {
             if (this.state.view !== "main") return;
             this._refreshSidebar();
             this._syncOpenChatChrome();
+            this._refreshGroupInfoNames();
         });
 
         // Group list changes — membership and invite state are structural, so

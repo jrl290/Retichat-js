@@ -806,3 +806,64 @@ test("audit L4: group member keys and own channel posts never add this device as
     assert.equal(r.ContactStore.get(lxmfHash(me)), null, "an own post from the channel history");
     assert.equal(r.posts.length, 1, "the post itself is still shown");
 });
+
+test("§5.3 an open Group Info modal relabels its members when a name arrives", () => {
+    const store = contactStore(memory());
+    const me = "e".repeat(32), h = "a2".repeat(16);
+    store.add(h);
+    const el = (text) => ({ textContent: text, style: {} });
+    const row = (hash, text) => {
+        const parts = { ".member-name": el(text), ".member-avatar": el(text.charAt(0).toUpperCase()) };
+        return { parts, getAttribute: () => hash, querySelector: (q) => parts[q] ?? null };
+    };
+    const rows = [row(h, DN.shortHash(h)), row(me, "You")];
+    const env = { ContactStore: store, ownLxmfDestinationHash: () => me, avatarHue: () => 120 };
+    const self = {
+        state: { showGroupInfo: true },
+        root: { querySelectorAll: (q) => (q === ".modal-sheet [data-member-hash]" ? rows : []) },
+    };
+    self._groupMemberLabel = compile("_groupMemberLabel(hash)", env)(self);
+    self._paintMemberAvatar = compile("_paintMemberAvatar(avatar, name)", env)(self);
+    const refresh = compile("_refreshGroupInfoNames()", env)(self);
+    store.acceptMessageName(h, DN.nameState("Zoe"), "validated");
+    refresh();
+    assert.equal(rows[0].parts[".member-name"].textContent, "Zoe");
+    assert.equal(rows[0].parts[".member-avatar"].textContent, "Z");
+    assert.equal(rows[1].parts[".member-name"].textContent, "You", "this device stays \"You\"");
+    assert.match(methodBody("_wire()"), /ContactStore\.onChange\(\(\) => \{[\s\S]*?this\._refreshGroupInfoNames\(\);/,
+        "the app wires the store to the open modal");
+    assert.match(methodBody("_renderGroupInfoModal()"), /"data-member-hash": hash/, "the rows it relabels");
+});
+
+test("§5.3 system notices stored with a frozen name get an actor when the member can be identified", () => {
+    const store = contactStore(memory());
+    const alice = "a1b2c3d4".repeat(4), bob = "b0b0b0b0".repeat(4), carol = "c0c0c0c0".repeat(4), carl = "c0c0c0c0" + "d".repeat(24);
+    store.add(bob);
+    store.acceptMessageName(bob, DN.nameState("Bob"), "validated");
+    const nameOf = (h) => store.name(h);
+    const legacy = fn("legacyNoticeActor", "content, memberHashes, nameOf", {});
+    const members = [alice, bob, carol, carl];
+    assert.deepEqual(legacy("?a1b2c3d4 joined the group", members, nameOf), { actor: alice, content: "joined the group" });
+    assert.deepEqual(legacy("a1b2c3d4 left the group", members, nameOf), { actor: alice, content: "left the group" });
+    assert.deepEqual(legacy("Bob invited you to \"Team A\"", members, nameOf), { actor: bob, content: "invited you to \"Team A\"" });
+    assert.equal(legacy("c0c0c0c0 joined the group", members, nameOf), null, "two members share the prefix: left as it is");
+    assert.equal(legacy("Mallory joined the group", members, nameOf), null, "no member resolves to it");
+    assert.equal(legacy("You joined \"Team A\"", members, nameOf), null, "own notices have no actor");
+    assert.equal(legacy("Group \"x\" created", members, nameOf), null);
+
+    const storage = memory();
+    const GroupMsgStore = build("GroupMsgStore", { sGet: storage.sGet, sSet: storage.sSet, legacyNoticeActor: legacy, Date });
+    const groupId = "9".repeat(32);
+    storage.sSet("gmsg_" + groupId, [
+        { id: "1", dir: "system", content: "?a1b2c3d4 joined the group" },
+        { id: "2", dir: "system", content: "joined the group", actor: bob },
+        { id: "3", dir: "in", content: "?a1b2c3d4 joined the group", srcHash: bob },
+    ]);
+    GroupMsgStore.migrateLegacyNotices([{ groupId, members: new Map(members.map((h) => [h, "accepted"])) }], nameOf);
+    const [first, second, third] = GroupMsgStore.get(groupId);
+    assert.deepEqual([first.actor, first.content], [alice, "joined the group"], "named when shown from now on");
+    assert.deepEqual(second, { id: "2", dir: "system", content: "joined the group", actor: bob }, "new notices untouched");
+    assert.equal(third.actor, undefined, "only system notices");
+    assert.match(app, /\nGroupMsgStore\.migrateLegacyNotices\(GroupStore\.getAll\(\), \(hash\) => ContactStore\.name\(hash\)\);\n/,
+        "run as the page loads");
+});
