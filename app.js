@@ -4554,9 +4554,9 @@ function groupSenderLabel(m) {
     return m.senderName ? { label: m.senderName, secondary: null } : null;
 }
 
-/** The sender label of an incoming channel post (§5.3): the Channel Display
- *  Name that sender chose in this channel, with its short hash beside it,
- *  or else the contact chain. */
+/** The sender label of an incoming channel post (§5.3): the user's own name
+ *  for the sender with the Channel Display Name beside it; else that channel
+ *  name with the sender's short hash beside it; else the contact chain. */
 function channelSenderLabel(channelName, m) {
     if (m.dir !== "in") return null;
     if (m.srcHash) {
@@ -5473,12 +5473,16 @@ const App = {
         );
     },
 
-    /** A sender label: the resolved name, and for a channel name the
-     *  sender's short hash beside it (§5.3). */
+    /** A sender label: the resolved name and, for a channel post, the grey
+     *  secondary text beside it (§5.3): the Channel Display Name when the
+     *  user has their own name for the sender, else the sender's short hash
+     *  under a channel name. */
     _buildSenderLabel(sender) {
+        const secondaryClass = sender.secondaryKind === "hash"
+            ? "msg-sender-secondary msg-sender-hash" : "msg-sender-secondary";
         return h("div", { className: "msg-sender" },
             sender.label,
-            sender.secondary ? h("span", { className: "msg-sender-hash" }, sender.secondary) : null,
+            sender.secondary ? h("span", { className: secondaryClass }, sender.secondary) : null,
         );
     },
 

@@ -346,11 +346,69 @@ test("§5.3 group labels and system notices are resolved when shown, and follow 
     assert.equal(systemText({ dir: "system", content: "You joined \"G\"" }), "You joined \"G\"");
     assert.equal(groupLabel({ dir: "out", srcHash: h }), null, "own messages carry no label");
 
-    assert.deepEqual(channelLabel("public.x", post), { label: "Fay", secondary: null }, "contact chain");
+    assert.deepEqual(channelLabel("public.x", post), { label: "Fay", secondary: null, secondaryKind: null }, "contact chain");
     channelNames.apply("public.x", h, DN.nameState("Pseud"), Date.now());
-    assert.deepEqual(channelLabel("public.x", post), { label: "Pseud", secondary: "ffffffff…" },
+    assert.deepEqual(channelLabel("public.x", post), { label: "Pseud", secondary: "ffffffff…", secondaryKind: "hash" },
         "the channel name, with the short hash beside it");
-    assert.deepEqual(channelLabel("public.y", post), { label: "Fay", secondary: null }, "per channel");
+    assert.deepEqual(channelLabel("public.y", post), { label: "Fay", secondary: null, secondaryKind: null }, "per channel");
+    store.setLocalName(h, "My Fay");
+    assert.deepEqual(channelLabel("public.x", post), { label: "My Fay", secondary: "Pseud", secondaryKind: "channel" },
+        "the user's own name leads, the channel name goes to the secondary text");
+    assert.deepEqual(channelLabel("public.y", post), { label: "My Fay", secondary: null, secondaryKind: null },
+        "no channel name there: the contact chain alone");
+});
+
+test("§5.3 the channel bubble renders the secondary text in both cases: channel name beside a local name, short hash beside a channel name", () => {
+    // A minimal DOM for the real h() and _buildSenderLabel from app.js.
+    class Node_ { constructor(tag) { this.tag = tag; this.children = []; this.className = ""; this.attrs = {}; }
+        appendChild(c) { this.children.push(c); return c; } setAttribute(k, v) { this.attrs[k] = v; }
+        addEventListener() {} get style() { return {}; }
+        get textContent() { return this.children.map((c) => c.textContent).join(""); } }
+    const document = {
+        createElement: (tag) => new Node_(tag),
+        createTextNode: (text) => ({ textContent: text }),
+    };
+    const hEl = fn("h", "tag, a={}, ...kids", { document });
+    const buildLabel = compile("_buildSenderLabel(sender)", { h: hEl })({});
+
+    const store = contactStore(memory());
+    const x = "a".repeat(32);
+    store.add(x);
+    const channelNames = new ChannelSenderNames({ get: () => null, set() {} });
+    const channelLabel = fn("channelSenderLabel", "channelName, m",
+        { ContactStore: store, ChannelSenderNamesStore: channelNames, channelPosterName: DN.channelPosterName });
+    const post = { dir: "in", content: "x", srcHash: x };
+    channelNames.apply("public.x", x, DN.nameState("Pseud"), Date.now());
+
+    const secondaryOf = (el) => el.children.find((c) => c.tag === "span");
+
+    let el = buildLabel(channelLabel("public.x", post));
+    assert.equal(el.className, "msg-sender");
+    assert.equal(el.children[0].textContent, "Pseud", "a channel name alone is the main label");
+    assert.equal(secondaryOf(el).textContent, "aaaaaaaa…", "with the short hash beside it");
+    assert.equal(secondaryOf(el).className, "msg-sender-secondary msg-sender-hash", "grey, and a hash in monospace");
+
+    store.setLocalName(x, "Alex");
+    el = buildLabel(channelLabel("public.x", post));
+    assert.equal(el.children[0].textContent, "Alex", "the local name is the main label");
+    assert.equal(secondaryOf(el).textContent, "Pseud", "the channel name is the secondary text");
+    assert.equal(secondaryOf(el).className, "msg-sender-secondary", "grey, in the text face");
+
+    el = buildLabel(channelLabel("public.y", post));
+    assert.equal(el.textContent, "Alex");
+    assert.equal(secondaryOf(el), undefined, "no channel name: no secondary text");
+});
+
+test("§5.3 the grey secondary style is the one both cases share; only the hash is monospace", async () => {
+    const css = await readFile(new URL("./style.css", import.meta.url), "utf8");
+    const rule = (sel) => {
+        const m = css.match(new RegExp(`\\n${sel.replace(".", "\\.")}\\s*\\{([^}]*)\\}`));
+        assert.ok(m, `${sel} is missing from style.css`);
+        return m[1];
+    };
+    assert.match(rule(".msg-sender-secondary"), /color:\s*var\(--text-muted\)/);
+    assert.doesNotMatch(rule(".msg-sender-secondary"), /font-mono/);
+    assert.match(rule(".msg-sender-hash"), /font-family:\s*var\(--font-mono\)/);
 });
 
 test("§5.3 no surface builds a name from displayName or a \"?hash\" placeholder any more", () => {

@@ -1137,13 +1137,17 @@ html, body {
     margin-bottom: 3px;
 }
 
-/* A channel sender's short hash beside the name the post chose for itself:
-   channel names are public and anyone can pick any name (DISPLAY_NAMES.md §5.3). */
-.msg-sender-hash {
+/* A channel sender's grey secondary text beside the main label: the Channel
+   Display Name beside the user's own name for the sender, or the short hash
+   beside a channel name. Channel names are public and anyone can pick any
+   name, so one never stands alone (DISPLAY_NAMES.md §5.3). */
+.msg-sender-secondary {
     font-weight: 400;
-    font-family: var(--font-mono);
     color: var(--text-muted);
     margin-left: 4px;
+}
+.msg-sender-hash {
+    font-family: var(--font-mono);
 }
 
 /* Empty chat placeholder */

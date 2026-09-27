@@ -289,13 +289,33 @@ test("§5.3 resolver: local > message > announce > legacy > 8-hex short hash; ch
     assert.equal(DN.contactName({ destHash: h, legacyName: "Legacy" }, h), "Legacy");
     assert.equal(DN.contactName({ destHash: h, legacyName: "Legacy", announceName: "Ann" }, h), "Ann",
         "a current announce name outranks a migrated one");
-    assert.deepEqual(DN.channelPosterName(null, { legacyName: "Legacy" }, h), { label: "Legacy", secondary: null });
+    assert.deepEqual(DN.channelPosterName(null, { legacyName: "Legacy" }, h), { label: "Legacy", secondary: null, secondaryKind: null });
     assert.equal(DN.contactName({ destHash: h, announceName: "Ann" }, h), "Ann");
     assert.equal(DN.contactName({ destHash: h, announceName: "Ann", messageName: "Msg" }, h), "Msg");
     assert.equal(DN.contactName({ destHash: h, announceName: "Ann", messageName: "Msg", localName: "Mine" }, h), "Mine");
-    assert.deepEqual(DN.channelPosterName("Pseud", { localName: "Mine" }, h), { label: "Pseud", secondary: "01234567…" });
-    assert.deepEqual(DN.channelPosterName(null, { localName: "Mine" }, h), { label: "Mine", secondary: null });
-    assert.deepEqual(DN.channelPosterName(null, null, h), { label: "01234567…", secondary: null });
+    assert.deepEqual(DN.channelPosterName(null, { localName: "Mine" }, h), { label: "Mine", secondary: null, secondaryKind: null });
+    assert.deepEqual(DN.channelPosterName(null, null, h), { label: "01234567…", secondary: null, secondaryKind: null });
+});
+
+test("§5.3 channel label: a local name leads and the channel name goes grey; a channel name alone keeps the short hash", () => {
+    const h = "0123456789abcdef0123456789abcdef";
+    // A channelName and a localName: the user's own name for the poster is
+    // the main label, the channel name the secondary text.
+    assert.deepEqual(DN.channelPosterName("Pseud", { localName: "Mine" }, h),
+        { label: "Mine", secondary: "Pseud", secondaryKind: "channel" });
+    assert.deepEqual(DN.channelPosterName("Pseud", { localName: "Mine", messageName: "Msg", announceName: "Ann" }, h),
+        { label: "Mine", secondary: "Pseud", secondaryKind: "channel" });
+    // A channelName, no localName: the channel name with the short hash,
+    // whatever other names the contact holds.
+    for (const contact of [null, {}, { localName: null, messageName: "Msg", announceName: "Ann", legacyName: "Leg" }]) {
+        assert.deepEqual(DN.channelPosterName("Pseud", contact, h),
+            { label: "Pseud", secondary: "01234567…", secondaryKind: "hash" });
+    }
+    // No channelName: the contact chain, no secondary.
+    assert.deepEqual(DN.channelPosterName(null, { messageName: "Msg", announceName: "Ann" }, h),
+        { label: "Msg", secondary: null, secondaryKind: null });
+    assert.deepEqual(DN.channelPosterName("", { localName: "Mine" }, h),
+        { label: "Mine", secondary: null, secondaryKind: null }, "an empty channel name is no channel name");
 });
 
 test("§5.4 contact migration: nameCustomized → local, otherwise legacy, placeholders dropped", () => {
