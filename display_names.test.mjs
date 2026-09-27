@@ -307,6 +307,16 @@ test("§5.4 contact migration: nameCustomized → local, otherwise legacy, place
     }
     assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bea", nameCustomized: true }), slots("Bea", null),
         "a short all-hex name is not a hash form");
+    // "Never lose a name the user typed": only the old field's pre-fill (this
+    // contact's own hash) is dropped from a customized name, never another
+    // hash-looking name the user typed.
+    for (const typed of ["deadbeef", "CafeBabe12", "?deadbeef", "fedcba9876543210"]) {
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: typed, nameCustomized: true }), slots(typed, null), typed);
+    }
+    for (const prefill of ["01234567", "?0123456789ABCDEF", "01234567\u2026"]) {
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: prefill, nameCustomized: true }), slots(null, null),
+            `${prefill}: this contact's own hash, as the old rename field pre-filled it`);
+    }
     const migrated = slots("L", "Leg");
     assert.deepEqual(DN.migrateContact(migrated), migrated, "idempotent");
 

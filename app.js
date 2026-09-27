@@ -406,14 +406,26 @@ const ContactStore = {
     },
 
     /** The row for a peer the user has not added (a group member, a channel
-     *  poster, the sender of a name): created hidden when there is none,
-     *  returned as it is when there is one. Returns the row. */
-    keep(destHash, publicKey = null) {
+     *  poster): created hidden when there is none, returned as it is when
+     *  there is one. Returns the row.
+     *
+     *  `nameOnly` marks a row created only to hold the name of a group
+     *  sender the client had no row for (_handleGroupMessage). Such a row
+     *  never vouches for an invite (mayInvite): before hidden rows, that
+     *  sender had no row at all. Keeping it for any other reason (its key
+     *  as a member, a channel post, a send to it), or adding it, clears the
+     *  mark, as those paths always created a row. */
+    keep(destHash, publicKey = null, nameOnly = false) {
         const existing = this.get(destHash);
-        return existing ?? this._put(destHash, false, publicKey, true);
+        if (!existing) return this._put(destHash, false, publicKey, true, nameOnly);
+        if (existing.nameOnly && !nameOnly) {
+            existing.nameOnly = false;
+            this._save();
+        }
+        return existing;
     },
 
-    _put(destHash, isDistro, publicKey, hidden) {
+    _put(destHash, isDistro, publicKey, hidden, nameOnly = false) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         if (destHash.length !== 32) throw new Error("Destination hash must be exactly 32 hex characters");
         const existing = this._contacts.get(destHash);
@@ -430,6 +442,7 @@ const ContactStore = {
             reachable: existing?.reachable ?? null,
             isDistro: existing?.isDistro ?? isDistro,
             hidden,
+            nameOnly,
         };
         this._contacts.set(destHash, contact);
         this._save();
@@ -470,6 +483,14 @@ const ContactStore = {
     /** Any row, hidden or listed: a peer this client knows (its key, its
      *  names). */
     known(destHash) { return this._contacts.has(destHash); },
+
+    /** Whether an invite from `destHash` is processed: any row but a
+     *  name-only one, the rows that were all listed contacts before hidden
+     *  rows. Stored rows without the mark count. */
+    mayInvite(destHash) {
+        const c = this._contacts.get(destHash);
+        return !!c && !c.nameOnly;
+    },
 
     /** The label every surface shows for `destHash` (§5.3):
      *  localName ?? messageName ?? announceName ?? 8-hex short hash. */
@@ -2583,10 +2604,12 @@ const RnsClient = {
 
         const group = GroupStore.get(groupId);
         const actualSender = groupSender || srcHash;
-        // Any row counts as known to the inviter check, hidden ones (group
-        // members, channel posters) included, as when every such row was a
-        // listed contact.
-        if (!shouldProcessGroupMessage(groupAction, ContactStore.known(srcHash), !!group)) {
+        // The inviter check counts the rows that were all listed contacts
+        // before hidden rows (group members, channel posters, peers sent
+        // to), not a row created below only to hold a sender's name: a
+        // leave or plain message to a group the user holds must not let its
+        // sender invite the user to others.
+        if (!shouldProcessGroupMessage(groupAction, ContactStore.mayInvite(srcHash), !!group)) {
             console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for unknown group ${groupId.slice(0,8)}`);
             return;
         }
@@ -2609,7 +2632,7 @@ const RnsClient = {
         // taken by the same table. Group labels, the member list and system
         // notices then name it; the contact list does not show it.
         if (!ContactStore.known(srcHash) && srcHash !== (this.ownHash ?? ownLxmfDestinationHash())) {
-            ContactStore.keep(srcHash);
+            ContactStore.keep(srcHash, null, true);
             ContactStore.acceptMessageName(srcHash, lxmfMsg.displayName,
                 lxmfMsg.signatureState ?? "invalid", lxmfMsg.timestamp);
         }
@@ -7144,7 +7167,7 @@ Harness (headless):
             destHash: c.destHash.slice(0,12) + '...',
             displayName: ContactStore.name(c.destHash),
             localName: c.localName, messageName: c.messageName, announceName: c.announceName,
-            legacyName: c.legacyName, hidden: !!c.hidden,
+            legacyName: c.legacyName, hidden: !!c.hidden, nameOnly: !!c.nameOnly,
             hasPublicKey: !!c.publicKey,
             pkPreview: c.publicKey?.slice(0,12) + '...' || 'NONE',
             lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',

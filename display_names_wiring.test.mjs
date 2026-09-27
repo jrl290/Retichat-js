@@ -1019,7 +1019,7 @@ test("§5.2 a group member with no row still gets its name: a hidden row, named 
     assert.equal(r.ContactStore.get(C).publicKey, carol.getPublicKey().toString("hex"));
 });
 
-test("§5.2 a message the group branch drops creates no row; a hidden row still counts as known to invites", () => {
+test("§5.2 a message the group branch drops creates no row; a member's hidden row still counts to invites", () => {
     const me = Identity.create(), dave = Identity.create(), bob = Identity.create();
     const r = makeGroupReceiver(me, []);
     const D = lxmfHash(dave), B = lxmfHash(bob);
@@ -1040,6 +1040,48 @@ test("§5.2 a message the group branch drops creates no row; a hidden row still 
         [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${B},${lxmfHash(me)}`]])));
     assert.equal(r.groups.get(other)?.groupStatus, "pending", "the invite from a known member arrives");
     assert.equal(r.systemText(r.notices.at(-1)), "Bob invited you to \"Group\"", "named by the validated 0xD1");
+});
+
+test("§5.2 a row created only for a group sender's name never lets that sender invite", () => {
+    const me = Identity.create(), zed = Identity.create();
+    const r = makeGroupReceiver(me, []);
+    const Z = lxmfHash(zed);
+    const other = "8".repeat(32), third = "7".repeat(32);
+    const invite = (groupId, t) => lxm(zed, me, "", new Map([[0xD1, Buffer.from("Zed")], [GROUP_FIELDS.GROUP_ID, groupId],
+        [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${Z},${lxmfHash(me)}`]]), zed, t);
+
+    // Zed is no member and has no row, but knows the id of a group the user
+    // holds. A leave (or plain message, or relay_done) is processed and
+    // names him on a hidden row...
+    const t = tick() + 1000;
+    r.deliver(lxm(zed, me, "", groupFields("Zed", "leave", [[GROUP_FIELDS.GROUP_SENDER, Z]]), zed, t));
+    assert.deepEqual([r.ContactStore.get(Z)?.messageName, r.ContactStore.get(Z)?.hidden], ["Zed", true]);
+    assert.equal(r.ContactStore.mayInvite(Z), false, "a name-only row");
+    // ...but his invites are still dropped, as when he had no row at all.
+    r.deliver(invite(other, t + 1));
+    assert.equal(r.groups.has(other), false, "the name-only row does not vouch for an invite");
+    assert.equal(r.notices.some((n) => /invited you/.test(n.content)), false, "no invite notice");
+
+    // His key arriving as a member (the path that always created a row)
+    // makes the row count, as before hidden rows.
+    r.self._rememberGroupMemberKeys([[Z, zed.getPublicKey().toString("base64")]]);
+    assert.equal(r.ContactStore.mayInvite(Z), true);
+    assert.equal(r.ContactStore.get(Z).messageName, "Zed", "the name is kept");
+    r.deliver(invite(third, t + 2));
+    assert.equal(r.groups.get(third)?.groupStatus, "pending");
+
+    // Adding a name-only row by hand also makes it count; stored rows without
+    // the mark count, as every row did before.
+    const s = memory();
+    const store = contactStore(s);
+    store.keep(Z, null, true);
+    assert.equal(store.mayInvite(Z), false);
+    assert.equal(contactStore(s).mayInvite(Z), false, "the mark is persisted");
+    store.add(Z);
+    assert.deepEqual([store.mayInvite(Z), store.isContact(Z)], [true, true]);
+    s.sSet("contacts_v2", [{ destHash: Z, localName: null, messageName: null, announceName: null, legacyName: null, hidden: true, lastSeen: 1 }]);
+    assert.equal(contactStore(s).mayInvite(Z), true);
+    assert.equal(store.mayInvite("6".repeat(32)), false, "no row, no invite");
 });
 
 test("audit L4: group members and channel posters are kept as hidden rows, never listed as contacts", () => {
