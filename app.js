@@ -1623,6 +1623,17 @@ const RnsClient = {
         for (const key of RFED_PERSISTENT_KEYS) this._rfedReopenArmed.add(key);
         this._propReopenArmed = true;
 
+        // The page came back while the exchange is still down (its own
+        // check() on the same event decides): a pull on a link that is up
+        // would lose its request, and while it waited out its timeout it
+        // would take the place of the pull the exchange's return makes
+        // (the in-flight guards); a re-drive would be refused. The return
+        // (_followExchange) does all of it.
+        if (this._exchangeIsDown()) {
+            console.log(`[retichat] Resume (${trigger}): the exchange is down — its return re-drives and pulls`);
+            return;
+        }
+
         // rfed.link: pull the opened channels and the distro (Android
         // ON_RESUME, iOS scenePhase .active), or bring the link back, whose
         // "established" does the same (_onRfedLinkEstablished).

@@ -115,10 +115,11 @@ test("connect() hooks the page events and disconnect() unhooks them", () => {
 });
 
 /** _onPageResume over recorded stubs. */
-function makeResume({ rfedLink = null, propLink = null, distro = true, held = true, connected = true } = {}) {
+function makeResume({ rfedLink = null, propLink = null, distro = true, held = true, connected = true, exchangeDown = false } = {}) {
     const calls = [];
     const self = {
         _rns: connected ? {} : null,
+        _exchangeIsDown: () => exchangeDown,
         _rfedLinks: new Map(rfedLink ? [["link", rfedLink]] : []),
         _rfedReopenArmed: new Set(),
         _propReopenArmed: false,
@@ -158,6 +159,21 @@ test("no distro, no distro pull", () => {
     const { self, calls } = makeResume({ rfedLink: { status: Link.ACTIVE }, propLink: { status: Link.ACTIVE }, distro: false });
     self._onPageResume("visible");
     assert.deepEqual(calls, ["pull channels (visible)", "fetch propagated"]);
+});
+
+test("a resume while the exchange is still down arms the links and does nothing else; the exchange's return does the rest", () => {
+    // A pull sent now would lose its request (PostInterface.sendData) and,
+    // in flight until its timeout, take the place of the pull the return
+    // makes (the in-flight guards).
+    const up = makeResume({ rfedLink: { status: Link.ACTIVE }, propLink: { status: Link.ACTIVE }, exchangeDown: true });
+    up.self._onPageResume("online");
+    assert.deepEqual(up.calls, [], "no pull on the links that are still up");
+    assert.deepEqual([...up.self._rfedReopenArmed].sort(), [...RFED_PERSISTENT_KEYS].sort(), "but the event arms their re-open");
+    assert.equal(up.self._propReopenArmed, true);
+
+    const down = makeResume({ exchangeDown: true });
+    down.self._onPageResume("visible");
+    assert.deepEqual(down.calls, [], "and no re-drive of the ones that are down");
 });
 
 test("a tab without the lock, or a stopped connection, does nothing on resume", () => {

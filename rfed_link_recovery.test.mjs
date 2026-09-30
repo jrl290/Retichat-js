@@ -581,6 +581,9 @@ test("an exchange outage that times out rfed.link: nothing starts while it is do
     const first = await c.up();
     c.calls.length = 0;
     exchange(false);
+    c.self._onPageResume("visible"); // the link is still up, the exchange is not
+    await settle();
+    assert.deepEqual(c.calls, [], "no pull whose request the down exchange would lose");
     await c.closeUnder(first, Link.TIMEOUT); // the keepalive watchdog
     assert.equal(c.links.length, 1, "no LINKREQUEST into a down exchange: it would be lost, and the doomed attempt would swallow the exchange's return");
     assert.equal(c.self._rfedPending.has("link"), false, "and nothing parked for an announce hours away");
