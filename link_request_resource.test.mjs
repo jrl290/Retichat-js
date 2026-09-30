@@ -132,6 +132,7 @@ test("an accepted advertisement records whether it is a request or a response", 
     assert.equal(receiver.isRequest, true);
     assert.equal(receiver.isResponse, false);
     assert.ok(receiver.requestId.equals(requestId));
+    receiver.cancel("test over");
 });
 
 // ── The link sends over the MDU as a Resource, and dispatches on arrival ──
@@ -228,9 +229,9 @@ test("a request or response Resource is accepted even under ACCEPT_NONE", () => 
     const self = {
         resourceStrategy: 0, // ACCEPT_NONE
         decrypt: (d) => d,
-        _dispatchConcludedResource() {},
+        _acceptResource(adv) { accepted.push(adv); return null; },
     };
-    const ResourceStub = { accept(link, adv) { accepted.push(adv); return { once() {} }; } };
+    const ResourceStub = {};
     const run = new Function("packet", "Packet", "MsgPack", "Resource", "Link", "console", "self",
         branch.replaceAll("this.", "self."));
     const packet = (flags, q) => ({ context: 0x02, data: MsgPack.pack(new Map([["f", flags], ["q", q], ["h", Buffer.alloc(32)]])) });
