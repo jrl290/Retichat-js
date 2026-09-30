@@ -2320,21 +2320,13 @@ const RnsClient = {
             return;
         }
 
-        // Build a LINK-type DATA packet. Packet.pack() handles link encryption
+        // A LINK-type DATA packet. Packet.pack() handles link encryption
         // via this.destination.encrypt(), so do NOT pre-encrypt here.
-        const pkt = new Packet();
-        pkt.headerType = Packet.HEADER_1;
-        pkt.packetType = Packet.DATA;
-        pkt.transportType = 0;  // BROADCAST
-        pkt.context = Packet.NONE;
-        pkt.contextFlag = Packet.FLAG_UNSET;
-        pkt.destination = link;
-        pkt.destinationHash = link.hash;
-        pkt.destinationType = Destination.LINK;
-        pkt.data = propagationPacked;
+        const pkt = link.newLinkPacket(Packet.NONE, propagationPacked);
         const raw = pkt.pack();
 
-        // Track packet hash for proof matching
+        // Track packet hash for proof matching, before the packet can go
+        // (DESIGN_PRINCIPLES §5: a proof never outruns its entry).
         const truncatedHex = pkt.packetHash.slice(0, 16).toString("hex");
         this._pendingPacketHashes.set(truncatedHex, {
             contactHash: contact.destHash,
@@ -2343,7 +2335,16 @@ const RnsClient = {
             dm: true,
         });
 
-        this._rns.sendData(raw, link.attachedInterface);
+        // Through the link, like every other link send (RNS Packet.send on a
+        // link: had_outbound), so the keepalive watchdog sees the outbound
+        // and a CLOSED link drops it. Until 2026-09-30 this one went straight
+        // to _rns.sendData: the link's outbound clock never moved, and it was
+        // sent even on a closed link.
+        if (link._transmit(raw) === null) {
+            this._pendingPacketHashes.delete(truncatedHex);
+            park("the link closed before the upload");
+            return;
+        }
 
         // Mark as likely offline
         if (contact.reachable !== false) {

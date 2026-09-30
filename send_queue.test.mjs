@@ -38,6 +38,7 @@ import LXMessage from "./lib/rns/lxmf/lxmf_message.js";
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
 import { applyToFields as applyDisplayName, ABSENT } from "./lib/display_name.js";
+import { linkPair } from "./test_link_pair.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 const css = await readFile(new URL("./style.css", import.meta.url), "utf8");
@@ -494,6 +495,52 @@ test("a propagation proof never downgrades a direct proof", async () => {
     finishUpload();
     await afterLinkEvents();
     assert.equal(c.MsgStore.get(alice.destHash)[0].status, "proved");
+});
+
+test("a propagated copy that fits one packet goes through the link, and its proof entry matches the packet", async () => {
+    // app.js:2179 until 2026-09-30 sent this packet with _rns.sendData: the
+    // link's outbound clock (the keepalive watchdog's) never moved, and a
+    // CLOSED link sent it anyway. Now it goes through Link._transmit, like
+    // every other link send (RNS Packet.send → had_outbound).
+    const alice = contactFor(peer);
+    const c = makePropagationClient({ nodeKnown: true, contacts: [alice] });
+    const { a, b, wire } = linkPair();
+    a.lastOutbound = 0;
+    c.self._ensurePropagationLink = async () => a;
+    const small = Buffer.alloc(200, 0x42);
+    c.self._buildPropagationPacked = async () => small;
+    const received = [];
+    b.on("packet", ({ data }) => received.push(Buffer.from(data)));
+    const m = sendingRecord(c, alice, "fits one packet");
+    const before = Date.now();
+    await c.self._propagateMessage(alice, m);
+    assert.ok(a.lastOutbound >= before, "the link's outbound clock saw the upload");
+    await afterLinkEvents();
+    await afterLinkEvents();
+    assert.equal(wire.a.length, 1, "one packet, on the link");
+    assert.ok(received[0]?.equals(small), "the peer decrypted the upload on the link");
+    const keys = [...c.self._pendingPacketHashes.keys()];
+    assert.deepEqual(keys, [wire.a[0].packetHash.subarray(0, 16).toString("hex")],
+        "the proof entry is the hash of the packet that went out");
+    assert.equal(c.self._pendingPacketHashes.get(keys[0]).messageId, m.id);
+});
+
+test("a one-packet copy whose link is closed when it goes is dropped by the link and parked", async () => {
+    const alice = contactFor(peer);
+    const c = makePropagationClient({ nodeKnown: true, contacts: [alice] });
+    const { a, wire } = linkPair();
+    // The link closes at the moment of the send: the real _transmit sees
+    // CLOSED and drops the packet (RNS Packet.send on a closed link).
+    const transmit = a._transmit.bind(a);
+    a._transmit = (raw, keepalive) => { a.status = Link.CLOSED; return transmit(raw, keepalive); };
+    c.self._ensurePropagationLink = async () => a;
+    c.self._buildPropagationPacked = async () => Buffer.alloc(200, 0x42);
+    const m = sendingRecord(c, alice, "the link closed under it");
+    await c.self._propagateMessage(alice, m);
+    assert.equal(wire.a.length, 0, "nothing reached the wire");
+    assert.equal(c.self._pendingPacketHashes.size, 0, "no proof is awaited for a packet that never left");
+    assert.deepEqual(c.MsgStore.get(alice.destHash).map((r) => [r.status, r.waitFor]), [["queued", "propagation"]],
+        "parked for the next link, not lost to the 30 s ceiling");
 });
 
 test("a direct proof that lands while the propagation link comes up stops the upload", async () => {
