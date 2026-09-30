@@ -170,3 +170,362 @@ test("distro registration and pull both park on a failed link", () => {
             `${sig} must only park on an establishment failure, not on every error`);
     }
 });
+
+// ── Persistent rfed.link: re-open once when it closes under us ────────────
+//
+// The keepalive defect of 2026-09-29 had an app half: after an established
+// rfed.link closed, nothing re-opened it and nothing pulled again, so every
+// post rfed deferred for this subscriber waited for a page reload. The fix
+// ports the app-links persistent model (app-links/src/lib.rs 414-497): a
+// one-shot "reopen armed" flag, consumed when an established link closes
+// under us and armed again by the next establishment and by explicit events;
+// a re-open that fails is parked for the service's announce. Every new
+// rfed.link identifies, re-binds, and then pulls. These run the real shipped
+// method bodies over the real Link class, with only the wire handshake
+// skipped; any app-level setTimeout/setInterval on these paths fails them.
+
+import Link from "./lib/rns/link.js";
+import MsgPack from "./lib/rns/msgpack.js";
+import { Buffer } from "node:buffer";
+
+/** `const NAME = <expr>;` from app.js, evaluated over `env`. */
+function extractConst(name, env = {}) {
+    const match = new RegExp(`\\nconst ${name} = ([\\s\\S]*?);\\n`).exec(appSource);
+    assert.ok(match, `${name} is missing from app.js`);
+    const names = Object.keys(env);
+    return new Function(...names, `return (${match[1]});`)(...names.map((n) => env[n]));
+}
+
+const APP_CONSTS = {
+    RFED_LINK_PATHS: extractConst("RFED_LINK_PATHS"),
+    RFED_PERSISTENT_KEYS: extractConst("RFED_PERSISTENT_KEYS"),
+    RFED_LINK_IDLE: extractConst("RFED_LINK_IDLE"),
+    RFED_LINK_ESTABLISHING: extractConst("RFED_LINK_ESTABLISHING"),
+    RFED_LINK_ESTABLISHED: extractConst("RFED_LINK_ESTABLISHED"),
+    RFED_LINK_FAILED: extractConst("RFED_LINK_FAILED"),
+    RFED_PENDING_TIMEOUT_MS: extractConst("RFED_PENDING_TIMEOUT_MS"),
+};
+
+/** A real method body, `this.` read as `self.`, its free names from env. */
+function compileMethod(signature, env) {
+    const body = extractMethod(signature).replaceAll("this.", "self.");
+    const params = signature.slice(signature.indexOf("(") + 1, signature.lastIndexOf(")"))
+        .split(",").map((p) => p.trim()).filter(Boolean);
+    const names = Object.keys(env);
+    const fn = new Function(...names, "self", ...params,
+        signature.startsWith("async ") ? `return (async () => {${body}})();` : body);
+    return (self) => (...args) => fn(...names.map((n) => env[n]), self, ...args);
+}
+
+const PERSISTENT_METHODS = [
+    "_ensureRfedLink(aspects)", "_rfedPersistentBound(key)", "async _onRfedLinkEstablished(key, link)",
+    "_onRfedLinkClosed(key, link)", "_redriveRfedLink(key, trigger)", "_rebindChannelStream()",
+    "_pullOpenedChannels(trigger, generation = null)", "_rfedLinkKeyFor(aspects, path)", "_closeRefusedRfedLink(key, what)",
+    "_rfedDeferUntilAnnounce(key, label, run)", "_rfedRunPending(key)", "_onPageResume(trigger)",
+    "async pullChannel(channelName)", "async openChannel(channelName)",
+];
+
+/**
+ * Let the link events and the promise chains after them run. Each listener
+ * is a setTimeout 0 (utils/events.js), which Node runs no earlier than 1 ms
+ * later, so every round waits for a timer queued after them.
+ */
+const settle = async (rounds = 4) => {
+    for (let i = 0; i < rounds; i++) {
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setImmediate(r));
+    }
+};
+
+/**
+ * A stub RnsClient carrying the real persistent-link bodies. Every link it
+ * creates is a real Link whose establish() only records the attempt.
+ * `channels` are subscribed channels; `opened` the ones opened this session.
+ */
+function makePersistent({ channels = ["general"], opened = channels, distro = false, held = true } = {}) {
+    const links = [];
+    class OfflineLink extends Link {
+        constructor() { super(); links.push(this); }
+        establish(destination) {
+            this.initiator = true;
+            this.status = Link.PENDING;
+            this.destination = destination;
+            this.hash = Buffer.alloc(16, links.length);
+        }
+        identify(identity) { (this.identified ??= []).push(identity); }
+    }
+    const log = { log: [], warn: [], error: [] };
+    const console_ = {
+        log: (...a) => log.log.push(a.join(" ")),
+        warn: (...a) => log.warn.push(a.join(" ")),
+        error: (...a) => log.error.push(a.join(" ")),
+    };
+    const channelRows = channels.map((name) => ({ channelName: name, channelHash: Buffer.from(name.padEnd(16, "_")).toString("hex"), isSubscribed: true }));
+    const ChannelStore = {
+        getAll: () => channelRows,
+        get: (name) => channelRows.find((c) => c.channelName === name) ?? null,
+    };
+    const ActiveTab = { held };
+    const DistroManager = { has: distro };
+    const noTimers = () => assert.fail("no timer may be started on the persistent-link paths (DESIGN_PRINCIPLES §3)");
+    const env = {
+        ...APP_CONSTS, Link: OfflineLink, IdMgr: { id: { name: "me" } }, ActiveTab, DistroManager, ChannelStore,
+        MsgPack, Buffer, Date, console: console_, setTimeout: noTimers, setInterval: noTimers,
+    };
+    const calls = [];
+    const self = {
+        _rns: {},
+        _cfg: { rfedNodeHash: "c".repeat(32) },
+        _rfedLinks: new Map(),
+        _rfedLinkPromises: new Map(),
+        _rfedLinkState: new Map(),
+        _rfedPending: new Map(),
+        _rfedServiceReady: new Set(["link", "channel", "channel.stream", "channel.pull", "distro.register"]),
+        _rfedReopenArmed: new Set(),
+        _rfedLinkGeneration: 0,
+        _rfedOpenedChannelHashes: new Set(channelRows.filter((c) => opened.includes(c.channelName)).map((c) => c.channelHash)),
+        _rfedPullState: new Map(),
+        _rfedStreamPromises: new Map(),
+        _channelsInitialized: true,
+        _propLink: null,
+        _onMsg: [],
+        _getRfedDest: (aspects) => ({ rns: { registerLink() {}, sendData: () => {} }, aspects }),
+        _onRfedLinkPush: () => {},
+        _handleChannelPacket: () => true,
+        // What the new link sends, recorded; each answers at once unless a
+        // test holds it.
+        _configureChannelStream: async () => { calls.push("stream-open"); },
+        _bindRfedLinkForDistroPush: async () => { calls.push("distro-bind"); },
+        _rfedRequest: async (aspects, path) => { calls.push(`request ${aspects.join(".")}:${path}`); return [[], false]; },
+        _pullDistroMessages: async () => { calls.push("distro-pull"); return []; },
+        _fetchPropagatedMessages: () => { calls.push("prop-fetch"); },
+        _redrivePropagationLink: () => { calls.push("prop-redrive"); },
+    };
+    for (const signature of PERSISTENT_METHODS) {
+        self[signature.replace(/^async /, "").split("(")[0]] = compileMethod(signature, env)(self);
+    }
+    /** Complete the handshake of `link` (Link.validateProof's outcome). */
+    const establish = async (link) => {
+        link.status = Link.ACTIVE;
+        link.emit("established");
+        await settle();
+    };
+    /** Close `link` the way the watchdog (TIMEOUT) or the peer's LINKCLOSE (DESTINATION_CLOSED) does. */
+    const closeUnder = async (link, reason) => {
+        link.status = Link.CLOSED;
+        link.closeReason = reason;
+        link._linkClosed();
+        await settle();
+    };
+    /** A connected client whose rfed.link is up. */
+    const up = async () => {
+        const pending = self._ensureRfedLink(["link"]);
+        await establish(links.at(-1));
+        await pending;
+        return links.at(-1);
+    };
+    return { self, links, calls, log, env, ActiveTab, DistroManager, channelRows, establish, closeUnder, up };
+}
+
+test("an established rfed.link that closes under us re-opens exactly once", async () => {
+    const c = makePersistent();
+    const first = await c.up();
+    assert.equal(c.self._rfedReopenArmed.has("link"), true, "armed by the establishment");
+
+    await c.closeUnder(first, Link.TIMEOUT);
+    assert.equal(c.links.length, 2, "one re-open, on the close event");
+    assert.equal(c.links[1].status, Link.PENDING);
+    assert.equal(c.self._rfedReopenArmed.has("link"), false, "the one-shot flag is consumed");
+    assert.ok(c.log.error.some((l) => /timed out/.test(l)), "a TIMEOUT close is logged as an error, so the re-open does not hide it");
+
+    // The re-open never establishes (a lost LINKREQUEST): nothing re-tries it.
+    await c.closeUnder(c.links[1], Link.TIMEOUT);
+    assert.equal(c.links.length, 2, "a failed re-open is not retried");
+    assert.equal(c.self._rfedPending.get("link")?.label, "rfed.link re-open", "it is parked for the next rfed.link announce");
+
+    // The announce re-drives it, once.
+    c.self._rfedRunPending("link");
+    await settle();
+    assert.equal(c.links.length, 3);
+    c.self._rfedRunPending("link");
+    await settle();
+    assert.equal(c.links.length, 3, "the parked intent is consumed");
+
+    // That one establishes (armed again) and is closed by the node: one more.
+    await c.establish(c.links[2]);
+    await c.closeUnder(c.links[2], Link.DESTINATION_CLOSED);
+    assert.equal(c.links.length, 4, "a LINKCLOSE from the node re-opens it once too");
+    await c.closeUnder(c.links[3], Link.TIMEOUT);
+    assert.equal(c.links.length, 4);
+});
+
+test("a close this client made never re-opens the link", async () => {
+    const c = makePersistent();
+    const link = await c.up();
+    link.close(); // INITIATOR_CLOSED: disconnect(), or a refusal teardown
+    await settle();
+    assert.equal(link.closeReason, Link.INITIATOR_CLOSED);
+    assert.equal(c.links.length, 1, "not re-opened");
+    assert.equal(c.self._rfedReopenArmed.has("link"), false, "and disarmed until an explicit event");
+});
+
+test("a tab that lost the lock, or a disconnected client, re-opens nothing", async () => {
+    // TabLock takeover: ActiveTab._takenOver runs disconnect(), which clears
+    // _rfedLinks before the close events run, and the lock is gone.
+    const taken = makePersistent();
+    const link = await taken.up();
+    taken.ActiveTab.held = false;
+    await taken.closeUnder(link, Link.TIMEOUT);
+    assert.equal(taken.links.length, 1, "another tab owns the identity: it must keep rfed's one binding");
+
+    const stopped = makePersistent();
+    const old = await stopped.up();
+    stopped.self._rfedLinks.clear(); // disconnect()
+    await stopped.closeUnder(old, Link.TIMEOUT);
+    assert.equal(stopped.links.length, 1, "a link disconnect() dropped is not the current one");
+
+    const gone = makePersistent();
+    const last = await gone.up();
+    gone.self._rns = null;
+    await gone.closeUnder(last, Link.TIMEOUT);
+    assert.equal(gone.links.length, 1);
+});
+
+test("a link nothing is bound to is not re-opened", async () => {
+    const c = makePersistent({ opened: [], distro: false });
+    const link = await c.up();
+    await c.closeUnder(link, Link.TIMEOUT);
+    assert.equal(c.links.length, 1, "no opened channel and no distro: nothing needs the link");
+    const withDistro = makePersistent({ opened: [], distro: true });
+    await withDistro.closeUnder(await withDistro.up(), Link.TIMEOUT);
+    assert.equal(withDistro.links.length, 2, "a distro's push and pull ride on rfed.link");
+});
+
+test("an identify refusal on a pull does not loop: the next link waits for an explicit event", async () => {
+    const c = makePersistent();
+    c.self._rfedRequest = async (aspects, path) => { c.calls.push(`request ${path}`); return 0xF0; };
+    const first = await c.up();
+    // The new link's pull was refused: the link is torn down (Link.md
+    // "Identify"), as the close this client makes.
+    assert.ok(c.calls.includes("request /rfed/pull"), "the new link pulled");
+    assert.equal(first.status, Link.CLOSED);
+    assert.equal(first.closeReason, Link.INITIATOR_CLOSED);
+    assert.equal(c.links.length, 1, "no establish, refuse, close loop");
+    assert.equal(c.self._rfedReopenArmed.has("link"), false);
+
+    // A new explicit event (the page becomes visible): exactly one new link,
+    // whose own refusal again ends there.
+    c.self._onPageResume("visible");
+    await settle();
+    assert.equal(c.links.length, 2, "one attempt for the event");
+    await c.establish(c.links[1]);
+    await settle();
+    assert.equal(c.links[1].status, Link.CLOSED);
+    assert.equal(c.links.length, 2, "and nothing after its refusal");
+});
+
+test("a new rfed.link re-sends the stream open, then pulls the opened channels and the distro", async () => {
+    const c = makePersistent({ channels: ["alpha", "beta", "gamma"], opened: ["alpha", "beta"], distro: true });
+    const gates = [];
+    const held = (name) => async () => { c.calls.push(name); await new Promise((resolve) => gates.push(resolve)); };
+    c.self._configureChannelStream = held("stream-open");
+    c.self._bindRfedLinkForDistroPush = held("distro-bind");
+    c.self.pullChannel = async (name) => { c.calls.push(`pull #${name}`); return false; };
+
+    const first = await c.up();
+    assert.deepEqual(first.identified, [{ name: "me" }], "identified first");
+    assert.deepEqual(c.calls, ["distro-bind", "stream-open"],
+        "both bindings, one /channel/stream/open for the whole filter set, and no pull before they are answered");
+    gates.splice(0).forEach((open) => open());
+    await settle();
+    assert.deepEqual(c.calls.slice(2), ["pull #alpha", "pull #beta", "distro-pull"],
+        "then every opened channel (not gamma, which was never opened) and the distro");
+    assert.equal(c.self._rfedLinkGeneration, 1);
+
+    // The link dies and is re-opened: the node dropped the bindings with it.
+    c.calls.length = 0;
+    await c.closeUnder(first, Link.TIMEOUT);
+    await c.establish(c.links[1]);
+    assert.deepEqual(c.calls, ["distro-bind", "stream-open"], "re-bound on the new link (Link.md: the client re-binds on every link)");
+    // openChannel pulled alpha on this new link while the bindings were
+    // answered: once per generation, so the link does not pull it again.
+    c.self._rfedPullState.set(c.channelRows[0].channelHash, { inFlight: false, morePending: false, gen: 2 });
+    gates.splice(0).forEach((open) => open());
+    await settle();
+    assert.deepEqual(c.calls.slice(2), ["pull #beta", "distro-pull"], "and pulled again, each channel once per link");
+    assert.equal(c.self._rfedLinkGeneration, 2);
+});
+
+test("a new link that closes while its bindings are answered pulls nothing; the next one does", async () => {
+    const c = makePersistent({ distro: true });
+    let release;
+    c.self._configureChannelStream = async () => { c.calls.push("stream-open"); await new Promise((r) => { release = r; }); };
+    const first = await c.up();
+    await c.closeUnder(first, Link.TIMEOUT);
+    release();
+    await settle();
+    assert.equal(c.calls.filter((x) => x.startsWith("request") || x === "distro-pull").length, 0,
+        "the pulls belong to the link that is up");
+    // The re-opened link establishes: its own bindings, then its pulls.
+    await c.establish(c.links[1]);
+    release();
+    await settle();
+    assert.deepEqual(c.calls.filter((x) => x.startsWith("request") || x === "distro-pull"),
+        ["request channel.pull:/rfed/pull", "distro-pull"]);
+});
+
+test("openChannel pulls once per rfed.link generation, not once per session", async () => {
+    const c = makePersistent({ channels: ["general"], opened: [] });
+    const pulls = [];
+    c.self._ensureChannelSubscribed = async () => {};
+    c.self._ensureChannelStreamConfigured = async () => {};
+    c.self.pullChannel = async (name) => { pulls.push(name); };
+    const hash = c.channelRows[0].channelHash;
+    c.self._rfedLinkGeneration = 1;
+    c.self._rfedPullState.set(hash, { inFlight: false, morePending: false, gen: 1 });
+    await c.self.openChannel("general");
+    assert.deepEqual(pulls, [], "pulled on this link already");
+    c.self._rfedLinkGeneration = 2; // the link was re-opened
+    await c.self.openChannel("general");
+    assert.deepEqual(pulls, ["general"], "a new link: pulled again");
+});
+
+test("a channel pull is one at a time, follows more_pending on the response, and records its generation", async () => {
+    const c = makePersistent({ channels: ["general"] });
+    const [row] = c.channelRows;
+    const channelHash = Buffer.from(row.channelHash, "hex");
+    const page = (n) => [[channelHash, Buffer.from(`post-${n}`)]];
+    const answers = [[page(1), true], [page(2), false]];
+    let release;
+    c.self._rfedRequest = async (aspects, path) => {
+        c.calls.push(`request ${path}`);
+        if (!release) await new Promise((r) => { release = r; });
+        return answers.shift();
+    };
+    const handled = [];
+    c.self._handleChannelPacket = (data) => { handled.push(Buffer.from(data).subarray(16).toString()); return true; };
+    c.self._rfedLinkGeneration = 3;
+    const first = c.self.pullChannel("general");
+    const second = c.self.pullChannel("general");
+    await settle();
+    assert.equal(c.calls.length, 1, "a pull while one is in flight sends nothing");
+    release();
+    await first; await second;
+    await settle();
+    assert.equal(c.calls.length, 2, "more_pending: one follow-up, after the page was handled");
+    assert.deepEqual(handled, ["post-1", "post-2"]);
+    assert.equal(c.self._rfedPullState.get(row.channelHash).gen, 3, "the generation it was pulled on");
+
+    // An empty page that claims more is not followed.
+    answers.push([[], true]);
+    await c.self.pullChannel("general");
+    await settle();
+    assert.equal(c.calls.length, 3);
+});
+
+test("the persistent-link paths schedule nothing", () => {
+    for (const signature of PERSISTENT_METHODS.concat(["_hookPageLifecycle()", "_unhookPageLifecycle()", "async _pullDistroMessages()"])) {
+        assert.doesNotMatch(extractMethod(signature), /setTimeout|setInterval/,
+            `${signature}: a re-open or a pull follows an event, never a clock (DESIGN_PRINCIPLES §3)`);
+    }
+});

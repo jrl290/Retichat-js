@@ -192,6 +192,33 @@ const RFED_LINK_ESTABLISHING = "establishing";
 const RFED_LINK_ESTABLISHED = "established";
 const RFED_LINK_FAILED = "link_failed";
 
+// ── Persistent links: the app-links model (app-links/src/lib.rs 414-497) ────
+//
+// rfed.link (and the legacy rfed.channel.stream link) and the propagation
+// link are held open while something is bound to them, like
+// AppLinks::open_persistent on iOS and Android. When one that had been
+// ESTABLISHED closes under us, it is re-opened once, straight away: a
+// one-shot "reopen armed" flag is consumed on the close
+// (handle_tracked_outbound_closed / consume_reconnect_arm) and armed again
+// by the next successful establishment and by explicit events — any rfed.*
+// announce, the page coming back online, becoming visible, or returning
+// from the back/forward cache (Android ON_RESUME, iOS scenePhase .active).
+// A re-open that does not establish is parked for the service's next
+// announce (_rfedDeferUntilAnnounce). No timers, no backoff
+// (DESIGN_PRINCIPLES §3): each attempt follows an event.
+//
+// Only a close we did not ask for re-opens: TIMEOUT (the keepalive watchdog,
+// or no answer at all) or DESTINATION_CLOSED (the node's LINKCLOSE). Every
+// close this client makes is INITIATOR_CLOSED — disconnect() when another
+// tab takes over, and the teardown after an identify refusal (0xF0/0xF1) —
+// and never re-opens: a taken-over tab would take rfed's one binding per
+// subscriber back from the active tab, and a refusal would become an
+// establish, refuse, close loop.
+//
+// rfed.channel.stream is persistent for completeness: no mapped path opens
+// it any more (RFED_LINK_PATHS sends every stream-open over rfed.link).
+const RFED_PERSISTENT_KEYS = ["link", "channel.stream"];
+
 // How long a pending operation stays eligible for re-driving, mirroring
 // LXMRouter.PR_PATH_TIMEOUT. Services re-announce every 15 min, so this
 // spans a couple of announce cycles and then gives up rather than firing
@@ -1119,8 +1146,18 @@ const RnsClient = {
     _rfedServicePathsRequested: false,
     _propagationPathRequested: false,
     _propagationInitialized: false,
-    _propRetryTimer: null,
+    // Persistent links (RFED_PERSISTENT_KEYS): the keys whose one-shot
+    // re-open is armed, and the count of rfed.link establishments. A channel
+    // is pulled once per rfed.link generation (_rfedPullState .gen), as
+    // Android's rfedLinkGeneration and iOS's ConversationView do.
+    _rfedReopenArmed: new Set(),
+    _rfedLinkGeneration: 0,
+    _propReopenArmed: false,
+    _distroPullInFlight: null,
+    _pageHooks: null,
     _rfedOpenedChannelHashes: new Set(),
+    // channelHash → { inFlight, morePending, gen }: gen is the rfed.link
+    // generation of the last pull that completed.
     _rfedPullState: new Map(),
     _rfedStampRefreshed: new Set(),
     _rfedSubscriptionPromises: new Map(),
@@ -1465,7 +1502,73 @@ const RnsClient = {
             this._annTimer = setInterval(() => this._announce(), this._cfg.announceIntervalMs);
         }
 
+        // The page events that re-drive the persistent links (online,
+        // visible, back from the back/forward cache). Unhooked by
+        // disconnect(), so a stopped or taken-over tab drives nothing.
+        this._hookPageLifecycle();
+
         console.log(`[rns] Connecting via ${this._connType} (${(this._rns?.interfaces || []).length} interface(s))...`);
+    },
+
+    /**
+     * The page events that mean "the network or the user is back", hooked
+     * once per connection: window "online", document "visibilitychange" to
+     * visible, and "pageshow" from the back/forward cache (persisted). Each
+     * one is an explicit event for the persistent links (_onPageResume):
+     * Android pulls on ON_RESUME (ConversationScreen.kt:618-635) and
+     * re-opens on a network change (ConnectionStateManager.kt:572-585); iOS
+     * does both on scenePhase .active (RetichatApp.swift:281-310). A hidden
+     * tab's timers are throttled, so its links may have died meanwhile.
+     */
+    _hookPageLifecycle() {
+        if (this._pageHooks || typeof window === "undefined" || !window.addEventListener) return;
+        this._pageHooks = [
+            [window, "online", () => this._onPageResume("online")],
+            [window, "pageshow", (event) => { if (event?.persisted) this._onPageResume("pageshow"); }],
+        ];
+        if (typeof document !== "undefined" && document.addEventListener) {
+            this._pageHooks.push([document, "visibilitychange", () => {
+                if (document.visibilityState === "visible") this._onPageResume("visible");
+            }]);
+        }
+        for (const [target, type, listener] of this._pageHooks) target.addEventListener(type, listener);
+    },
+
+    _unhookPageLifecycle() {
+        for (const [target, type, listener] of this._pageHooks ?? []) target.removeEventListener(type, listener);
+        this._pageHooks = null;
+    },
+
+    /**
+     * The page is back (online, visible, or restored from the cache): arm
+     * every persistent link's one-shot re-open, re-drive the ones that are
+     * down, and collect what the node deferred meanwhile on the ones that
+     * are up. A link that is coming up, or STALE and waiting on its
+     * keepalive watchdog, is left alone: its "established" pulls, and a
+     * second link would break rfed's one binding per subscriber. Only the
+     * tab holding the identity does anything.
+     */
+    _onPageResume(trigger) {
+        if (!this._rns || !ActiveTab.held) return;
+        console.log(`[retichat] Page ${trigger}: re-arming the persistent links`);
+        for (const key of RFED_PERSISTENT_KEYS) this._rfedReopenArmed.add(key);
+        this._propReopenArmed = true;
+
+        // rfed.link: pull the opened channels and the distro (Android
+        // ON_RESUME, iOS scenePhase .active), or bring the link back, whose
+        // "established" does the same (_onRfedLinkEstablished).
+        const link = this._rfedLinks.get("link");
+        if (link?.status === Link.ACTIVE) {
+            this._pullOpenedChannels(trigger);
+            if (DistroManager.has) this._pullDistroMessages();
+        } else {
+            this._redriveRfedLink("link", trigger);
+        }
+
+        // The propagation link: fetch what is stored for us (iOS
+        // pollPropagationNode(force: true) on .active), or bring it back.
+        if (this._propLink?.status === Link.ACTIVE) this._fetchPropagatedMessages();
+        else this._redrivePropagationLink(trigger);
     },
 
     _announce() {
@@ -1660,7 +1763,9 @@ const RnsClient = {
         // _ensurePropagationLink still get the rejection.
         this._propLinkPromise.catch(() => {});
 
+        let established = false;
         link.on("established", () => {
+            established = true;
             console.log(`[retichat] 🔗 Propagation link established, rtt=${link.rtt}ms`);
             this._propLinkResolve?.(link);
             this._propLinkPromise = null;
@@ -1668,18 +1773,7 @@ const RnsClient = {
             this._propLinkReject = null;
             const upWaiters = this._propLinkUpWaiters.splice(0);
             upWaiters.forEach(waiter => waiter.resolve(link));
-            // Propagate the copies parked while there was no link to upload
-            // on (_propagateMessage), including ones parked before a reload.
-            this._flushPropagation();
-            // Identify ourselves so the PN can authorize /get requests.
-            // Small delay to let the link settle before sending.
-            setTimeout(() => { link.identify(IdMgr.id); }, 1_000);
-            // Pull any stored messages for us — after identify has propagated
-            setTimeout(() => { this._fetchPropagatedMessages(); }, 5_000);
-            // Also pull distro messages if we have a distro identity
-            if (DistroManager.has) {
-                setTimeout(() => { RnsClient._pullDistroMessages(); }, 7_000);
-            }
+            this._onPropagationLinkEstablished(link);
         });
 
         // A STALE link that hears from the PN again is ACTIVE without being
@@ -1704,9 +1798,8 @@ const RnsClient = {
             if (this._propLink !== link) {
                 // A superseded link: a STALE one replaced by a new attempt
                 // (this function overwrites _propLink), or one disconnect()
-                // or _retryPropagationLink closed. The attempt, the link and
-                // the retry are the current link's; the same guard as
-                // "recovered" above.
+                // closed. The attempt and the link are the current link's;
+                // the same guard as "recovered" above.
                 console.log("[retichat] Superseded propagation link closed");
                 return;
             }
@@ -1716,13 +1809,87 @@ const RnsClient = {
             this._propLinkResolve = null;
             this._propLinkReject = null;
             this._propLink = null;
-            // Retry with backoff — the link may have closed because the
-            // upstream path changed (interface flap, peer restart, etc.).
-            this._retryPropagationLink(4000);
+            this._onPropagationLinkClosed(link, established);
         });
 
         link.establish(propDest);
         console.log(`[retichat] 🔗 Establishing propagation link to ${this._cfg.propagationNodeHash.slice(0,12)}...`);
+    },
+
+    /**
+     * A new propagation link is up. Its re-open is armed again, and the work
+     * that needs it runs in order, each step on the one before it
+     * (DESIGN_PRINCIPLES §5), not on a clock:
+     *   1. LINKIDENTIFY, so the node authorizes /get (LXMRouter.py
+     *      request_messages_from_propagation_node: identify, then request);
+     *      identify() puts it on the wire before it returns, and the /get
+     *      below follows it on the same link;
+     *   2. the copies parked while there was no link (_flushPropagation);
+     *   3. /get: fetch what the node stores for us;
+     *   4. once that has concluded, /distro/pull when this device holds a
+     *      distro.
+     * Until 2026-09-30 these ran on fixed 1 s, 5 s and 7 s timers ("to let
+     * the link settle").
+     */
+    async _onPropagationLinkEstablished(link) {
+        this._propReopenArmed = true;
+        try {
+            link.identify(IdMgr.id);
+        } catch (e) {
+            console.warn(`[retichat] Propagation link identify failed: ${e.message}`);
+        }
+        this._flushPropagation();
+        await this._fetchPropagatedMessages();
+        if (DistroManager.has) await this._pullDistroMessages();
+    },
+
+    /**
+     * The current propagation link closed. One that had been established
+     * and closed under us (TIMEOUT: the keepalive watchdog; or
+     * DESTINATION_CLOSED: the node's LINKCLOSE) is re-opened once, if armed
+     * (the app-links model, RFED_PERSISTENT_KEYS). Anything else waits for
+     * an event: the node's next lxmf.propagation announce (_initPropagation),
+     * the page coming back (_onPageResume), or an upload that needs the link
+     * (_ensurePropagationLink). Until 2026-09-30 every close started a
+     * timer loop that re-established the link, doubling from 4 s to 30 s
+     * and never giving up: an application-level link retry
+     * (DESIGN_PRINCIPLES §3).
+     */
+    _onPropagationLinkClosed(link, established) {
+        if (!established) {
+            console.log("[retichat] Propagation link attempt closed before establishment — the next lxmf.propagation announce or page resume re-drives it");
+            return;
+        }
+        const reason = link.closeReason;
+        if (reason === Link.TIMEOUT) {
+            console.error(`[retichat] Propagation link ${link.hash?.toString("hex").slice(0,12)} timed out (keepalive)`);
+        }
+        const unexpected = reason === Link.TIMEOUT || reason === Link.DESTINATION_CLOSED;
+        if (!unexpected || !this._rns || !ActiveTab.held) {
+            this._propReopenArmed = false;
+            return;
+        }
+        if (!this._propReopenArmed) {
+            console.log("[retichat] Propagation link closed; its re-open is not armed — waiting for the next announce or page resume");
+            return;
+        }
+        this._propReopenArmed = false;
+        console.log("[retichat] 🔁 Propagation link closed under us — re-opening it once");
+        this._establishPropagationLink();
+    },
+
+    /**
+     * One attempt at the propagation link on an explicit event, when it is
+     * down: not while one is up, STALE (its keepalive watchdog decides), or
+     * coming up. Returns whether an attempt started.
+     */
+    _redrivePropagationLink(trigger) {
+        if (!this._rns || !ActiveTab.held) return false;
+        if (!this._cfg?.propagationNodePubKey || !this._cfg?.propagationNodeHash) return false;
+        if (this._propLink || this._propLinkPromise) return false;
+        console.log(`[retichat] 🔗 Propagation link is down — re-driving it (${trigger})`);
+        this._establishPropagationLink();
+        return true;
     },
 
     /**
@@ -2362,8 +2529,9 @@ const RnsClient = {
         // "propagation") and never a record still "sending", so starting
         // the link no longer re-propagates M inside its direct window — the
         // double delivery this rule first guarded against. The link is kept
-        // up by _initPropagation / _retryPropagationLink and by M's own
-        // propagation timer, so the copy rides the next one.
+        // up by its persistent re-open, the node's announces
+        // (_initPropagation) and page resumes, and by M's own propagation
+        // timer, so the copy rides the next one.
         const link = await this._whenPropagationLinkUp(recipientHex);
         const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
         const dispatched = (how) => {
@@ -3208,54 +3376,23 @@ const RnsClient = {
         }
     },
 
-    /** Initialize the persistent propagation link with retry.
-     *  The LINKREQUEST can fail if path entries haven't propagated to all
-     *  intermediate exchanges yet. Retry with exponential backoff until
-     *  the link is established. Same pattern as _ensureRfedLink. */
+    /**
+     * The configured propagation node announced (lxmf.propagation): the
+     * reference's "path is available" moment, and an explicit event for the
+     * persistent propagation link (app-links announce_received). Its re-open
+     * is armed, and a link that is down gets one attempt. The LINKREQUEST
+     * can fail while path entries are still spreading across the exchanges;
+     * such an attempt is not retried on a timer, the next announce (or page
+     * resume, or an upload that needs the link) makes the next one.
+     */
     _initPropagation() {
         if (!this._cfg.propagationNodeHash || !this._cfg.propagationNodePubKey) return;
-        if (this._propagationInitialized) return;
-        this._propagationInitialized = true;
-        console.log(`[retichat] 📡 Propagation service ready, establishing link...`);
-        this._establishPropagationLink();
-    },
-
-    /** Retry propagation link establishment with exponential backoff.
-     *  Closes any stale PENDING link before creating a new one. */
-    _retryPropagationLink(delayMs) {
-        // Disconnected: the attempt this follows was rejected by disconnect(),
-        // and there is nothing to establish a link on until connect().
-        if (!this._rns) return;
-        // Already active — done
-        if (this._propLink?.status === Link.ACTIVE) return;
-
-        // Clear any pending retry timer
-        if (this._propRetryTimer) {
-            clearTimeout(this._propRetryTimer);
-            this._propRetryTimer = null;
+        this._propReopenArmed = true;
+        if (!this._propagationInitialized) {
+            this._propagationInitialized = true;
+            console.log(`[retichat] 📡 Propagation service ready, establishing link...`);
         }
-
-        // If there's an existing pending link that's never going to
-        // complete, close it so we can start fresh.
-        if (this._propLink && this._propLink.status !== Link.ACTIVE) {
-            try { this._propLink.close(); } catch(e) {}
-            this._propLink = null;
-            this._propLinkPromise = null;
-            this._propLinkResolve = null;
-            this._propLinkReject = null;
-        }
-
-        console.log(`[retichat] 🔄 Establishing propagation link (retry in ${(delayMs/1000).toFixed(0)}s)...`);
-        this._propRetryTimer = setTimeout(() => {
-            this._propRetryTimer = null;
-            this._ensurePropagationLink().then(() => {
-                console.log(`[retichat] 🔗 Propagation link established via retry`);
-            }).catch((e) => {
-                const nextDelay = Math.min(delayMs * 2, 30000);
-                console.warn(`[retichat] Propagation link retry failed: ${e.message}, next in ${(nextDelay/1000).toFixed(0)}s`);
-                this._retryPropagationLink(nextDelay);
-            });
-        }, delayMs);
+        this._redrivePropagationLink("announce");
     },
 
     _markRfedServiceReady(aspects, event) {
@@ -3281,6 +3418,10 @@ const RnsClient = {
         // for a destination that has not announced, so nobody answers.
         this._catchRfedNodeAnnounce(event);
         const key = aspects.join(".");
+        // An explicit event for the persistent links: the next close of one
+        // that is up re-opens it once (app-links announce_received arms,
+        // RFED_PERSISTENT_KEYS). A re-open that failed is parked below.
+        for (const persistent of RFED_PERSISTENT_KEYS) this._rfedReopenArmed.add(persistent);
         this._rfedServiceReady.add(key);
         const waiters = this._rfedServiceWaiters.get(key) || [];
         this._rfedServiceWaiters.delete(key);
@@ -3379,6 +3520,9 @@ const RnsClient = {
                 this._rfedLinkState.set(key, RFED_LINK_ESTABLISHED);
                 console.log(`[retichat] RFed ${key} link active`);
                 resolve(link);
+                // Link.md "The client re-binds on every link": the bindings
+                // and the pulls, after identify (above) and in order.
+                if (RFED_PERSISTENT_KEYS.includes(key)) this._onRfedLinkEstablished(key, link);
             });
             link.on("packet", ({data}) => {
                 if (key === "channel.stream") this._handleChannelPacket(data);
@@ -3390,11 +3534,6 @@ const RnsClient = {
                 if (key === "channel.stream") this._handleChannelPacket(data);
             });
             if (key === "link") {
-                // Bind this link for live pushes as soon as it is up (Link.md
-                // "Binding the link for push"). Channel pushes are bound by
-                // _openChannelStream when there are subscriptions; the distro
-                // fan-out is bound here, by lxmf.delivery hash.
-                link.on("established", () => { this._bindRfedLinkForDistroPush(); });
                 // Node → client pushes arrive as REQUESTS on the bound link
                 // (Link.md "Path map — node → client"). Our response is the
                 // node's delivery proof: an unanswered push goes to the
@@ -3410,20 +3549,182 @@ const RnsClient = {
                 // The janitor, mirroring LXMRouter.jobs(): a CLOSED link is
                 // cleared so the next attempt starts from scratch, and the
                 // outcome is recorded as a state rather than vanishing.
-                if (this._rfedLinks.get(key) === link) this._rfedLinks.delete(key);
+                const current = this._rfedLinks.get(key) === link;
+                if (current) this._rfedLinks.delete(key);
                 // Link.md: the binding dies with the link. The channel-stream
                 // memo is per channel, not per link, so it must be dropped
                 // here or the next link never re-sends /channel/stream/open
                 // and every /delivery silently goes to the deferred queue.
                 if (key === "link" || key === "channel.stream") this._rfedStreamPromises.clear();
-                this._rfedLinkPromises.delete(key);
+                // Only this link's own attempt: a late close of a link
+                // disconnect() dropped must not forget a newer one.
+                if (this._rfedLinkPromises.get(key) === promise) this._rfedLinkPromises.delete(key);
                 this._rfedLinkState.set(key, established ? RFED_LINK_IDLE : RFED_LINK_FAILED);
                 if (!established) reject(new Error(`RFed ${key} link closed before establishment`));
+                // A persistent link that was up and closed under us is
+                // re-opened once (RFED_PERSISTENT_KEYS). Not one that
+                // disconnect() already dropped from _rfedLinks.
+                else if (current && RFED_PERSISTENT_KEYS.includes(key)) this._onRfedLinkClosed(key, link);
             });
         });
         this._rfedLinkPromises.set(key, promise);
         link.establish(destination);
         return promise;
+    },
+
+    /** Something is bound to the persistent link `key`: opened channels
+     *  (both keys) or a distro (rfed.link carries its push and its pull). */
+    _rfedPersistentBound(key) {
+        if (this._rfedOpenedChannelHashes.size > 0) return true;
+        return key === "link" && DistroManager.has;
+    },
+
+    /**
+     * A new persistent link is up (a new rfed.link generation). Its re-open
+     * is armed again (app-links: reconnect_armed on each ACTIVE), and the
+     * bindings the node dropped with the last link are sent again before
+     * anything is pulled, so a post fanned out after a binding comes live
+     * and one deferred before it comes in the pull (Link.md "The client
+     * re-binds on every link", tiers 1 and 4):
+     *   1. identify: already sent by the "established" handler;
+     *   2. /propagation/stream/open (distro push) and /channel/stream/open
+     *      for every opened channel;
+     *   3. once both have answered, /channel/pull for every opened channel
+     *      and /distro/pull when a distro exists (iOS and Android pull once
+     *      per fresh rfed link: Android ConversationScreen.kt:603-615, iOS
+     *      ConversationView.swift:596-612).
+     */
+    async _onRfedLinkEstablished(key, link) {
+        this._rfedReopenArmed.add(key);
+        if (key !== "link") {
+            await this._rebindChannelStream().catch(e => console.warn(`[retichat] Channel stream re-bind failed: ${e.message}`));
+            return;
+        }
+        this._rfedLinkGeneration++;
+        await Promise.allSettled([this._bindRfedLinkForDistroPush(), this._rebindChannelStream()]);
+        // Closed or replaced while the bindings were answered: the next
+        // link's own "established" pulls.
+        if (this._rfedLinks.get(key) !== link || link.status !== Link.ACTIVE) return;
+        this._pullOpenedChannels("new rfed.link", this._rfedLinkGeneration);
+        if (DistroManager.has) this._pullDistroMessages();
+    },
+
+    /**
+     * A persistent link that had been established closed, and it was the
+     * current one. Re-open it once when the close was not ours (TIMEOUT or
+     * DESTINATION_CLOSED), this tab holds the identity, something is bound
+     * to it, and its re-open is armed; the flag is consumed. See
+     * RFED_PERSISTENT_KEYS.
+     */
+    _onRfedLinkClosed(key, link) {
+        const reason = link.closeReason;
+        const hex = link.hash?.toString("hex").slice(0, 12) ?? "?";
+        if (reason === Link.TIMEOUT) {
+            // Keepalives should keep an idle link up; a TIMEOUT close is
+            // the defect of 2026-09-29, which the re-open must not hide.
+            console.error(`[retichat] RFed ${key} link ${hex} timed out (keepalive)`);
+        }
+        if (reason !== Link.TIMEOUT && reason !== Link.DESTINATION_CLOSED) {
+            // Ours: disconnect() (another tab took over) or an identify
+            // refusal. Re-armed only by a new explicit event.
+            this._rfedReopenArmed.delete(key);
+            console.log(`[retichat] RFed ${key} link ${hex} closed by this client — not re-opened`);
+            return;
+        }
+        if (!this._rns || !ActiveTab.held) return;
+        if (!this._rfedPersistentBound(key)) {
+            console.log(`[retichat] RFed ${key} link ${hex} closed; nothing is bound to it, so it is not re-opened`);
+            return;
+        }
+        if (!this._rfedReopenArmed.has(key)) {
+            console.log(`[retichat] RFed ${key} link ${hex} closed; its re-open is not armed — waiting for the next announce or page resume`);
+            return;
+        }
+        this._rfedReopenArmed.delete(key);
+        console.log(`[retichat] 🔁 RFed ${key} link ${hex} closed under us (reason ${reason}) — re-opening it once`);
+        this._redriveRfedLink(key, "close");
+    },
+
+    /**
+     * One attempt at the persistent link `key`, on an event: its close, an
+     * announce that re-drives a parked re-open, or the page coming back. Not
+     * while it is up, STALE (its keepalive watchdog decides) or coming up,
+     * and only when this tab holds the identity and something is bound to
+     * it. An attempt that closes before establishment is parked for the
+     * service's next announce (_rfedDeferUntilAnnounce); nothing re-tries it
+     * on a clock (DESIGN_PRINCIPLES §3). Returns whether it started one.
+     */
+    _redriveRfedLink(key, trigger) {
+        if (!this._rns || !ActiveTab.held) return false;
+        if (!this._rfedPersistentBound(key)) return false;
+        if (this._rfedLinks.get(key)?.status === Link.ACTIVE) return false;
+        if (this._rfedLinkPromises.has(key)) return false;
+        console.log(`[retichat] 🔗 RFed ${key} link is down — re-driving it (${trigger})`);
+        Promise.resolve()
+            .then(() => this._ensureRfedLink(key.split(".")))
+            .catch((e) => {
+                console.warn(`[retichat] RFed ${key} link re-open failed: ${e.message}`);
+                if (this._rfedLinkState.get(key) === RFED_LINK_FAILED) {
+                    this._rfedDeferUntilAnnounce(key, `rfed.${key} re-open`, () => this._redriveRfedLink(key, "announce"));
+                }
+            });
+        return true;
+    },
+
+    /**
+     * /channel/stream/open once for every opened channel that has no binding
+     * on the current link yet (the memo is cleared when a link closes). One
+     * request carries the whole filter set (_configureChannelStream), so it
+     * is sent once and shared, rather than once per channel.
+     */
+    _rebindChannelStream() {
+        // Before _initChannels has run, _configureChannelStream sends
+        // nothing; no memo is set then, so _initChannels binds them.
+        if (!this._channelsInitialized) return Promise.resolve();
+        const unbound = ChannelStore.getAll().filter(ch => ch.isSubscribed
+            && this._rfedOpenedChannelHashes.has(ch.channelHash)
+            && !this._rfedStreamPromises.has(ch.channelHash));
+        if (unbound.length === 0) return Promise.resolve();
+        const configured = this._configureChannelStream();
+        for (const ch of unbound) this._rfedStreamPromises.set(ch.channelHash, configured);
+        return configured;
+    },
+
+    /** /channel/pull every opened channel (one pull per channel at a time:
+     *  pullChannel's in-flight guard). With `generation`, a channel already
+     *  pulled on that rfed.link generation (openChannel got there first) is
+     *  not pulled again; a page resume pulls them all, as Android's
+     *  ON_RESUME does. */
+    _pullOpenedChannels(trigger, generation = null) {
+        for (const ch of ChannelStore.getAll()) {
+            if (!ch.isSubscribed || !this._rfedOpenedChannelHashes.has(ch.channelHash)) continue;
+            if (generation !== null && this._rfedPullState.get(ch.channelHash)?.gen === generation) continue;
+            this.pullChannel(ch.channelName).catch(e =>
+                console.warn(`[retichat] 📡 Channel pull for #${ch.channelName} (${trigger}) failed: ${e.message}`));
+        }
+    },
+
+    /** The key of the link a request on (aspects, path) travels on: rfed.link
+     *  for every mapped path (_rfedRequest), else the aspect's own. */
+    _rfedLinkKeyFor(aspects, path) {
+        return RFED_LINK_PATHS[`${aspects.join(".")}:${path}`] ? "link" : aspects.join(".");
+    },
+
+    /**
+     * An identify refusal (0xF0 NO_IDENTITY, 0xF1 NO_ACCESS) on a pull: tear
+     * down the link it came on, so the next one identifies afresh (Link.md
+     * "Identify"; LXMRouter.py message_list_response). The close is ours
+     * (INITIATOR_CLOSED), so nothing re-opens it, and its re-open is
+     * disarmed: the next link comes from the next request or explicit event,
+     * never from this close, or a refusal that repeats would be an
+     * establish, refuse, close loop (DESIGN_PRINCIPLES §3).
+     */
+    _closeRefusedRfedLink(key, what) {
+        this._rfedReopenArmed.delete(key);
+        const link = this._rfedLinks.get(key);
+        if (!link) return;
+        console.warn(`[retichat] ${what}: tearing down the ${key} link — the next link re-identifies`);
+        link.close();
     },
 
     /**
@@ -3473,9 +3774,14 @@ const RnsClient = {
             if (!payload) { link.sendResponse(requestId, false); return; }
             link.sendResponse(requestId, this._handleChannelPacket(payload) === true);
         } else if (hex === RFED_LINK_PUSH_HASHES.notify) {
-            // A wake for a client that is already here: nothing to do but
-            // acknowledge it, so the node does not count it as missed.
+            // A wake: something was deferred for this device, and it is
+            // collected with /distro/pull (SPEC §17.3 tier 3; Android
+            // WakeWorker, iOS RfedDistroClient.pull). Acknowledged at once,
+            // so the node does not count the wake as missed; the pull is
+            // the pull's own request. Until 2026-09-30 it was acknowledged
+            // and nothing was pulled.
             link.sendResponse(requestId, true);
+            if (DistroManager.has) this._pullDistroMessages();
         } else if (hex === RFED_LINK_PUSH_HASHES.lxmf) {
             // A live LXMF push for this device's lxmf.delivery — for this
             // client that is a distro fan-out (the node's distro tier 1),
@@ -3891,57 +4197,84 @@ const RnsClient = {
         }
     },
 
-    /** PULL deferred distro messages from RFed. */
+    /**
+     * PULL deferred distro messages from RFed. One pull at a time: a call
+     * while one is in flight gets that pull's result (the rfed.link
+     * "established", the propagation link, a /notify wake and the page
+     * resuming can all ask at once). A page that says more is queued, and
+     * brought something, is followed by one more pull when it has been
+     * handled: the completed response is the event, never a timer.
+     */
     async _pullDistroMessages() {
         if (!DistroManager.has) return [];
-        try {
-            // No request data → msgpack nil, per the Python reference
-            // (request(path, data=None)). Buffer.alloc(0) here produced a
-            // malformed 2-element request the server could not parse — see
-            // sendRequestPacked's guard.
-            const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", MsgPack.pack(null));
-            // PULL authenticates by link identity (the only rfed request that
-            // does), so the server can refuse with a bare LXMF error code —
-            // mirroring the reference propagation node, LXMF/LXMRouter.py:1445.
-            // The reference client's reaction (LXMRouter.py:1525) is to tear
-            // the link down: LINKIDENTIFY is fire-and-forget, so a fresh link
-            // whose identify precedes the next request is the recovery. Our
-            // close handler already drops the link from _rfedLinks, so the
-            // next pull re-establishes and re-identifies. No auto-retry here
-            // (DESIGN_PRINCIPLES §3) — the next scheduled pull or user action
-            // makes the attempt.
-            if (typeof response === "number") {
-                const names = {0xF0:"NO_IDENTITY",0xF1:"NO_ACCESS",0xF3:"INVALID_KEY",0xF4:"INVALID_DATA"};
-                console.warn(`[distro] 📬 PULL refused: 0x${response.toString(16)} (${names[response]||"unknown"})`);
-                if (response === 0xF0 || response === 0xF1) {
-                    const link = this._rfedLinks.get("distro.register");
-                    if (link) {
-                        console.warn("[distro] 📬 Tearing down distro.register link — next pull re-identifies (ref: LXMRouter.message_list_response)");
-                        link.close();
+        if (this._distroPullInFlight) return this._distroPullInFlight;
+        let again = false;
+        const pull = (async () => {
+            // The link this pull travels on (rfed.link for the mapped path).
+            const linkKey = this._rfedLinkKeyFor(["distro", "register"], "/rfed/pull");
+            try {
+                // No request data → msgpack nil, per the Python reference
+                // (request(path, data=None)). Buffer.alloc(0) here produced a
+                // malformed 2-element request the server could not parse — see
+                // sendRequestPacked's guard.
+                const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", MsgPack.pack(null));
+                // PULL authenticates by link identity, so the server can
+                // refuse with a bare LXMF error code — mirroring the reference
+                // propagation node, LXMF/LXMRouter.py:1445. The reference
+                // client's reaction (LXMRouter.py:1525) is to tear the link
+                // down: LINKIDENTIFY is fire-and-forget, so a fresh link whose
+                // identify precedes the next request is the recovery. The link
+                // is the one the pull used — rfed.link since the migration;
+                // until 2026-09-30 this closed "distro.register", which a
+                // mapped pull never opens, so the refused link stayed up. No
+                // auto-retry and no re-open (DESIGN_PRINCIPLES §3): the next
+                // request or explicit event makes the next link.
+                if (typeof response === "number") {
+                    const names = {0xF0:"NO_IDENTITY",0xF1:"NO_ACCESS",0xF3:"INVALID_KEY",0xF4:"INVALID_DATA"};
+                    console.warn(`[distro] 📬 PULL refused: 0x${response.toString(16)} (${names[response]||"unknown"})`);
+                    if (response === 0xF0 || response === 0xF1) {
+                        this._closeRefusedRfedLink(linkKey, "[distro] 📬 PULL refused (ref: LXMRouter.message_list_response)");
+                    }
+                    return [];
+                }
+                if (!Array.isArray(response) || response.length < 2) return [];
+                const [pairs, morePending] = response;
+                const count = pairs?.length ?? 0;
+                console.log(`[distro] 📬 PULL returned ${count} blob(s), more=${morePending}`);
+                for (const pair of pairs || []) {
+                    if (!Array.isArray(pair) || pair.length < 2) continue;
+                    const [distroHash, blob] = pair;
+                    this._handleDistroBlob(distroHash, blob);
+                }
+                // A page that brought nothing is not followed, whatever it
+                // says: pulling again would repeat the same answer.
+                again = morePending === true && count > 0;
+                return pairs || [];
+            } catch(e) {
+                console.error(`[distro] PULL failed:`, e);
+                // The link never came up. On rfed.link the re-drive is parked
+                // (its "established" pulls again); a legacy link parks the
+                // pull itself.
+                if (this._rfedLinkState.get(linkKey) === RFED_LINK_FAILED) {
+                    if (linkKey === "link") {
+                        this._rfedDeferUntilAnnounce(linkKey, "rfed.link re-open", () => this._redriveRfedLink(linkKey, "announce"));
+                    } else {
+                        this._rfedDeferUntilAnnounce(linkKey, "distro pull", () => this._pullDistroMessages());
                     }
                 }
                 return [];
             }
-            if (!Array.isArray(response) || response.length < 2) return [];
-            const [pairs, morePending] = response;
-            const count = pairs?.length ?? 0;
-            console.log(`[distro] 📬 PULL returned ${count} blob(s), more=${morePending}`);
-            for (const pair of pairs || []) {
-                if (!Array.isArray(pair) || pair.length < 2) continue;
-                const [distroHash, blob] = pair;
-                this._handleDistroBlob(distroHash, blob);
+        })();
+        this._distroPullInFlight = pull;
+        try {
+            return await pull;
+        } finally {
+            // Only its own entry: after a reconnect a newer pull may hold it.
+            if (this._distroPullInFlight === pull) this._distroPullInFlight = null;
+            if (again) {
+                console.log("[distro] 📬 More is queued — pulling the next page");
+                this._pullDistroMessages();
             }
-            return pairs || [];
-        } catch(e) {
-            console.error(`[distro] PULL failed:`, e);
-            if (this._rfedLinkState.get("distro.register") === RFED_LINK_FAILED) {
-                this._rfedDeferUntilAnnounce(
-                    "distro.register",
-                    "distro pull",
-                    () => this._pullDistroMessages(),
-                );
-            }
-            return [];
         }
     },
 
@@ -4131,7 +4464,12 @@ const RnsClient = {
         this._rfedOpenedChannelHashes.add(channel.channelHash);
         await this._ensureChannelSubscribed(channel);
         const stream = this._ensureChannelStreamConfigured(channel);
-        const pull = this._rfedPullState.has(channel.channelHash)
+        // Once per rfed.link generation, not once per session: a link that
+        // closed and re-opened pulls again (its "established" does, and so
+        // does this). Until 2026-09-30 a channel was pulled at most once per
+        // page load, so what the node deferred after that waited for a reload.
+        const pulled = this._rfedPullState.get(channel.channelHash);
+        const pull = pulled?.gen === this._rfedLinkGeneration && this._rfedLinkGeneration > 0
             ? Promise.resolve()
             : this.pullChannel(channelName);
         await Promise.all([stream, pull]);
@@ -4147,14 +4485,23 @@ const RnsClient = {
         return configured;
     },
 
+    /**
+     * /channel/pull one channel: what the node deferred for this subscriber
+     * on it (Channel.md /rfed/pull). One pull per channel at a time (the
+     * in-flight guard). A page that says more is queued, and brought
+     * something, is followed by one more pull once it has been handled: the
+     * completed response is the event, never a timer. The rfed.link
+     * generation of a completed pull is recorded (openChannel).
+     */
     async pullChannel(channelName) {
         const channel = ChannelStore.get(channelName);
         if (!channel) return false;
         const key = channel.channelHash;
         const current = this._rfedPullState.get(key);
         if (current?.inFlight) return current.morePending !== false;
-        this._rfedPullState.set(key, {inFlight: true, morePending: current?.morePending});
+        this._rfedPullState.set(key, {inFlight: true, morePending: current?.morePending, gen: current?.gen});
         this._onMsg.forEach(fn => fn({kind: "channel-pull-start"}, channelName));
+        let again = false;
         try {
             const response = await this._rfedRequest(
                 ["channel", "pull"],
@@ -4162,16 +4509,14 @@ const RnsClient = {
                 MsgPack.pack(Buffer.from(key, "hex"))
             );
             // Link.md "Identify": ERROR_NO_IDENTITY (0xF0) means the node saw no
-            // LINKIDENTIFY on this link. Close it; the next pull establishes a
-            // fresh link and identifies on it (same rule as /distro/pull).
+            // LINKIDENTIFY on this link. Close it; the next link identifies
+            // on it (same rule as /distro/pull). The close does not re-open
+            // the link (_closeRefusedRfedLink).
             if (typeof response === "number") {
                 const names = {0xF0:"NO_IDENTITY",0xF1:"NO_ACCESS",0xF3:"INVALID_KEY",0xF4:"INVALID_DATA"};
                 console.warn(`[retichat] 📡 channel PULL refused: 0x${response.toString(16)} (${names[response]||"unknown"})`);
                 if (response === 0xF0 || response === 0xF1) {
-                    for (const linkKey of ["link", "channel.pull"]) {
-                        const l = this._rfedLinks.get(linkKey);
-                        if (l) { console.warn(`[retichat] 📡 Tearing down ${linkKey} link — next pull re-identifies`); l.close(); }
-                    }
+                    this._closeRefusedRfedLink(this._rfedLinkKeyFor(["channel", "pull"], "/rfed/pull"), "📡 channel PULL refused");
                 }
                 throw new Error(`channel pull refused: 0x${response.toString(16)}`);
             }
@@ -4183,13 +4528,21 @@ const RnsClient = {
                 this._handleChannelPacket(Buffer.concat([Buffer.from(pair[0]), Buffer.from(pair[1])]));
             }
             const morePending = response[1] === true;
-            this._rfedPullState.set(key, {inFlight: false, morePending});
+            this._rfedPullState.set(key, {inFlight: false, morePending, gen: this._rfedLinkGeneration});
+            // A page that brought nothing is not followed, whatever it says:
+            // pulling again would repeat the same answer.
+            again = morePending && response[0].length > 0;
             return morePending;
         } catch(e) {
-            this._rfedPullState.set(key, {inFlight: false, morePending: current?.morePending});
+            this._rfedPullState.set(key, {inFlight: false, morePending: current?.morePending, gen: current?.gen});
             throw e;
         } finally {
             this._onMsg.forEach(fn => fn({kind: "channel-pull-complete"}, channelName));
+            if (again) {
+                console.log(`[retichat] 📡 More is queued for #${channelName} — pulling the next page`);
+                this.pullChannel(channelName).catch(e =>
+                    console.warn(`[retichat] 📡 Channel pull for #${channelName} failed: ${e.message}`));
+            }
         }
     },
 
@@ -4385,6 +4738,14 @@ const RnsClient = {
 
     disconnect() {
         if (this._annTimer) { clearInterval(this._annTimer); this._annTimer = null; }
+        // A stopped tab (taken over by another, or reconnecting) re-drives
+        // nothing: no page events, and no persistent link re-opens. The
+        // links below close as INITIATOR_CLOSED, which never re-opens, and
+        // _rfedLinks is cleared before their (deferred) close events run.
+        this._unhookPageLifecycle();
+        this._rfedReopenArmed.clear();
+        this._propReopenArmed = false;
+        this._distroPullInFlight = null;
         this._pendingTickets.clear();
         this._pendingPacketHashes.clear();
         for (const tid of this._pendingTimeouts.values()) clearTimeout(tid);
@@ -4432,7 +4793,6 @@ const RnsClient = {
         // in place, reconnect() would hand the old ACTIVE link to every
         // upload, and they would queue into a dead interface until it went
         // STALE. Nulled before close() so its "close" is a superseded one.
-        if (this._propRetryTimer) { clearTimeout(this._propRetryTimer); this._propRetryTimer = null; }
         const propLink = this._propLink;
         this._propLink = null;
         try { propLink?.close(); } catch(e) {}

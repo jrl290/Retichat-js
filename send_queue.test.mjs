@@ -292,15 +292,19 @@ const PROPAGATION_METHODS = [
 /** The real propagation-link lifecycle, with only the wire handshake skipped. */
 function makePropagationClient({ nodeKnown, contacts }) {
     const uploads = [];
+    const identified = [];
     class OfflineLink extends Link {
         establish() { this.initiator = true; this.status = Link.PENDING; }
+        identify(identity) { identified.push(identity); }
         async sendResource(data) { uploads.push(data); }
     }
     const node = Identity.create();
     const c = makeClient({
         contacts,
-        methods: [...PROPAGATION_METHODS, "_establishPropagationLink()", "_ensurePropagationLink()"],
-        env: { Link: OfflineLink, IdMgr: { id: me }, DistroManager: { has: false }, RnsClient: {} },
+        methods: [...PROPAGATION_METHODS, "_establishPropagationLink()", "_ensurePropagationLink()",
+            "async _onPropagationLinkEstablished(link)", "_onPropagationLinkClosed(link, established)",
+            "_redrivePropagationLink(trigger)", "_initPropagation()"],
+        env: { Link: OfflineLink, IdMgr: { id: me }, DistroManager: { has: false }, RnsClient: {}, ActiveTab: { held: true } },
     });
     Object.assign(c.self, {
         _cfg: { propagationNodePubKey: nodeKnown ? node.getPublicKey().toString("hex") : "", propagationNodeHash: "b".repeat(32) },
@@ -311,9 +315,13 @@ function makePropagationClient({ nodeKnown, contacts }) {
         _propLink: null, _propLinkPromise: null, _propLinkUpWaiters: [],
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
         _fetchPropagatedMessages() {},
+        _pullDistroMessages() {},
     });
-    c.retries = [];
-    c.self._retryPropagationLink = (ms) => c.retries.push(ms);
+    c.identified = identified;
+    // Every link attempt, whoever starts it (an upload, an event, a re-open).
+    c.attempts = 0;
+    const establishLink = c.self._establishPropagationLink;
+    c.self._establishPropagationLink = () => { c.attempts++; return establishLink(); };
     c.built = [];
     c.self._buildPropagationPacked = async (packed, publicKeyHex) => {
         c.built.push({ packed, publicKeyHex });
@@ -566,15 +574,21 @@ test("two overlapping flushes propagate each parked copy once", async () => {
     assert.equal(c.uploads.length, 3, "one upload per parked copy, however many flushes ran");
 });
 
-test("the propagation link retry stays down once disconnected", () => {
-    const c = makeClient({ methods: ["_retryPropagationLink(delayMs)"], env: { Link } });
-    Object.assign(c.self, { _propLink: null, _propRetryTimer: null });
-    c.self._rns = null; // disconnect() has run; its reject reached the retry's catch
-    c.self._retryPropagationLink(8000);
-    assert.equal(c.timers.length, 0, "no timer to start a link on a stopped Reticulum");
-    c.self._rns = {};
-    c.self._retryPropagationLink(8000);
-    assert.equal(c.timers.length, 1, "connected, the retry is armed as before");
+test("the propagation link is re-driven by an event, and stays down once disconnected", () => {
+    // Until 2026-09-30 a closed propagation link started _retryPropagationLink,
+    // a setTimeout loop doubling from 4 s to 30 s (DESIGN_PRINCIPLES §3). The
+    // re-drive is one attempt per event, and never a timer.
+    const c = makePropagationClient({ nodeKnown: true, contacts: [] });
+    const rns = c.self._rns;
+    c.self._rns = null; // disconnect() has run
+    assert.equal(c.self._redrivePropagationLink("announce"), false);
+    assert.equal(c.attempts, 0, "no link on a stopped Reticulum");
+    c.self._rns = rns;
+    assert.equal(c.self._redrivePropagationLink("announce"), true);
+    assert.equal(c.attempts, 1, "connected: one attempt");
+    assert.equal(c.self._redrivePropagationLink("announce"), false, "not while that attempt is in flight");
+    assert.equal(c.attempts, 1);
+    assert.equal(c.timers.length, 0, "no timer, ever");
 });
 
 test("a queued message storage cannot keep is refused, so it stays in the composer", () => {
@@ -630,19 +644,23 @@ test("a superseded propagation link's close leaves the current attempt alone", a
     assert.equal(rejected, null, "the current attempt is not rejected");
     assert.equal(c.self._propLink, current, "nor dropped");
     assert.equal(c.self._propLinkPromise, attempt);
-    assert.deepEqual(c.retries, [], "nor a retry scheduled");
+    const attempts = c.attempts;
+    assert.equal(attempts, 2, "the first attempt and the one that replaced the STALE link");
 
-    // The current link's own close still does all three.
+    // The current link's own close rejects the attempt and clears it. It
+    // never established, so nothing starts another: the next event does.
     current.status = Link.CLOSED;
+    current.closeReason = Link.TIMEOUT;
     current.emit("close");
     await afterLinkEvents();
     assert.match(rejected?.message ?? "", /closed before establishment/);
     assert.equal(c.self._propLink, null);
-    assert.deepEqual(c.retries, [4000]);
+    assert.equal(c.attempts, attempts, "no retry of an attempt that failed (DESIGN_PRINCIPLES §3)");
+    assert.equal(c.timers.length, 0, "and no timer");
 });
 
-test("disconnect resets the propagation link, its retry and initialization", () => {
-    const c = makeClient({ methods: ["disconnect()", "_ensurePropagationLink()"], env: { clearInterval() {} } });
+test("disconnect resets the propagation link, its re-open and initialization", () => {
+    const c = makeClient({ methods: ["disconnect()", "_ensurePropagationLink()", "_unhookPageLifecycle()"], env: { clearInterval() {} } });
     let closed = 0;
     const oldLink = { status: Link.ACTIVE, close() { closed++; } }; // still thinks it is ACTIVE
     Object.assign(c.self, {
@@ -655,14 +673,23 @@ test("disconnect resets the propagation link, its retry and initialization", () 
         _groupPeerWaiters: new Map(), _groupPathsRequested: new Set(), _groupFallbacks: new Map(),
         _propLinkUpWaiters: [], _propLinkReject: null,
         _rns: { interfaces: [] }, _setStatus() {},
-        _propLink: oldLink, _propRetryTimer: 77, _propagationInitialized: true, _initialized: true,
+        _propLink: oldLink, _propagationInitialized: true, _initialized: true,
+        _rfedReopenArmed: new Set(["link", "channel.stream"]), _propReopenArmed: true,
+        _distroPullInFlight: Promise.resolve([]), _pageHooks: null,
         _cfg: { propagationNodePubKey: "a".repeat(128), propagationNodeHash: "b".repeat(32) },
     });
+    const removed = [];
+    const target = { removeEventListener: (type) => removed.push(type) };
+    c.self._pageHooks = [[target, "online", () => {}], [target, "visibilitychange", () => {}]];
     c.self.disconnect();
     assert.equal(c.self._propLink, null);
     assert.equal(closed, 1, "the old link is closed");
-    assert.ok(c.cleared.includes(77), "the retry timer is cleared");
-    assert.equal(c.self._propRetryTimer, null);
+    assert.deepEqual(removed, ["online", "visibilitychange"], "the page events are unhooked: a stopped tab re-drives nothing");
+    assert.equal(c.self._pageHooks, null);
+    assert.equal(c.self._rfedReopenArmed.size, 0, "no persistent link re-opens after disconnect");
+    assert.equal(c.self._propReopenArmed, false);
+    assert.equal(c.self._distroPullInFlight, null);
+    assert.equal("_propRetryTimer" in c.self, false, "there is no retry timer any more");
     assert.equal(c.self._propagationInitialized, false, "the next announce re-initializes propagation");
     assert.equal(c.self._initialized, false, "sends queue until the next connection initializes");
 
