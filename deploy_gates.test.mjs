@@ -348,11 +348,14 @@ function runRemote(home, script) {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 // Two suites run side by side. The Chromium one runs at most two browsers at a
-// time: `npm test` is the deploy gate, and six boots at once (this file's peak
-// was five boot gates, 16 Chromium processes) made a timing-sensitive test in
-// another file (link_request_resource.test.mjs, a 150 ms budget) go red under
-// load, which refuses the deploy. Its first three tests each watch the whole
-// 10 s window, so two slots keep the file's wall time.
+// time: `npm test` is the deploy gate, and this file's peak (five boot gates,
+// 16 Chromium processes) ran beside timing-sensitive tests in other files
+// (link_request_resource.test.mjs has 100 ms and 150 ms budgets). Two slots
+// halve the peak (8 processes); its first three tests each watch the whole
+// 10 s window, so two slots cost the file only about 4 s. This is not shown to be
+// what turns those tests red: on 2026-09-30, under load from other work, they
+// went red in whole-suite runs with the old peak and with this one, and never
+// in 12 runs beside this file alone.
 describe("deploy gates", { concurrency: 2 }, () => {
 
     describe("in Chromium, at most two browsers at a time", { concurrency: 2 }, () => {
