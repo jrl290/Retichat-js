@@ -79,6 +79,10 @@ class WireOnly {
     newLinkPacket(context, data, packetType) {
         return { context, data, packetType: packetType ?? Packet.DATA, pack() { return this; } };
     }
+    _transmit(raw) {
+        this.destination.rns.sendData(raw, this.attachedInterface);
+        return raw;
+    }
 }
 
 test("a request Resource advertises flag bit 3 and its request id; a response bit 4", () => {

@@ -66,6 +66,12 @@ class FakeLink {
         return padded.slice(0, padded.length - padding);
     }
 
+    /** Link._transmit: every link and Resource send goes out through it. */
+    _transmit(raw) {
+        this.destination.rns.sendData(raw, this.attachedInterface);
+        return raw;
+    }
+
     // Resource builds packets through the link, but for the loopback we only
     // need the context and payload, so we hand back a marker object.
     newLinkPacket(context, data, packetType) {

@@ -31,14 +31,17 @@
 // more likely to succeed. It restores the reference implementation's
 // guarantee that an attempt terminates, so the existing retry path can run.
 //
-// The module graph resolves `@noble/curves` through the browser importmap, so
-// link.js cannot be imported under Node. We lift the real shipped methods out
-// of the source and run them against stubs, so this tests actual behaviour
-// rather than the text of the file.
+// These drive a real Link (link.js imports under Node through package.json's
+// devDependencies), so they test the shipped behaviour rather than the text of
+// the file. Events are recorded synchronously by replacing the instance's emit.
 
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test, { mock } from "node:test";
+
+import Link from "./lib/rns/link.js";
+import Packet from "./lib/rns/packet.js";
 
 const linkSource = await readFile(new URL("./lib/rns/link.js", import.meta.url), "utf8");
 
@@ -58,27 +61,14 @@ function extractMethod(source, signature, label) {
     throw new Error(`could not brace-match ${signature} in ${label}`);
 }
 
-const LinkStub = { PENDING: 0x00, ACTIVE: 0x02, CLOSED: 0x04, TIMEOUT: 0x01 };
-
-/** A link-like object wired to the real shipped watchdog methods. */
+/** A PENDING link wired to the real shipped watchdog. */
 function makeLink(establishmentTimeout) {
-    const startBody = extractMethod(linkSource, "_startEstablishmentWatchdog()", "link.js");
-    const clearBody = extractMethod(linkSource, "_clearEstablishmentWatchdog()", "link.js");
-    const scope = (source) => new Function("Link", source)(LinkStub);
-
-    const link = {
-        status: LinkStub.PENDING,
-        establishmentTimeout,
-        events: [],
-        hash: Buffer.from("00112233445566778899aabbccddeeff", "hex"),
-        emit(name) { this.events.push(name); },
-        _startEstablishmentWatchdog: scope(
-            `return function _startEstablishmentWatchdog() {${startBody}};`,
-        ),
-        _clearEstablishmentWatchdog: scope(
-            `return function _clearEstablishmentWatchdog() {${clearBody}};`,
-        ),
-    };
+    const link = new Link();
+    link.status = Link.PENDING;
+    link.establishmentTimeout = establishmentTimeout;
+    link.hash = Buffer.from("00112233445566778899aabbccddeeff", "hex");
+    link.events = [];
+    link.emit = function (name) { this.events.push(name); };
     return link;
 }
 
@@ -107,12 +97,12 @@ test("a link still PENDING at the deadline closes with reason TIMEOUT", () => {
 
         mock.timers.tick(29_999);
         assert.deepEqual(link.events, [], "must not close before the deadline");
-        assert.equal(link.status, LinkStub.PENDING);
+        assert.equal(link.status, Link.PENDING);
 
         mock.timers.tick(1);
         assert.deepEqual(link.events, ["close"], "a stalled establishment must emit close");
-        assert.equal(link.status, LinkStub.CLOSED);
-        assert.equal(link.closeReason, LinkStub.TIMEOUT);
+        assert.equal(link.status, Link.CLOSED);
+        assert.equal(link.closeReason, Link.TIMEOUT);
     } finally {
         mock.timers.reset();
     }
@@ -126,24 +116,41 @@ test("a link that becomes ACTIVE is never closed by the watchdog", () => {
 
         // onLinkRequestRtt() clears the watchdog before activating the link.
         link._clearEstablishmentWatchdog();
-        link.status = LinkStub.ACTIVE;
+        link.status = Link.ACTIVE;
 
         mock.timers.tick(120_000);
         assert.deepEqual(link.events, [], "an established link must never be torn down by the watchdog");
-        assert.equal(link.status, LinkStub.ACTIVE);
+        assert.equal(link.status, Link.ACTIVE);
     } finally {
         mock.timers.reset();
     }
 });
 
 test("the watchdog is disarmed on every terminal transition", () => {
-    for (const signature of ["onLinkRequestRtt(packet)", "close()"]) {
-        const body = extractMethod(linkSource, signature, "link.js");
-        assert.match(body, /this\._clearEstablishmentWatchdog\(\)/,
-            `${signature} must disarm the watchdog`);
-    }
-    // The LINKCLOSE branch lives inside onPacket().
-    const onPacket = extractMethod(linkSource, "onPacket(packet)", "link.js");
-    assert.match(onPacket, /this\._clearEstablishmentWatchdog\(\)/,
-        "the LINKCLOSE branch must disarm the watchdog");
+    // onLinkRequestRtt() disarms it before activating the responder's link.
+    const body = extractMethod(linkSource, "onLinkRequestRtt(packet)", "link.js");
+    assert.match(body, /this\._clearEstablishmentWatchdog\(\)/,
+        "onLinkRequestRtt(packet) must disarm the watchdog");
+
+    // close(), and a LINKCLOSE from the peer, on a link that has its keys.
+    const keyed = () => {
+        const link = makeLink(30_000);
+        link.status = Link.HANDSHAKE;
+        link.derivedKey = crypto.randomBytes(64);
+        link.attachedInterface = { name: "test" };
+        link.destination = { rns: { sendData() {} } };
+        link._startEstablishmentWatchdog();
+        assert.ok(link._establishmentTimer, "armed");
+        return link;
+    };
+    const closed = keyed();
+    closed.close();
+    assert.equal(closed._establishmentTimer, null, "close() must disarm the watchdog");
+    assert.deepEqual(closed.events, ["close"]);
+
+    const peerClosed = keyed();
+    peerClosed.onPacket({ context: Packet.LINKCLOSE, data: peerClosed.encrypt(peerClosed.hash) });
+    assert.equal(peerClosed.status, Link.CLOSED);
+    assert.equal(peerClosed._establishmentTimer, null, "the LINKCLOSE branch must disarm the watchdog");
+    assert.deepEqual(peerClosed.events, ["close"]);
 });

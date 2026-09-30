@@ -87,12 +87,19 @@ function makeLink(mdu, sent) {
         `return function newLinkPacket(context, data, packetType) {${builderBody}};`,
         [],
     );
+    // Every link send goes out through _transmit (the watchdog's outbound clock).
+    const transmitBody = extractMethod(linkSource, "_transmit(raw, isKeepalive = false)", "link.js");
+    const hadOutboundBody = extractMethod(linkSource, "_hadOutbound(isKeepalive = false)", "link.js");
+    const _transmit = scope(`return function _transmit(raw, isKeepalive = false) {${transmitBody}};`, []);
+    const _hadOutbound = scope(`return function _hadOutbound(isKeepalive = false) {${hadOutboundBody}};`, []);
     return {
         hash: "hash",
         attachedInterface: "iface",
         destination: { rns: { sendData: (raw, iface) => sent.push({ raw, iface }) } },
         send,
         newLinkPacket,
+        _transmit,
+        _hadOutbound,
     };
 }
 
