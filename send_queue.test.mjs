@@ -115,7 +115,7 @@ function makeClient({ storage = makeStorage(), contacts = [], groups = [], metho
     const ContactStore = {
         get: (h) => contactMap.get(h) ?? null,
         getAll: () => [...contactMap.values()],
-        touch() {}, setReachable() {}, propagationDelay: () => 5,
+        touch() {}, setReachable() {}, propagationDelay: () => 5, allow() {},
     };
     const groupMap = new Map(groups.map((g) => [g.groupId, g]));
     const GroupStore = { get: (id) => groupMap.get(id) ?? null, getAll: () => [...groupMap.values()], _save() {} };

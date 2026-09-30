@@ -436,8 +436,12 @@ function ownLxmfDestinationHash() {
     return IdMgr.has ? Destination.hash(IdMgr.id, "lxmf", "delivery").toString("hex") : null;
 }
 
-function shouldProcessGroupMessage(groupAction, inviterKnown, groupExists) {
-    return groupAction === "invite" ? inviterKnown : groupExists;
+/** iOS groupMessagePolicy (ChatRepository.swift:3066-3070), Android
+ *  DeliveryPolicy.groupMessage: an invite is processed when its source
+ *  passes the privacy filter (PrivacyFilter.allows), any other group
+ *  message when the group exists here. */
+function shouldProcessGroupMessage(groupAction, inviterAllowed, groupExists) {
+    return groupAction === "invite" ? inviterAllowed : groupExists;
 }
 
 // =========================================================================
@@ -451,6 +455,17 @@ function shouldProcessGroupMessage(groupAction, inviterKnown, groupExists) {
 //  name them (as iOS and Android keep a plain contact row). Hidden rows are
 //  never listed (chat list, contacts, group picker: audit L4); adding the
 //  contact or a DM with it lists the row, names and key included.
+//
+//  Separately, a row is `allowlisted` or not: iOS ContactEntity.isAllowlisted,
+//  Android ContactEntity.isAllowlisted. The privacy filter (PrivacyFilter)
+//  keeps direct messages and group invites only from allowlisted rows. The
+//  user allowlists a peer by adding it (Add Contact, New Conversation, an
+//  lxma:// link), by sending it a DM, by creating or accepting a group with
+//  it, and by an invite or accept it sends in a group (allow()). A row a
+//  message created while the filter was off, a distro sender's and a distro
+//  sent-copy recipient's are listed but not allowlisted, as iOS and Android
+//  make a plain row for them. Listing and allowlisting are independent: a
+//  group member is allowlisted and stays hidden.
 // =========================================================================
 const ContactStore = {
     _contacts: new Map(),
@@ -465,6 +480,13 @@ const ContactStore = {
      * by name(). Records stored before 2026-09-27 had one displayName plus
      * nameCustomized, and the first three-slot build had no legacyName; both
      * are migrated as they load (§5.4).
+     *
+     * Rows stored before the privacy filter (2026-09-30) have no
+     * `allowlisted`: a listed row becomes allowlisted, as Android's
+     * migration allowlisted every existing contact (NamesMigration.kt:30-35,
+     * the `1` of :99-106), so turning the filter on does not silently drop
+     * the user's own contacts. A hidden row (a group member's, a channel
+     * poster's, a name-only one) does not: it was never a contact.
      */
     init() {
         const data = sGet("contacts_v2");
@@ -472,6 +494,10 @@ const ContactStore = {
         if (Array.isArray(data)) for (const stored of data) {
             const c = migrateContact(stored);
             if ("displayName" in stored || "nameCustomized" in stored || !("localName" in stored) || !("legacyName" in stored)) migrated = true;
+            if (!("allowlisted" in stored)) {
+                c.allowlisted = !c.hidden && !c.nameOnly;
+                migrated = true;
+            }
             this._contacts.set(c.destHash, c);
         }
         if (migrated) this._save();
@@ -481,22 +507,42 @@ const ContactStore = {
     _notify() { const all = this.getAll(); this._listeners.forEach(fn => fn(all)); },
 
     /** Add a contact by destination hash. Returns the contact. Adding one
-     *  that exists keeps everything it holds, names and key included, and
-     *  lists a hidden row. */
+     *  that exists keeps everything it holds, names, key and allowlisting
+     *  included, and lists a hidden row. It does not allowlist: a peer the
+     *  user adds is also passed to allow(). */
     add(destHash, isDistro = false, publicKey = null) {
         return this._put(destHash, isDistro, publicKey, false);
     },
+
+    /** iOS ensureAllowlistedContact (ChatRepository.swift:2984-3000),
+     *  Android ensureAllowlistedContact (ChatRepository.kt:277-285): the
+     *  privacy filter lets `destHash`'s DMs and invites through from now on.
+     *  A peer with no row gets a hidden one (keep), and a name-only row is
+     *  one no longer. Listing is left as it is. Returns the row. */
+    allow(destHash) {
+        const c = this.keep(destHash);
+        if (c.allowlisted !== true) {
+            c.allowlisted = true;
+            this._save();
+        }
+        return c;
+    },
+
+    /** Whether the user allowlisted `destHash` (allow()). */
+    allowlisted(destHash) { return this._contacts.get(destHash)?.allowlisted === true; },
 
     /** The row for a peer the user has not added (a group member, a channel
      *  poster): created hidden when there is none, returned as it is when
      *  there is one. Returns the row.
      *
      *  `nameOnly` marks a row created only to hold the name of a group
-     *  sender the client had no row for (_handleGroupMessage). Such a row
-     *  never vouches for an invite (mayInvite): before hidden rows, that
-     *  sender had no row at all. Keeping it for any other reason (its key
-     *  as a member, a channel post, a send to it), or adding it, clears the
-     *  mark, as those paths always created a row. */
+     *  sender the client had no row for (_handleGroupMessage). Until
+     *  2026-09-30 such a row was the one row that never vouched for an
+     *  invite; invites now need an allowlisted source (PrivacyFilter.allows),
+     *  which a name-only row never is until allow() clears the mark. Keeping
+     *  it for any other reason (its key as a member, a channel post, a send
+     *  to it), or adding it, clears the mark, as those paths always created
+     *  a row. */
     keep(destHash, publicKey = null, nameOnly = false) {
         const existing = this.get(destHash);
         if (!existing) return this._put(destHash, false, publicKey, true, nameOnly);
@@ -525,6 +571,7 @@ const ContactStore = {
             isDistro: existing?.isDistro ?? isDistro,
             hidden,
             nameOnly,
+            allowlisted: existing?.allowlisted === true,
         };
         this._contacts.set(destHash, contact);
         this._save();
@@ -565,14 +612,6 @@ const ContactStore = {
     /** Any row, hidden or listed: a peer this client knows (its key, its
      *  names). */
     known(destHash) { return this._contacts.has(destHash); },
-
-    /** Whether an invite from `destHash` is processed: any row but a
-     *  name-only one, the rows that were all listed contacts before hidden
-     *  rows. Stored rows without the mark count. */
-    mayInvite(destHash) {
-        const c = this._contacts.get(destHash);
-        return !!c && !c.nameOnly;
-    },
 
     /** The label every surface shows for `destHash` (§5.3):
      *  localName ?? messageName ?? announceName ?? 8-hex short hash. */
@@ -955,6 +994,12 @@ const GroupStore = {
             .sort((a, b) => b.lastActivity - a.lastActivity);
     },
     isGroupChat(id) { return this._groups.has(id); },
+    /** Whether `memberHash` is in the member list of any group this client
+     *  holds, pending or active, whatever its status. */
+    hasMember(memberHash) {
+        for (const g of this._groups.values()) if (g.members.has(memberHash)) return true;
+        return false;
+    },
     isActiveGroup(id) {
         const g = this._groups.get(id);
         return g && g.groupStatus === "active";
@@ -990,6 +1035,107 @@ const GroupStore = {
     },
 };
 GroupStore.init();
+
+// =========================================================================
+//  PRIVACY FILTER — which received LXMF messages this client keeps
+//
+//  iOS: UserPreferences.filterStrangers (on by default), allowlistDecision
+//  and groupMessagePolicy (ChatRepository.swift:3002-3070), applied in
+//  handleIncomingMessage (:1947-1972). Android copies it exactly:
+//  DeliveryPolicy.kt, applied in onMessageReceived (ChatRepository.kt
+//  :1378-1394). With the filter on, a direct message is kept only from an
+//  allowlisted contact (ContactStore.allow); a group invite only from an
+//  allowlisted source; any other group message when its group exists here,
+//  whoever sent it; a distro identity transfer is offered whoever sent it.
+//  Off, everything is kept but group messages for a group this client does
+//  not hold. Messages fanned out to the distro address are never filtered:
+//  mail to the distro is mail to this person (iOS handleDistroMessage,
+//  ChatRepository.swift:2049-2055; Android onDistroMessageReceived,
+//  ChatRepository.kt:1436-1437), and _handleDistroBlob does not ask.
+//
+//  Where the decision is made differs from the phones, on purpose ("drop
+//  costs nothing", James 2026-09-30): the LXMF router asks this filter
+//  before it spends anything on a message (lib/rns/lxmf/lxmf_router.js
+//  acceptsSource / acceptsMessage):
+//    1. acceptsSource, on the decrypted bytes, before the proof and the
+//       parse. It knows only the source, so it drops what no rule could
+//       keep: a source that is neither allowlisted nor a member of a group
+//       this client holds. That is the stranger, who then costs no proof,
+//       no msgpack, no signature check, no ticket reply and no write.
+//    2. acceptsMessage, after the parse and before the proof: the whole
+//       rule above, for the sources step 1 let through.
+//  A dropped message is never proved and never reaches the router's
+//  listeners, so it records nothing, its 0xD1 name included (iOS applies
+//  the name only once its policy accepts the message). A link Resource is
+//  the exception to "no proof": the Resource protocol proves it on
+//  assembly, before the source can be read.
+//
+//  Departures from iOS, forced by step 1 (the source is all it knows):
+//  - a group message for a group this client holds, from a source that is
+//    neither allowlisted nor in any group's member list here, is dropped
+//    (iOS keeps it: groupMessagePolicy asks only whether the group exists).
+//    Legitimate group traffic comes from members, whose hashes the invite
+//    lists, so this is a member the local list does not have;
+//  - a distro identity transfer from a device that is neither allowlisted
+//    nor a co-member is dropped (iOS and Android offer it whoever sent
+//    it). Add the sending device first, turn the filter off for the
+//    transfer, or paste the key (Identity, Import).
+// =========================================================================
+const PrivacyFilter = {
+    _on: true,
+
+    /** On unless the user turned it off: iOS filterStrangers and Android
+     *  filter_strangers both default to true (UserPreferences.swift:192-195). */
+    init() { this._on = sGet("filterStrangers") !== false; },
+
+    get on() { return this._on; },
+
+    /** The Settings "Privacy filter" toggle: persisted, and applied to the
+     *  next message at once (the router asks at every delivery), as
+     *  Android's setCoreFilterStrangers. */
+    set(on) {
+        this._on = !!on;
+        sSet("filterStrangers", this._on);
+    },
+
+    /** iOS allowlistDecision(...).isAllowed, Android DeliveryPolicy
+     *  .allowlisted: a DM, or a group invite, from `srcHash` (hex) is kept
+     *  when the filter is off, or when `srcHash` is an allowlisted row. */
+    allows(srcHash) {
+        return !this._on || ContactStore.allowlisted(srcHash);
+    },
+
+    /** Step 1, for the router (LXMRouter.acceptsSource): may a message from
+     *  `sourceHash` (16 bytes, straight from the decrypted plaintext) be
+     *  kept by any rule? */
+    acceptsSource(sourceHash, path) {
+        const src = Buffer.from(sourceHash).toString("hex");
+        const accepted = this.allows(src) || GroupStore.hasMember(src);
+        if (!accepted) Harness.event("privacy-drop", { src: src.slice(0, 12), path, at: "source" });
+        return accepted;
+    },
+
+    /** Step 2, for the router (LXMRouter.acceptsMessage): is this parsed
+     *  message kept? */
+    acceptsMessage(lxmfMsg, path) {
+        const src = Buffer.from(lxmfMsg.sourceHash ?? []).toString("hex");
+        let accepted;
+        if (LXMF.distroTransferKeyFromFields(lxmfMsg.fields) !== null) {
+            // An offer the user answers, checked before the allowlist on iOS
+            // (handleIncomingMessage, ChatRepository.swift:1926-1933) and
+            // Android (onMessageReceived, ChatRepository.kt:1365-1373).
+            accepted = true;
+        } else {
+            const group = LXMessage.extractGroupFields(lxmfMsg.fields);
+            accepted = group?.groupId
+                ? shouldProcessGroupMessage(group.groupAction, this.allows(src), GroupStore.get(group.groupId) !== null)
+                : this.allows(src);
+        }
+        if (!accepted) Harness.event("privacy-drop", { src: src.slice(0, 12), path, at: "message" });
+        return accepted;
+    },
+};
+PrivacyFilter.init();
 
 // =========================================================================
 //  GROUP MESSAGE STORE — per-group messages
@@ -1376,8 +1522,11 @@ const RnsClient = {
         this._connType = "exchange";
 
         // Set up LXMF router, with the Announce Display Name its announces
-        // carry (DISPLAY_NAMES.md §2.2; nil until the user sets one).
-        this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id);
+        // carry (DISPLAY_NAMES.md §2.2; nil until the user sets one) and the
+        // privacy filter, which it asks before it proves or parses anything
+        // (PrivacyFilter). Given to the constructor, so no message can reach
+        // the router before the filter is in place.
+        this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id, { filter: PrivacyFilter });
         this._lxmfRouter.setAnnounceName(OwnNames.announce);
         this._lxmfRouter.on("message", (lxmfMsg) => {
             const srcHash = lxmfMsg.sourceHash?.toString("hex");
@@ -1385,7 +1534,9 @@ const RnsClient = {
             const title = lxmfMsg.title?.toString() ?? "";
             const ts = lxmfMsg.timestamp;
 
-            // Log EVERY incoming message BEFORE the privacy filter
+            // Every message here has passed the privacy filter: the router
+            // asked PrivacyFilter before it proved or parsed it, and a
+            // dropped one never reaches this handler.
             console.log(`[retichat] 📥 RX message: src=${srcHash?.slice(0,12) ?? "???"}... title="${title.slice(0,40)}" content="${content.slice(0,80)}" ts=${ts} fields=${lxmfMsg.fields?.size ?? 0}`);
             console.log(`[retichat]   ownHash=${RnsClient.ownHash?.slice(0,12)} msg.destHash=${lxmfMsg.destinationHash?.toString("hex")?.slice(0,12)}`);
 
@@ -1418,7 +1569,12 @@ const RnsClient = {
             // than the one that last set or cleared the name counts (§5.2
             // order: a propagated copy can land after a later direct one).
             // A sender with no row yet gets one where its message is kept:
-            // the DM below, a group message in _handleGroupMessage.
+            // the DM below, a group message in _handleGroupMessage. The name
+            // is taken after the privacy filter's decision, never before: the
+            // router asks PrivacyFilter before this handler hears of a
+            // message, so a dropped one records no name (iOS applies it only
+            // once its policy accepts the message, ChatRepository.swift
+            // handleIncomingMessage).
             const nameField = lxmfMsg.displayName; // read from the payload bytes by LXMessage.fromBytes
             const signatureState = lxmfMsg.signatureState ?? "invalid";
             if (!lxmfMsg.signatureValidated) {
@@ -1464,15 +1620,15 @@ const RnsClient = {
                 return;
             }
 
-            // Privacy filter — DISABLED for testing
-            // if (!ContactStore.isContact(srcHash)) {
-            //     console.log(`[rns] 🔒 Filtered: ${srcHash.slice(0,12)}... not in contact list`);
-            //     return;
-            // }
-
-            // Auto-create contact for unknown senders so messages appear in
-            // UI; a hidden row (a group member's, a channel poster's) is
-            // listed now that there is a conversation.
+            // The privacy filter has let this DM through (PrivacyFilter): its
+            // sender is allowlisted, or the filter is off. Either way the
+            // conversation gets a listed row so it appears in the UI; a
+            // hidden row (a group member's, a channel poster's) is listed
+            // now that there is a conversation. A row made here is not
+            // allowlisted (iOS and Android make a plain row for a sender
+            // they accept), so a stranger let in while the filter was off is
+            // dropped again once it is on, unless the user adds or answers
+            // them.
             if (!ContactStore.isContact(srcHash)) {
                 console.log(`[rns] 📇 Auto-adding contact: ${srcHash.slice(0,12)}...`);
                 ContactStore.add(srcHash);
@@ -2097,9 +2253,23 @@ const RnsClient = {
                 const destHash = lxmfData.slice(0, 16);
                 if (!destHash.equals(myDeliverHash)) { console.log(`[retichat] 📬 [3/4] ${tidHex} not for us`); continue; }
 
+                // A message this client had, delivered or dropped: the node
+                // purges it. LXMF does the same with every message a /get
+                // returns, whatever lxmf_propagation made of it
+                // (LXMRouter.py message_get_response: haves).
+                const had = () => {
+                    this._propSeenIds.add(Buffer.from(tid).toString("hex"));
+                    deliveredIds.push(tid);
+                };
                 try {
                     const decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
                     if (!decrypted || decrypted.length < 80) { console.log(`[retichat] 📬 [3/4] ${tidHex} decrypt failed`); continue; }
+                    // The privacy filter on the decrypted bytes, before any
+                    // parse, as the router applies it on every direct path
+                    // (LXMRouter.acceptsSource): a stranger's message was
+                    // downloaded (its source is inside the ciphertext) but
+                    // costs nothing more.
+                    if (!this._lxmfRouter.acceptsSource(decrypted.subarray(0, 16), "propagated")) { had(); continue; }
                     let payload;
                     try { payload = MsgPack.unpack(decrypted.slice(80)); } catch(e) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
                     if (!Array.isArray(payload) || payload.length < 3) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload shape`); continue; }
@@ -2109,10 +2279,10 @@ const RnsClient = {
                     // and the same signature check against the identity store.
                     const message = LXMessage.fromBytes(decrypted, destHash);
                     if (!message) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
+                    if (!this._lxmfRouter.acceptsMessage(message, "propagated")) { had(); continue; }
                     console.log(`[retichat] 📬 [3/4] ✅ ${tidHex} from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
                     this._lxmfRouter.emit("message", message);
-                    this._propSeenIds.add(Buffer.from(tid).toString("hex"));
-                    deliveredIds.push(tid);
+                    had();
                 } catch(e) {
                     console.warn(`[retichat] 📬 [3/4] ${tidHex} exception:`, e.message);
                 }
@@ -2169,6 +2339,11 @@ const RnsClient = {
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
 
         console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"`);
+
+        // The user wrote to them, so their answer passes the privacy filter
+        // (iOS allowlists a chat the user starts: createDirectChat,
+        // ChatRepository.swift:2481).
+        ContactStore.allow(contact.destHash);
 
         // Create the outgoing message record
         ContactStore.touch(contact.destHash);
@@ -2864,12 +3039,15 @@ const RnsClient = {
 
         const group = GroupStore.get(groupId);
         const actualSender = groupSender || srcHash;
-        // The inviter check counts the rows that were all listed contacts
-        // before hidden rows (group members, channel posters, peers sent
-        // to), not a row created below only to hold a sender's name: a
-        // leave or plain message to a group the user holds must not let its
-        // sender invite the user to others.
-        if (!shouldProcessGroupMessage(groupAction, ContactStore.mayInvite(srcHash), !!group)) {
+        // iOS groupMessagePolicy: an invite only from a source the privacy
+        // filter allows (an allowlisted contact while it is on; iOS
+        // handleGroupInvite, ChatRepository.swift:2166-2171), anything else
+        // only for a group this client holds. The router has already asked
+        // the same (PrivacyFilter.acceptsMessage); asked again here so this
+        // handler holds the rule on its own. Until 2026-09-30 any row but a
+        // name-only one could invite, channel posters and every auto-added
+        // stranger included.
+        if (!shouldProcessGroupMessage(groupAction, PrivacyFilter.allows(srcHash), !!group)) {
             console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for unknown group ${groupId.slice(0,8)}`);
             return;
         }
@@ -2899,9 +3077,17 @@ const RnsClient = {
 
         switch (groupAction) {
             case "invite": {
-                this._rememberGroupMemberKeys(memberKeys);
+                const verified = this._rememberGroupMemberKeys(memberKeys);
                 // If we already have this group active, ignore
                 if (group && group.groupStatus === "active") return;
+                // The inviter, and each co-member the invite lists whose key
+                // checked out, pass the privacy filter from now on: iOS
+                // handleGroupInvite (ChatRepository.swift:2183-2191, 2220-2221),
+                // Android handleGroupMessage (ChatRepository.kt:1545-1552,
+                // 1596-1599).
+                const listed = new Set([...(members || []), srcHash]);
+                ContactStore.allow(srcHash);
+                for (const hash of verified) if (listed.has(hash)) ContactStore.allow(hash);
                 // Create pending group entry. The inviter is named when the
                 // notice is shown, through the contact resolver: its 0xD1
                 // was already taken under §5.2 above, and the raw field is
@@ -2914,6 +3100,10 @@ const RnsClient = {
             case "accept": {
                 if (!group) return;
                 GroupStore.updateMember(groupId, actualSender, "accepted");
+                // A confirmed member passes the privacy filter: iOS
+                // handleGroupAccept (ChatRepository.swift:2260-2264), Android
+                // (ChatRepository.kt:1643-1646).
+                if (actualSender !== (this.ownHash ?? ownLxmfDestinationHash())) ContactStore.allow(actualSender);
                 GroupMsgStore.addSystem(groupId, "joined the group", actualSender);
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
                 break;
@@ -3235,11 +3425,14 @@ const RnsClient = {
         });
     },
 
+    /** Keep each member key that produces its hash as an lxmf.delivery
+     *  destination. Returns the hashes whose keys checked out. */
     _rememberGroupMemberKeys(memberKeys) {
         // The member list includes this device. Its own hash is never a
         // contact: it would show as a "yourself" row in the chat list, the
         // contacts and the group picker (audit L4).
         const ownHash = this.ownHash ?? ownLxmfDestinationHash();
+        const verified = [];
         for (const [hash, encodedPublicKey] of memberKeys || []) {
             if (hash === ownHash) continue;
             try {
@@ -3253,11 +3446,13 @@ const RnsClient = {
                 }
                 const contact = ContactStore.keep(hash);
                 contact.publicKey = publicKey.toString("hex");
+                verified.push(hash);
             } catch (error) {
                 console.warn(`[retichat] 👥 Ignored invalid member key for ${hash.slice(0,8)}:`, error.message);
             }
         }
         ContactStore._save();
+        return verified;
     },
 
     /**
@@ -4523,7 +4718,12 @@ const RnsClient = {
             }
 
             console.log(`[distro] 📥 Message from ${srcHashHex.slice(0,12)}: "${content.slice(0,60)}"`);
-            // Auto-add contact and store message
+            // Auto-add contact and store message. No privacy filter here:
+            // mail to the distro is mail to this person (iOS
+            // handleDistroMessage, Android onDistroMessageReceived). The row
+            // is listed, not allowlisted, as the phones make a plain row
+            // (ensureContact): a DM from the sender to this device's own
+            // address still needs the user to add or answer them.
             if (!ContactStore.isContact(srcHashHex)) {
                 ContactStore.add(srcHashHex);
             }
@@ -5645,6 +5845,11 @@ const App = {
                     h("div", { className: "empty-icon" }, "💬"),
                     h("h2", {}, "No conversations yet"),
                     h("p", {}, "Add a contact or create a group to start chatting privately over Reticulum."),
+                    // iOS ChatListView's empty list says the same.
+                    PrivacyFilter.on
+                        ? h("p", { className: "field-hint" },
+                            "Privacy filter is on — only messages from contacts you've added will appear. Add contacts with + Add Contact, or turn the filter off in Settings.")
+                        : null,
                     h("div", { style: { display: "flex", gap: "8px", marginTop: "8px", justifyContent: "center" } },
                         h("button", { className: "btn btn-primary",
                             onClick: () => { this.state.showAddContact = true; this.render(); } },
@@ -6143,8 +6348,10 @@ const App = {
         for (const memberHash of group.members.keys()) {
             if (memberHash === RnsClient.ownHash) continue;
             // Members are kept (their key, their names), not listed as
-            // contacts (audit L4).
-            ContactStore.keep(memberHash);
+            // contacts (audit L4), and pass the privacy filter: iOS
+            // acceptGroupInvite (ChatRepository.swift:1543-1548), Android
+            // (ChatRepository.kt:1772-1773).
+            ContactStore.allow(memberHash);
             RnsClient._requestGroupPeer(memberHash);
         }
         GroupMsgStore.addSystem(groupId, `You joined "${group.groupName}"`);
@@ -6336,6 +6543,30 @@ const App = {
                 nameField("cfg-channel-name", "Channel Display Name", OwnNames.channel,
                     "Shown on your channel posts. Anyone who can read a channel can see it. Leave empty to post without a name.",
                     (v) => OwnNames.setChannel(v)),
+            ),
+        );
+
+        // ---- Privacy (iOS SettingsView privacySection, Android
+        // SettingsScreen "Privacy" card: the same words) ----
+        // Applied at once, like the theme: the router asks the filter at
+        // every delivery.
+        body.appendChild(
+            h("div", { className: "settings-section compact" },
+                h("h3", {}, "Privacy"),
+                h("div", { className: "settings-row" },
+                    h("span", { className: "row-label" }, "Privacy filter"),
+                    h("label", { className: "toggle" },
+                        h("input", {
+                            id: "cfg-privacy-filter",
+                            type: "checkbox",
+                            checked: PrivacyFilter.on,
+                            onChange: (e) => { PrivacyFilter.set(e.target.checked); },
+                        }),
+                        h("span", { className: "slider" }),
+                    ),
+                ),
+                h("div", { className: "field-hint" },
+                    "Only accept messages from contacts you have explicitly added"),
             ),
         );
 
@@ -6722,7 +6953,10 @@ const App = {
                 return;
             }
             try {
+                // The user added it: listed and allowlisted (iOS
+                // createDirectChat, Android addContact).
                 ContactStore.add(hash, false, publicKey);
+                ContactStore.allow(hash);
                 this._requestPathForContact(hash);
                 this.state.showAddContact = false;
                 this.render();
@@ -6996,7 +7230,10 @@ const App = {
             hash = hash.replace(/[^0-9a-f]/g, "");
             if (hash.length !== 32) { alert("Destination hash must be exactly 32 hex characters."); return; }
             try {
+                // The user added it: listed and allowlisted (iOS
+                // createDirectChat, Android addContact).
                 ContactStore.add(hash, false, publicKey);
+                ContactStore.allow(hash);
                 this._requestPathForContact(hash);
                 this.state.showNewConversation = false;
                 this.render();
@@ -7057,6 +7294,9 @@ const App = {
             scroll.querySelectorAll(".group-member-check:checked").forEach(cb => selected.push(cb.value));
             if (selected.length === 0) { alert("Select at least one member."); return; }
             const group = GroupStore.create(name, selected);
+            // Co-members pass the privacy filter: iOS createGroupChat
+            // (ChatRepository.swift:2532-2536), Android (ChatRepository.kt:404-405).
+            for (const hash of selected) ContactStore.allow(hash);
             GroupMsgStore.addSystem(group.groupId, `Group "${name}" created`);
             RnsClient.sendGroupInvites(group.groupId, name, selected)
                 .catch(e => console.warn("Group invite send failed:", e.message));
@@ -7614,9 +7854,23 @@ window.RetichatTest = {
      *  announce, which can be minutes away. */
     addPeer(destHash, publicKeyHex) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
+        // As the Add Contact flow does: listed and allowlisted, so the
+        // privacy filter (on by default) keeps the peer's messages.
         ContactStore.add(destHash, false, publicKeyHex || null);
+        ContactStore.allow(destHash);
         if (!publicKeyHex) App._requestPathForContact(destHash);
         return ContactStore.get(destHash);
+    },
+
+    /** The privacy filter (Settings "Privacy filter"): with no argument,
+     *  whether it is on; with a boolean, turn it on or off (persisted, as
+     *  the toggle does) and return the new state. A stage that needs a
+     *  stranger's message kept turns it off first; debug.html?privacy=0
+     *  does it before the page boots. Drops are recorded as Harness events
+     *  of kind "privacy-drop" ({src, path, at: "source"|"message"}). */
+    privacyFilter(on) {
+        if (on !== undefined) PrivacyFilter.set(on);
+        return PrivacyFilter.on;
     },
 
     /** True once a received message contains `marker` (optionally via "direct"|"distro"). */
@@ -7665,7 +7919,8 @@ Harness (headless):
   .identity()     — own identity + destination hashes
   .inbox          — received messages [{srcHash, content, via}]
   .got(marker)    — true if a message containing marker arrived
-  .addPeer(h,pk)  — seed a peer's public key
+  .addPeer(h,pk)  — add a peer (allowlisted), optionally with its public key
+  .privacyFilter([on]) — read, or turn on/off, the privacy filter
   .distro()       — distro identity state
   .generateDistro() / .adoptDistro(privHex) / .pullDistro()
   .tab()          — "active" | "inactive" (one active tab per identity)
@@ -7701,6 +7956,7 @@ Harness (headless):
             displayName: ContactStore.name(c.destHash),
             localName: c.localName, messageName: c.messageName, announceName: c.announceName,
             legacyName: c.legacyName, hidden: !!c.hidden, nameOnly: !!c.nameOnly,
+            allowlisted: c.allowlisted === true,
             hasPublicKey: !!c.publicKey,
             pkPreview: c.publicKey?.slice(0,12) + '...' || 'NONE',
             lastSeen: c.lastSeen ? new Date(c.lastSeen).toLocaleString() : 'never',

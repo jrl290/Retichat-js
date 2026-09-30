@@ -547,7 +547,7 @@ function makeDmClient(iface) {
     const propagationLinks = [];
     const env = {
         MsgStore, Harness, console: { log() {}, warn() {}, error() {} },
-        ContactStore: { touch() {}, setReachable() {}, propagationDelay: () => 5 },
+        ContactStore: { touch() {}, setReachable() {}, propagationDelay: () => 5, allow() {} },
         setTimeout: (fn, ms) => { const timer = { fn, ms }; appTimers.push(timer); return timer; },
         clearTimeout: (timer) => { if (timer !== undefined) cleared.push(timer); },
         Identity, Buffer, Destination, LXMessage, Link, Packet, crypto: globalThis.crypto,

@@ -119,6 +119,17 @@ function contactStore(storage) {
     return store;
 }
 const msgStore = (storage) => build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });
+const groupPolicy = () => fn("shouldProcessGroupMessage", "groupAction, inviterAllowed, groupExists", {});
+/** The real PrivacyFilter over `storage` (on unless stored off), as a page
+ *  load builds it. */
+function privacyFilter(storage, ContactStore, GroupStore) {
+    const filter = build("PrivacyFilter", {
+        sGet: storage.sGet, sSet: storage.sSet, ContactStore, GroupStore, Harness, LXMF, LXMessage, Buffer,
+        shouldProcessGroupMessage: groupPolicy(),
+    });
+    filter.init();
+    return filter;
+}
 
 // ── §5.4 / §5.1 contacts ───────────────────────────────────────────────────
 
@@ -921,7 +932,10 @@ test("§5.2 a message fetched from the propagation node is verified and named by
         const link = { status: ACTIVE, sendRequest: (path, data) => data };
         const self = {
             _propLink: link,
-            _lxmfRouter: { destination: { hash: myHash }, emit: (event, message) => handle(message) },
+            _lxmfRouter: {
+                destination: { hash: myHash }, emit: (event, message) => handle(message),
+                acceptsSource: () => true, acceptsMessage: () => true,   // no privacy filter here
+            },
             async _waitForResponse(l, request) {
                 if (request[0] === null && request[1] === null) return ids;
                 if (request[0]) return [stored[request[0][0][0]]];
@@ -1084,6 +1098,7 @@ function makeGroupReceiver(me, memberHashes) {
         addSystem: (id, content, actor) => notices.push({ dir: "system", content, actor }),
         add: (id, m) => posts.push(m),
     };
+    const PrivacyFilter = privacyFilter(memory(), r.ContactStore, GroupStore);
     const own = () => lxmfHash(me);
     r.self.ownHash = own();
     r.self._performGroupRelay = () => {};
@@ -1092,11 +1107,11 @@ function makeGroupReceiver(me, memberHashes) {
     })(r.self);
     r.self._handleGroupMessage = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
         GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, ownLxmfDestinationHash: own,
-        shouldProcessGroupMessage: fn("shouldProcessGroupMessage", "groupAction, inviterKnown, groupExists", {}),
+        shouldProcessGroupMessage: groupPolicy(), PrivacyFilter,
     })(r.self);
     const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
     const groupLabel = fn("groupSenderLabel", "m", { ContactStore: r.ContactStore });
-    return { ...r, groups, notices, posts, systemText, groupLabel };
+    return { ...r, groups, notices, posts, systemText, groupLabel, PrivacyFilter };
 }
 const groupFields = (name, action = null, extra = []) => new Map([
     ...(name === null ? [] : [[0xD1, new Map([[0, Buffer.from(name)]])]]),
@@ -1121,6 +1136,8 @@ test("§5.2 a group member with no row still gets its name: a hidden row, named 
     assert.equal(r.ContactStore.name(C), "Carol", "the member list's resolver");
     assert.equal(r.ContactStore.isContact(C), false, "not a contact");
     assert.equal(r.ContactStore.listed().some((c) => c.destHash === C), false, "not in the contact list (audit L4)");
+    assert.equal(r.ContactStore.allowlisted(C), true,
+        "a member's accept allowlists it (iOS handleGroupAccept, Android ACCEPT); the row stays hidden");
 
     // The key arrives: later messages are validated and rename her, in order.
     r.ContactStore.get(C).publicKey = carol.getPublicKey().toString("hex");
@@ -1137,11 +1154,11 @@ test("§5.2 a group member with no row still gets its name: a hidden row, named 
     assert.equal(r.ContactStore.get(C).publicKey, carol.getPublicKey().toString("hex"));
 });
 
-test("§5.2 a message the group branch drops creates no row; a member's hidden row still counts to invites", () => {
-    const me = Identity.create(), dave = Identity.create(), bob = Identity.create();
+test("§5.2 a message the group branch drops creates no row; an invite needs an allowlisted inviter", () => {
+    const me = Identity.create(), dave = Identity.create(), bob = Identity.create(), alice = Identity.create();
     const r = makeGroupReceiver(me, []);
-    const D = lxmfHash(dave), B = lxmfHash(bob);
-    const other = "8".repeat(32);
+    const D = lxmfHash(dave), B = lxmfHash(bob), A = lxmfHash(alice);
+    const other = "8".repeat(32), third = "7".repeat(32), fourth = "6".repeat(32);
     r.deliver(lxm(dave, me, "", new Map([[0xD1, new Map([[0, Buffer.from("Dave")]])], [GROUP_FIELDS.GROUP_ID, other],
         [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${D},${lxmfHash(me)}`]])));
     assert.equal(r.groups.has(other), false, "a stranger's invite is dropped, as before");
@@ -1149,18 +1166,49 @@ test("§5.2 a message the group branch drops creates no row; a member's hidden r
     r.deliver(lxm(dave, me, "to an unknown group", new Map([[0xD1, new Map([[0, Buffer.from("Dave")]])], [GROUP_FIELDS.GROUP_ID, other]])));
     assert.equal(r.ContactStore.get(D), null);
 
-    // Bob is a member of another group: his key arrived with its invite, so
-    // he has a hidden row. An invite from him is processed, as when every
-    // such row was a listed contact.
+    // A key alone vouches for nothing: Bob's arrived with some invite and
+    // gives him a hidden row, but he is not allowlisted, so while the
+    // filter is on his invite is dropped (until 2026-09-30 any such row
+    // could invite).
     r.self._rememberGroupMemberKeys([[B, bob.getPublicKey().toString("base64")]]);
-    assert.equal(r.ContactStore.get(B).hidden, true);
-    r.deliver(lxm(bob, me, "", new Map([[0xD1, new Map([[0, Buffer.from("Bob")]])], [GROUP_FIELDS.GROUP_ID, other],
-        [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${B},${lxmfHash(me)}`]])));
-    assert.equal(r.groups.get(other)?.groupStatus, "pending", "the invite from a known member arrives");
-    assert.equal(r.systemText(r.notices.at(-1)), "Bob invited you to \"Group\"", "named by the validated 0xD1");
+    assert.deepEqual([r.ContactStore.get(B).hidden, r.ContactStore.allowlisted(B)], [true, false]);
+    const inviteFrom = (who, groupId, members) => lxm(who, me, "", new Map([[0xD1, new Map([[0, Buffer.from("Inviter")]])],
+        [GROUP_FIELDS.GROUP_ID, groupId], [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, members],
+        [GROUP_FIELDS.GROUP_MEMBER_KEYS, `${B}:${bob.getPublicKey().toString("base64")}`]]));
+    r.deliver(inviteFrom(bob, other, `${B},${lxmfHash(me)}`));
+    assert.equal(r.groups.has(other), false, "a member's hidden row does not vouch for an invite");
+
+    // Alice is a contact the user added: her invite is processed, and she
+    // and the co-member whose key checked out (Bob) pass the filter from
+    // now on (iOS handleGroupInvite, Android INVITE).
+    r.ContactStore.add(A, false, alice.getPublicKey().toString("hex"));
+    r.ContactStore.allow(A);
+    r.deliver(inviteFrom(alice, other, `${A},${B},${lxmfHash(me)}`));
+    assert.equal(r.groups.get(other)?.groupStatus, "pending", "the invite from an allowlisted contact arrives");
+    assert.equal(r.ContactStore.allowlisted(B), true, "the co-member whose key checked out is allowlisted");
+    assert.equal(r.ContactStore.get(B).hidden, true, "and still not listed (audit L4)");
+    r.deliver(inviteFrom(bob, third, `${B},${lxmfHash(me)}`));
+    assert.equal(r.groups.get(third)?.groupStatus, "pending", "now Bob's own invite arrives");
+    assert.equal(r.systemText(r.notices.at(-1)), "Inviter invited you to \"Group\"", "named by the validated 0xD1");
+
+    // A key for a hash the invite does not list is kept but not allowlisted
+    // (iOS: memberList.contains).
+    const eve = Identity.create(), E = lxmfHash(eve);
+    r.deliver(lxm(alice, me, "", new Map([[GROUP_FIELDS.GROUP_ID, fourth], [GROUP_FIELDS.GROUP_ACTION, "invite"],
+        [GROUP_FIELDS.GROUP_MEMBERS, `${A},${lxmfHash(me)}`],
+        [GROUP_FIELDS.GROUP_MEMBER_KEYS, `${E}:${eve.getPublicKey().toString("base64")}`]])));
+    assert.equal(r.groups.get(fourth)?.groupStatus, "pending");
+    assert.deepEqual([!!r.ContactStore.get(E)?.publicKey, r.ContactStore.allowlisted(E)], [true, false]);
+
+    // With the filter off, as on iOS (allowlistDecision: filter-disabled),
+    // an invite is processed whoever sends it.
+    r.PrivacyFilter.set(false);
+    r.deliver(inviteFrom(dave, "5".repeat(32), `${D},${lxmfHash(me)}`));
+    assert.equal(r.groups.get("5".repeat(32))?.groupStatus, "pending", "filter off: a stranger's invite arrives");
+    assert.equal(r.ContactStore.allowlisted(D), true, "and the inviter passes the filter from now on (iOS handleGroupInvite)");
 });
 
-test("§5.2 a row created only for a group sender's name never lets that sender invite", () => {
+test("§5.2 a row created only for a group sender's name never lets that sender invite; allowlisting does", () => {
     const me = Identity.create(), zed = Identity.create();
     const r = makeGroupReceiver(me, []);
     const Z = lxmfHash(zed);
@@ -1173,33 +1221,35 @@ test("§5.2 a row created only for a group sender's name never lets that sender 
     // names him on a hidden row...
     const t = tick() + 1000;
     r.deliver(lxm(zed, me, "", groupFields("Zed", "leave", [[GROUP_FIELDS.GROUP_SENDER, Z]]), zed, t));
-    assert.deepEqual([r.ContactStore.get(Z)?.messageName, r.ContactStore.get(Z)?.hidden], ["Zed", true]);
-    assert.equal(r.ContactStore.mayInvite(Z), false, "a name-only row");
-    // ...but his invites are still dropped, as when he had no row at all.
+    assert.deepEqual([r.ContactStore.get(Z)?.messageName, r.ContactStore.get(Z)?.hidden, r.ContactStore.get(Z)?.nameOnly], ["Zed", true, true]);
+    assert.equal(r.ContactStore.allowlisted(Z), false, "a name-only row is not allowlisted");
+    // ...but his invites are still dropped.
     r.deliver(invite(other, t + 1));
     assert.equal(r.groups.has(other), false, "the name-only row does not vouch for an invite");
     assert.equal(r.notices.some((n) => /invited you/.test(n.content)), false, "no invite notice");
 
-    // His key arriving as a member (the path that always created a row)
-    // makes the row count, as before hidden rows.
+    // His key arriving as a member does not make the row count either.
     r.self._rememberGroupMemberKeys([[Z, zed.getPublicKey().toString("base64")]]);
-    assert.equal(r.ContactStore.mayInvite(Z), true);
-    assert.equal(r.ContactStore.get(Z).messageName, "Zed", "the name is kept");
+    assert.equal(r.ContactStore.get(Z).nameOnly, false, "the key clears the name-only mark");
     r.deliver(invite(third, t + 2));
+    assert.equal(r.groups.has(third), false, "a key is no allowlisting");
+
+    // The user allowlisting him (adding him, writing to him) does.
+    r.ContactStore.allow(Z);
+    assert.equal(r.ContactStore.get(Z).messageName, "Zed", "the name is kept");
+    r.deliver(invite(third, t + 3));
     assert.equal(r.groups.get(third)?.groupStatus, "pending");
 
-    // Adding a name-only row by hand also makes it count; stored rows without
-    // the mark count, as every row did before.
+    // allow() on a name-only row clears the mark and is persisted; it
+    // leaves the row hidden.
     const s = memory();
     const store = contactStore(s);
     store.keep(Z, null, true);
-    assert.equal(store.mayInvite(Z), false);
-    assert.equal(contactStore(s).mayInvite(Z), false, "the mark is persisted");
-    store.add(Z);
-    assert.deepEqual([store.mayInvite(Z), store.isContact(Z)], [true, true]);
-    s.sSet("contacts_v2", [{ destHash: Z, localName: null, messageName: null, announceName: null, legacyName: null, hidden: true, lastSeen: 1 }]);
-    assert.equal(contactStore(s).mayInvite(Z), true);
-    assert.equal(store.mayInvite("6".repeat(32)), false, "no row, no invite");
+    assert.equal(contactStore(s).get(Z).nameOnly, true, "the mark is persisted");
+    store.allow(Z);
+    assert.deepEqual([store.get(Z).nameOnly, store.allowlisted(Z), store.isContact(Z)], [false, true, false]);
+    assert.equal(contactStore(s).allowlisted(Z), true, "persisted");
+    assert.equal(store.allowlisted("6".repeat(32)), false, "no row, not allowlisted");
 });
 
 test("audit L4: group members and channel posters are kept as hidden rows, never listed as contacts", () => {
@@ -1224,6 +1274,8 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     store.keep(A, alice.getPublicKey().toString("hex"));
     accept({ render() {} })(GROUP);
     assert.deepEqual([store.get(A).hidden, store.get(B).hidden], [true, true]);
+    assert.deepEqual([store.allowlisted(A), store.allowlisted(B)], [true, true],
+        "and allowlisted: every member passes the privacy filter (iOS acceptGroupInvite, Android)");
     assert.equal(store.get(lxmfHash(me)), null, "never this device");
     assert.deepEqual(store.listed(), []);
 

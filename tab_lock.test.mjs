@@ -499,6 +499,7 @@ async function runConnect({ held, takenOverWhileLoading = false }) {
         Reticulum: class { constructor() { this.interfaces = []; } addInterface(i) { this.interfaces.push(i); made.push("addInterface"); } },
         PostInterface: class { constructor() { made.push("PostInterface"); } on() {} },
         LXMRouter: class { constructor() { throw STOP; } },
+        PrivacyFilter: {},
     };
     const self = { _setStatus() {}, _followExchange() {} };
     let outcome;

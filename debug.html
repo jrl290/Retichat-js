@@ -43,6 +43,8 @@
  *   ?name=<string>       Message Display Name (DISPLAY_NAMES.md §1)
  *   ?iface=<string>      PostInterface name registered on the PHP node
  *   ?reset=1             clear all retichat_* keys before seeding
+ *   ?privacy=0|1         privacy filter off / on (app default: on); a stage
+ *                        that needs a stranger's message kept passes 0
  * ------------------------------------------------------------------------- */
 (function () {
   var P = new URLSearchParams(location.search);
@@ -74,6 +76,11 @@
 
   var iface = P.get("iface");
   if (iface) put("interfaceName", iface);
+
+  // app.js PrivacyFilter reads retichat_filterStrangers (absent: on).
+  var privacy = P.get("privacy");
+  if (privacy === "0") put("filterStrangers", false);
+  else if (privacy === "1") put("filterStrangers", true);
 
   // Surface uncaught failures to the driver rather than only the console.
   window.__bootErrors = [];
