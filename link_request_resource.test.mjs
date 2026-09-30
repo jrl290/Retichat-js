@@ -59,7 +59,8 @@ function lift(signature, self, globals) {
 
 class WireOnly {
     constructor() {
-        this.rtt = 0.05;
+        this.rtt = 50;                 // ms, as Link.rtt
+        this.status = 0x02;            // Link.ACTIVE
         this.hash = Buffer.alloc(16, 0xAB);
         this.attachedInterface = { name: "fake" };
         this.incomingResources = [];

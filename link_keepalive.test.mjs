@@ -347,7 +347,7 @@ test("every link send updates lastOutbound; only a keepalive updates lastKeepali
         assert.ok(link.lastOutbound > 0, `${name} updates lastOutbound`);
         assert.equal(link.lastKeepalive, 7, `${name} is not a keepalive`);
     }
-    for (const r of [...link.outgoingResources]) r.fail("test over");
+    for (const r of [...link.outgoingResources]) r.cancel("test over");
 
     link.lastOutbound = 0;
     link._sendKeepalive();
