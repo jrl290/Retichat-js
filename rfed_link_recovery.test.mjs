@@ -604,6 +604,67 @@ test("an exchange outage that times out rfed.link: nothing starts while it is do
     assert.equal(c.self._rfedReopenArmed.has("link"), true, "and is armed for its own next close");
 });
 
+test("a late close of an attempt disconnect() dropped leaves the newer attempt, its state and its bindings alone", async () => {
+    // disconnect() clears _rfedLinks and _rfedLinkPromises but closes only
+    // the links in _rfedLinks: one still establishing fails later, on its
+    // own establishment timeout, possibly after reconnect() started the next.
+    const disconnect = (c) => { c.self._rfedLinks.clear(); c.self._rfedLinkPromises.clear(); c.self._rfedStreamPromises.clear(); };
+
+    const c = makePersistent();
+    c.self._ensureRfedLink(["link"]).catch(() => {});
+    disconnect(c);
+    const next = c.self._ensureRfedLink(["link"]);
+    await c.closeUnder(c.links[0], Link.TIMEOUT); // the dropped attempt times out
+    assert.equal(c.self._rfedLinkPromises.get("link"), next, "the newer attempt is still the one in flight");
+    assert.equal(c.self._rfedLinkState.get("link"), APP_CONSTS.RFED_LINK_ESTABLISHING, "and its state is its own");
+    assert.equal(c.self._redriveRfedLink("link", "online"), false, "so an event starts no second link beside it");
+    assert.equal(c.links.length, 2);
+    await c.establish(c.links[1]);
+    assert.equal(await next, c.links[1]);
+
+    // The newer link is up and bound when the dropped one times out.
+    const b = makePersistent();
+    b.self._ensureRfedLink(["link"]).catch(() => {});
+    disconnect(b);
+    const live = await b.up();
+    const channelHash = b.channelRows[0].channelHash;
+    assert.ok(b.self._rfedStreamPromises.has(channelHash), "the live link bound the opened channel");
+    await b.closeUnder(b.links[0], Link.TIMEOUT);
+    assert.equal(b.self._rfedLinks.get("link"), live);
+    assert.equal(b.self._rfedLinkState.get("link"), APP_CONSTS.RFED_LINK_ESTABLISHED);
+    assert.ok(b.self._rfedStreamPromises.has(channelHash),
+        "its binding memo is kept: dropping it would re-send /channel/stream/open on a link that holds the binding");
+    assert.equal(b.links.length, 2, "and nothing re-opens");
+});
+
+test("a distro pull that fails on a dead rfed.link parks the link's re-open, and the link that brings back pulls the distro", async () => {
+    const c = makePersistent({ opened: [], distro: true });
+    Object.assign(c.self, { _distroPullInFlight: null, _handleDistroBlob: () => true });
+    // The mapped /distro/pull travels on rfed.link (RFED_LINK_PATHS).
+    c.self._rfedRequest = async (aspects, path) => {
+        await c.self._ensureRfedLink(["link"]);
+        c.calls.push(`request ${aspects.join(".")}:${path}`);
+        return [[], false];
+    };
+    c.self._pullDistroMessages = compileMethod("async _pullDistroMessages()", c.env)(c.self);
+
+    const pull = c.self._pullDistroMessages();
+    assert.equal(c.links.length, 1);
+    await c.closeUnder(c.links[0], Link.TIMEOUT); // the LINKREQUEST or its proof was lost
+    assert.deepEqual(await pull, []);
+    assert.equal(c.self._rfedLinkState.get("link"), APP_CONSTS.RFED_LINK_FAILED);
+    assert.equal(c.self._rfedPending.get("link")?.label, "rfed.link re-open",
+        "the link's re-open is parked, whose \"established\" pulls the distro");
+    assert.equal(c.self._rfedPending.has("distro.register"), false, "not a pull parked under a key no mapped pull fails on");
+
+    c.self._rfedRunPending("link"); // the rfed.link announce
+    await settle();
+    assert.equal(c.links.length, 2, "one attempt");
+    await c.establish(c.links[1]);
+    assert.deepEqual(c.calls.filter((x) => x.startsWith("request")), ["request distro.register:/rfed/pull"],
+        "the new link pulls the distro");
+});
+
 test("the persistent-link paths schedule nothing", () => {
     for (const signature of PERSISTENT_METHODS.concat(["_hookPageLifecycle()", "_unhookPageLifecycle()", "async _pullDistroMessages()", "_followExchange(iface)"])) {
         assert.doesNotMatch(extractMethod(signature), /setTimeout|setInterval/,

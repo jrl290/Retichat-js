@@ -3640,15 +3640,23 @@ const RnsClient = {
                 // outcome is recorded as a state rather than vanishing.
                 const current = this._rfedLinks.get(key) === link;
                 if (current) this._rfedLinks.delete(key);
-                // Link.md: the binding dies with the link. The channel-stream
-                // memo is per channel, not per link, so it must be dropped
-                // here or the next link never re-sends /channel/stream/open
-                // and every /delivery silently goes to the deferred queue.
-                if (key === "link" || key === "channel.stream") this._rfedStreamPromises.clear();
                 // Only this link's own attempt: a late close of a link
-                // disconnect() dropped must not forget a newer one.
-                if (this._rfedLinkPromises.get(key) === promise) this._rfedLinkPromises.delete(key);
-                this._rfedLinkState.set(key, established ? RFED_LINK_IDLE : RFED_LINK_FAILED);
+                // disconnect() dropped (one still establishing is not closed
+                // by it, and fails on its own timeout) must not touch the
+                // newer attempt: forgetting it lets the next re-drive start a
+                // second link beside it, and its state and bindings are not
+                // this link's. disconnect() cleared all three itself.
+                const own = this._rfedLinkPromises.get(key) === promise;
+                if (own) {
+                    // Link.md: the binding dies with the link. The
+                    // channel-stream memo is per channel, not per link, so it
+                    // must be dropped here or the next link never re-sends
+                    // /channel/stream/open and every /delivery silently goes
+                    // to the deferred queue.
+                    if (key === "link" || key === "channel.stream") this._rfedStreamPromises.clear();
+                    this._rfedLinkPromises.delete(key);
+                    this._rfedLinkState.set(key, established ? RFED_LINK_IDLE : RFED_LINK_FAILED);
+                }
                 if (!established) reject(new Error(`RFed ${key} link closed before establishment`));
                 // A persistent link that was up and closed under us is
                 // re-opened once (RFED_PERSISTENT_KEYS). Not one that

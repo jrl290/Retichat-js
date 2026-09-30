@@ -71,8 +71,13 @@ test("channel stream bindings are dropped when the link that held them closes", 
     // The rfed.link close handler is the one with the janitor comment.
     const start = source.indexOf("The janitor, mirroring LXMRouter.jobs()");
     assert.notEqual(start, -1);
-    const closeHandler = source.slice(start, start + 1200);
-    assert.match(closeHandler, /_rfedStreamPromises\.clear\(\)/);
+    const end = source.indexOf("this._rfedLinkPromises.set(key, promise);", start);
+    assert.notEqual(end, -1);
+    const closeHandler = source.slice(start, end);
+    // The link's own attempt only: a late close of a link disconnect()
+    // dropped must not drop the bindings of the link that replaced it
+    // (rfed_link_recovery.test.mjs runs both cases).
+    assert.match(closeHandler, /if \(own\) \{[^}]*_rfedStreamPromises\.clear\(\)/);
 });
 
 test("a new rfed.link re-binds the channel stream, from its established handler", () => {
