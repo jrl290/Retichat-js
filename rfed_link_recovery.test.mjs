@@ -21,8 +21,9 @@
 //   - a janitor clearing CLOSED links, like LXMRouter.jobs()
 //   - re-entry driven by an EVENT — the reference re-calls
 //     request_messages_from_propagation_node() when a path appears
-//     (__request_messages_path_job); we re-drive when the service announces,
-//     since rfed re-announces every service every 15 minutes
+//     (__request_messages_path_job); we re-drive when the service announces
+//     (every 6 hours since RFed-rust b5ba134, 2026-09-23; 15 minutes before),
+//     and the persistent links also when the exchange or the page comes back
 //
 // These tests run the real shipped methods against stubs.
 
@@ -228,7 +229,7 @@ const PERSISTENT_METHODS = [
     "_onRfedLinkClosed(key, link)", "_redriveRfedLink(key, trigger)", "_rebindChannelStream()",
     "_pullOpenedChannels(trigger, generation = null)", "_rfedLinkKeyFor(aspects, path)", "_closeRefusedRfedLink(key, what)",
     "_rfedDeferUntilAnnounce(key, label, run)", "_rfedRunPending(key)", "_onPageResume(trigger)",
-    "async pullChannel(channelName)", "async openChannel(channelName)",
+    "async pullChannel(channelName)", "async openChannel(channelName)", "_exchangeIsDown()",
 ];
 
 /**
@@ -279,8 +280,10 @@ function makePersistent({ channels = ["general"], opened = channels, distro = fa
         MsgPack, Buffer, Date, console: console_, setTimeout: noTimers, setInterval: noTimers,
     };
     const calls = [];
+    // The connection's one exchange interface; a test takes it down.
+    const exchange = { isDown: false };
     const self = {
-        _rns: {},
+        _rns: { interfaces: [exchange] },
         _cfg: { rfedNodeHash: "c".repeat(32) },
         _rfedLinks: new Map(),
         _rfedLinkPromises: new Map(),
@@ -330,7 +333,7 @@ function makePersistent({ channels = ["general"], opened = channels, distro = fa
         await pending;
         return links.at(-1);
     };
-    return { self, links, calls, log, env, ActiveTab, DistroManager, channelRows, establish, closeUnder, up };
+    return { self, links, calls, log, env, exchange, ActiveTab, DistroManager, channelRows, establish, closeUnder, up };
 }
 
 test("an established rfed.link that closes under us re-opens exactly once", async () => {
@@ -556,8 +559,53 @@ test("rfed.link refuses a push larger than a message at LXMF's delivery limit, a
     assert.equal(c.links[1].maxRequestSize, null);
 });
 
+test("an exchange outage that times out rfed.link: nothing starts while it is down, and its return re-opens the link once and pulls", async () => {
+    // Review of 2026-09-30: the re-open after the TIMEOUT went out while the
+    // exchange was down, its LINKREQUEST was lost (PostInterface.sendData),
+    // and the failed attempt was parked for an rfed.link announce that comes
+    // every 6 h, while the intent expires in 45 min. A visible, idle tab
+    // then got no live channel or distro pushes until the user did something.
+    const c = makePersistent({ distro: true });
+    // The exchange as PostInterface presents it: isDown, and "up"/"down" events.
+    const iface = new EventTarget();
+    iface.on = (type, fn) => iface.addEventListener(type, () => fn());
+    c.self._rns.interfaces = [iface];
+    const exchange = (up) => {
+        iface.isDown = !up;
+        iface.dispatchEvent(new Event(up ? "up" : "down"));
+    };
+    Object.assign(c.self, { _setStatus() {}, _onExchangeRegistered() {}, _onPacketsLost() {} });
+    compileMethod("_followExchange(iface)", c.env)(c.self)(iface);
+    exchange(true); // the connection's first "up"
+
+    const first = await c.up();
+    c.calls.length = 0;
+    exchange(false);
+    await c.closeUnder(first, Link.TIMEOUT); // the keepalive watchdog
+    assert.equal(c.links.length, 1, "no LINKREQUEST into a down exchange: it would be lost, and the doomed attempt would swallow the exchange's return");
+    assert.equal(c.self._rfedPending.has("link"), false, "and nothing parked for an announce hours away");
+    assert.ok(c.log.log.some((l) => /so is the exchange/.test(l)), "it says why");
+
+    // The page comes online first; the exchange is still down (its own check() decides).
+    c.self._onPageResume("online");
+    await settle();
+    assert.equal(c.links.length, 1, "still nothing while it is down");
+
+    exchange(true); // the exchange is back
+    await settle();
+    assert.equal(c.links.length, 2, "one re-open on the exchange's return");
+    exchange(true);
+    await settle();
+    assert.equal(c.links.length, 2, "an up with no down before it is not a return");
+    await c.establish(c.links[1]);
+    assert.deepEqual(c.calls.filter((x) => !x.startsWith("prop-")),
+        ["distro-bind", "stream-open", "request channel.pull:/rfed/pull", "distro-pull"],
+        "the new link re-binds, then pulls what the node deferred during the outage");
+    assert.equal(c.self._rfedReopenArmed.has("link"), true, "and is armed for its own next close");
+});
+
 test("the persistent-link paths schedule nothing", () => {
-    for (const signature of PERSISTENT_METHODS.concat(["_hookPageLifecycle()", "_unhookPageLifecycle()", "async _pullDistroMessages()"])) {
+    for (const signature of PERSISTENT_METHODS.concat(["_hookPageLifecycle()", "_unhookPageLifecycle()", "async _pullDistroMessages()", "_followExchange(iface)"])) {
         assert.doesNotMatch(extractMethod(signature), /setTimeout|setInterval/,
             `${signature}: a re-open or a pull follows an event, never a clock (DESIGN_PRINCIPLES §3)`);
     }

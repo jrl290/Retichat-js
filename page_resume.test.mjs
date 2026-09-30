@@ -16,6 +16,12 @@
  * down, and pulls on one that is up. Only the tab holding the identity does
  * anything.
  *
+ * The exchange coming back after it went down is the same event
+ * (_followExchange), the web's interface up-edge (app-links
+ * interface_online): without it an outage long enough to time the links out
+ * left a visible, idle tab without them, since rfed announces every 6 h.
+ * While the exchange is down nothing is re-driven (_exchangeIsDown).
+ *
  * These run the real shipped method bodies from app.js against stubs.
  * Run: node --test page_resume.test.mjs
  */
@@ -165,8 +171,57 @@ test("a tab without the lock, or a stopped connection, does nothing on resume", 
     assert.deepEqual(stopped.calls, []);
 });
 
+/** _followExchange over a stand-in exchange that emits as PostInterface does. */
+function makeExchange() {
+    const listeners = new Map();
+    const iface = { on: (type, fn) => listeners.set(type, [...(listeners.get(type) ?? []), fn]) };
+    const emit = (type, arg) => (listeners.get(type) ?? []).forEach((fn) => fn(arg));
+    const statuses = [];
+    const resumes = [];
+    const self = {
+        _rns: { interfaces: [iface] },
+        _setStatus: (s) => statuses.push(s),
+        _onExchangeRegistered() {},
+        _onPacketsLost() {},
+        _onPageResume: (trigger) => resumes.push(trigger),
+    };
+    compile("_followExchange(iface)", {})(self)(iface);
+    return { self, emit, statuses, resumes };
+}
+
+test("the exchange coming back resumes the persistent links; its first \"up\" is initialization", () => {
+    const x = makeExchange();
+    x.emit("up");
+    assert.deepEqual(x.resumes, [], "the connection's first up: the registration and the announces drive the start (§5)");
+    x.emit("down", "fetch failed");
+    assert.deepEqual(x.resumes, [], "going down re-drives nothing");
+    x.emit("up");
+    assert.deepEqual(x.resumes, ["exchange back"], "back after an outage: the web's interface up-edge (app-links interface_online)");
+    assert.deepEqual(x.statuses, ["online", "offline", "online"], "the status dot still follows the exchange");
+    x.emit("up");
+    assert.deepEqual(x.resumes, ["exchange back"], "an up with no down before it is not a return");
+    x.emit("down", "a");
+    x.emit("down", "b");
+    x.emit("up");
+    assert.deepEqual(x.resumes, ["exchange back", "exchange back"], "one resume per return");
+
+    // A page opened offline: its first up follows a down, and is still initialization.
+    const offline = makeExchange();
+    offline.emit("down", "offline");
+    offline.emit("up");
+    assert.deepEqual(offline.resumes, []);
+
+    // An interface disconnect() stopped is no longer this connection's.
+    const stopped = makeExchange();
+    stopped.emit("up");
+    stopped.emit("down", "x");
+    stopped.self._rns = null;
+    stopped.emit("up");
+    assert.deepEqual(stopped.resumes, []);
+});
+
 test("the resume path schedules nothing", () => {
-    for (const signature of ["_hookPageLifecycle()", "_unhookPageLifecycle()", "_onPageResume(trigger)"]) {
+    for (const signature of ["_hookPageLifecycle()", "_unhookPageLifecycle()", "_onPageResume(trigger)", "_followExchange(iface)"]) {
         assert.doesNotMatch(extractMethod(signature), /setTimeout|setInterval/, `${signature}: events, never a clock`);
     }
 });

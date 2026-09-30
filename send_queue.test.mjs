@@ -304,7 +304,7 @@ function makePropagationClient({ nodeKnown, contacts }) {
         contacts,
         methods: [...PROPAGATION_METHODS, "_establishPropagationLink()", "_ensurePropagationLink()",
             "async _onPropagationLinkEstablished(link)", "_onPropagationLinkClosed(link, established)",
-            "_redrivePropagationLink(trigger)", "_initPropagation()"],
+            "_redrivePropagationLink(trigger)", "_initPropagation()", "_exchangeIsDown()"],
         env: { Link: OfflineLink, IdMgr: { id: me }, DistroManager: { has: false }, RnsClient: {}, ActiveTab: { held: true } },
     });
     Object.assign(c.self, {

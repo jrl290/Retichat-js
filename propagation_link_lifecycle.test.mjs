@@ -59,6 +59,7 @@ function compile(signature, env) {
 const LIFECYCLE = [
     "_establishPropagationLink()", "_ensurePropagationLink()", "async _onPropagationLinkEstablished(link)",
     "_onPropagationLinkClosed(link, established)", "_redrivePropagationLink(trigger)", "_initPropagation()",
+    "_exchangeIsDown()",
 ];
 
 /** Link events are a setTimeout 0 per listener (Node: ≥ 1 ms); wait past them and their promise chains. */
@@ -85,8 +86,10 @@ function makeClient({ distro = true } = {}) {
         RnsClient: {}, console: { log() {}, warn() {}, error() {} }, setTimeout: noTimers, setInterval: noTimers,
     };
     let fetched;
+    // The connection's one exchange interface; a test takes it down.
+    const exchange = { isDown: false };
     const self = {
-        _rns: { registerDestination: () => ({ rns: { registerLink() {}, sendData() {} } }) },
+        _rns: { interfaces: [exchange], registerDestination: () => ({ rns: { registerLink() {}, sendData() {} } }) },
         _cfg: { propagationNodePubKey: node.getPublicKey().toString("hex"), propagationNodeHash: "b".repeat(32) },
         _propLink: null, _propLinkPromise: null, _propLinkUpWaiters: [], _propagationInitialized: false, _propReopenArmed: false,
         _flushPropagation: () => { order.push("flush"); },
@@ -97,7 +100,7 @@ function makeClient({ distro = true } = {}) {
     for (const signature of LIFECYCLE) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, env)(self);
     const establish = async (link) => { link.status = Link.ACTIVE; link.emit("established"); await settle(); };
     const closeUnder = async (link, reason) => { link.status = Link.CLOSED; link.closeReason = reason; link._linkClosed(); await settle(); };
-    return { self, links, order, ActiveTab, establish, closeUnder, finishFetch: () => fetched?.() };
+    return { self, links, order, exchange, ActiveTab, establish, closeUnder, finishFetch: () => fetched?.() };
 }
 
 test("no backoff loop remains", () => {
@@ -179,4 +182,27 @@ test("a STALE propagation link is left to its keepalive watchdog by the announce
     c.links[0].status = Link.STALE;
     c.self._initPropagation();
     assert.equal(c.links.length, 1, "it either recovers or times out, and a TIMEOUT re-opens it");
+});
+
+test("while the exchange is down the propagation link is not re-opened; the exchange's return re-drives it once", async () => {
+    // The re-open after a TIMEOUT caused by an exchange outage would send its
+    // LINKREQUEST into the down exchange (PostInterface.sendData loses it),
+    // and the doomed attempt, in flight for its establishment timeout,
+    // would swallow the exchange's return; the next lxmf.propagation
+    // announce is 6 h away. So nothing starts until the exchange is back.
+    const c = makeClient();
+    c.self._initPropagation();
+    await c.establish(c.links[0]);
+    c.exchange.isDown = true;
+    await c.closeUnder(c.links[0], Link.TIMEOUT);
+    assert.equal(c.links.length, 1, "no LINKREQUEST into a down exchange");
+    assert.equal(c.self._propReopenArmed, false, "the close consumed its one re-open");
+    assert.equal(c.self._redrivePropagationLink("online"), false, "a page event while it is still down starts nothing either");
+
+    c.exchange.isDown = false;
+    assert.equal(c.self._redrivePropagationLink("exchange back"), true, "the exchange's return (_onPageResume) re-drives it");
+    assert.equal(c.links.length, 2);
+    assert.equal(c.self._redrivePropagationLink("exchange back"), false, "one attempt at a time");
+    await c.establish(c.links[1]);
+    assert.equal(c.self._propReopenArmed, true);
 });

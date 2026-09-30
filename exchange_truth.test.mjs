@@ -743,7 +743,7 @@ test("a channel post sent while the exchange is up goes on toward the channel (c
 
 // ── The app follows the exchange (app.js) ──────────────────────────────────
 
-test("the app follows the exchange: the dot on up and down, lost packets to the DM path, nothing from a stopped interface", async (t) => {
+test("the app follows the exchange: the dot on up and down, lost packets to the DM path, its return to the persistent links, nothing from a stopped interface", async (t) => {
     quiet(t);
     const clock = fakeTimers(t);
     const node = fakeNode(t);
@@ -758,6 +758,8 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     const lost = [];
     self._onExchangeRegistered = () => registered.push(1);
     self._onPacketsLost = (detail) => lost.push(detail);
+    const resumes = [];
+    self._onPageResume = (trigger) => resumes.push(trigger);
     self._setStatus = compile("_setStatus(s, type)", env)(self);
     compile("_followExchange(iface)", env)(self)(iface);
 
@@ -766,6 +768,7 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     (await node.pending("exchange")).respond(200, {});
     await eventually(() => self._status === "online", "online on up");
     assert.equal(registered.length, 1, "the registration initializes the connection");
+    assert.deepEqual(resumes, [], "the first up is initialization, not a return");
 
     clock.fire(clock.armed());
     const failing = await node.pending("exchange");
@@ -780,6 +783,8 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     (await node.pending("exchange")).respond(200, {});
     await eventually(() => self._status === "online", "online again on up");
     assert.deepEqual(statuses, ["online", "offline", "online"], "credentials alone never made it green");
+    assert.deepEqual(resumes, ["exchange back"],
+        "the exchange's return re-drives the persistent links (app-links interface_online)");
 
     // disconnect() replaced the interface: its events are no longer this connection's.
     self._rns = { interfaces: [] };
@@ -788,6 +793,7 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     await eventually(() => iface.isDown, "down");
     await tick(); await tick();
     assert.deepEqual(statuses, ["online", "offline", "online"], "a stopped interface does not move the dot");
+    assert.deepEqual(resumes, ["exchange back"], "nor re-drive anything");
 
     assert.match(extractMethod("async connect()"), /this\._followExchange\(iface\);\s*this\._rns\.addInterface\(iface\);/,
         "hooked before addInterface() connects it");

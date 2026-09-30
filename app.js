@@ -142,10 +142,16 @@ const RESPONSE_MAX_GRACE_MS = 10_000;
 //      it wanted (wants_download_on_path_available_from/to, with
 //      PR_PATH_TIMEOUT) and re-calls request_messages_from_propagation_node()
 //      when the path appears — __request_messages_path_job. Our equivalent
-//      event is the service announce: rfed re-announces every service every
-//      15 minutes, and each announce proves the destination is reachable
-//      again. _rfedPending records the wanted operation; _onRfedServiceAnnounce
-//      re-drives it.
+//      event is the service announce, which proves the destination is
+//      reachable again. _rfedPending records the wanted operation;
+//      _markRfedServiceReady re-drives it. rfed re-announces its services
+//      only every 6 hours (RFed-rust destinations.rs
+//      SERVICE_REFRESH_INTERVAL_SECS, since b5ba134 on 2026-09-23; it was
+//      15 minutes before), so an intent is re-driven by an announce only when
+//      one comes early (rfed restarting) and otherwise expires
+//      (RFED_PENDING_TIMEOUT_MS). The persistent links do not rely on it: the
+//      exchange coming back and the page events re-drive them
+//      (_onPageResume).
 //
 // So nothing re-attempts on a schedule. A failed operation waits for evidence
 // that the service is back, exactly like the reference waits for a path.
@@ -233,10 +239,20 @@ const RFED_LINK_FAILED = "link_failed";
 // (handle_tracked_outbound_closed / consume_reconnect_arm) and armed again
 // by the next successful establishment and by explicit events — any rfed.*
 // announce, the page coming back online, becoming visible, or returning
-// from the back/forward cache (Android ON_RESUME, iOS scenePhase .active).
-// A re-open that does not establish is parked for the service's next
-// announce (_rfedDeferUntilAnnounce). No timers, no backoff
-// (DESIGN_PRINCIPLES §3): each attempt follows an event.
+// from the back/forward cache (Android ON_RESUME, iOS scenePhase .active),
+// and the exchange coming back after it went down (PostInterface "up" after
+// "down": app-links interface_online, lib.rs:1040). Those events also
+// re-drive a link that is down (_onPageResume). A re-open that does not
+// establish is parked for the service's next announce
+// (_rfedDeferUntilAnnounce). No timers, no backoff (DESIGN_PRINCIPLES §3):
+// each attempt follows an event.
+//
+// While the exchange is down no attempt starts at all (_exchangeIsDown): its
+// LINKREQUEST would be lost at once (PostInterface.sendData), and the doomed
+// attempt, in flight for its whole establishment timeout, would swallow the
+// exchange's return, the one event that can bring the link back. This is
+// app-links' "no usable interface" failure, which interface_online
+// re-attempts.
 //
 // Only a close we did not ask for re-opens: TIMEOUT (the keepalive watchdog,
 // or no answer at all) or DESTINATION_CLOSED (the node's LINKCLOSE). Every
@@ -251,9 +267,12 @@ const RFED_LINK_FAILED = "link_failed";
 const RFED_PERSISTENT_KEYS = ["link", "channel.stream"];
 
 // How long a pending operation stays eligible for re-driving, mirroring
-// LXMRouter.PR_PATH_TIMEOUT. Services re-announce every 15 min, so this
-// spans a couple of announce cycles and then gives up rather than firing
-// against a node that has genuinely gone away.
+// LXMRouter.PR_PATH_TIMEOUT, then it gives up rather than firing against a
+// node that has genuinely gone away. Written when services re-announced
+// every 15 min, so it spanned a few announce cycles; since 2026-09-23 they
+// re-announce every 6 h (RFed-rust destinations.rs
+// SERVICE_REFRESH_INTERVAL_SECS), so only an early announce (rfed
+// restarting) re-drives an intent before it expires.
 const RFED_PENDING_TIMEOUT_MS = 45 * 60 * 1000;
 
 /** Reference request timeout for a link, in ms. `rtt` is measured at
@@ -1284,11 +1303,29 @@ const RnsClient = {
         // 200 after a registration or a failure, "down" on a failure. Until
         // 2026-09-25 a 2 s monitor showed online whenever the interface held
         // credentials, so a dead exchange stayed green.
+        //
+        // The exchange coming back ("up" after a "down", once it had been
+        // up) is also an explicit event for the persistent links, the web's
+        // interface up-edge (app-links interface_online, lib.rs:1040): an
+        // outage long enough to time out rfed.link or the propagation link
+        // leaves them down, and nothing else brings them back while the tab
+        // stays visible and idle (rfed announces every 6 h). The
+        // connection's first "up" is not one: that is initialization, which
+        // the registration and the announces drive (§5).
+        let wasUp = false;
+        let wentDown = false;
         iface.on("up", () => {
-            if (current()) this._setStatus("online");
+            if (!current()) return;
+            this._setStatus("online");
+            const back = wasUp && wentDown;
+            wasUp = true;
+            wentDown = false;
+            if (back) this._onPageResume("exchange back");
         });
         iface.on("down", () => {
-            if (current()) this._setStatus("offline");
+            if (!current()) return;
+            this._setStatus("offline");
+            wentDown = true;
         });
         iface.on("lost", (lost) => {
             if (current()) this._onPacketsLost(lost);
@@ -1571,17 +1608,18 @@ const RnsClient = {
     },
 
     /**
-     * The page is back (online, visible, or restored from the cache): arm
-     * every persistent link's one-shot re-open, re-drive the ones that are
-     * down, and collect what the node deferred meanwhile on the ones that
-     * are up. A link that is coming up, or STALE and waiting on its
-     * keepalive watchdog, is left alone: its "established" pulls, and a
-     * second link would break rfed's one binding per subscriber. Only the
-     * tab holding the identity does anything.
+     * The page is back (online, visible, or restored from the cache), or
+     * the exchange is (_followExchange): arm every persistent link's
+     * one-shot re-open, re-drive the ones that are down, and collect what
+     * the node deferred meanwhile on the ones that are up. A link that is
+     * coming up, or STALE and waiting on its keepalive watchdog, is left
+     * alone: its "established" pulls, and a second link would break rfed's
+     * one binding per subscriber. Only the tab holding the identity does
+     * anything.
      */
     _onPageResume(trigger) {
         if (!this._rns || !ActiveTab.held) return;
-        console.log(`[retichat] Page ${trigger}: re-arming the persistent links`);
+        console.log(`[retichat] Resume (${trigger}): re-arming the persistent links`);
         for (const key of RFED_PERSISTENT_KEYS) this._rfedReopenArmed.add(key);
         this._propReopenArmed = true;
 
@@ -1880,15 +1918,17 @@ const RnsClient = {
      * DESTINATION_CLOSED: the node's LINKCLOSE) is re-opened once, if armed
      * (the app-links model, RFED_PERSISTENT_KEYS). Anything else waits for
      * an event: the node's next lxmf.propagation announce (_initPropagation),
-     * the page coming back (_onPageResume), or an upload that needs the link
-     * (_ensurePropagationLink). Until 2026-09-30 every close started a
-     * timer loop that re-established the link, doubling from 4 s to 30 s
-     * and never giving up: an application-level link retry
+     * the page or the exchange coming back (_onPageResume), or an upload
+     * that needs the link (_ensurePropagationLink). The re-open goes through
+     * _redrivePropagationLink, so it starts nothing while the exchange is
+     * down; the exchange's return re-drives it. Until 2026-09-30 every close
+     * started a timer loop that re-established the link, doubling from 4 s
+     * to 30 s and never giving up: an application-level link retry
      * (DESIGN_PRINCIPLES §3).
      */
     _onPropagationLinkClosed(link, established) {
         if (!established) {
-            console.log("[retichat] Propagation link attempt closed before establishment — the next lxmf.propagation announce or page resume re-drives it");
+            console.log("[retichat] Propagation link attempt closed before establishment — the next lxmf.propagation announce, page resume or exchange return re-drives it");
             return;
         }
         const reason = link.closeReason;
@@ -1906,18 +1946,24 @@ const RnsClient = {
         }
         this._propReopenArmed = false;
         console.log("[retichat] 🔁 Propagation link closed under us — re-opening it once");
-        this._establishPropagationLink();
+        this._redrivePropagationLink("close");
     },
 
     /**
      * One attempt at the propagation link on an explicit event, when it is
      * down: not while one is up, STALE (its keepalive watchdog decides), or
-     * coming up. Returns whether an attempt started.
+     * coming up, and not while the exchange is down (_exchangeIsDown: the
+     * exchange's return is the event then). Returns whether an attempt
+     * started.
      */
     _redrivePropagationLink(trigger) {
         if (!this._rns || !ActiveTab.held) return false;
         if (!this._cfg?.propagationNodePubKey || !this._cfg?.propagationNodeHash) return false;
         if (this._propLink || this._propLinkPromise) return false;
+        if (this._exchangeIsDown()) {
+            console.log(`[retichat] Propagation link is down, and so is the exchange — its return re-drives the link (${trigger})`);
+            return false;
+        }
         console.log(`[retichat] 🔗 Propagation link is down — re-driving it (${trigger})`);
         this._establishPropagationLink();
         return true;
@@ -3387,8 +3433,9 @@ const RnsClient = {
         // one on demand. A browser that started up between announces therefore
         // had no way to make progress and simply sat there — observed
         // 2026-08-09 01:12, where RFed had announced at 01:11 (restart) and the
-        // client, opened at 01:12:12, waited out the whole 15-minute service
-        // refresh interval with every distro call unusable.
+        // client, opened at 01:12:12, waited out the whole service refresh
+        // interval (then 15 minutes; 6 hours since 2026-09-23) with every
+        // distro call unusable.
         for (const aspects of [["link"], ["channel"], ["channel", "stream"], ["channel", "pull"], ["distro", "register"]]) {
             const rfedIdBytes = Buffer.from(this._cfg.rfedNodeHash, "hex");
             const hash = Destination.hash({hash: rfedIdBytes}, "rfed", ...aspects).toString("hex");
@@ -3442,7 +3489,10 @@ const RnsClient = {
         // Harvesting only from rfed.node made bootstrap depend on the rarest
         // announce on the wire: RFed publishes rfed.node at
         // `announce_interval_secs` (the live node is configured to 360
-        // MINUTES) while every service destination refreshes every 15 min.
+        // MINUTES) while every service destination then refreshed every
+        // 15 min (every 6 h too since 2026-09-23, RFed-rust
+        // SERVICE_REFRESH_INTERVAL_SECS, so the startup path requests'
+        // answers are what bring the key in practice).
         // A browser that started up therefore sat with no rfedNodePubKey and
         // failed every distro/channel call with "RFed node identity is not
         // known yet" for up to six hours. The startup path request for
@@ -3485,8 +3535,11 @@ const RnsClient = {
      * This is the reference's wants_download_on_path_available_from/to/timeout
      * (LXMRouter.request_messages_from_propagation_node), which parks the
      * intent and lets __request_messages_path_job re-call the entry point once
-     * a path exists. Same shape, different event: rfed re-announces every
-     * service every 15 minutes, and an announce is our proof of reachability.
+     * a path exists. Same shape, different event: an announce is our proof
+     * of reachability. rfed re-announces its services every 6 hours (15
+     * minutes until 2026-09-23), so an intent outlives RFED_PENDING_TIMEOUT_MS
+     * only when an announce comes early; the persistent links are re-driven
+     * by the exchange and the page coming back as well (_onPageResume).
      *
      * One pending operation per aspect — re-driving the same intent twice is
      * duplicate work, not resilience (see the _registerDistro coalescing note).
@@ -3688,13 +3741,19 @@ const RnsClient = {
      * and only when this tab holds the identity and something is bound to
      * it. An attempt that closes before establishment is parked for the
      * service's next announce (_rfedDeferUntilAnnounce); nothing re-tries it
-     * on a clock (DESIGN_PRINCIPLES §3). Returns whether it started one.
+     * on a clock (DESIGN_PRINCIPLES §3). While the exchange is down nothing
+     * starts (_exchangeIsDown): the exchange's return is the event then
+     * (_followExchange). Returns whether it started one.
      */
     _redriveRfedLink(key, trigger) {
         if (!this._rns || !ActiveTab.held) return false;
         if (!this._rfedPersistentBound(key)) return false;
         if (this._rfedLinks.get(key)?.status === Link.ACTIVE) return false;
         if (this._rfedLinkPromises.has(key)) return false;
+        if (this._exchangeIsDown()) {
+            console.log(`[retichat] RFed ${key} link is down, and so is the exchange — its return re-drives the link (${trigger})`);
+            return false;
+        }
         console.log(`[retichat] 🔗 RFed ${key} link is down — re-driving it (${trigger})`);
         Promise.resolve()
             .then(() => this._ensureRfedLink(key.split(".")))
