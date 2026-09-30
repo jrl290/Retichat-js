@@ -76,7 +76,7 @@ function makeLink(mdu, sent) {
     const body = extractMethod(linkSource, "send(data)", "link.js");
     const builderBody = extractMethod(linkSource, "newLinkPacket(context, data, packetType)", "link.js");
     const scope = (source, args) => new Function("Link", "Packet", "Transport", "Destination", source)(
-        { MDU: mdu },
+        { MDU: mdu, ACTIVE: 0x02, CLOSED: 0x04 },
         PacketStub,
         { BROADCAST: "BROADCAST" },
         { LINK: "LINK" },
@@ -94,6 +94,7 @@ function makeLink(mdu, sent) {
     const _hadOutbound = scope(`return function _hadOutbound(isKeepalive = false) {${hadOutboundBody}};`, []);
     return {
         hash: "hash",
+        status: 0x02,
         attachedInterface: "iface",
         destination: { rns: { sendData: (raw, iface) => sent.push({ raw, iface }) } },
         send,

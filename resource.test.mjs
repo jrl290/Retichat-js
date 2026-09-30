@@ -35,7 +35,7 @@ import MsgPack from "./lib/rns/msgpack.js";
 import Packet from "./lib/rns/packet.js";
 import Resource from "./lib/rns/resource.js";
 import Transport from "./lib/rns/transport.js";
-import { linkPair, once, settle } from "./test_link_pair.mjs";
+import { linkPair, once, settle, within } from "./test_link_pair.mjs";
 
 const bytes = (n, k = 7) => Buffer.from(Array.from({ length: n }, (_, i) => (i * k) % 251));
 const advOf = (resource) => MsgPack.unpack(resource.packAdvertisement(0));
@@ -45,13 +45,6 @@ const withAdv = (adv, changes) => {
     for (const [k, v] of Object.entries(changes)) copy.set(k, v);
     return copy;
 };
-
-/** Fail the test if `promise` has not settled within `ms` (a test-failure bound only). */
-function within(promise, ms, label = "promise") {
-    let timer;
-    const bound = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms); });
-    return Promise.race([promise, bound]).finally(() => clearTimeout(timer));
-}
 
 /** A receiver accepting bare data on `b`, resolving with the concluded payload. */
 function receiveOn(b) {

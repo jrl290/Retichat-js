@@ -19,56 +19,31 @@
 // request with no payload, which is why every other request worked and this
 // one "regressed". The clients that pull successfully all send nil (0xc0).
 //
-// This test runs the real shipped sendRequestPacked body against stubs, so it
-// tests behaviour rather than the text of the file.
+// These run the real Link (two ends joined in process, test_link_pair.mjs)
+// and decode what actually went on the wire.
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import MsgPack from "./lib/rns/msgpack.js";
+import Packet from "./lib/rns/packet.js";
+import { linkPair } from "./test_link_pair.mjs";
 
-const linkSource = await readFile(new URL("./lib/rns/link.js", import.meta.url), "utf8");
-
-function extractMethod(source, signature, label) {
-    const start = source.indexOf(`\n    ${signature} {`);
-    assert.notEqual(start, -1, `${signature} is missing from ${label}`);
-    const bodyStart = source.indexOf("{", start);
-    let depth = 0;
-    for (let i = bodyStart; i < source.length; i++) {
-        if (source[i] === "{") depth++;
-        else if (source[i] === "}") {
-            depth--;
-            if (depth === 0) return source.slice(bodyStart + 1, i);
-        }
-    }
-    throw new Error(`could not brace-match ${signature} in ${label}`);
-}
-
+/** sendRequestPacked on a real link; `captured` gets the REQUEST as sent. */
 function makeSendRequestPacked(captured) {
-    const body = extractMethod(linkSource, "sendRequestPacked(path, packedData)", "link.js");
-    // Stub the collaborators the body touches.
-    const Cryptography = {
-        truncatedHash: (b) => Buffer.alloc(16, 0xab),
+    const { a, wire } = linkPair({ drop: () => true });
+    return (path, packedData) => {
+        try {
+            return a.sendRequestPacked(path, packedData, { timeoutMs: 1 });
+        } finally {
+            const sent = wire.a.at(-1);
+            if (sent) {
+                captured.context = sent.context;
+                captured.payload = a.decrypt(sent.data);
+            }
+        }
     };
-    const Packet = { REQUEST: 0x09 };
-    const self = {
-        _sendWithContext(data, context) {
-            captured.payload = data;
-            captured.context = context;
-            return { getTruncatedHash: () => Buffer.alloc(16, 0xcd) };
-        },
-        // The MDU split (packet vs request Resource) has its own test in
-        // link_request_resource.test.mjs; here every request is one packet.
-        _sendRequestPayload(payload) {
-            return this._sendWithContext(payload, Packet.REQUEST).getTruncatedHash();
-        },
-    };
-    const fn = new Function(
-        "path", "packedData", "Cryptography", "MsgPack", "Packet", "Buffer",
-        body.replaceAll("this.", "self.").replace(/^/, "const self = arguments[6];\n"),
-    );
-    return (path, packedData) => fn(path, packedData, Cryptography, MsgPack, Packet, Buffer, self);
 }
 
 test("sendRequestPacked emits a parseable three-element request for nil data", () => {

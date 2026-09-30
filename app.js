@@ -1879,27 +1879,24 @@ const RnsClient = {
         }
     },
 
-    /** Wait for a response matching requestId on the given link.
+    /** Wait for the response to a request sent on the given link; null if
+     *  the request fails.
      *
-     *  The timeout defaults to the RNS reference budget scaled from the link's
-     *  measured RTT (rfedRequestTimeoutMs — RNS/Link.py:509), the same rule
-     *  the RFed request paths use since the flat-10s rework. The propagation
-     *  callers used to pass flat 10–15s here, which is *below* that budget on
-     *  this transport (rtt 2.3s → ~25s): the same discarded-success bug the
-     *  rework removed, surviving on this path. Pass an explicit timeoutMs only
-     *  for a wait that genuinely has a different contract than a link request. */
-    _waitForResponse(link, requestId, timeoutMs = rfedRequestTimeoutMs(link)) {
-        return new Promise((resolve) => {
-            const timer = setTimeout(() => { link.off("response", handler); resolve(null); }, timeoutMs);
-            const handler = (resp) => {
-                if (!resp.requestId || resp.requestId.length !== requestId.length) return;
-                if (!Buffer.from(resp.requestId).equals(Buffer.from(requestId))) return;
-                clearTimeout(timer);
-                link.off("response", handler);
-                resolve(resp.data);
-            };
-            link.on("response", handler);
-        });
+     *  The link's request receipt owns the timeout (RNS/Link.py
+     *  RequestReceipt): the reference budget scaled from the link's measured
+     *  RTT (rfedRequestTimeoutMs's formula, RNS/Link.py:509) runs until a
+     *  response starts to arrive. A response that arrives as a Resource
+     *  stops it (RECEIVING), so a large /get is no longer thrown away half
+     *  transferred; that transfer's failure, or the link closing, fails the
+     *  request at once. Until 2026-09-30 a flat timer here kept running
+     *  through the transfer. */
+    async _waitForResponse(link, requestId) {
+        try {
+            return await link.responseFor(requestId);
+        } catch (e) {
+            console.log(`[retichat] request ${Buffer.from(requestId).toString("hex").slice(0, 12)}: ${e.message}`);
+            return null;
+        }
     },
 
     /**
@@ -3516,44 +3513,23 @@ const RnsClient = {
             path = mapped;
         }
         const link = await this._ensureRfedLink(aspects);
-        return new Promise((resolve, reject) => {
-            const startedAt = Date.now();
-            // Scaled from the link's measured RTT, per RNS/Link.py:509. The old
-            // code had no timer at all: it only checked, once a response had
-            // already arrived, whether it was late — so a slow-but-correct
-            // answer was thrown away, and a response that never came hung until
-            // the link closed.
-            const timeoutMs = rfedRequestTimeoutMs(link);
-            let requestId = null;
-            const done = () => {
-                clearTimeout(timer);
-                link.off("response", responseHandler);
-                link.off("close", closeHandler);
-            };
-            const responseHandler = (response) => {
-                if (!requestId || !response.requestId) return;
-                if (!Buffer.from(response.requestId).equals(Buffer.from(requestId))) return;
-                done();
-                console.log(`[retichat] ${path} answered in ${Date.now() - startedAt}ms (budget ${Math.round(timeoutMs)}ms)`);
-                resolve(response.data);
-            };
-            const closeHandler = () => {
-                done();
-                reject(new Error(`${path} link closed before a response`));
-            };
-            const timer = setTimeout(() => {
-                done();
-                reject(new Error(`${path} did not respond within ${Math.round(timeoutMs)}ms (rtt=${link.rtt}ms)`));
-            }, timeoutMs);
-            link.on("response", responseHandler);
-            link.on("close", closeHandler);
-            try {
-                requestId = link.sendRequestPacked(path, packedValue);
-            } catch(e) {
-                done();
-                reject(e);
-            }
-        });
+        const startedAt = Date.now();
+        // Scaled from the link's measured RTT, per RNS/Link.py:509. The
+        // link's request receipt owns the timer (RNS/Link.py RequestReceipt):
+        // it runs until the response starts to arrive, and stops while a
+        // response Resource transfers (a /distro/pull page of photos takes
+        // far longer than the budget); a failed transfer or a closed link
+        // fails the request at once. Before 2026-09-30 a flat timer here kept
+        // running through the transfer and threw the page away.
+        const timeoutMs = rfedRequestTimeoutMs(link);
+        const requestId = link.sendRequestPacked(path, packedValue, { timeoutMs });
+        try {
+            const data = await link.responseFor(requestId);
+            console.log(`[retichat] ${path} answered in ${Date.now() - startedAt}ms (budget ${Math.round(timeoutMs)}ms)`);
+            return data;
+        } catch (e) {
+            throw new Error(`${path}: ${e.message} (rtt=${link.rtt}ms)`);
+        }
     },
 
     /** Initialize channel support: register rfed.delivery destination

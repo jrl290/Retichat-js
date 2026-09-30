@@ -1,5 +1,5 @@
 /**
- * Requests and responses that do not fit one link packet travel as Resources.
+ * Requests and responses over a link, and the ones that travel as Resources.
  *
  * RNS/Link.py request(): `if len(packed_request) <= self.mdu` the request is a
  * REQUEST packet, otherwise the packed request goes as a Resource flagged as a
@@ -14,231 +14,267 @@
  * moved the blob to the deferred queue and the client only saw it on the next
  * /channel/pull.
  *
- * link.js cannot be imported under Node (its module graph needs the browser
- * importmap), so the link methods are lifted from source and run against
- * stubs, as request_wire_format.test.mjs does. resource.js can be imported.
+ * 2026-09-30, RNS/Link.py RequestReceipt parity: the link tracks its pending
+ * requests. A response Resource is accepted only for one of them; while it
+ * transfers the request is RECEIVING and its timeout does not fire (a
+ * /distro/pull page of photos, or a large /get, was thrown away half
+ * transferred by a flat timer in app.js); a request sent as a Resource starts
+ * its timeout only once the peer has proved it; a failed response transfer
+ * or a closing link fails the request at once. Responses over 1 MiB arrive
+ * as split Resources and are received whole.
  *
  * Run: node --test link_request_resource.test.mjs
  */
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+
 import Cryptography from "./lib/rns/cryptography.js";
+import Link from "./lib/rns/link.js";
 import MsgPack from "./lib/rns/msgpack.js";
 import Packet from "./lib/rns/packet.js";
 import Resource from "./lib/rns/resource.js";
+import { linkPair, once, sendSplit, settle, within } from "./test_link_pair.mjs";
 
-const linkSource = await readFile(new URL("./lib/rns/link.js", import.meta.url), "utf8");
-const MDU = 431;
+const bytes = (n, k = 7) => Buffer.from(Array.from({ length: n }, (_, i) => (i * k) % 251));
+const advertisementsFrom = (wire) => wire.filter((p) => p.context === Packet.RESOURCE_ADV);
 
-function extractMethod(source, signature) {
-    const start = source.indexOf(`\n    ${signature} {`);
-    assert.notEqual(start, -1, `${signature} is missing from link.js`);
-    const bodyStart = source.indexOf("{", start);
-    let depth = 0;
-    for (let i = bodyStart; i < source.length; i++) {
-        if (source[i] === "{") depth++;
-        else if (source[i] === "}") {
-            depth--;
-            if (depth === 0) return source.slice(bodyStart + 1, i);
-        }
-    }
-    throw new Error(`could not brace-match ${signature}`);
-}
-
-/** Run a lifted link method with `this` bound to `self` and the given globals. */
-function lift(signature, self, globals) {
-    const params = signature.slice(signature.indexOf("(") + 1, signature.indexOf(")")).split(",").map((p) => p.trim()).filter(Boolean);
-    const body = extractMethod(linkSource, signature);
-    const names = Object.keys(globals);
-    const fn = new Function(...params, ...names, "self", body.replaceAll("this.", "self."));
-    return (...args) => fn(...args, ...names.map((n) => globals[n]), self);
+/** Answer every request on `link` with `answer(request)`, as a responder would. */
+function respondWith(link, answer) {
+    link.on("request", (request) => {
+        const value = answer(request);
+        if (value !== undefined) link.sendResponse(request.requestId, value);
+    });
 }
 
 // ── The advertisement carries the request/response flags and id ──────────
 
-class WireOnly {
-    constructor() {
-        this.rtt = 50;                 // ms, as Link.rtt
-        this.status = 0x02;            // Link.ACTIVE
-        this.hash = Buffer.alloc(16, 0xAB);
-        this.attachedInterface = { name: "fake" };
-        this.incomingResources = [];
-        this.outgoingResources = [];
-        this.frames = [];
-        this.destination = { rns: { sendData: (raw) => this.frames.push(raw) } };
-    }
-    encrypt(data) {
-        const padding = 16 - (data.length % 16);
-        const padded = Buffer.concat([data, Buffer.alloc(padding, padding)]);
-        return Buffer.concat([Buffer.alloc(16, 0x11), padded, Buffer.alloc(32, 0x22)]);
-    }
-    decrypt(data) {
-        const padded = data.slice(16, data.length - 32);
-        return padded.slice(0, padded.length - padded[padded.length - 1]);
-    }
-    newLinkPacket(context, data, packetType) {
-        return { context, data, packetType: packetType ?? Packet.DATA, pack() { return this; } };
-    }
-    _transmit(raw) {
-        this.destination.rns.sendData(raw, this.attachedInterface);
-        return raw;
-    }
-}
-
 test("a request Resource advertises flag bit 3 and its request id; a response bit 4", () => {
-    const link = new WireOnly();
+    const { a } = linkPair({ drop: () => true });
     const requestId = Buffer.alloc(16, 0x5a);
-    const request = new Resource(link);
-    request.initiator = true;
-    request.requestId = requestId;
-    request.isRequest = true;
-    request.prepareOutgoing(Buffer.alloc(900, 1));
-    const adv = MsgPack.unpack(request.packAdvertisement(0));
-    const get = (k) => (adv instanceof Map ? adv.get(k) : adv[k]);
-    assert.equal((Number(get("f")) >> 3) & 1, 1, "request flag (u)");
-    assert.equal((Number(get("f")) >> 4) & 1, 0, "not a response");
-    assert.ok(Buffer.from(get("q")).equals(requestId), "q carries the request id");
-
-    const response = new Resource(link);
-    response.initiator = true;
-    response.requestId = requestId;
-    response.isResponse = true;
-    response.prepareOutgoing(Buffer.alloc(900, 2));
-    const adv2 = MsgPack.unpack(response.packAdvertisement(0));
-    const get2 = (k) => (adv2 instanceof Map ? adv2.get(k) : adv2[k]);
-    assert.equal((Number(get2("f")) >> 4) & 1, 1, "response flag (p)");
-    assert.equal((Number(get2("f")) >> 3) & 1, 0, "not a request");
-
-    const plain = new Resource(link);
-    plain.initiator = true;
-    plain.prepareOutgoing(Buffer.alloc(900, 3));
-    const adv3 = MsgPack.unpack(plain.packAdvertisement(0));
-    const get3 = (k) => (adv3 instanceof Map ? adv3.get(k) : adv3[k]);
-    assert.equal(Number(get3("f")) & 0b11000, 0, "bare data carries neither flag");
-    assert.equal(get3("q"), null);
+    const make = (fields) => {
+        const r = new Resource(a);
+        r.initiator = true;
+        Object.assign(r, fields);
+        r.prepareOutgoing(Buffer.alloc(900, 1));
+        const adv = MsgPack.unpack(r.packAdvertisement(0));
+        return (k) => (adv instanceof Map ? adv.get(k) : adv[k]);
+    };
+    const request = make({ requestId, isRequest: true });
+    assert.equal((Number(request("f")) >> 3) & 1, 1, "request flag (u)");
+    assert.equal((Number(request("f")) >> 4) & 1, 0, "not a response");
+    assert.ok(Buffer.from(request("q")).equals(requestId), "q carries the request id");
+    const response = make({ requestId, isResponse: true });
+    assert.equal((Number(response("f")) >> 4) & 1, 1, "response flag (p)");
+    assert.equal((Number(response("f")) >> 3) & 1, 0, "not a request");
+    const plain = make({});
+    assert.equal(Number(plain("f")) & 0b11000, 0, "bare data carries neither flag");
+    assert.equal(plain("q"), null);
 });
 
-test("an accepted advertisement records whether it is a request or a response", () => {
-    const link = new WireOnly();
-    const requestId = Buffer.alloc(16, 0x77);
-    const sender = new Resource(link);
-    sender.initiator = true;
-    sender.requestId = requestId;
-    sender.isRequest = true;
-    sender.prepareOutgoing(Buffer.alloc(600, 9));
-    const receiver = Resource.accept(new WireOnly(), MsgPack.unpack(sender.packAdvertisement(0)));
-    assert.ok(receiver, "accepted");
-    assert.equal(receiver.isRequest, true);
-    assert.equal(receiver.isResponse, false);
-    assert.ok(receiver.requestId.equals(requestId));
-    receiver.cancel("test over");
+// ── Requests ──────────────────────────────────────────────────────────────
+
+test("a request at the MDU is one REQUEST packet; one byte over goes as a request Resource", async () => {
+    const { a, b, wire } = linkPair();
+    const requests = [];
+    b.on("request", (r) => requests.push(r));
+
+    // [timestamp(9), path hash(18), data]: data sized so the whole is exactly the MDU.
+    const fixed = MsgPack.pack([Date.now() / 1000, Buffer.alloc(16), Buffer.alloc(0)]).length;
+    const small = a.sendRequest("/p", Buffer.alloc(Link.MDU - fixed - 1));
+    assert.equal(wire.a.at(-1).context, Packet.REQUEST, "at the MDU it is still one packet");
+    const big = a.sendRequest("/p", Buffer.alloc(Link.MDU));
+    const adv = MsgPack.unpack(a.decrypt(advertisementsFrom(wire.a).at(-1).data));
+    const q = Buffer.from(adv instanceof Map ? adv.get("q") : adv.q);
+    assert.ok(q.equals(big), "the request Resource's q is the request id");
+    await settle(40);
+    assert.equal(requests.length, 2);
+    assert.ok(requests[0].requestId.equals(small), "the packet request's id is its truncated packet hash");
+    assert.ok(Buffer.from(requests[1].path).equals(Cryptography.truncatedHash(Buffer.from("/p"))), "path is the 16-byte path hash");
+    assert.equal(big.length, 16);
+    assert.ok(requests[1].requestId.equals(big), "the receiver derives the same id from the assembled bytes (RNS/Link.py:870)");
+    a.close();   // nobody answers: fail the two requests rather than wait out their budget
 });
 
-// ── The link sends over the MDU as a Resource, and dispatches on arrival ──
+test("a request Resource is accepted even under ACCEPT_NONE, and so is the response to one", async () => {
+    const { a, b } = linkPair();
+    assert.equal(a.resourceStrategy, Link.ACCEPT_NONE);
+    assert.equal(b.resourceStrategy, Link.ACCEPT_NONE);
+    respondWith(b, (request) => ["echo", Buffer.from(request.data)]);
+    const id = a.sendRequest("/echo", bytes(2000));
+    const [label, echoed] = await within(a.responseFor(id), 3000, "the response");
+    assert.equal(label, "echo");
+    assert.ok(Buffer.from(echoed).equals(bytes(2000)), "request and response both crossed as Resources");
+});
 
-test("a request over the MDU goes as a request Resource whose id is the packed request's hash", () => {
-    const sent = { resources: [], packets: [] };
-    const self = {
-        _sendWithContext(data, context) {
-            sent.packets.push({ data, context });
-            return { getTruncatedHash: () => Buffer.alloc(16, 0xcd) };
-        },
-    };
-    const ResourceStub = {
-        send(link, data, options) {
-            sent.resources.push({ data, options });
-            return Promise.resolve();
-        },
-    };
-    const send = lift("_sendRequestPayload(requestPayload)", self, {
-        Link: { MDU }, Packet: { REQUEST: 0x09 }, Cryptography, Resource: ResourceStub, Buffer, console,
+// ── Responses belong to pending requests ──────────────────────────────────
+
+test("a response, packet or Resource, is taken only for a pending request (Link.py handle_response)", async () => {
+    const { a, b, wire } = linkPair();
+    const responses = [];
+    a.on("response", (r) => responses.push(r));
+    const stranger = Buffer.alloc(16, 0x77);
+    b.sendResponse(stranger, "small");
+    b.sendResponse(stranger, bytes(3000));
+    await settle(20);
+    assert.equal(responses.length, 0, "no response event for a request that was never sent");
+    assert.equal(a.incomingResources.length, 0, "the response Resource was not accepted");
+    assert.equal(wire.a.filter((p) => p.context === Packet.RESOURCE_REQ).length, 0, "no part of it was asked for");
+    for (const r of [...b.outgoingResources]) r.cancel("test over");
+});
+
+test("a response Resource's transfer does not run into the request's timeout", async () => {
+    // Every part takes 25 ms: a 200 KB response takes far longer than the
+    // 150 ms the request has for its response to start.
+    const { a, b } = linkPair({ delay: (p) => (p.context === Packet.RESOURCE ? 25 : 0) });
+    const page = bytes(200_000, 3);
+    respondWith(b, () => page);
+    const progress = [];
+    const started = Date.now();
+    const id = a.sendRequest("/distro/pull", null, { timeoutMs: 150, onProgress: (p) => progress.push(p) });
+    const response = await within(a.responseFor(id), 20_000, "the response");
+    assert.ok(Date.now() - started > 300, "the transfer outlasted the request timeout");
+    assert.ok(Buffer.from(response).equals(page));
+    assert.ok(progress.length > 2 && progress.at(-1) === 1, "the request reports the response's progress");
+    assert.equal(a.pendingRequests.length, 0);
+});
+
+test("a request sent as a Resource starts its timeout only once the peer has proved it", async () => {
+    // The request itself (40 KB) takes longer to upload than its timeout.
+    const { a, b } = linkPair({ delay: (p, from) => (from === "a" && p.context === Packet.RESOURCE ? 10 : 0) });
+    respondWith(b, () => "got it");
+    const started = Date.now();
+    const id = a.sendRequest("/lxmf/delivery", bytes(40_000), { timeoutMs: 40 });
+    assert.equal(a._pendingRequest(id).status, Link.REQUEST_SENT, "no clock while the request uploads");
+    assert.equal(await within(a.responseFor(id), 20_000, "the response"), "got it");
+    assert.ok(Date.now() - started > 80, "the upload took longer than the request's timeout");
+});
+
+test("a request whose response never starts fails after its timeout", async () => {
+    const { a } = linkPair();
+    const id = a.sendRequest("/nobody/home", null, { timeoutMs: 60 });
+    await assert.rejects(within(a.responseFor(id), 2000), /no response within 60 ms/);
+    assert.equal(a.pendingRequests.length, 0);
+});
+
+test("a response transfer that fails fails its request at once", async () => {
+    // Parts never arrive; then the responder gives up (ICL).
+    const { a, b } = linkPair({ drop: (p) => p.context === Packet.RESOURCE });
+    respondWith(b, () => bytes(5000));
+    const id = a.sendRequest("/get", null, { timeoutMs: 60 });
+    await settle(10);
+    assert.equal(a._pendingRequest(id).status, Link.REQUEST_RECEIVING);
+    b.outgoingResources[0].cancel("the responder gave up");
+    await assert.rejects(within(a.responseFor(id), 2000), /the response transfer failed/);
+});
+
+test("closing the link fails every pending request, from either end", async () => {
+    for (const closer of ["a", "b"]) {
+        const pair = linkPair();
+        const id = pair.a.sendRequest("/slow", null, { timeoutMs: 60_000 });
+        pair[closer].close();
+        await assert.rejects(within(pair.a.responseFor(id), 2000), /the link closed before a response/, `closed by ${closer}`);
+        assert.equal(pair.a.pendingRequests.length, 0);
+    }
+});
+
+test("a closed link sends nothing, and a request on it fails at once", () => {
+    const { a, wire } = linkPair();
+    a.close();
+    const sent = wire.a.length;
+    assert.throws(() => a.sendRequest("/p", null), /the link is closed/);
+    a.send(Buffer.from("into the void"));
+    assert.equal(wire.a.length, sent, "RNS/Packet.py send(): a closed link drops the packet");
+});
+
+// ── Split responses ───────────────────────────────────────────────────────
+
+test("a response over 1 MiB arrives as a split Resource and is received whole", async () => {
+    const { a, b } = linkPair();
+    // A /distro/pull page of six 200 KB blobs: ~1.2 MB, two segments.
+    const page = [true, Array.from({ length: 6 }, (_, i) => bytes(200_000, 11 + i)), false];
+    b.on("request", (request) => {
+        const packed = MsgPack.pack([request.requestId, page]);
+        assert.ok(packed.length > Resource.MAX_EFFICIENT_SIZE);
+        sendSplit(b, packed, { requestId: request.requestId, isResponse: true });
     });
-
-    const small = Buffer.alloc(MDU, 1);
-    assert.ok(send(small).equals(Buffer.alloc(16, 0xcd)));
-    assert.equal(sent.packets.length, 1, "at the MDU it is still one packet");
-    assert.equal(sent.resources.length, 0);
-
-    const big = Buffer.alloc(MDU + 1, 2);
-    const id = send(big);
-    assert.equal(sent.packets.length, 1, "one byte over the MDU is not a packet");
-    assert.equal(sent.resources.length, 1);
-    assert.equal(sent.resources[0].options.isRequest, true);
-    assert.ok(id.equals(Cryptography.truncatedHash(big)), "request id = truncated hash of the packed request (RNS/Link.py:497)");
-    assert.ok(sent.resources[0].options.requestId.equals(id));
+    const progress = [];
+    const id = a.sendRequest("/distro/pull", null, { timeoutMs: 200, onProgress: (p) => progress.push(p) });
+    const [ok, blobs, more] = await within(a.responseFor(id), 60_000, "the split response");
+    assert.equal(ok, true);
+    assert.equal(more, false);
+    assert.equal(blobs.length, 6);
+    blobs.forEach((blob, i) => assert.ok(Buffer.from(blob).equals(bytes(200_000, 11 + i)), `blob ${i}`));
+    assert.ok(progress.every((p, i) => i === 0 || p >= progress[i - 1]), "progress rises across the segments");
+    assert.equal(a._splitAssemblies.size, 0);
 });
 
-test("a response over the MDU goes as a response Resource carrying the request id", () => {
-    const sent = { resources: [], packets: [] };
-    const self = {
-        _sendWithContext(data, context) { sent.packets.push({ data, context }); },
-    };
-    const ResourceStub = { send(link, data, options) { sent.resources.push({ data, options }); return Promise.resolve(); } };
-    const sendResponse = lift("sendResponse(requestId, responseData)", self, {
-        Link: { MDU }, Packet: { RESPONSE: 0x0A }, MsgPack, Resource: ResourceStub, Buffer, console,
-    });
-    const requestId = Buffer.alloc(16, 0x31);
-    sendResponse(requestId, true);
-    assert.equal(sent.packets.length, 1);
-    assert.equal(sent.packets[0].context, 0x0A);
-
-    sendResponse(requestId, Buffer.alloc(2000, 7));
-    assert.equal(sent.resources.length, 1);
-    assert.equal(sent.resources[0].options.isResponse, true);
-    assert.ok(sent.resources[0].options.requestId.equals(requestId));
-    const [id, value] = MsgPack.unpack(sent.resources[0].data);
-    assert.ok(Buffer.from(id).equals(requestId), "packed like a RESPONSE packet: [request_id, response]");
-    assert.equal(Buffer.from(value).length, 2000);
+test("between two segments of a response the request waits again, and times out if the next never comes", async () => {
+    const saved = Resource.MAX_EFFICIENT_SIZE;
+    Resource.MAX_EFFICIENT_SIZE = 5000;
+    try {
+        const { a, b } = linkPair();
+        b.on("request", (request) => {
+            const packed = MsgPack.pack([request.requestId, bytes(9000)]);
+            sendSplit(b, packed, { requestId: request.requestId, isResponse: true, segments: 1 });
+        });
+        const id = a.sendRequest("/pull", null, { timeoutMs: 100 });
+        await assert.rejects(within(a.responseFor(id), 3000), /no response within 100 ms/);
+    } finally {
+        Resource.MAX_EFFICIENT_SIZE = saved;
+    }
 });
 
-test("a concluded request Resource is dispatched as a request with the reference's id and path", () => {
-    const events = [];
-    const self = { hash: Buffer.alloc(16, 1), emit: (name, payload) => events.push({ name, payload }) };
-    const dispatch = lift("_dispatchConcludedResource(resource)", self, { MsgPack, Cryptography, console });
+// ── app.js waits on the link's receipt ────────────────────────────────────
 
-    const pathHash = Cryptography.truncatedHash(Buffer.from("/lxmf/delivery"));
-    const body = Buffer.alloc(1200, 0xEE);
-    const packed = MsgPack.pack([1790000000.5, pathHash, body]);
-    dispatch({ isRequest: true, isResponse: false, data: packed });
-    assert.equal(events.length, 1);
-    assert.equal(events[0].name, "request");
-    assert.ok(events[0].payload.requestId.equals(Cryptography.truncatedHash(packed)), "request id = truncated hash of the packed request (RNS/Link.py:870)");
-    assert.ok(Buffer.from(events[0].payload.path).equals(pathHash), "path is the 16-byte path hash, as on a REQUEST packet");
-    assert.equal(Buffer.from(events[0].payload.data).length, 1200);
+const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
+function appMethod(signature, env) {
+    const start = app.indexOf(`\n    ${signature} {`);
+    assert.notEqual(start, -1, `${signature} is missing from app.js`);
+    const open = app.indexOf("{", start + signature.length);
+    let depth = 0, close = -1;
+    for (let i = open; i < app.length; i++) {
+        if (app[i] === "{") depth++;
+        else if (app[i] === "}" && --depth === 0) { close = i; break; }
+    }
+    const body = app.slice(open + 1, close).replaceAll("this.", "self.");
+    const params = signature.slice(signature.indexOf("(") + 1, signature.lastIndexOf(")")).split(",").map((p) => p.trim()).filter(Boolean);
+    const names = Object.keys(env);
+    const fn = new Function(...names, "self", ...params, `return (async () => {${body}})();`);
+    return (self) => (...args) => fn(...names.map((n) => env[n]), self, ...args);
+}
+const quiet = { log() {}, warn() {}, error() {} };
 
-    const requestId = Buffer.alloc(16, 0x42);
-    dispatch({ isRequest: false, isResponse: true, data: MsgPack.pack([requestId, Buffer.alloc(700, 3)]) });
-    assert.equal(events[1].name, "response");
-    assert.ok(Buffer.from(events[1].payload.requestId).equals(requestId));
-
-    dispatch({ isRequest: false, isResponse: false, data: Buffer.alloc(500, 4) });
-    assert.equal(events[2].name, "resource", "bare data still reaches the resource event");
-
-    dispatch({ isRequest: true, isResponse: false, data: Buffer.from("not msgpack at all") });
-    assert.equal(events.length, 3, "a malformed request resource is dropped, not dispatched");
+test("app.js _rfedRequest resolves with a response that takes longer than its budget to transfer", async () => {
+    const { a, b } = linkPair({ delay: (p) => (p.context === Packet.RESOURCE ? 25 : 0) });
+    const page = bytes(150_000, 5);
+    respondWith(b, () => page);
+    const self = { _rfedLinkAvailable: () => true, _ensureRfedLink: async () => a };
+    const rfedRequest = appMethod("async _rfedRequest(aspects, path, packedValue)", {
+        RFED_LINK_PATHS: {}, rfedRequestTimeoutMs: () => 150, Buffer, console: quiet,
+    })(self);
+    const started = Date.now();
+    const response = await within(rfedRequest(["link"], "/rfed/pull", MsgPack.pack(null)), 20_000, "_rfedRequest");
+    assert.ok(Date.now() - started > 300);
+    assert.ok(Buffer.from(response).equals(page));
 });
 
-test("a request or response Resource is accepted even under ACCEPT_NONE", () => {
-    // The advertisement branch of Link.onPacket, lifted with its guard. We
-    // give it a strategy of ACCEPT_NONE and a request-flagged advertisement.
-    const branchStart = linkSource.indexOf("else if(packet.context === Packet.RESOURCE_ADV){");
-    const branchEnd = linkSource.indexOf("\n        }\n", branchStart) + 11;
-    const branch = linkSource.slice(branchStart + "else if(packet.context === Packet.RESOURCE_ADV)".length, branchEnd);
-    const accepted = [];
-    const self = {
-        resourceStrategy: 0, // ACCEPT_NONE
-        decrypt: (d) => d,
-        _acceptResource(adv) { accepted.push(adv); return null; },
-    };
-    const ResourceStub = {};
-    const run = new Function("packet", "Packet", "MsgPack", "Resource", "Link", "console", "self",
-        branch.replaceAll("this.", "self."));
-    const packet = (flags, q) => ({ context: 0x02, data: MsgPack.pack(new Map([["f", flags], ["q", q], ["h", Buffer.alloc(32)]])) });
-    run(packet(0x01, null), { RESOURCE_ADV: 0x02 }, MsgPack, ResourceStub, { ACCEPT_NONE: 0 }, console, self);
-    assert.equal(accepted.length, 0, "bare data honours ACCEPT_NONE");
-    run(packet(0x01 | (1 << 3), Buffer.alloc(16, 1)), { RESOURCE_ADV: 0x02 }, MsgPack, ResourceStub, { ACCEPT_NONE: 0 }, console, self);
-    assert.equal(accepted.length, 1, "a request Resource is accepted regardless of the strategy (RNS/Link.py:1036)");
-    run(packet(0x01 | (1 << 4), Buffer.alloc(16, 1)), { RESOURCE_ADV: 0x02 }, MsgPack, ResourceStub, { ACCEPT_NONE: 0 }, console, self);
-    assert.equal(accepted.length, 2, "so is a response Resource");
+test("app.js _rfedRequest rejects when no response starts within the budget", async () => {
+    const { a } = linkPair();
+    const self = { _rfedLinkAvailable: () => true, _ensureRfedLink: async () => a };
+    const rfedRequest = appMethod("async _rfedRequest(aspects, path, packedValue)", {
+        RFED_LINK_PATHS: {}, rfedRequestTimeoutMs: () => 60, Buffer, console: quiet,
+    })(self);
+    await assert.rejects(within(rfedRequest(["link"], "/rfed/pull", MsgPack.pack(null)), 2000), /\/rfed\/pull: no response within 60 ms/);
+});
+
+test("app.js _waitForResponse gives the response of a long transfer, and null for a failed request", async () => {
+    const { a, b } = linkPair({ delay: (p) => (p.context === Packet.RESOURCE ? 25 : 0) });
+    respondWith(b, (request) => (Buffer.from(request.data ?? []).length === 1 ? undefined : bytes(100_000)));
+    const wait = appMethod("async _waitForResponse(link, requestId)", { Buffer, console: quiet })({});
+    const id = a.sendRequest("/get", null, { timeoutMs: 150 });
+    const blob = await within(wait(a, id), 20_000, "_waitForResponse");
+    assert.ok(Buffer.from(blob).equals(bytes(100_000)));
+    const unanswered = a.sendRequest("/get", Buffer.from([1]), { timeoutMs: 50 });
+    assert.equal(await within(wait(a, unanswered), 2000, "_waitForResponse"), null);
 });

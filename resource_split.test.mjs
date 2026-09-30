@@ -26,40 +26,9 @@ import test from "node:test";
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
 import Resource from "./lib/rns/resource.js";
-import { linkPair, once, settle } from "./test_link_pair.mjs";
+import { linkPair, once, sendSplit, settle } from "./test_link_pair.mjs";
 
 const bytes = (n, k = 7) => Buffer.from(Array.from({ length: n }, (_, i) => (i * k) % 251));
-
-/**
- * Send `data` from `link` as a split Resource, segment by segment, the way
- * RNS/Resource.py does: each segment is advertised when the previous one is
- * proved. `declaredSize` overrides the advertised total (`d`).
- */
-export async function sendSplit(link, data, { requestId = null, isResponse = false, isRequest = false, declaredSize = null } = {}) {
-    const segmentSize = Resource.MAX_EFFICIENT_SIZE;
-    const total = Math.floor((data.length - 1) / segmentSize) + 1;
-    let originalHash = null;
-    for (let i = 1; i <= total; i++) {
-        const segment = new Resource(link);
-        segment.initiator = true;
-        segment.segmentIndex = i;
-        segment.totalSegments = total;
-        segment.totalSize = declaredSize ?? data.length;
-        segment.originalHash = originalHash;
-        if (requestId) {
-            segment.requestId = Buffer.from(requestId);
-            segment.isResponse = isResponse;
-            segment.isRequest = isRequest;
-        }
-        segment.prepareOutgoing(data.subarray((i - 1) * segmentSize, i * segmentSize));
-        originalHash ??= segment.hash;
-        await new Promise((resolve, reject) => {
-            segment.once("concluded", resolve);
-            segment.once("failed", reject);
-            segment.advertise();
-        });
-    }
-}
 
 /** Run `fn` with a small MAX_EFFICIENT_SIZE. */
 async function withSegmentSize(size, fn) {

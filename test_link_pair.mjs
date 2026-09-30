@@ -11,16 +11,18 @@
  * onResourceProof, any other PROOF to onPacketProof.
  *
  * Delivery is asynchronous (one macrotask per packet), so a transfer runs as
- * a sequence of events rather than as recursion, and `drop(packet, fromName)`
- * can lose any packet on the way.
+ * a sequence of events rather than as recursion, `drop(packet, fromName)`
+ * can lose any packet on the way, and `delay(packet, fromName)` can hold one
+ * back for that many milliseconds.
  */
 import crypto from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
+import Resource from "./lib/rns/resource.js";
 
-export function linkPair({ rttMs = 50, drop = null } = {}) {
+export function linkPair({ rttMs = 50, drop = null, delay = null } = {}) {
     const hash = crypto.randomBytes(16);
     const derivedKey = crypto.randomBytes(64);
     const wire = { a: [], b: [] };
@@ -49,11 +51,14 @@ export function linkPair({ rttMs = 50, drop = null } = {}) {
         const packet = Packet.fromBytes(Buffer.from(raw));
         wire[from.name].push(packet);
         if (drop && drop(packet, from.name)) return;
-        setImmediate(() => {
+        const deliver = () => {
             if (packet.packetType === Packet.DATA) to.onPacket(packet);
             else if (packet.packetType === Packet.PROOF && packet.context === Packet.RESOURCE_PRF) to.onResourceProof(packet);
             else if (packet.packetType === Packet.PROOF) to.onPacketProof(packet);
-        });
+        };
+        const ms = delay ? delay(packet, from.name) : 0;
+        if (ms > 0) setTimeout(deliver, ms);
+        else setImmediate(deliver);
     };
     a.destination = { rns: { sendData: route(a, b) } };
     b.destination = { rns: { sendData: route(b, a) } };
@@ -70,4 +75,43 @@ export function settle(rounds = 3) {
     let p = Promise.resolve();
     for (let i = 0; i < rounds; i++) p = p.then(() => new Promise((r) => setTimeout(r, 0)));
     return p;
+}
+
+/**
+ * Send `data` from `link` as a split Resource, segment by segment, the way
+ * RNS/Resource.py does: each segment is advertised when the previous one is
+ * proved. `declaredSize` overrides the advertised total (`d`);
+ * `segments` stops after that many segments.
+ */
+export async function sendSplit(link, data, { requestId = null, isResponse = false, isRequest = false, declaredSize = null, segments = Infinity } = {}) {
+    const segmentSize = Resource.MAX_EFFICIENT_SIZE;
+    const total = Math.floor((data.length - 1) / segmentSize) + 1;
+    let originalHash = null;
+    for (let i = 1; i <= Math.min(total, segments); i++) {
+        const segment = new Resource(link);
+        segment.initiator = true;
+        segment.segmentIndex = i;
+        segment.totalSegments = total;
+        segment.totalSize = declaredSize ?? data.length;
+        segment.originalHash = originalHash;
+        if (requestId) {
+            segment.requestId = Buffer.from(requestId);
+            segment.isResponse = isResponse;
+            segment.isRequest = isRequest;
+        }
+        segment.prepareOutgoing(data.subarray((i - 1) * segmentSize, i * segmentSize));
+        originalHash ??= segment.hash;
+        await new Promise((resolve, reject) => {
+            segment.once("concluded", resolve);
+            segment.once("failed", reject);
+            segment.advertise();
+        });
+    }
+}
+
+/** Fail the test if `promise` has not settled within `ms` (a test-failure bound only). */
+export function within(promise, ms, label = "promise") {
+    let timer;
+    const bound = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms); });
+    return Promise.race([promise, bound]).finally(() => clearTimeout(timer));
 }
