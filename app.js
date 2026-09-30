@@ -187,6 +187,37 @@ const RFED_LINK_PUSH_HASHES = {
     notify:   Cryptography.truncatedHash(Buffer.from(RFED_LINK_PUSH_NOTIFY, "utf8")).toString("hex"),
 };
 
+// The largest request rfed.link takes from the node: RNS
+// Destination.max_request_size, which this link checks against a request
+// Resource's advertised data size d (Link.maxRequestSize; RNS/Link.py:1036-1042).
+// A push is the only request the node sends here (Link.md "Path map — node →
+// client"), and the largest one a client must take is an /lxmf/delivery
+// carrying a message at LXMF's delivery limit. rfed pushes the propagation
+// form it stored (lxmf_propagation.rs dispatch_live_or_notify, distro.rs
+// fan-out: stamp already stripped by validate_pn_stamps), inside the request
+// Reticulum-rust builds (link.rs request(), as RNS/Link.py request()):
+//
+//   packed LXMF at LXMF's delivery limit (LXMRouter.DELIVERY_LIMIT KB)   1,000,000 B
+//   propagation form: dest(16) | Identity.encrypt(packed[16:]), so        +     96 B
+//     ephemeral X25519 key 32 + Token IV 16 + HMAC 32
+//     + PKCS7 padding, at most 16
+//   request envelope: msgpack [f64 timestamp, bin path hash, bin data]   +     33 B
+//     (link_session.rs push_request encodes the payload as Binary):
+//     fixarray 1 + f64 (0xcb) 9 + bin8 header 2 + path hash 16
+//     + bin32 header 5
+//   ----------------------------------------------------------------------------
+//   RFED_LINK_MAX_REQUEST_SIZE                                           1,000,129 B
+//
+// Anything larger is refused at its advertisement (RCL) before a part is
+// fetched, so a misbehaving node cannot make the tab hold a multi-MiB split
+// push. The node's request then fails and the blob goes to the pull path
+// (Link.md "The response is the delivery proof"), where it comes as a
+// response, which this limit does not bound.
+const LXMF_PROPAGATION_FORM_OVERHEAD = 32 + 16 + 32 + 16;
+const RFED_PUSH_REQUEST_ENVELOPE = 1 + 9 + 2 + 16 + 5;
+const RFED_LINK_MAX_REQUEST_SIZE = LXMRouter.DELIVERY_LIMIT * 1000
+    + LXMF_PROPAGATION_FORM_OVERHEAD + RFED_PUSH_REQUEST_ENVELOPE;
+
 const RFED_LINK_IDLE = "idle";
 const RFED_LINK_ESTABLISHING = "establishing";
 const RFED_LINK_ESTABLISHED = "established";
@@ -3535,6 +3566,10 @@ const RnsClient = {
                 if (key === "channel.stream") this._handleChannelPacket(data);
             });
             if (key === "link") {
+                // The pushes this link takes are bounded before it exists: a
+                // request Resource over RFED_LINK_MAX_REQUEST_SIZE is refused
+                // at its advertisement (RNS Destination.max_request_size).
+                link.maxRequestSize = RFED_LINK_MAX_REQUEST_SIZE;
                 // Node → client pushes arrive as REQUESTS on the bound link
                 // (Link.md "Path map — node → client"). Our response is the
                 // node's delivery proof: an unanswered push goes to the

@@ -186,6 +186,8 @@ test("distro registration and pull both park on a failed link", () => {
 
 import Link from "./lib/rns/link.js";
 import MsgPack from "./lib/rns/msgpack.js";
+import Identity from "./lib/rns/identity.js";
+import LXMRouter from "./lib/rns/lxmf/lxmf_router.js";
 import { Buffer } from "node:buffer";
 
 /** `const NAME = <expr>;` from app.js, evaluated over `env`. */
@@ -196,6 +198,8 @@ function extractConst(name, env = {}) {
     return new Function(...names, `return (${match[1]});`)(...names.map((n) => env[n]));
 }
 
+const LXMF_PROPAGATION_FORM_OVERHEAD = extractConst("LXMF_PROPAGATION_FORM_OVERHEAD");
+const RFED_PUSH_REQUEST_ENVELOPE = extractConst("RFED_PUSH_REQUEST_ENVELOPE");
 const APP_CONSTS = {
     RFED_LINK_PATHS: extractConst("RFED_LINK_PATHS"),
     RFED_PERSISTENT_KEYS: extractConst("RFED_PERSISTENT_KEYS"),
@@ -204,6 +208,8 @@ const APP_CONSTS = {
     RFED_LINK_ESTABLISHED: extractConst("RFED_LINK_ESTABLISHED"),
     RFED_LINK_FAILED: extractConst("RFED_LINK_FAILED"),
     RFED_PENDING_TIMEOUT_MS: extractConst("RFED_PENDING_TIMEOUT_MS"),
+    RFED_LINK_MAX_REQUEST_SIZE: extractConst("RFED_LINK_MAX_REQUEST_SIZE",
+        { LXMRouter, LXMF_PROPAGATION_FORM_OVERHEAD, RFED_PUSH_REQUEST_ENVELOPE }),
 };
 
 /** A real method body, `this.` read as `self.`, its free names from env. */
@@ -521,6 +527,33 @@ test("a channel pull is one at a time, follows more_pending on the response, and
     await c.self.pullChannel("general");
     await settle();
     assert.equal(c.calls.length, 3);
+});
+
+test("rfed.link refuses a push larger than a message at LXMF's delivery limit, and takes one that size", async () => {
+    // The arithmetic of RFED_LINK_MAX_REQUEST_SIZE, rebuilt from real bytes:
+    // a packed LXMF of exactly LXMF's delivery limit, in the propagation form
+    // rfed pushes (dest | Identity.encrypt(rest)), inside the request rfed
+    // builds (rmpv: fixarray, f64 timestamp, bin(16) path hash, bin(data)).
+    const limit = LXMRouter.DELIVERY_LIMIT * 1000;
+    assert.equal(limit, 1_000_000);
+    const recipient = Identity.create();
+    const packed = Buffer.alloc(limit, 7);
+    const blob = Buffer.concat([packed.subarray(0, 16), recipient.encrypt(packed.subarray(16))]);
+    assert.equal((limit - 16) % 16, 0, "a whole number of blocks: PKCS7 adds a full block, the most it adds");
+    assert.equal(blob.length, limit + LXMF_PROPAGATION_FORM_OVERHEAD, "32 key + 16 IV + 32 HMAC + 16 padding");
+    const f64 = Buffer.alloc(9); f64[0] = 0xcb; f64.writeDoubleBE(Date.now() / 1000, 1);
+    const bin32 = Buffer.alloc(5); bin32[0] = 0xc6; bin32.writeUInt32BE(blob.length, 1);
+    const request = Buffer.concat([Buffer.from([0x93]), f64, Buffer.from([0xc4, 16]), Buffer.alloc(16, 1), bin32, blob]);
+    assert.equal(request.length, APP_CONSTS.RFED_LINK_MAX_REQUEST_SIZE, "the largest legitimate push, to the byte");
+    assert.equal(APP_CONSTS.RFED_LINK_MAX_REQUEST_SIZE, 1_000_129);
+
+    // Every rfed.link carries it from before its first packet; other links
+    // keep the reference default (no limit), as they take no requests.
+    const c = makePersistent();
+    c.self._ensureRfedLink(["link"]);
+    assert.equal(c.links[0].maxRequestSize, 1_000_129);
+    c.self._ensureRfedLink(["channel"]);
+    assert.equal(c.links[1].maxRequestSize, null);
 });
 
 test("the persistent-link paths schedule nothing", () => {
