@@ -2,9 +2,27 @@
 #
 # deploy.sh — the only supported way to move the web client onto a live node.
 #
-#   ./deploy.sh                  # deploy HEAD to both nodes
+#   ./deploy.sh                  # deploy HEAD to both nodes: retichat, then selectiv
 #   ./deploy.sh HEAD selectiv    # ...to one node
 #   ./deploy.sh be8964d          # ...a specific ref (rollback)
+#   ./deploy.sh strays [node]    # list files a node serves outside the payload (SSH ls, read-only)
+#   ./deploy.sh clean-strays <node> --yes
+#                                # move exactly those files out of the docroot (never rm)
+#   ./deploy.sh boot-check <dir> # the headless boot gate alone, on any directory
+#                                # (e.g. `test-harnesses/staging/staging.sh export Retichat-js <ref>`)
+#
+# NODE ORDER
+# ==========
+# With no node named, retichat.com is deployed first and selectiv straight after
+# it (the order of NODES below). selectiv depends on retichat.com: its PHP node
+# reaches the network only through retichat.com (selectiv's own gateway bridge
+# row is offline; the 'retichat.com' PHP peer is its one route), so every
+# selectiv user's traffic crosses retichat.com's relay, and selectiv's browsers
+# mostly talk to browsers on retichat.com. selectiv is therefore no independent
+# canary: a change is only live end to end there once retichat.com carries it.
+# Every stray check and every local gate runs for both nodes before either
+# receives a byte, so a refused deploy never leaves the two nodes on different
+# builds. To deploy one node alone, name it.
 #
 # TWO NODES, ONE SOURCE
 # =====================
@@ -28,16 +46,45 @@
 # never got them. It was still deployed by hand, from the filesystem, with no
 # check that what landed matched any commit.
 #
-# The checks are the same four, for the same reason:
+# The checks, in order:
 #
 #   1. refuse a dirty working tree      — you cannot ship what isn't committed
 #   2. run the test suite               — and refuse on any failure
 #   3. deploy from `git archive <ref>`  — never from the working directory
-#   4. verify the served bytes          — proof, not hope
+#   4. boot the staged export in headless Chromium — refuse on a pageerror or a
+#      failed module import in the first 10 s (0760960 passed 1–3 and died at
+#      load with "Buffer is not defined"; only a browser sees that class)
+#   5. refuse while a node serves stray files — anything in the web client's
+#      directory that is not the payload or the node's config.json
+#   6. verify the served bytes          — proof, not hope
 #
-# Step 4 is cheaper here than for the PHP node: every file is fetchable over
+# Step 6 is cheaper here than for the PHP node: every file is fetchable over
 # plain HTTPS, so verify-deploy.sh needs no credentials and can be run by anyone,
 # at any time, without touching the node. Run it whenever you suspect drift.
+#
+# STRAY FILES
+# ===========
+# On 2026-09-30 both nodes served files no gate knew about: debug.html and
+# debug-standalone.html (same origin as the app, so a crafted debug.html link
+# could wipe or replace a user's identity and exchange URL), nine
+# app.js.bak-*, five each of index.html.bak-* and style.css.bak-*, and a
+# July-era packet.js and post_interface.js at the top level. The debug pages
+# are for the harness, which serves them from the working copy
+# (HARNESS_PAGE=local); no production node serves them any more.
+#
+# `strays` lists the node's directory over the SSH the deploy already uses
+# (`ls`, nothing else) and sorts every entry per node layout:
+#   dedicated (selectiv: public_html/retichat holds only the web client) —
+#     everything but the payload and config.json is stray.
+#   shared (retichat.com: public_html is also the host's docroot, with the PHP
+#     node in reticulum/, cPanel's cgi-bin/ and .well-known/, and maybe other
+#     sites) — only names the web client owns count (OWNED_NAMES,
+#     OWNED_BASES below); everything else is reported as not ours and is
+#     never flagged or touched.
+# config.json, every .ht* file and reticulum/ are never stray on either.
+# `clean-strays <node> --yes` moves exactly the listed entries into
+# ~/retichat-web-strays/<node>-<UTC time>/, outside every served directory,
+# with a RESTORE.sh beside them. Nothing is deleted.
 #
 # Credentials come from the environment. Keep them in a gitignored deploy.env:
 #
@@ -47,37 +94,478 @@
 # Bypass for a genuine emergency: DEPLOY_ALLOW_DIRTY=1 (tree check) and
 # DEPLOY_SKIP_TESTS=1 (suite). Both print a loud warning and are recorded in
 # .deploy.log. If you find yourself using them routinely, fix the cause.
+# There is no bypass for strays: clean them, it is reversible.
+#
+# The boot gate uses the Playwright + Chromium that the staging harness uses
+# (../test-harnesses/distro-pipeline; DEPLOY_PLAYWRIGHT_DIR names another
+# project dir). With no browser installed it is skipped with a loud warning and
+# boot_checked=0 in .deploy.log.
 
 set -uo pipefail
-
-REF="${1:-HEAD}"
-ONLY_NODE="${2:-}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${REPO_DIR}/.deploy.log"
 
-# name : host env var : pass env var : remote dir : served base URL
+# name : host env var : pass env var : remote dir : served base URL : layout
+# The order is the default deploy order (see NODE ORDER above).
 NODES=(
-  "retichat|RETICHAT_SSH_HOST|RETICHAT_SSH_PASS|public_html|https://retichat.com"
-  "selectiv|SELECTIV_SSH_HOST|SELECTIV_SSH_PASS|public_html/retichat|https://selectivesubconscious.com/retichat"
+  "retichat|RETICHAT_SSH_HOST|RETICHAT_SSH_PASS|public_html|https://retichat.com|shared"
+  "selectiv|SELECTIV_SSH_HOST|SELECTIV_SSH_PASS|public_html/retichat|https://selectivesubconscious.com/retichat|dedicated"
 )
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'; DIM=$'\033[2m'; NC=$'\033[0m'
 SSH_OPTS=(-o ConnectTimeout=15 -o StrictHostKeyChecking=no -o LogLevel=ERROR)
 
-# The web client's deployable surface. Tests, README and the local config
-# template are not served. config.json is per-node runtime config the node owns
-# (it names that node's exchangeUrl) — deploying ours would repoint the live app
-# at 127.0.0.1.
+# The web client's deployable surface. Tests, README, the local config
+# template and the harness pages (debug.html, debug-standalone.html) are not
+# served. config.json is per-node runtime config the node owns (it names that
+# node's exchangeUrl) — deploying ours would repoint the live app at 127.0.0.1.
 PAYLOAD=(index.html app.js style.css retichat-icon.png .htaccess lib)
 EXCLUDE=(config.json config.local.json)
 
+# Names the web client owns, so they are stray on a shared docroot too.
+# OWNED_NAMES match exactly; OWNED_BASES also match with any suffix that starts
+# with . - _ or ~ (app.js.bak-bug135, app.js~, index.html.orig, lib.old).
+OWNED_NAMES=(debug.html debug-standalone.html packet.js post_interface.js
+             config.local.json config.template.json selectiv-snapshot
+             deploy.sh verify-deploy.sh deploy.env deploy.env.example .deploy.log)
+OWNED_BASES=(index.html app.js style.css retichat-icon.png config.json lib
+             debug.html debug-standalone.html packet.js post_interface.js)
+
+# Moved strays go here, relative to the node account's home: outside every
+# served directory (the docroots are under ~/public_html).
+STRAY_ARCHIVE="retichat-web-strays"
+
+PLAYWRIGHT_DIR="${DEPLOY_PLAYWRIGHT_DIR:-$REPO_DIR/../test-harnesses/distro-pipeline}"
+
 die() { echo "${RED}✗ $*${NC}" >&2; exit 1; }
 step() { echo; echo "${CYAN}▸ $*${NC}"; }
-
-trap 'echo "${RED}deploy aborted${NC}"' ERR
+# The header down to NODE ORDER's end: the commands, and why retichat goes first.
+usage() { sed -n '3,/^# TWO NODES, ONE SOURCE/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 [[ -f "$REPO_DIR/deploy.env" ]] && source "$REPO_DIR/deploy.env"
+
+# ── Nodes ─────────────────────────────────────────────────────────────────
+
+# node_fields <name> — sets NODE_NAME HOST_VAR PASS_VAR REMOTE_DIR BASE_URL LAYOUT.
+node_fields() {
+  local entry
+  for entry in "${NODES[@]}"; do
+    IFS='|' read -r NODE_NAME HOST_VAR PASS_VAR REMOTE_DIR BASE_URL LAYOUT <<< "$entry"
+    [[ "$NODE_NAME" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+node_names() { local e; for e in "${NODES[@]}"; do echo "${e%%|*}"; done; }
+
+# set_ssh <pass> — SSH=(...) for a node: key auth with BatchMode, or sshpass
+# when the node's password is set.
+set_ssh() {
+  if [[ -n "$1" ]]; then
+    if ! command -v sshpass >/dev/null 2>&1; then
+      echo "${RED}sshpass required when the node's password is set${NC}" >&2
+      return 1
+    fi
+    SSH=(env "SSHPASS=$1" sshpass -e ssh "${SSH_OPTS[@]}")
+  else
+    SSH=(ssh "${SSH_OPTS[@]}" -o BatchMode=yes)
+  fi
+}
+
+# ── Stray files ───────────────────────────────────────────────────────────
+
+owned_name() { # name — is this a name the web client owns?
+  local n="$1" b
+  for b in "${OWNED_NAMES[@]}"; do [[ "$n" == "$b" ]] && return 0; done
+  for b in "${OWNED_BASES[@]}"; do [[ "$n" == "$b"[._~-]* ]] && return 0; done
+  [[ "$n" == *.test.mjs ]] && return 0
+  return 1
+}
+
+# entry_class <layout> <entry> — payload | node | protected | stray | foreign.
+# An entry is one line of `ls -1Ap` (directories end in /).
+entry_class() {
+  local layout="$1" name="${2%/}" p
+  case "$name" in ""|.|..) echo protected; return ;; esac
+  for p in "${PAYLOAD[@]}"; do
+    [[ "$name" == "$p" ]] && { echo payload; return; }
+  done
+  case "$name" in
+    config.json) echo node; return ;;
+    # Apache serves no .ht* file, and .htaccess is deployed; reticulum/ is the
+    # PHP node. Neither is the stray check's business on any layout.
+    .ht*|reticulum) echo protected; return ;;
+  esac
+  if owned_name "$name"; then echo stray; return; fi
+  if [[ "$layout" == dedicated ]]; then echo stray; else echo foreign; fi
+}
+
+# remote_listing <host> <remote_dir> — the directory's top-level entries, one
+# per line. Read-only: the one command is ls. An absent directory lists nothing.
+remote_listing() {
+  "${SSH[@]}" "$1" "if [ -d ~/$2 ]; then cd ~/$2 && ls -1Ap; fi"
+}
+
+# classify_listing <layout> <listing> — fills KEPT (payload and config.json),
+# PROTECTED, STRAYS and FOREIGN.
+classify_listing() {
+  STRAYS=(); FOREIGN=(); KEPT=(); PROTECTED=()
+  local entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    case "$(entry_class "$1" "$entry")" in
+      stray) STRAYS+=("$entry") ;;
+      foreign) FOREIGN+=("$entry") ;;
+      protected) PROTECTED+=("$entry") ;;
+      *) KEPT+=("$entry") ;;
+    esac
+  done <<< "$2"
+}
+
+print_classes() { # name remote_dir layout
+  if [[ "$3" == dedicated ]]; then
+    echo "  ${DIM}~/$2 holds only the web client: everything but the payload and config.json is stray${NC}"
+  else
+    echo "  ${DIM}~/$2 is shared with the host and the PHP node: only the web client's own names count${NC}"
+  fi
+  echo "  ${GREEN}✓${NC} payload and node config: ${#KEPT[@]} entries"
+  if [[ ${#PROTECTED[@]} -gt 0 ]]; then
+    echo "  ${DIM}never touched (.ht*, the PHP node): ${PROTECTED[*]}${NC}"
+  fi
+  if [[ ${#FOREIGN[@]} -gt 0 ]]; then
+    echo "  ${DIM}not the web client's, left alone: ${FOREIGN[*]}${NC}"
+  fi
+  if [[ ${#STRAYS[@]} -gt 0 ]]; then
+    echo "  ${RED}✗ ${#STRAYS[@]} stray (served from the app's origin, in no payload):${NC}"
+    printf '      %s\n' "${STRAYS[@]}"
+  else
+    echo "  ${GREEN}✓${NC} no stray files"
+  fi
+}
+
+# check_node_strays <name> — lists and classifies one node. Returns 0 clean,
+# 1 strays present, 2 the node could not be listed.
+check_node_strays() {
+  node_fields "$1" || { echo "${RED}no node named '$1'${NC}" >&2; return 2; }
+  local host="${!HOST_VAR:-}" listing
+  if [[ -z "$host" ]]; then
+    echo "${RED}${HOST_VAR} not set (see deploy.env.example)${NC}" >&2
+    return 2
+  fi
+  set_ssh "${!PASS_VAR:-}" || return 2
+  if ! listing="$(remote_listing "$host" "$REMOTE_DIR")"; then
+    echo "${RED}could not list ~/${REMOTE_DIR} on ${NODE_NAME} over SSH${NC}" >&2
+    return 2
+  fi
+  classify_listing "$LAYOUT" "$listing"
+  print_classes "$NODE_NAME" "$REMOTE_DIR" "$LAYOUT"
+  [[ ${#STRAYS[@]} -eq 0 ]] || return 1
+  return 0
+}
+
+cmd_strays() { # [node]
+  local want="${1:-}" name rc worst=0
+  if [[ -n "$want" ]] && ! node_fields "$want"; then
+    die "no node named '${want}' (valid: $(node_names | tr '\n' ' '))"
+  fi
+  for name in $(node_names); do
+    [[ -n "$want" && "$want" != "$name" ]] && continue
+    step "Stray files on ${name}"
+    if check_node_strays "$name"; then rc=0; else rc=$?; fi
+    [[ $rc -gt $worst ]] && worst=$rc
+  done
+  return $worst
+}
+
+# Names clean-strays will hand to a remote shell. Anything else is refused
+# rather than quoted: the listing is the node's word, not ours.
+SAFE_NAME='^[A-Za-z0-9._~+,@=-]+/?$'
+
+cmd_clean_strays() { # <node> [--yes]
+  local want="${1:-}" confirm="${2:-}"
+  if [[ -z "$want" || ( -n "$confirm" && "$confirm" != "--yes" ) || $# -gt 2 ]]; then
+    die "usage: ./deploy.sh clean-strays <$(node_names | paste -sd'|' -)> --yes"
+  fi
+  node_fields "$want" || die "no node named '${want}' (valid: $(node_names | tr '\n' ' '))"
+  local host="${!HOST_VAR:-}"
+  [[ -n "$host" ]] || die "${HOST_VAR} not set (see deploy.env.example)"
+  set_ssh "${!PASS_VAR:-}" || die "no SSH to ${NODE_NAME}"
+
+  step "Stray files on ${NODE_NAME}"
+  local listing
+  listing="$(remote_listing "$host" "$REMOTE_DIR")" || die "could not list ~/${REMOTE_DIR} on ${NODE_NAME} over SSH"
+  classify_listing "$LAYOUT" "$listing"
+  print_classes "$NODE_NAME" "$REMOTE_DIR" "$LAYOUT"
+  if [[ ${#STRAYS[@]} -eq 0 ]]; then
+    echo "${GREEN}✓ nothing to move${NC}"
+    return 0
+  fi
+
+  local n unsafe=()
+  for n in "${STRAYS[@]}"; do
+    [[ "$n" =~ $SAFE_NAME ]] || unsafe+=("$n")
+  done
+  if [[ ${#unsafe[@]} -gt 0 ]]; then
+    echo "${RED}These names carry characters this script will not pass to a remote shell:${NC}"
+    printf '      %q\n' "${unsafe[@]}"
+    die "nothing moved — move them by hand (to ~/${STRAY_ARCHIVE}/, never rm), then run this again"
+  fi
+
+  local dest="${STRAY_ARCHIVE}/${NODE_NAME}-$(date -u +%Y%m%dT%H%M%SZ)" verb="go"
+  [[ "$confirm" == "--yes" ]] || verb="would go"
+  echo
+  echo "  ${#STRAYS[@]} entries ${verb} to ~/${dest}/ on ${NODE_NAME} (outside every served directory),"
+  echo "  with ~/${dest}/RESTORE.sh to put them back. Nothing is deleted."
+  if [[ "$confirm" != "--yes" ]]; then
+    echo "${YELLOW}nothing moved — run again with --yes to move exactly the entries above${NC}"
+    return 2
+  fi
+
+  local names="" protected
+  for n in "${STRAYS[@]}"; do names+=" '${n%/}'"; done
+  protected="$(IFS='|'; echo "${PAYLOAD[*]}")"
+  # The remote side refuses anything protected even though the list was
+  # classified here: config.json, .ht*, reticulum/ and the payload never move,
+  # and neither does a path (no /), whatever the listing said.
+  "${SSH[@]}" "$host" "
+    set -e
+    src=\"\$HOME/${REMOTE_DIR}\"
+    dest=\"\$HOME/${dest}\"
+    case \"\$dest\" in \"\$HOME/public_html\"|\"\$HOME/public_html/\"*|\"\$src\"|\"\$src/\"*)
+      echo 'refusing: the destination is inside a served directory' >&2; exit 3 ;;
+    esac
+    for n in ${names}; do
+      case \"\$n\" in ''|.|..|*/*|config.json|.ht*|reticulum|${protected})
+        echo \"refusing to move \$n: it is protected\" >&2; exit 3 ;;
+      esac
+    done
+    cd \"\$src\"
+    mkdir -p \"\$dest\"
+    for n in ${names}; do
+      if [ -e \"\$n\" ] || [ -L \"\$n\" ]; then
+        if [ -e \"\$dest/\$n\" ] || [ -L \"\$dest/\$n\" ]; then
+          echo \"\$dest/\$n already exists — \$n not moved\" >&2; exit 4
+        fi
+        mv -- \"\$n\" \"\$dest/\$n\"
+        printf \"mv -- '%s' '%s'\\n\" \"\$dest/\$n\" \"\$src/\$n\" >> \"\$dest/RESTORE.sh\"
+        echo \"  moved \$n\"
+      else
+        echo \"  already gone: \$n\"
+      fi
+    done
+  " || die "moving the strays on ${NODE_NAME} failed — see above; whatever moved is listed in ~/${dest}/RESTORE.sh"
+
+  step "Listing ${NODE_NAME} again"
+  if check_node_strays "$NODE_NAME"; then
+    echo
+    echo "${GREEN}✓ ${NODE_NAME} serves no stray files; they are in ~/${dest}/ (restore: sh ~/${dest}/RESTORE.sh)${NC}"
+    return 0
+  fi
+  die "strays remain on ${NODE_NAME}"
+}
+
+# ── The boot gate ─────────────────────────────────────────────────────────
+#
+# Loads index.html from a local static server in headless Chromium and fails on
+# any pageerror or failed module import (or stylesheet, or the page itself) in
+# the first 10 s, and if nothing is rendered into #app by then. Only this
+# directory and esm.sh (the importmap's CDN) are reachable; every other request
+# is blocked, never sent, and listed. The node's config.json is never deployed,
+# so the gate answers /config.json itself with an exchange on its own server
+# that refuses everything: a boot never reaches a real exchange.
+#
+# Exit status: 0 booted clean, 1 failed, 3 no browser installed.
+boot_gate() { # dir
+  local tmp rc
+  tmp="$(mktemp -d)"
+  boot_gate_js > "$tmp/boot-gate.mjs"
+  if node "$tmp/boot-gate.mjs" "$1" "$PLAYWRIGHT_DIR"; then rc=0; else rc=$?; fi
+  rm -rf "$tmp"
+  return $rc
+}
+
+boot_gate_js() {
+  cat <<'JS'
+import { createServer } from "node:http";
+import { createRequire } from "node:module";
+import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { extname, join, resolve, sep } from "node:path";
+
+// The observation window the deploy gate asks for: the first 10 s after
+// navigation. It decides pass/fail; it is not a wait for anything to get ready.
+const WINDOW_MS = 10_000;
+const REMOTE_OK = new Set(["esm.sh"]);
+const LOADS = { document: "the page", script: "module import", stylesheet: "stylesheet" };
+const EXCHANGE = "/__deploy_boot_gate_no_exchange__";
+const TYPES = {
+    ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
+    ".ico": "image/x-icon", ".wasm": "application/wasm",
+};
+const say = (s) => console.log(`  ${s}`);
+const [rootArg, pwDir] = process.argv.slice(2);
+const ROOT = resolve(rootArg ?? ".");
+if (!existsSync(join(ROOT, "index.html"))) { say(`FAIL no index.html in ${ROOT}`); process.exit(1); }
+
+let chromium;
+try {
+    ({ chromium } = createRequire(join(resolve(pwDir), "package.json"))("playwright"));
+} catch (e) {
+    say(`no Playwright in ${pwDir} (${e.code ?? e.message.split("\n")[0]})`);
+    process.exit(3);
+}
+let browser;
+try {
+    browser = await chromium.launch({ headless: true, args: ["--disable-dev-shm-usage"] });
+} catch (e) {
+    if (/Executable doesn't exist/i.test(e.message)) {
+        say(`Playwright in ${pwDir} has no Chromium installed`);
+        process.exit(3);
+    }
+    say(`FAIL Chromium would not start: ${e.message.split("\n")[0]}`);
+    process.exit(1);
+}
+
+const server = createServer(async (req, res) => {
+    let path;
+    try { path = decodeURIComponent(new URL(req.url, "http://gate").pathname); }
+    catch { res.writeHead(400).end(); return; }
+    if (path.startsWith(EXCHANGE)) {
+        res.writeHead(503, { "content-type": "text/plain" }).end("the boot gate runs no exchange");
+        return;
+    }
+    if (path === "/config.json") {
+        res.writeHead(200, { "content-type": TYPES[".json"], "cache-control": "no-store" })
+            .end(JSON.stringify({ exchangeUrl: `http://127.0.0.1:${server.address().port}${EXCHANGE}` }));
+        return;
+    }
+    const file = resolve(ROOT, "." + (path.endsWith("/") ? `${path}index.html` : path));
+    if (file !== ROOT && !file.startsWith(ROOT + sep)) { res.writeHead(403).end(); return; }
+    try {
+        const body = await readFile(file);
+        res.writeHead(200, {
+            "content-type": TYPES[extname(file).toLowerCase()] ?? "application/octet-stream",
+            "cache-control": "no-store",
+        }).end(body);
+    } catch {
+        res.writeHead(404, { "content-type": "text/plain" }).end("not found");
+    }
+});
+await new Promise((ok, no) => { server.once("error", no); server.listen(0, "127.0.0.1", ok); });
+const origin = `http://127.0.0.1:${server.address().port}`;
+
+const failures = [];
+const blocked = [];
+let rendered = null;
+let settle;
+const settled = new Promise((r) => { settle = r; });
+let t0 = Date.now(); // reset at navigation: times below are from there
+const at = () => `${((Date.now() - t0) / 1000).toFixed(1)} s`;
+const fail = (why) => { failures.push(`${at()} ${why}`); settle(); };
+
+try {
+    const context = await browser.newContext({ serviceWorkers: "block" });
+    await context.route("**/*", (route) => {
+        const req = route.request();
+        let u;
+        try { u = new URL(req.url()); } catch { return route.continue(); }
+        if (u.origin === origin || (u.protocol === "https:" && REMOTE_OK.has(u.hostname))) return route.continue();
+        blocked.push(`${req.resourceType()} ${req.url()}`);
+        return route.abort("blockedbyclient");
+    });
+    const page = await context.newPage();
+    page.on("pageerror", (e) => fail(`pageerror: ${e.message}`));
+    page.on("crash", () => fail("the page crashed"));
+    page.on("requestfailed", (req) => {
+        const what = LOADS[req.resourceType()];
+        if (!what) return;
+        const err = req.failure()?.errorText ?? "failed";
+        const why = /BLOCKED_BY_CLIENT/.test(err) ? " — blocked: the gate allows only this directory and esm.sh" : "";
+        fail(`${what} failed: ${req.url()} (${err})${why}`);
+    });
+    page.on("response", (r) => {
+        const what = LOADS[r.request().resourceType()];
+        if (what && r.status() >= 400) fail(`${what} failed: ${r.url()} → HTTP ${r.status()}`);
+    });
+    page.on("console", (m) => {
+        if (m.type() === "error" && /module script|module specifier|import ?map/i.test(m.text())) fail(m.text());
+    });
+    await page.exposeFunction("__deployBootGateRendered", () => { rendered ??= at(); });
+    await page.addInitScript(() => {
+        const seen = () => {
+            const app = document.getElementById("app");
+            if (app && app.childElementCount > 0) { observer.disconnect(); window.__deployBootGateRendered(); }
+        };
+        const observer = new MutationObserver(seen);
+        observer.observe(document, { childList: true, subtree: true });
+    });
+    t0 = Date.now();
+    page.goto(`${origin}/index.html`, { waitUntil: "commit" })
+        .catch((e) => fail(`navigation failed: ${e.message.split("\n")[0]}`));
+    await Promise.race([settled, new Promise((r) => setTimeout(r, WINDOW_MS))]);
+} catch (e) {
+    fail(`the gate itself failed: ${e.message.split("\n")[0]}`);
+}
+const renderedAt = rendered;
+await browser.close().catch(() => {});
+server.close();
+
+for (const b of blocked) say(`blocked, never sent: ${b}`);
+if (!failures.length && !renderedAt) failures.push(`nothing rendered into #app within ${WINDOW_MS / 1000} s: a blank page`);
+if (failures.length) {
+    for (const f of failures) say(`FAIL ${f}`);
+    process.exit(1);
+}
+say(`rendered at ${renderedAt}; no pageerror and no failed module import in the first ${WINDOW_MS / 1000} s`);
+process.exit(0);
+JS
+}
+
+boot_skipped_warning() {
+  echo "  ${YELLOW}⚠⚠⚠ BOOT GATE SKIPPED — no headless browser is installed ⚠⚠⚠${NC}"
+  echo "  ${YELLOW}Nothing has shown that this build boots. 0760960 passed every other gate${NC}"
+  echo "  ${YELLOW}and died at load in every browser with \"Buffer is not defined\".${NC}"
+  echo "  ${YELLOW}Install: (cd ${PLAYWRIGHT_DIR} && npm install && npx playwright install chromium)${NC}"
+}
+
+cmd_boot_check() { # <dir>
+  [[ $# -eq 1 && -d "$1" ]] || die "usage: ./deploy.sh boot-check <directory holding index.html>"
+  command -v node >/dev/null 2>&1 || die "node not found"
+  step "Booting $1 in headless Chromium"
+  local rc
+  if boot_gate "$1"; then rc=0; else rc=$?; fi
+  case $rc in
+    0) echo "  ${GREEN}✓${NC} boots" ;;
+    3) boot_skipped_warning ;;
+    *) echo "${RED}✗ the page does not boot${NC}" >&2; rc=1 ;;
+  esac
+  return $rc
+}
+
+# ── Subcommands ───────────────────────────────────────────────────────────
+case "${1:-}" in
+  strays)       shift; cmd_strays "$@"; exit $? ;;
+  clean-strays) shift; cmd_clean_strays "$@"; exit $? ;;
+  boot-check)   shift; cmd_boot_check "$@"; exit $? ;;
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+# ── Deploy ────────────────────────────────────────────────────────────────
+trap 'echo "${RED}deploy aborted${NC}"' ERR
+
+REF="${1:-HEAD}"
+ONLY_NODE="${2:-}"
+if [[ -n "$ONLY_NODE" ]] && ! node_fields "$ONLY_NODE"; then
+  die "no node matched '${ONLY_NODE}' (valid: $(node_names | tr '\n' ' '))"
+fi
+TARGETS=()
+for name in $(node_names); do
+  [[ -n "$ONLY_NODE" && "$ONLY_NODE" != "$name" ]] && continue
+  TARGETS+=("$name")
+done
 
 # ── 1. The tree must be clean ────────────────────────────────────────────
 step "Checking working tree"
@@ -108,6 +596,7 @@ fi
 REF_SHA="$(git -C "$REPO_DIR" rev-parse --short "$REF")"
 REF_SUBJECT="$(git -C "$REPO_DIR" log -1 --format=%s "$REF")"
 echo "  ${GREEN}✓${NC} deploying ${REF_SHA} — ${REF_SUBJECT}"
+echo "  ${GREEN}✓${NC} to: ${TARGETS[*]}"
 
 # ── 2. The suite must be green ───────────────────────────────────────────
 step "Running test suite"
@@ -186,17 +675,44 @@ done < <(find "$STAGE" -type f -name '*.js')
 [[ $MISSING -eq 0 ]] || die "${MISSING} import(s) do not resolve in ${REF_SHA}"
 echo "  ${GREEN}✓${NC} every relative import resolves"
 
-# ── 5. Push to every node ────────────────────────────────────────────────
+# ── 5. Boot it ───────────────────────────────────────────────────────────
+# Every check above reads files. The class that killed the page at 0760960
+# ("Buffer is not defined" at module load) and a module the importmap cannot
+# resolve pass all of them; only a browser executing the graph sees them.
+step "Booting ${REF_SHA} in headless Chromium"
+BOOT_CHECKED=0
+if boot_gate "$STAGE"; then BOOT_RC=0; else BOOT_RC=$?; fi
+case $BOOT_RC in
+  0) BOOT_CHECKED=1; echo "  ${GREEN}✓${NC} boots" ;;
+  3) boot_skipped_warning ;;
+  *) die "${REF_SHA} does not boot in a browser — not deploying" ;;
+esac
+
+# ── 6. No node may serve stray files ─────────────────────────────────────
+# Checked on every target before any node receives a byte.
+STRAY_NODES=()
+for name in "${TARGETS[@]}"; do
+  step "Checking ${name} for stray files"
+  if check_node_strays "$name"; then rc=0; else rc=$?; fi
+  case $rc in
+    0) ;;
+    1) STRAY_NODES+=("$name") ;;
+    *) die "cannot tell whether ${name} serves stray files — not deploying" ;;
+  esac
+done
+if [[ ${#STRAY_NODES[@]} -gt 0 ]]; then
+  echo
+  echo "${DIM}Every file in the web client's directory is served from the app's origin."
+  echo "Move the strays out of the docroot first (reversible, nothing is deleted):${NC}"
+  for name in "${STRAY_NODES[@]}"; do echo "    ./deploy.sh clean-strays ${name} --yes"; done
+  die "refusing to deploy while ${STRAY_NODES[*]} serve(s) stray files"
+fi
+
+# ── 7. Push to every node ────────────────────────────────────────────────
 deploy_node() { # name host pass remote_dir
   local name="$1" host="$2" pass="$3" remote_dir="$4"
-  local SSH
 
-  if [[ -n "$pass" ]]; then
-    command -v sshpass >/dev/null 2>&1 || { echo "${RED}sshpass required when ${name}'s password is set${NC}"; return 1; }
-    SSH=(env "SSHPASS=$pass" sshpass -e ssh "${SSH_OPTS[@]}")
-  else
-    SSH=(ssh "${SSH_OPTS[@]}" -o BatchMode=yes)
-  fi
+  set_ssh "$pass" || return 1
 
   # Roll back to the previous *served* state, not to a guess about it. Only the
   # files this deploy will overwrite are backed up, so the rest of the remote
@@ -235,22 +751,13 @@ deploy_node() { # name host pass remote_dir
   echo "  ${GREEN}✓${NC} ${name} — uploaded (rollback in ~/retichat-web-rollback)"
 }
 
-DEPLOYED=0
-for node in "${NODES[@]}"; do
-  IFS='|' read -r name host_var pass_var remote_dir base_url <<< "$node"
-  [[ -n "$ONLY_NODE" && "$ONLY_NODE" != "$name" ]] && continue
-  step "Deploying to ${name} (${base_url})"
-  host="${!host_var:-}"
-  pass="${!pass_var:-}"
-  if [[ -z "$host" ]]; then
-    die "${host_var} not set (see deploy.env.example) — every node this script does not reach is a shadow copy in the making"
-  fi
-  deploy_node "$name" "$host" "$pass" "$remote_dir" || die "deploy to ${name} failed"
-  DEPLOYED=$((DEPLOYED + 1))
+for name in "${TARGETS[@]}"; do
+  node_fields "$name"
+  step "Deploying to ${name} (${BASE_URL})"
+  deploy_node "$name" "${!HOST_VAR:-}" "${!PASS_VAR:-}" "$REMOTE_DIR" || die "deploy to ${name} failed"
 done
-[[ $DEPLOYED -gt 0 ]] || die "no node matched '${ONLY_NODE}' (valid: retichat, selectiv)"
 
-# ── 6. Prove it ──────────────────────────────────────────────────────────
+# ── 8. Prove it ──────────────────────────────────────────────────────────
 step "Verifying served bytes against ${REF_SHA}"
 if "$REPO_DIR/verify-deploy.sh" "$REF" "$ONLY_NODE"; then
   VERIFY_OK=1
@@ -258,9 +765,9 @@ else
   VERIFY_OK=0
 fi
 
-printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  verified=%s\n' \
+printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  boot_checked=%s  verified=%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REF_SHA" "${ONLY_NODE:-all}" \
-  "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "$VERIFY_OK" >> "$LOG_FILE"
+  "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "$BOOT_CHECKED" "$VERIFY_OK" >> "$LOG_FILE"
 
 [[ $VERIFY_OK -eq 1 ]] || die "post-deploy verification failed — a served app does not match ${REF_SHA}"
 
