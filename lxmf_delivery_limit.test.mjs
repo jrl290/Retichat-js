@@ -9,6 +9,12 @@
  * is asked for. Until 2026-09-30 this client's delivery links were
  * ACCEPT_ALL: a peer could make the tab fetch and hold whatever it advertised.
  *
+ * The gate governs bare data only. A Resource flagged as a request is taken
+ * only where the destination has request handlers (RNS/Link.py:1036-1042),
+ * and LXMF registers none on its delivery destination (LXMRouter.py:669-676
+ * registers them on the propagation and control destinations), so on a
+ * delivery link a request Resource is ignored, whatever size it declares.
+ *
  * Run: node --test lxmf_delivery_limit.test.mjs
  */
 import assert from "node:assert/strict";
@@ -20,9 +26,11 @@ import Link from "./lib/rns/link.js";
 import LXMRouter from "./lib/rns/lxmf/lxmf_router.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import Packet from "./lib/rns/packet.js";
-import { linkPair, once, settle, within } from "./test_link_pair.mjs";
+import Cryptography from "./lib/rns/cryptography.js";
+import { linkPair, once, sendSplit, settle, within } from "./test_link_pair.mjs";
 
 const bytes = (n, k = 7) => Buffer.from(Array.from({ length: n }, (_, i) => (i * k) % 251));
+const advertisementsFrom = (wire) => wire.filter((p) => p.context === Packet.RESOURCE_ADV);
 
 /** `b` of a link pair, set up as an incoming LXMF delivery link. */
 async function deliveryLink() {
@@ -77,4 +85,23 @@ test("ACCEPT_APP: the callback sees the advertisement; a falsy answer or a throw
     assert.equal(seen[0].segmentIndex, 1);
     assert.equal(seen[0].totalSegments, 1);
     assert.ok(seen[0].transferSize > 3000 && Buffer.isBuffer(seen[0].hash));
+});
+
+test("a delivery link fetches nothing of a Resource flagged as a request, whatever size it declares", async () => {
+    // Until 2026-09-30 a request flag walked any Resource past the size gate:
+    // a 2.2 MB split request was fetched whole (110 part requests) and then
+    // dropped, since nothing on a delivery link handles requests.
+    const { a, b, wire } = await deliveryLink();
+    const payload = bytes(2_200_000);
+    const split = sendSplit(a, payload, { requestId: Cryptography.truncatedHash(payload), isRequest: true }).catch(() => {});
+    const small = a.sendRequest("/lxmf/anything", bytes(2000));   // over the MDU: a request Resource
+    await settle(60);
+    assert.ok(advertisementsFrom(wire.a).length >= 2, "both request Resources were advertised");
+    assert.equal(wire.b.filter((p) => p.context === Packet.RESOURCE_REQ).length, 0, "not one part was asked for");
+    assert.equal(wire.b.filter((p) => p.context === Packet.RESOURCE_RCL).length, 0, "ignored, not refused (RNS/Link.py)");
+    assert.equal(b.incomingResources.length, 0);
+    assert.equal(b._splitAssemblies.size, 0);
+    a.close();
+    await split;
+    await assert.rejects(a.responseFor(small), /link closed|could not be sent|failed/);
 });

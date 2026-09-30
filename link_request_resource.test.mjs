@@ -23,6 +23,13 @@
  * or a closing link fails the request at once. Responses over 1 MiB arrive
  * as split Resources and are received whole.
  *
+ * Review fixes, 2026-09-30: a request Resource is taken only by a link that
+ * handles requests and within its maxRequestSize (Link.py:1036-1042); a
+ * response the link refuses fails its request at once (response_rejected);
+ * a failed request releases its half-assembled split response; and a request
+ * whose response is already arriving is not put back to waiting when the
+ * promise of its own Resource settles late.
+ *
  * Run: node --test link_request_resource.test.mjs
  */
 import assert from "node:assert/strict";
@@ -46,6 +53,31 @@ function respondWith(link, answer) {
         if (value !== undefined) link.sendResponse(request.requestId, value);
     });
 }
+
+/**
+ * Advertise, from `link`, a response Resource for `requestId` carrying
+ * `value`, with `fields` set on the Resource before it is built and its
+ * advertisement edited by `edit(map)` on the way out.
+ */
+function advertiseResponse(link, requestId, value, { fields = {}, edit = () => {} } = {}) {
+    const r = new Resource(link);
+    r.initiator = true;
+    r.requestId = Buffer.from(requestId);
+    r.isResponse = true;
+    Object.assign(r, fields);
+    r.prepareOutgoing(MsgPack.pack([requestId, value]));
+    const pack = r.packAdvertisement.bind(r);
+    r.packAdvertisement = (segment) => {
+        const adv = MsgPack.unpack(pack(segment));
+        const map = adv instanceof Map ? adv : new Map(Object.entries(adv));
+        edit(map);
+        return MsgPack.pack(map);
+    };
+    r.once("failed", () => {});
+    r.advertise();
+    return r;
+}
+const claimBz2 = (map) => map.set("f", Number(map.get("f")) | 0x02);
 
 // ── The advertisement carries the request/response flags and id ──────────
 
@@ -107,6 +139,38 @@ test("a request Resource is accepted even under ACCEPT_NONE, and so is the respo
     assert.ok(Buffer.from(echoed).equals(bytes(2000)), "request and response both crossed as Resources");
 });
 
+test("a request Resource is taken only by a link that handles requests, and only within its maxRequestSize", async () => {
+    // RNS/Link.py:1036-1042: accepted only where the destination has request
+    // handlers (here: a "request" listener on the link), and only when its
+    // data size is within max_request_size. With no handler it is ignored.
+    {
+        const { a, wire } = linkPair();
+        const id = a.sendRequest("/p", bytes(2000));
+        await settle(30);
+        assert.ok(advertisementsFrom(wire.a).length >= 1, "the request went as a Resource");
+        assert.equal(wire.b.filter((p) => p.context === Packet.RESOURCE_REQ).length, 0, "no handler: nothing asked for");
+        assert.equal(wire.b.filter((p) => p.context === Packet.RESOURCE_RCL).length, 0, "no handler: ignored, not refused");
+        a.close();
+        await assert.rejects(a.responseFor(id));
+    }
+    {
+        const { a, b, wire } = linkPair();
+        b.on("request", () => assert.fail("a request over maxRequestSize reached the handler"));
+        b.maxRequestSize = 2000;          // the packed request is 2000 bytes of data plus its envelope
+        const id = a.sendRequest("/p", bytes(2000), { timeoutMs: 60_000 });
+        await assert.rejects(within(a.responseFor(id), 3000, "the refused request"), /the peer rejected the resource/);
+        assert.equal(wire.b.filter((p) => p.context === Packet.RESOURCE_RCL).length, 1, "refused at its advertisement");
+        assert.equal(wire.b.filter((p) => p.context === Packet.RESOURCE_REQ).length, 0, "not one part was asked for");
+    }
+    {
+        const { a, b } = linkPair();
+        b.maxRequestSize = 3000;
+        respondWith(b, (request) => Buffer.from(request.data).length);
+        const id = a.sendRequest("/p", bytes(2000));
+        assert.equal(await within(a.responseFor(id), 3000, "the response"), 2000, "within the limit: taken and answered");
+    }
+});
+
 // ── Responses belong to pending requests ──────────────────────────────────
 
 test("a response, packet or Resource, is taken only for a pending request (Link.py handle_response)", async () => {
@@ -121,6 +185,23 @@ test("a response, packet or Resource, is taken only for a pending request (Link.
     assert.equal(a.incomingResources.length, 0, "the response Resource was not accepted");
     assert.equal(wire.a.filter((p) => p.context === Packet.RESOURCE_REQ).length, 0, "no part of it was asked for");
     for (const r of [...b.outgoingResources]) r.cancel("test over");
+});
+
+test("an advertisement flagged as both request and response is a request (ResourceAdvertisement.is_request first)", async () => {
+    // Until 2026-09-30 the response flag won here, while the concluded
+    // Resource was then dispatched as a request. Now the link decides as the
+    // reference does: a request, so a link with no request handler ignores
+    // it even when a request of that id is pending.
+    const { a, b, wire } = linkPair();
+    b.on("request", (request) => {
+        advertiseResponse(b, request.requestId, bytes(3000), { edit: (map) => map.set("f", Number(map.get("f")) | 0x08) });
+    });
+    const id = a.sendRequest("/get", null, { timeoutMs: 60_000 });
+    await settle(30);
+    assert.ok(advertisementsFrom(wire.b).length >= 1, "the doubly flagged Resource was advertised");
+    assert.equal(wire.a.filter((p) => p.context === Packet.RESOURCE_REQ).length, 0, "not taken as the response");
+    assert.equal(a._pendingRequest(id).status, Link.REQUEST_DELIVERED, "the request still waits for its response");
+    a.close();
 });
 
 test("a response Resource's transfer does not run into the request's timeout", async () => {
@@ -150,6 +231,45 @@ test("a request sent as a Resource starts its timeout only once the peer has pro
     assert.ok(Date.now() - started > 80, "the upload took longer than the request's timeout");
 });
 
+test("a request whose response is already arriving is not put back to waiting when its own Resource settles", async () => {
+    // PostInterface hands a poll's packets over in one synchronous loop, so
+    // the proof of a request Resource and the response's advertisement can
+    // be handled back to back, before the request Resource's promise
+    // settles. The request is then RECEIVING; until 2026-09-30 the late
+    // settlement put it back to DELIVERED with its timer running, and a first
+    // part slower than the timeout failed a response mid-transfer. The
+    // advertisement-first order is covered too.
+    for (const order of ["proof first", "advertisement first"]) {
+        const held = [];
+        let holding = true;
+        const { a, b } = linkPair({
+            drop: (p, from) => {
+                if (from === "b" && holding && (p.context === Packet.RESOURCE_PRF || p.context === Packet.RESOURCE_ADV)) {
+                    held.push(p);
+                    return true;
+                }
+                return false;
+            },
+            delay: (p, from) => (from === "b" && p.context === Packet.RESOURCE ? 300 : 0),
+        });
+        respondWith(b, () => bytes(1500));
+        const id = a.sendRequest("/get", bytes(2000), { timeoutMs: 150 });
+        for (let i = 0; i < 400 && held.length < 2; i++) await settle(1);
+        holding = false;
+        const proof = held.find((p) => p.context === Packet.RESOURCE_PRF);
+        const advertisement = held.find((p) => p.context === Packet.RESOURCE_ADV);
+        assert.ok(proof && advertisement, `${order}: both packets were held`);
+        if (order === "proof first") { a.onResourceProof(proof); a.onPacket(advertisement); }
+        else { a.onPacket(advertisement); a.onResourceProof(proof); }
+        await settle(5);
+        const receipt = a._pendingRequest(id);
+        assert.equal(receipt.status, Link.REQUEST_RECEIVING, `${order}: the response is arriving`);
+        assert.equal(receipt.timer, null, `${order}: no timeout runs while it arrives`);
+        const response = await within(a.responseFor(id), 5000, `${order}: the response`);
+        assert.ok(Buffer.from(response).equals(bytes(1500)), `${order}: the response arrived whole, after its 150 ms budget`);
+    }
+});
+
 test("a request whose response never starts fails after its timeout", async () => {
     const { a } = linkPair();
     const id = a.sendRequest("/nobody/home", null, { timeoutMs: 60 });
@@ -166,6 +286,48 @@ test("a response transfer that fails fails its request at once", async () => {
     assert.equal(a._pendingRequest(id).status, Link.REQUEST_RECEIVING);
     b.outgoingResources[0].cancel("the responder gave up");
     await assert.rejects(within(a.responseFor(id), 2000), /the response transfer failed/);
+});
+
+test("a response the link refuses fails its request at once, saying why (Link.py response_rejected)", async () => {
+    // Until 2026-09-30 the request waited out its whole timeout and then
+    // reported "no response within N ms": false, as a response had come and
+    // been refused.
+    {
+        const { a, b, wire } = linkPair();
+        b.on("request", (request) => { advertiseResponse(b, request.requestId, bytes(3000), { edit: claimBz2 }); });
+        const id = a.sendRequest("/get", null, { timeoutMs: 60_000 });
+        await assert.rejects(within(a.responseFor(id), 2000, "the refused response"), /the response was refused: .*compressed/);
+        assert.equal(wire.a.filter((p) => p.context === Packet.RESOURCE_RCL).length, 1, "the refusal went back to the responder");
+        assert.equal(a.pendingRequests.length, 0);
+    }
+    // A later segment of a split response the link is not reassembling is refused, and fails its request too.
+    const saved = Resource.MAX_EFFICIENT_SIZE;
+    Resource.MAX_EFFICIENT_SIZE = 5000;
+    try {
+        const { a, b } = linkPair();
+        b.on("request", (request) => {
+            advertiseResponse(b, request.requestId, bytes(4000), {
+                fields: { segmentIndex: 2, totalSegments: 2, totalSize: 9000, originalHash: Buffer.alloc(32, 0x42) },
+            });
+        });
+        const id = a.sendRequest("/pull", null, { timeoutMs: 60_000 });
+        await assert.rejects(within(a.responseFor(id), 2000, "the refused segment"), /the response was refused: segment 2\/2 of a split Resource this link is not reassembling/);
+    } finally {
+        Resource.MAX_EFFICIENT_SIZE = saved;
+    }
+});
+
+test("a refused advertisement leaves a request whose response is already transferring to that transfer", async () => {
+    const { a, b, wire } = linkPair({ delay: (p, from) => (from === "b" && p.context === Packet.RESOURCE ? 50 : 0) });
+    let request = null;
+    respondWith(b, (r) => { request = r; return bytes(5000); });
+    const id = a.sendRequest("/get", null, { timeoutMs: 60_000 });
+    for (let i = 0; i < 200 && a._pendingRequest(id)?.status !== Link.REQUEST_RECEIVING; i++) await settle(1);
+    assert.equal(a._pendingRequest(id).status, Link.REQUEST_RECEIVING);
+    advertiseResponse(b, request.requestId, bytes(3000, 3), { edit: claimBz2 });   // a second, unreadable response
+    const response = await within(a.responseFor(id), 5000, "the response");
+    assert.equal(wire.a.filter((p) => p.context === Packet.RESOURCE_RCL).length, 1, "the second advertisement was refused while the request was pending");
+    assert.ok(Buffer.from(response).equals(bytes(5000)), "the transfer that was under way answered the request");
 });
 
 test("closing the link fails every pending request, from either end", async () => {
@@ -209,7 +371,7 @@ test("a response over 1 MiB arrives as a split Resource and is received whole", 
     assert.equal(a._splitAssemblies.size, 0);
 });
 
-test("between two segments of a response the request waits again, and times out if the next never comes", async () => {
+test("between two segments of a response the request waits again, times out if the next never comes, and releases the first", async () => {
     const saved = Resource.MAX_EFFICIENT_SIZE;
     Resource.MAX_EFFICIENT_SIZE = 5000;
     try {
@@ -218,8 +380,14 @@ test("between two segments of a response the request waits again, and times out 
             const packed = MsgPack.pack([request.requestId, bytes(9000)]);
             sendSplit(b, packed, { requestId: request.requestId, isResponse: true, segments: 1 });
         });
-        const id = a.sendRequest("/pull", null, { timeoutMs: 100 });
+        const progress = [];
+        const id = a.sendRequest("/pull", null, { timeoutMs: 100, onProgress: (p) => progress.push(p) });
         await assert.rejects(within(a.responseFor(id), 3000), /no response within 100 ms/);
+        assert.ok(Math.max(...progress) >= 0.5, "the first segment (half the response) arrived before the wait began");
+        // The half-assembled response can never complete now (its request is
+        // gone, so later segments are ignored): it is released at once, not
+        // held until the link closes.
+        assert.equal(a._splitAssemblies.size, 0, "the failed request's reassembly is released");
     } finally {
         Resource.MAX_EFFICIENT_SIZE = saved;
     }
