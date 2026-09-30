@@ -5,7 +5,9 @@
 //
 //   context LRPROOF       link request proof   -> Link.validateProof()
 //   context RESOURCE_PRF  resource proof       -> Link.onResourceProof()
-//   context anything else delivery proof       -> emit("proof", ...)
+//   context anything else delivery proof       -> emit("proof", ...), and
+//                                                 Link.onPacketProof() of the
+//                                                 link it is addressed to
 //
 // The dangerous pair is the last two. A resource proof is addressed to the LINK
 // hash and carries `resourceHash + proof` as its payload. The delivery-proof
@@ -77,8 +79,10 @@ function newLink(hash = LINK_HASH) {
         status: LinkStub.ACTIVE,
         resourceProofs: [],
         linkProofs: [],
+        packetProofs: [],
         dataPackets: [],
         onResourceProof(packet) { this.resourceProofs.push(packet); },
+        onPacketProof(packet) { this.packetProofs.push(packet); },
         validateProof(packet) { this.linkProofs.push(packet); },
         onPacket(packet) { this.dataPackets.push(packet); },
     };
@@ -155,6 +159,28 @@ test("an ordinary link delivery proof still emits proof", () => {
     assert.equal(link.resourceProofs.length, 0);
 });
 
+test("a link delivery proof also reaches its link, which counts it as hearing the peer", () => {
+    // RNS/Link.py: last heard = max(last_inbound, last_proof, activated_at),
+    // and validate_link_proof sets link.last_proof. The link checks the
+    // signature itself (Link.onPacketProof).
+    const ours = newLink();
+    const theirs = newLink(Buffer.from("ad0fdccf03c04e4322a67c22bb3bc103", "hex"));
+    const rns = newRns([ours, theirs]);
+    const packet = {
+        hops: 0,
+        packetType: PacketStub.PROOF,
+        context: PacketStub.NONE,
+        destinationType: DestinationStub.LINK,
+        destinationHash: LINK_HASH,
+        data: Buffer.concat([Buffer.alloc(32, 0x0f), Buffer.alloc(64, 0xbb)]),
+    };
+    onPacketReceived.call(rns, packet, { name: "post", hash: "iface" });
+    assert.deepEqual(ours.packetProofs, [packet]);
+    assert.equal(theirs.packetProofs.length, 0, "only the link it is addressed to");
+    assert.equal(rns.emitted.length, 1, "and the app still hears of the delivery");
+    assert.equal(ours.resourceProofs.length, 0);
+});
+
 test("a resource proof for another link is not delivered to ours", () => {
     const ours = newLink();
     const theirs = newLink(Buffer.from("ad0fdccf03c04e4322a67c22bb3bc103", "hex"));
@@ -184,5 +210,6 @@ test("a link request proof still reaches validateProof", () => {
 
     assert.equal(link.linkProofs.length, 1, "LRPROOF must not be captured by the resource branch");
     assert.equal(link.resourceProofs.length, 0);
+    assert.equal(link.packetProofs.length, 0, "nor taken for a packet proof");
     assert.deepEqual(rns.emitted, []);
 });
