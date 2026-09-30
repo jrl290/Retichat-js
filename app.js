@@ -487,6 +487,15 @@ const ContactStore = {
      * the `1` of :99-106), so turning the filter on does not silently drop
      * the user's own contacts. A hidden row (a group member's, a channel
      * poster's, a name-only one) does not: it was never a contact.
+     *
+     * Consequence, open with James (2026-09-30): Android allowlisted every
+     * row, group members' included, and the phones allowlist every member
+     * of a group the user creates or accepts. A member of a group the user
+     * held before this migration keeps a hidden, not allowlisted row here,
+     * so its DMs are dropped (unproved) where a phone that accepted the
+     * same group keeps them. Members of groups created or accepted from now
+     * on are allowlisted (_acceptGroupInvite, group creation), as on the
+     * phones.
      */
     init() {
         const data = sGet("contacts_v2");
@@ -2340,9 +2349,15 @@ const RnsClient = {
 
         console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"`);
 
-        // The user wrote to them, so their answer passes the privacy filter
-        // (iOS allowlists a chat the user starts: createDirectChat,
-        // ChatRepository.swift:2481).
+        // The user wrote to them, so their answer passes the privacy filter.
+        // A departure from iOS and Android, asked for with the web's filter
+        // (2026-09-30): neither phone allowlists on a send (iOS sendMessage,
+        // ChatRepository.swift:1029; Android sendMessage, ChatRepository.kt
+        // :507). They allowlist a chat the user starts (iOS createDirectChat
+        // :2481, reached from New Chat, QR and links), which the web's Add
+        // Contact and New Conversation do too. The difference: replying to
+        // a sender kept while the filter was off allowlists it here, and not
+        // on the phones.
         ContactStore.allow(contact.destHash);
 
         // Create the outgoing message record

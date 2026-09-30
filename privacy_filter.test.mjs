@@ -302,6 +302,48 @@ test("link packet: a stranger's is never proved, parsed or answered; a contact's
     assert.equal(linkProofs(plain.wire).length, 1);
 });
 
+test("a packet whose source the filter keeps is proved even when it does not parse (LXMF delivery_packet), on both paths; a stranger's is not", async () => {
+    // LXMRouter.py delivery_packet proves before it parses, and LXMF gives
+    // link packets to the same function (delivery_link_established). Only
+    // the filter's drops go unproved.
+    const r = recipient();
+    const friend = Identity.create(), stranger = Identity.create();
+    const F = lxmfHash(friend), S = lxmfHash(stranger);
+    r.ContactStore.add(F);
+    r.ContactStore.allow(F);
+    const junk = (src) => Buffer.concat([Buffer.from(src, "hex"), Buffer.alloc(64, 1), Buffer.from([0xc1, 0xc1])]);
+
+    let proved = 0;
+    r.destination.emit("packet", { data: junk(F), packet: { prove: () => proved++ } });
+    r.destination.emit("packet", { data: junk(S), packet: { prove: () => proved++ } });
+    await settle();
+    assert.equal(proved, 1, "opportunistic: the contact's unparseable packet is proved, the stranger's is not");
+
+    const { a, wire } = await deliveryLink(r);
+    a.send(Buffer.concat([r.destination.hash, junk(F)]));
+    await settle(6);
+    assert.equal(linkProofs(wire).length, 1, "link: the contact's unparseable packet is proved, as before 2026-09-30");
+    a.send(Buffer.concat([r.destination.hash, junk(S)]));
+    await settle(6);
+    assert.equal(linkProofs(wire).length, 1, "link: the stranger's is not");
+    assert.equal(r.emitted.length, 0, "neither is a message");
+    assert.deepEqual(r.drops().map((d) => [d.src, d.path]), [[S.slice(0, 12), "opportunistic"], [S.slice(0, 12), "link"]]);
+});
+
+test("a link payload with no plaintext is ignored and never proved, whatever the filter says", () => {
+    // RNS Link.receive calls LXMF only with what it decrypted (RNS/Link.py
+    // receive); with the filter off every source passes step 1, so only this
+    // guard keeps the parse-failure proof above off such a payload.
+    const r = recipient();
+    r.PrivacyFilter.set(false);
+    let proved = 0;
+    for (const payload of [null, undefined]) {
+        assert.equal(r.router.handleLinkPayload(null, payload, "link", () => proved++), false);
+    }
+    assert.equal(proved, 0);
+    assert.deepEqual(r.drops(), [], "and it is no privacy drop");
+});
+
 test("link Resource: a stranger's is transferred (its source is inside) but dropped unparsed, with no ticket reply", async (t) => {
     const r = recipient();
     const { a, wire } = await deliveryLink(r);
@@ -507,6 +549,31 @@ test("a group invite is kept only from an allowlisted contact: a channel poster'
     assert.equal(r.self.groups.length, 1, "the contact's invite is processed");
 });
 
+test("a group invite from a co-member who is not allowlisted passes step 1 and is dropped by the router at step 2, unproved", async () => {
+    // The router's own invite rule (acceptsMessage): the handler's check
+    // would drop it too, but only after the router had proved it, telling
+    // the inviter the invite was delivered.
+    const r = recipient();
+    const inviter = Identity.create(), member = Identity.create();
+    const I = lxmfHash(inviter), M = lxmfHash(member);
+    r.GroupStore.addPending("9".repeat(32), "G", I, [M]);
+    r.ContactStore.keep(M);                      // a co-member: its key, hidden
+    const invite = (groupId) => lxm(member, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, groupId], [GROUP_FIELDS.GROUP_ACTION, "invite"],
+        [GROUP_FIELDS.GROUP_MEMBERS, `${M},${lxmfHash(r.me)}`]]));
+
+    r.packet(invite("4".repeat(32)));
+    await settle();
+    assert.equal(r.proofs.length, 0, "not proved");
+    assert.equal(r.self.groups.length, 0, "never reaches the group handler");
+    assert.deepEqual(r.drops(), [{ src: M.slice(0, 12), path: "opportunistic", at: "message" }], "a member, so dropped after the parse");
+
+    r.ContactStore.allow(M);
+    r.packet(invite("5".repeat(32)));
+    await settle();
+    assert.equal(r.proofs.length, 1, "once allowlisted, its invite is proved");
+    assert.equal(r.self.groups.length, 1, "and processed");
+});
+
 // ── the allowlist ──────────────────────────────────────────────────────────
 
 test("migration: rows stored before the filter — listed ones become allowlisted, hidden and name-only ones do not", () => {
@@ -550,6 +617,35 @@ test("the user allowlists a peer by adding it, writing to it, or creating a grou
     assert.match(app, /addPeer\(destHash, publicKeyHex\) \{[\s\S]*?ContactStore\.add\(destHash, false, publicKeyHex \|\| null\);\s+ContactStore\.allow\(destHash\);/);
     // Creating a group allowlists its members (iOS createGroupChat).
     assert.match(methodBody("_renderGroupForm(top, scroll, footer)"), /for \(const hash of selected\) ContactStore\.allow\(hash\);/);
+});
+
+test("adding an allowlisted row keeps it allowlisted: a hidden co-member's first DM lists it, and its next DM still passes", async () => {
+    // _acceptGroupInvite allowlists members and keeps them hidden; the
+    // message handler lists the row with ContactStore.add on a first DM
+    // (as _handleDistroBlob does for a distro sender).
+    const r = recipient();
+    const member = Identity.create();
+    const M = lxmfHash(member);
+    r.ContactStore.allow(M);
+    assert.deepEqual([r.ContactStore.isContact(M), r.ContactStore.allowlisted(M)], [false, true], "allowlisted and hidden");
+
+    r.packet(lxm(member, r.me, "first DM"));
+    await settle();
+    assert.deepEqual([r.ContactStore.isContact(M), r.ContactStore.allowlisted(M)], [true, true], "listed, still allowlisted");
+    r.packet(lxm(member, r.me, "second DM"));
+    await settle();
+    assert.deepEqual(r.MsgStore.get(M).map((m) => m.content), ["first DM", "second DM"]);
+    assert.equal(r.proofs.length, 2, "both proved");
+
+    // add() on its own, and keep(), leave the mark as it is either way.
+    const other = "c".repeat(32);
+    r.ContactStore.add(other);
+    r.ContactStore.add(other);
+    assert.equal(r.ContactStore.allowlisted(other), false, "add() does not allowlist");
+    r.ContactStore.allow(other);
+    r.ContactStore.add(other, true);
+    r.ContactStore.keep(other);
+    assert.equal(r.ContactStore.allowlisted(other), true);
 });
 
 test("distro fan-out is never filtered: a stranger's message to the distro is stored, listed and not allowlisted", () => {
