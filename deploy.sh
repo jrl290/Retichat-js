@@ -78,9 +78,9 @@
 #     everything but the payload and config.json is stray.
 #   shared (retichat.com: public_html is also the host's docroot, with the PHP
 #     node in reticulum/, cPanel's cgi-bin/ and .well-known/, and maybe other
-#     sites) — only names the web client owns count (OWNED_NAMES,
-#     OWNED_BASES below); everything else is reported as not ours and is
-#     never flagged or touched.
+#     sites) — only names the web client owns count (OWNED_NAMES, and
+#     OWNED_BASES with a backup suffix, below); everything else is reported
+#     as not ours and is never flagged or touched.
 # config.json, every .ht* file and reticulum/ are never stray on either.
 # `clean-strays <node> --yes` moves exactly the listed entries into
 # ~/retichat-web-strays/<node>-<UTC time>/, outside every served directory,
@@ -98,8 +98,11 @@
 #
 # The boot gate uses the Playwright + Chromium that the staging harness uses
 # (../test-harnesses/distro-pipeline; DEPLOY_PLAYWRIGHT_DIR names another
-# project dir). With no browser installed it is skipped with a loud warning and
-# boot_checked=0 in .deploy.log.
+# project dir). With no browser installed (no Playwright there, or Playwright
+# without its Chromium) it is skipped with a loud warning and boot_checked=0 in
+# .deploy.log. A gate that cannot run — no node, a Playwright that is installed
+# but will not load, a Chromium that will not start — refuses the deploy and
+# says so; it never reports that as the page failing to boot.
 
 set -uo pipefail
 
@@ -124,13 +127,18 @@ PAYLOAD=(index.html app.js style.css retichat-icon.png .htaccess lib)
 EXCLUDE=(config.json config.local.json)
 
 # Names the web client owns, so they are stray on a shared docroot too.
-# OWNED_NAMES match exactly; OWNED_BASES also match with any suffix that starts
-# with . - _ or ~ (app.js.bak-bug135, app.js~, index.html.orig, lib.old).
+# OWNED_NAMES match exactly. OWNED_BASES match only with a backup suffix
+# (BACKUP_SUFFIXES: app.js.bak-bug135, app.js.bak2-20260808-120601,
+# index.html.orig, lib.old, app.js~). A base followed by anything else —
+# lib-vendor/, lib_legacy/, index.html.en, config.json.dist, style.css-print —
+# could be the host's or another site's on a shared docroot, so it is reported
+# there as not ours and never flagged or moved.
 OWNED_NAMES=(debug.html debug-standalone.html packet.js post_interface.js
              config.local.json config.template.json selectiv-snapshot
              deploy.sh verify-deploy.sh deploy.env deploy.env.example .deploy.log)
 OWNED_BASES=(index.html app.js style.css retichat-icon.png config.json lib
              debug.html debug-standalone.html packet.js post_interface.js)
+BACKUP_SUFFIXES=('.bak*' '.orig*' '.old*' '.save*' '~')
 
 # Moved strays go here, relative to the node account's home: outside every
 # served directory (the docroots are under ~/public_html).
@@ -176,9 +184,12 @@ set_ssh() {
 # ── Stray files ───────────────────────────────────────────────────────────
 
 owned_name() { # name — is this a name the web client owns?
-  local n="$1" b
+  local n="$1" b s
   for b in "${OWNED_NAMES[@]}"; do [[ "$n" == "$b" ]] && return 0; done
-  for b in "${OWNED_BASES[@]}"; do [[ "$n" == "$b"[._~-]* ]] && return 0; done
+  for b in "${OWNED_BASES[@]}"; do
+    # $s unquoted: the suffix is a glob (.bak* matches .bak2-20260808-120601).
+    for s in "${BACKUP_SUFFIXES[@]}"; do [[ "$n" == "$b"$s ]] && return 0; done
+  done
   [[ "$n" == *.test.mjs ]] && return 0
   return 1
 }
@@ -282,6 +293,46 @@ cmd_strays() { # [node]
 # rather than quoted: the listing is the node's word, not ours.
 SAFE_NAME='^[A-Za-z0-9._~+,@=-]+/?$'
 
+# clean_strays_remote_script <remote_dir> <dest> <entry>... — the script
+# clean-strays runs on the node over SSH; both dirs are relative to the node
+# account's home. It refuses what is protected even though the entries were
+# classified here: config.json, .ht*, reticulum/ and the payload never move,
+# and neither does a path (no /), whatever the listing said; a destination
+# inside public_html or the source, or climbing out with .., is refused. Every
+# refusal happens before anything moves.
+clean_strays_remote_script() {
+  local remote_dir="$1" dest="$2" names="" n protected
+  shift 2
+  for n in "$@"; do names+=" '${n%/}'"; done
+  protected="$(IFS='|'; echo "${PAYLOAD[*]}")"
+  printf '%s\n' "
+    set -e
+    src=\"\$HOME/${remote_dir}\"
+    dest=\"\$HOME/${dest}\"
+    case \"\$dest\" in \"\$HOME/public_html\"|\"\$HOME/public_html/\"*|\"\$src\"|\"\$src/\"*|*/..|*/../*)
+      echo 'refusing: the destination is inside a served directory, or climbs out with ..' >&2; exit 3 ;;
+    esac
+    for n in ${names}; do
+      case \"\$n\" in ''|.|..|*/*|config.json|.ht*|reticulum|${protected})
+        echo \"refusing to move \$n: it is protected\" >&2; exit 3 ;;
+      esac
+    done
+    cd \"\$src\"
+    mkdir -p \"\$dest\"
+    for n in ${names}; do
+      if [ -e \"\$n\" ] || [ -L \"\$n\" ]; then
+        if [ -e \"\$dest/\$n\" ] || [ -L \"\$dest/\$n\" ]; then
+          echo \"\$dest/\$n already exists — \$n not moved\" >&2; exit 4
+        fi
+        mv -- \"\$n\" \"\$dest/\$n\"
+        printf \"mv -- '%s' '%s'\\n\" \"\$dest/\$n\" \"\$src/\$n\" >> \"\$dest/RESTORE.sh\"
+        echo \"  moved \$n\"
+      else
+        echo \"  already gone: \$n\"
+      fi
+    done"
+}
+
 cmd_clean_strays() { # <node> [--yes]
   local want="${1:-}" confirm="${2:-}"
   if [[ -z "$want" || ( -n "$confirm" && "$confirm" != "--yes" ) || $# -gt 2 ]]; then
@@ -322,39 +373,8 @@ cmd_clean_strays() { # <node> [--yes]
     return 2
   fi
 
-  local names="" protected
-  for n in "${STRAYS[@]}"; do names+=" '${n%/}'"; done
-  protected="$(IFS='|'; echo "${PAYLOAD[*]}")"
-  # The remote side refuses anything protected even though the list was
-  # classified here: config.json, .ht*, reticulum/ and the payload never move,
-  # and neither does a path (no /), whatever the listing said.
-  "${SSH[@]}" "$host" "
-    set -e
-    src=\"\$HOME/${REMOTE_DIR}\"
-    dest=\"\$HOME/${dest}\"
-    case \"\$dest\" in \"\$HOME/public_html\"|\"\$HOME/public_html/\"*|\"\$src\"|\"\$src/\"*)
-      echo 'refusing: the destination is inside a served directory' >&2; exit 3 ;;
-    esac
-    for n in ${names}; do
-      case \"\$n\" in ''|.|..|*/*|config.json|.ht*|reticulum|${protected})
-        echo \"refusing to move \$n: it is protected\" >&2; exit 3 ;;
-      esac
-    done
-    cd \"\$src\"
-    mkdir -p \"\$dest\"
-    for n in ${names}; do
-      if [ -e \"\$n\" ] || [ -L \"\$n\" ]; then
-        if [ -e \"\$dest/\$n\" ] || [ -L \"\$dest/\$n\" ]; then
-          echo \"\$dest/\$n already exists — \$n not moved\" >&2; exit 4
-        fi
-        mv -- \"\$n\" \"\$dest/\$n\"
-        printf \"mv -- '%s' '%s'\\n\" \"\$dest/\$n\" \"\$src/\$n\" >> \"\$dest/RESTORE.sh\"
-        echo \"  moved \$n\"
-      else
-        echo \"  already gone: \$n\"
-      fi
-    done
-  " || die "moving the strays on ${NODE_NAME} failed — see above; whatever moved is listed in ~/${dest}/RESTORE.sh"
+  "${SSH[@]}" "$host" "$(clean_strays_remote_script "$REMOTE_DIR" "$dest" "${STRAYS[@]}")" \
+    || die "moving the strays on ${NODE_NAME} failed — see above; whatever moved is listed in ~/${dest}/RESTORE.sh"
 
   step "Listing ${NODE_NAME} again"
   if check_node_strays "$NODE_NAME"; then
@@ -375,7 +395,10 @@ cmd_clean_strays() { # <node> [--yes]
 # so the gate answers /config.json itself with an exchange on its own server
 # that refuses everything: a boot never reaches a real exchange.
 #
-# Exit status: 0 booted clean, 1 failed, 3 no browser installed.
+# Exit status: 0 booted clean; 1 the page failed; 2 the gate could not run (a
+# Playwright that is installed but will not load, a Chromium that will not
+# start), which says nothing about the page; 3 no browser installed (no
+# Playwright, or Playwright without its Chromium) — the only skip.
 boot_gate() { # dir
   local tmp rc
   tmp="$(mktemp -d)"
@@ -410,23 +433,37 @@ const [rootArg, pwDir] = process.argv.slice(2);
 const ROOT = resolve(rootArg ?? ".");
 if (!existsSync(join(ROOT, "index.html"))) { say(`FAIL no index.html in ${ROOT}`); process.exit(1); }
 
+// Only "not installed" skips: Playwright that cannot be found, or Playwright
+// whose Chromium was never downloaded. An installed Playwright that fails to
+// load, or a Chromium that will not start, is a broken gate (exit 2), not a
+// missing browser.
+const firstLine = (e) => String(e?.message ?? e).split("\n")[0];
+const requirePw = createRequire(join(resolve(pwDir), "package.json"));
+let pwPath;
+try {
+    pwPath = requirePw.resolve("playwright");
+} catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND") { say(`FAIL cannot resolve Playwright in ${pwDir}: ${firstLine(e)}`); process.exit(2); }
+    say(`no Playwright in ${pwDir} (${e.code})`);
+    process.exit(3);
+}
 let chromium;
 try {
-    ({ chromium } = createRequire(join(resolve(pwDir), "package.json"))("playwright"));
+    ({ chromium } = requirePw(pwPath));
 } catch (e) {
-    say(`no Playwright in ${pwDir} (${e.code ?? e.message.split("\n")[0]})`);
-    process.exit(3);
+    say(`FAIL Playwright is installed in ${pwDir} but will not load: ${firstLine(e)}`);
+    process.exit(2);
 }
 let browser;
 try {
     browser = await chromium.launch({ headless: true, args: ["--disable-dev-shm-usage"] });
 } catch (e) {
-    if (/Executable doesn't exist/i.test(e.message)) {
+    if (/Executable doesn't exist/i.test(e?.message ?? "")) {
         say(`Playwright in ${pwDir} has no Chromium installed`);
         process.exit(3);
     }
-    say(`FAIL Chromium would not start: ${e.message.split("\n")[0]}`);
-    process.exit(1);
+    say(`FAIL Chromium would not start: ${firstLine(e)}`);
+    process.exit(2);
 }
 
 const server = createServer(async (req, res) => {
@@ -465,6 +502,7 @@ const settled = new Promise((r) => { settle = r; });
 let t0 = Date.now(); // reset at navigation: times below are from there
 const at = () => `${((Date.now() - t0) / 1000).toFixed(1)} s`;
 const fail = (why) => { failures.push(`${at()} ${why}`); settle(); };
+let gateError = null;
 
 try {
     const context = await browser.newContext({ serviceWorkers: "block" });
@@ -507,13 +545,17 @@ try {
         .catch((e) => fail(`navigation failed: ${e.message.split("\n")[0]}`));
     await Promise.race([settled, new Promise((r) => setTimeout(r, WINDOW_MS))]);
 } catch (e) {
-    fail(`the gate itself failed: ${e.message.split("\n")[0]}`);
+    // The gate broke before it could watch the window: that says nothing about
+    // the page, unless the page had already failed.
+    gateError = `the gate itself failed: ${firstLine(e)}`;
 }
 const renderedAt = rendered;
 await browser.close().catch(() => {});
 server.close();
 
 for (const b of blocked) say(`blocked, never sent: ${b}`);
+if (gateError && !failures.length) { say(`FAIL ${gateError}`); process.exit(2); }
+if (gateError) say(`(and then ${gateError})`);
 if (!failures.length && !renderedAt) failures.push(`nothing rendered into #app within ${WINDOW_MS / 1000} s: a blank page`);
 if (failures.length) {
     for (const f of failures) say(`FAIL ${f}`);
@@ -540,10 +582,15 @@ cmd_boot_check() { # <dir>
   case $rc in
     0) echo "  ${GREEN}✓${NC} boots" ;;
     3) boot_skipped_warning ;;
+    2) echo "${RED}✗ the boot gate could not run (see above): this says nothing about the page${NC}" >&2 ;;
     *) echo "${RED}✗ the page does not boot${NC}" >&2; rc=1 ;;
   esac
   return $rc
 }
+
+# Sourced (the tests do, to run clean_strays_remote_script's output against a
+# fake node home): the functions above are defined and nothing runs.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 # ── Subcommands ───────────────────────────────────────────────────────────
 case "${1:-}" in
@@ -681,10 +728,15 @@ echo "  ${GREEN}✓${NC} every relative import resolves"
 # resolve pass all of them; only a browser executing the graph sees them.
 step "Booting ${REF_SHA} in headless Chromium"
 BOOT_CHECKED=0
+# The gate drives Chromium from node. Without node it cannot run, which is not
+# "no browser installed" and says nothing about whether the page boots.
+command -v node >/dev/null 2>&1 \
+  || die "node not found — the boot gate cannot run, so nothing shows ${REF_SHA} boots — not deploying"
 if boot_gate "$STAGE"; then BOOT_RC=0; else BOOT_RC=$?; fi
 case $BOOT_RC in
   0) BOOT_CHECKED=1; echo "  ${GREEN}✓${NC} boots" ;;
   3) boot_skipped_warning ;;
+  2) die "the boot gate could not run (see above), so nothing shows ${REF_SHA} boots — not deploying" ;;
   *) die "${REF_SHA} does not boot in a browser — not deploying" ;;
 esac
 

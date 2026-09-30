@@ -35,8 +35,9 @@
 # if the browser is entitled to serve last week's copy from memory — see the
 # comment at the top of .htaccess.
 #
-# RETICHAT_WEB_URL / SELECTIV_WEB_URL override a node's served base URL
-# (deploy.env.example); the tests point them at hosts that cannot resolve.
+# RETICHAT_WEB_URL and SELECTIV_WEB_URL override a node's served base URL
+# (deploy.env.example names only RETICHAT_WEB_URL); the tests point both at
+# hosts that cannot resolve.
 
 set -uo pipefail
 
