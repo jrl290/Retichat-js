@@ -254,11 +254,13 @@ const RFED_LINK_FAILED = "link_failed";
 // each attempt follows an event.
 //
 // While the exchange is down no attempt starts at all (_exchangeIsDown): its
-// LINKREQUEST would be lost at once (PostInterface.sendData), and the doomed
-// attempt, in flight for its whole establishment timeout, would swallow the
-// exchange's return, the one event that can bring the link back. This is
-// app-links' "no usable interface" failure, which interface_online
-// re-attempts.
+// LINKREQUEST would be lost at once (PostInterface.sendData). An attempt
+// whose LINKREQUEST is lost all the same — it was in the batch of an
+// exchange that then failed — fails on the interface's report at once
+// (Link.requestLost) instead of waiting out its establishment timeout, so it
+// cannot swallow the exchange's return, the one event that can bring the
+// link back. This is app-links' "no usable interface" failure, which
+// interface_online re-attempts.
 //
 // Only a close we did not ask for re-opens: TIMEOUT (the keepalive watchdog,
 // or no answer at all) or DESTINATION_CLOSED (the node's LINKCLOSE). Every
