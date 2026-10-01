@@ -138,7 +138,7 @@ function makeClient({ storage = makeStorage(), contacts = [], groups = [], metho
         _pendingTimeouts: new Map(),
         _pendingPacketHashes: new Map(),
         // The transfers a send waits on (lib/send_progress.js), on no clock.
-        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }),
+        _sendTransfers: new SendTransfers(),
         _onSendProgress: [],
         // Display names (DISPLAY_NAMES.md §4.1) are pinned in display_names_wiring.test.mjs.
         _decideMessageName: () => ABSENT,

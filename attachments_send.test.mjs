@@ -15,7 +15,8 @@
  *
  *   Outcome: a moving transfer is never failed by the 30 s send ceiling: the
  *   Resource's own end decides, and a silence of more than 5 s is a logged §1
- *   violation (DESIGN_PRINCIPLES §1, bulk transfers). The propagation
+ *   violation (DESIGN_PRINCIPLES §1, bulk transfers), which the Resource
+ *   asserts itself (bulk_transfer_rule.test.mjs). The propagation
  *   fallback counts only time without transfer activity (app-links 07bea51
  *   Timer P), so a photo still moving direct gets no second upload.
  *
@@ -38,7 +39,7 @@ import { AttachmentStore, attachmentKey, memoryBackend } from "./lib/attachment_
 import {
     MAX_ATTACHMENTS, NAME_FIELD_MAX, PROPAGATION_UPLOAD_OVERHEAD, attachmentRefusal, estimatePackedSize, formatSize,
 } from "./lib/attachment_limits.js";
-import { SendTransfers, transferProgress, propagationFailure, PROGRESS_START, QUIET_MS } from "./lib/send_progress.js";
+import { SendTransfers, transferProgress, propagationFailure, PROGRESS_START } from "./lib/send_progress.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 import { build, compile, constValue, install, memoryStorage, methodBody } from "./test_app_source.mjs";
 
@@ -123,7 +124,7 @@ function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = nul
     const self = {
         _initialized: initialized, _onMsg: [], _onSendProgress: [], _onAttachmentState: [],
         _pendingTickets: new Map(), _pendingPacketHashes: new Map(), _pendingTimeouts: new Map(),
-        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }),
+        _sendTransfers: new SendTransfers(),
         _cfg: { propagationNodeHash: "b".repeat(32), propagationLimits: perSyncKb === null ? null : { perTransferKb: 256, perSyncKb } },
         _exchangeIsDown: () => false,
         _decideMessageName: () => DN.ABSENT, _recordNameDelivered() {},
@@ -351,7 +352,7 @@ test("progress is 0.10 + 0.90 x fraction, only ever up, across the message's tra
     assert.equal(transferProgress(0.5), 0.55);
     assert.equal(transferProgress(7), 1);
     assert.equal(transferProgress(NaN), 0.10);
-    const t = new SendTransfers({ setTimer: () => null, clearTimer() {} });
+    const t = new SendTransfers();
     const direct = t.begin("m", "direct");
     const copy = t.begin("m", "propagated");
     assert.equal(t.progress(direct, 0.2), transferProgress(0.2));
@@ -367,7 +368,7 @@ test("progress is 0.10 + 0.90 x fraction, only ever up, across the message's tra
 test("a real Resource's progress reaches the message through _sendWithProgress, rising to 1.0", async () => {
     const { a, b } = linkPair();
     b.setResourceStrategy(Link.ACCEPT_ALL);
-    const self = { _onSendProgress: [], _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }) };
+    const self = { _onSendProgress: [], _sendTransfers: new SendTransfers() };
     install(self, {}, ["_sendWithProgress(link, data, convHash, msgId, label)"]);
     const seen = [];
     self._onSendProgress.push((conv, id, p) => seen.push([conv, id, p]));
@@ -381,7 +382,7 @@ test("a real Resource's progress reaches the message through _sendWithProgress, 
     assert.equal(self._sendTransfers.inFlight("msg1"), false, "ended");
 });
 
-// ── §1 for bulk transfers ───────────────────────────────────────────────────
+// ── a captured clock ────────────────────────────────────────────────────────
 
 function fakeClock() {
     let now = 0;
@@ -405,39 +406,6 @@ function fakeClock() {
     };
 }
 
-test("§1: a transfer silent for more than 5 s is logged as a violation, once, and never failed for it", () => {
-    const clock = fakeClock();
-    const errors = [];
-    const warns = [];
-    const t = new SendTransfers({ ...clock, log: { error: (m) => errors.push(m), warn: (m) => warns.push(m) } });
-    assert.equal(QUIET_MS, 5_000);
-    const h = t.begin("m", "direct transfer of m");
-    // A photo over the relay: a window answered every 4 s for two minutes.
-    for (let i = 1; i <= 30; i++) {
-        clock.advance(4_000);
-        t.progress(h, i / 31);
-    }
-    assert.deepEqual(errors, [], "minutes long, but never silent for 5 s: no violation");
-    clock.advance(5_001);
-    assert.equal(errors.length, 1);
-    assert.match(errors[0], /\[§1\] VIOLATION direct transfer of m: no progress for 5 s/);
-    clock.advance(20_000);
-    assert.equal(errors.length, 1, "logged once per silence");
-    assert.equal(t.inFlight("m"), true, "still in flight: the silence decides nothing");
-    t.progress(h, 0.99);
-    assert.match(warns[0], /progress again after 25\.0 s of silence/);
-    assert.deepEqual(t.violations.map((v) => [v.msgId, v.silentMs]), [["m", 25_001]]);
-    t.end(h, true);
-    clock.advance(60_000);
-    assert.equal(errors.length, 1, "an ended transfer is not watched");
-});
-
-test("the §1 assertion carries its NEVER REMOVE comment", async () => {
-    const { readFile } = await import("node:fs/promises");
-    const source = await readFile(new URL("./lib/send_progress.js", import.meta.url), "utf8");
-    assert.match(source, /\/\/ NEVER REMOVE EVER — see DESIGN_PRINCIPLES\.md §1[^\n]*\n\s+this\._log\.error\?\.\(`\[§1\] VIOLATION/);
-});
-
 // ── the send ceiling and the propagation fallback ───────────────────────────
 
 /** _dispatchMessage, _armSendCeiling and _failSending on captured timers. */
@@ -452,7 +420,7 @@ function dispatcher() {
         setTimeout: (f, ms) => { const t = { f, ms, at: clock.now() + ms }; timers.push(t); return t; },
         clearTimeout: (t) => { if (t) t.cleared = true; },
     };
-    const transfers = new SendTransfers({ ...clock, log: quiet });
+    const transfers = new SendTransfers({ now: clock.now });
     const self = {
         _onMsg: [], _pendingTimeouts: new Map(), _sendTransfers: transfers,
         _decideMessageName: () => null, _recordNameDelivered() {},
@@ -530,7 +498,7 @@ test("a fallback with nothing moving goes at once, as before", () => {
 // ── the legs: the last way to deliver it failing is the outcome, at once ────
 
 test("legs: a message fails when the last open way to deliver it fails, not before, and never after its outcome", () => {
-    const t = new SendTransfers({ setTimer: () => null, clearTimer() {} });
+    const t = new SendTransfers();
     t.openLeg("m", "direct");
     t.openLeg("m", "propagated");
     assert.equal(t.legFailed("m", "direct"), false, "the copy can still deliver it");

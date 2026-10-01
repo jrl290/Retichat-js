@@ -1864,8 +1864,9 @@ const RnsClient = {
     _initialized: false,
     _onStatus: [], _onMsg: [],
     // The Resources an outgoing message waits on: its progress (0.10 + 0.90
-    // x fraction), the send ceiling's deferral while one moves, and the §1
-    // watch for bulk transfers (lib/send_progress.js).
+    // x fraction) and the send ceiling's deferral while one moves
+    // (lib/send_progress.js). The §1 watch for bulk transfers is each
+    // Resource's own (lib/rns/resource.js).
     _sendTransfers: new SendTransfers(),
     _onSendProgress: [],      // (convHash, msgId, progress)
     _onAttachmentState: [],   // (convHash, msgId): an attachment's `stored` changed
@@ -2009,12 +2010,15 @@ const RnsClient = {
      * A Resource carrying message `msgId` (to `convHash`): sent on `link`,
      * its progress reported as the message's (_onSendProgress) and counted
      * as transfer activity (_sendTransfers), its end recorded. `label` is
-     * its leg, "direct" or "propagated". Resolves or rejects as the Resource
+     * its leg, "direct" or "propagated". The Resource asserts §1 for bulk
+     * transfers itself (lib/rns/resource.js), under the transfer's label,
+     * so its lines name the message. Resolves or rejects as the Resource
      * does.
      */
     _sendWithProgress(link, data, convHash, msgId, label) {
         const transfer = this._sendTransfers.begin(msgId, `${label} transfer of ${msgId.slice(0, 8)} to ${convHash.slice(0, 8)}`, label);
         return link.sendResource(data, {
+            label: transfer.label,
             onProgress: (fraction) => {
                 const value = this._sendTransfers.progress(transfer, fraction);
                 if (value !== null) this._onSendProgress.forEach(fn => fn(convHash, msgId, value));
@@ -3602,7 +3606,7 @@ const RnsClient = {
      *  from there. A failed propagated Resource leaves nothing to come, and
      *  the ceiling, already run out, fails the message at that failure. A
      *  moving transfer is never failed for its length, and a silence in it
-     *  is logged as a §1 violation by _sendTransfers. Until 2026-09-30 a
+     *  is logged as a §1 violation by the Resource itself. Until 2026-09-30 a
      *  photo whose Resource was still moving was failed at 30 s, then shown
      *  delivered at its late proof. */
     _armSendCeiling(contactHash, msgId) {

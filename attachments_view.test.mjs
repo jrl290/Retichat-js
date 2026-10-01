@@ -81,7 +81,7 @@ function view() {
         revoke: (url) => revoked.push(url),
         makeBlob: (bytes, type) => ({ bytes, type }),
     });
-    const transfers = new SendTransfers({ setTimer: () => null, clearTimer() {} });
+    const transfers = new SendTransfers();
     const app = { _statusIcon: (s) => ({ sending: "●", failed: "✗", proved: "✓✓" }[s] ?? "") };
     install(app, {
         h, document, Attachments, AttachmentUrls, isImageAttachment, formatSize,

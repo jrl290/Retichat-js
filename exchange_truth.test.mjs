@@ -604,7 +604,7 @@ function makeDmClient(iface) {
         _rns: rns, _initialized: true, _onMsg: [],
         _decideMessageName: () => ABSENT, _recordNameDelivered() {},
         _pendingTimeouts: new Map(), _pendingPacketHashes: new Map(), _pendingTickets: new Map(),
-        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }),
+        _sendTransfers: new SendTransfers(),
         _cfg: { propagationNodeHash: "b".repeat(32) },
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
         _ensurePropagationLink: async () => { propagationLinks.push(1); throw new Error("no propagation link in this test"); },

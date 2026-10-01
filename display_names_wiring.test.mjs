@@ -580,7 +580,7 @@ function makeSender({ me, messageName = "Alice", storage = memory() }) {
     };
     const self = {
         _onMsg: [], _pendingTickets: new Map(), _pendingPacketHashes: new Map(), _pendingTimeouts: new Map(),
-        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }), _onSendProgress: [],
+        _sendTransfers: new SendTransfers(), _onSendProgress: [],
         _cfg: { propagationNodeHash: "b".repeat(32) },
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
         _rns: {

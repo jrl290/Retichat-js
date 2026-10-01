@@ -200,7 +200,7 @@ function makeSender({ storage, me }) {
         _onMsg: [],
         _pendingTickets: new Map(),
         _pendingPacketHashes: new Map(),
-        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }),
+        _sendTransfers: new SendTransfers(),
         _onSendProgress: [],
         _cfg: { propagationNodeHash: "b".repeat(32) },
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
