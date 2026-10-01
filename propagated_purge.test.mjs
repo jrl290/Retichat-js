@@ -25,7 +25,7 @@ import LXMRouter from "./lib/rns/lxmf/lxmf_router.js";
 import Link from "./lib/rns/link.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import { settle } from "./test_link_pair.mjs";
-import { compile } from "./test_app_source.mjs";
+import { installPropagated } from "./test_app_source.mjs";
 
 const hex = (b) => Buffer.from(b).toString("hex");
 const lxmfHashOf = (identity) => Destination.hash(identity, "lxmf", "delivery");
@@ -72,7 +72,7 @@ async function fetchFrom(me, node, { decrypt = null, routerPatch = null } = {}) 
         },
     };
     const IdMgr = { id: decrypt ? { decrypt } : me };
-    await compile("async _fetchPropagatedMessages()", { Link, Buffer, LXMessage, MsgPack, IdMgr, console: capture })(self)();
+    await installPropagated(self, { Link, Buffer, LXMessage, MsgPack, IdMgr, console: capture })._fetchPropagatedMessages();
     await settle();
     return { purged, emitted, logs, self };
 }

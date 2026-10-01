@@ -39,6 +39,7 @@ import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
 import { applyToFields as applyDisplayName, decodePayload as decodeDisplayName, ABSENT } from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
+import { installPropagated } from "./test_app_source.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -340,9 +341,9 @@ function makeRecipient({ me, storage = makeStorage() }) {
         if (wants) return wants.map((id) => node.blobs.find((b) => tid(b).equals(Buffer.from(id))));
         return node.blobs.map(tid);
     };
-    self._fetchPropagatedMessages = compile("async _fetchPropagatedMessages()", {
+    installPropagated(self, {
         Link, Buffer, MsgPack, LXMessage, IdMgr: { id: me }, console: quiet,
-    })(self);
+    });
     const link = { send() {} };
     return {
         self, router, MsgStore, LxmfSeen, storage, logs, emitted, node, destination,

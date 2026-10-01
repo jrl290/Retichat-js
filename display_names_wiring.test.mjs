@@ -45,6 +45,7 @@ import { SendTransfers } from "./lib/send_progress.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
+import { installPropagated } from "./test_app_source.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -1007,11 +1008,11 @@ test("§5.2 a message fetched from the propagation node is verified and named by
                 return true; // purge
             },
         };
-        await compile("async _fetchPropagatedMessages()", {
+        await installPropagated(self, {
             Link: { ACTIVE }, Buffer, MsgPack, console: quiet, IdMgr: { id: me },
             LXMessage: new Proxy(LXMessage, { get: (t, k) => (k === "fromBytes"
                 ? (d, h) => LXMessage.fromBytes(d, h, recall) : t[k]) }),
-        })(self)();
+        })._fetchPropagatedMessages();
     };
     await fetchAll([lxm(alice, me, "stored for you", named("Alice"))]);
     assert.equal(r.ContactStore.get(A).messageName, "Alice", "validated");

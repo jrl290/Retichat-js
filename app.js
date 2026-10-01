@@ -1207,6 +1207,58 @@ const LxmfSeen = {
 LxmfSeen.init();
 
 // =========================================================================
+//  PROPAGATED MESSAGES THIS CLIENT HAS TAKEN
+//
+//  The transient ids (hex SHA-256 of the lxmf_data a propagation node stores:
+//  destination | encrypted, the bytes /get returns and rfed.link pushes) of
+//  the propagated messages this client is done with: each one a /get
+//  returned, and each one rfed pushed live on rfed.link that was read (kept,
+//  or dropped by the privacy filter). LXMF's locally_delivered_transient_ids
+//  (LXMRouter.py lxmf_propagation records it; has_message reads it): a
+//  listed id held here goes into the haves of the next /get, so the node
+//  purges it, and it is never downloaded again. rfed keeps a message it
+//  pushed live in its messagestore whatever the push's answer
+//  (lxmf_propagation.rs dispatch_live_or_notify; RFed-spec LXMFProp.md
+//  §10.4), so without this a photo received live crossed the relay a second
+//  time on the next /get (round 3 staging, 2026-10-01). Persisted, as LXMF
+//  saves its list, because a message taken before a reload is still listed
+//  after it. Bounded: the oldest ids are dropped past LIMIT, and one dropped
+//  is at worst downloaded again and kept once (LxmfSeen).
+// =========================================================================
+const PropagatedHeld = {
+    _keys: new Set(),
+    _order: [],
+    LIMIT: 2000,
+
+    init() {
+        const stored = sGet("propagated_held");
+        if (Array.isArray(stored)) {
+            this._order = stored.slice(-this.LIMIT);
+            this._keys = new Set(this._order);
+        }
+    },
+
+    /** True if transient id `tidHex` is one this client has taken. */
+    has(tidHex) {
+        return this._keys.has(tidHex);
+    },
+
+    /** Record transient id `tidHex` as taken. */
+    add(tidHex) {
+        if (this._keys.has(tidHex)) return;
+        this._keys.add(tidHex);
+        this._order.push(tidHex);
+        if (this._order.length > this.LIMIT) {
+            for (const k of this._order.splice(0, this._order.length - this.LIMIT)) {
+                this._keys.delete(k);
+            }
+        }
+        sSet("propagated_held", this._order);
+    },
+};
+PropagatedHeld.init();
+
+// =========================================================================
 //  OUTBOUND TICKETS
 //
 //  The tickets senders gave this client (LXMF include_ticket: [expires,
@@ -3017,8 +3069,23 @@ const RnsClient = {
         }
     },
 
-    /** Fetch propagated messages (called when propagation link establishes).
-     *  Sends /get over the link to list, download, and purge stored messages. */
+    /**
+     * Fetch propagated messages (called when the propagation link is
+     * established, on page resume, and by Debug.fetchPropagated). Sends /get
+     * over the link to list, download, and purge stored messages, as LXMF's
+     * request_messages_from_propagation_node does.
+     *
+     * A listed message this client has already taken (PropagatedHeld: rfed
+     * pushed it live on rfed.link, or an earlier /get returned it and its
+     * purge never landed) is not downloaded again: it goes straight into the
+     * purge, as LXMF puts a listed id it has into the haves of its next /get
+     * (LXMRouter.py message_list_response: has_message -> haves). The check
+     * is made again at each download's turn and once its answer is in, since
+     * a live push can land while this fetch runs: one that came back anyway
+     * is purged and not read. Until 2026-10-01 a message pushed live was
+     * downloaded here again whole, and the listed ids already seen were
+     * never purged at all.
+     */
     async _fetchPropagatedMessages() {
         const link = this._propLink;
         if (!link || link.status !== Link.ACTIVE) return;
@@ -3026,8 +3093,6 @@ const RnsClient = {
         this._propFetchInProgress = true;
 
         try {
-            if (!this._propSeenIds) this._propSeenIds = new Set();
-
             // ── Step 1: List pending message IDs ──
             console.log("[retichat] 📬 [1/4] Listing pending messages...");
             const listReqId = link.sendRequest("/get", [null, null]);
@@ -3053,23 +3118,33 @@ const RnsClient = {
                 this._propFetchInProgress = false; return;
             }
 
-            const newIds = pendingIds.filter(id => !this._propSeenIds.has(Buffer.from(id).toString("hex")));
-            if (newIds.length === 0) {
-                console.log("[retichat] 📬 All pending already seen");
-                this._propFetchInProgress = false; return;
-            }
-
-            // ── Step 2+3: Download and decrypt one at a time (avoids MTU limits) ──
-            const deliveredIds = [];
-            const unread = [];   // "<id> <why>" for each purged without being read
             const myDeliverHash = this._lxmfRouter?.destination?.hash;
             if (!myDeliverHash) {
                 console.log("[retichat] 📬 No local delivery hash — cannot decrypt");
                 this._propFetchInProgress = false; return;
             }
 
+            const held = (tid) => PropagatedHeld.has(Buffer.from(tid).toString("hex"));
+            // Listed and already taken here: purged, never downloaded.
+            const alreadyHeld = pendingIds.filter(held);
+            const newIds = pendingIds.filter((tid) => !held(tid));
+            if (alreadyHeld.length > 0) {
+                console.log(`[retichat] 📬 [1/4] ${alreadyHeld.length} already held here (received live, or by an earlier fetch): purged without downloading`);
+            }
+
+            // ── Step 2+3: Download and decrypt one at a time (avoids MTU limits) ──
+            const deliveredIds = [];
+            const unread = [];   // "<id> <why>" for each purged without being read
+
             for (const tid of newIds) {
                 const tidHex = Buffer.from(tid).toString("hex").slice(0,8);
+                // A live push may have brought it while an earlier one
+                // downloaded.
+                if (held(tid)) {
+                    console.log(`[retichat] 📬 [2/4] ${tidHex} arrived live meanwhile: not downloaded, purged`);
+                    alreadyHeld.push(tid);
+                    continue;
+                }
                 console.log(`[retichat] 📬 [2/4] Downloading ${tidHex}...`);
                 const blobResp = await this._waitForResponse(
                     link,
@@ -3077,6 +3152,13 @@ const RnsClient = {
                 );
                 if (!blobResp || !Array.isArray(blobResp) || blobResp.length === 0) {
                     console.log(`[retichat] 📬 [2/4] ${tidHex} download failed:`, typeof blobResp === 'number' ? `0x${blobResp.toString(16)}` : (blobResp ? `got ${blobResp.length||0} items` : 'timeout'));
+                    continue;
+                }
+                // The same message pushed live and taken while this one
+                // downloaded: the copy that came back is purged, not read.
+                if (held(tid)) {
+                    console.log(`[retichat] 📬 [3/4] ${tidHex} arrived live while it downloaded: this copy is ignored, purged`);
+                    alreadyHeld.push(tid);
                     continue;
                 }
                 const lxmfData = Buffer.from(blobResp[0]);
@@ -3092,61 +3174,20 @@ const RnsClient = {
                 // decrypted, or whose payload could not be read stayed on the
                 // node and was downloaded again on every fetch, for ever. One
                 // purged unread says so here and in step 4.
-                const had = () => {
-                    this._propSeenIds.add(Buffer.from(tid).toString("hex"));
-                    deliveredIds.push(tid);
-                };
-                const purgeUnread = (why) => {
+                const { unread: why } = this._ingestPropagatedBlob(lxmfData, `📬 [3/4] ${tidHex}`);
+                if (why !== null) {
                     console.log(`[retichat] 📬 [3/4] ${tidHex} ${why}: purged unread`);
                     unread.push(`${tidHex} ${why}`);
-                    had();
-                };
-
-                if (lxmfData.length < 48) { purgeUnread("too short"); continue; }
-                const destHash = lxmfData.slice(0, 16);
-                if (!destHash.equals(myDeliverHash)) { purgeUnread("not for us"); continue; }
-
-                let decrypted;
-                try {
-                    decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
-                } catch (e) {
-                    purgeUnread(`decrypt failed (${e.message})`); continue;
                 }
-                if (!decrypted || decrypted.length < 80) { purgeUnread("decrypt failed"); continue; }
-                try {
-                    // The privacy filter on the decrypted bytes (source |
-                    // signature | payload), before any parse, as the router
-                    // applies it on every direct path (LXMRouter
-                    // .acceptsSource): a stranger's message was downloaded
-                    // (its source is inside the ciphertext) but costs nothing
-                    // more, unless it is a group message for a group held
-                    // here, which goes on as any other.
-                    if (!this._lxmfRouter.acceptsSource(decrypted, "propagated")) { had(); continue; }
-
-                    // Parsed as the router parses the direct paths: the same
-                    // hash, so a copy of one already received is recognised,
-                    // and the same signature check against the identity store.
-                    // fromBytes alone reads the payload: a fields map msgpack
-                    // cannot decode costs the attachments, never the message
-                    // (LXMessage.decodePayload). Until 2026-09-30 a msgpack
-                    // pre-parse here threw on such a map first, so the
-                    // message was lost, never purged, and downloaded again
-                    // on every fetch.
-                    const message = LXMessage.fromBytes(decrypted, destHash);
-                    if (!message) { purgeUnread("bad payload"); continue; }
-                    if (!this._lxmfRouter.acceptsMessage(message, "propagated")) { had(); continue; }
-                    console.log(`[retichat] 📬 [3/4] ✅ ${tidHex} from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
-                    this._lxmfRouter.emit("message", message);
-                    had();
-                } catch(e) {
-                    purgeUnread(`exception (${e.message})`);
-                }
+                PropagatedHeld.add(Buffer.from(tid).toString("hex"));
+                deliveredIds.push(tid);
             }
 
-            // ── Step 4: Purge every message the node returned ──
-            if (deliveredIds.length > 0) {
-                console.log(`[retichat] 📬 [4/4] Purging ${deliveredIds.length} returned, ${unread.length} of them unread${unread.length ? `: ${unread.join("; ")}` : ""}...`);
-                const haveReqId = link.sendRequest("/get", [null, deliveredIds]);
+            // ── Step 4: Purge every message the node returned, and every
+            // listed one already held here ──
+            if (deliveredIds.length > 0 || alreadyHeld.length > 0) {
+                console.log(`[retichat] 📬 [4/4] Purging ${deliveredIds.length} returned, ${unread.length} of them unread${unread.length ? `: ${unread.join("; ")}` : ""}${alreadyHeld.length ? `, and ${alreadyHeld.length} already held` : ""}...`);
+                const haveReqId = link.sendRequest("/get", [null, [...deliveredIds, ...alreadyHeld]]);
                 await this._waitForResponse(link, haveReqId);
                 console.log("[retichat] 📬 [4/4] Purge complete");
             } else {
@@ -3157,6 +3198,106 @@ const RnsClient = {
         } finally {
             this._propFetchInProgress = false;
         }
+    },
+
+    /**
+     * One propagated LXMF message as a propagation node stores it,
+     * `destination(16) | encrypted`: one a /get returned
+     * (_fetchPropagatedMessages), or one rfed pushed live on rfed.link
+     * (_onPropagatedPush). Both are taken the same way, as LXMF takes both
+     * (LXMRouter.py lxmf_propagation; LXMF-rust ingest_propagated_lxmf, which
+     * Android's PropagationStream and iOS's configurePropagationStream call
+     * for a push to the device's own address): decrypted with this device's
+     * identity; the privacy filter on the decrypted bytes (source | signature
+     * | payload), before any parse, as the router applies it on every direct
+     * path (LXMRouter.acceptsSource): a stranger's message was downloaded
+     * (its source is inside the ciphertext) but costs nothing more, unless it
+     * is a group message for a group held here, which goes on as any other;
+     * then parsed as the router parses the direct paths (the same hash, so a
+     * copy of one already received is recognised by LxmfSeen in the router's
+     * message handler, and the same signature check against the identity
+     * store) and handed to the router's listeners. fromBytes alone reads the
+     * payload: a fields map msgpack cannot decode costs the attachments,
+     * never the message (LXMessage.decodePayload). Until 2026-09-30 a msgpack
+     * pre-parse here threw on such a map first, so the message was lost,
+     * never purged, and downloaded again on every fetch.
+     *
+     * `label` names it in the log. Returns { kept, unread }: `kept` is true
+     * when it was handed to the listeners (one already received included:
+     * the handler drops that copy), false when the privacy filter dropped
+     * it or it could not be read; `unread` is why it could not be read (too
+     * short, not for this destination, not decryptable, no payload, a
+     * throw), else null.
+     */
+    _ingestPropagatedBlob(lxmfData, label) {
+        if (lxmfData.length < 48) return { kept: false, unread: "too short" };
+        const destHash = lxmfData.slice(0, 16);
+        const myDeliverHash = this._lxmfRouter?.destination?.hash;
+        if (!myDeliverHash || !destHash.equals(myDeliverHash)) return { kept: false, unread: "not for us" };
+
+        let decrypted;
+        try {
+            decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
+        } catch (e) {
+            return { kept: false, unread: `decrypt failed (${e.message})` };
+        }
+        if (!decrypted || decrypted.length < 80) return { kept: false, unread: "decrypt failed" };
+        try {
+            if (!this._lxmfRouter.acceptsSource(decrypted, "propagated")) return { kept: false, unread: null };
+            const message = LXMessage.fromBytes(decrypted, destHash);
+            if (!message) return { kept: false, unread: "bad payload" };
+            if (!this._lxmfRouter.acceptsMessage(message, "propagated")) return { kept: false, unread: null };
+            console.log(`[retichat] ${label} ✅ from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
+            this._lxmfRouter.emit("message", message);
+            return { kept: true, unread: null };
+        } catch (e) {
+            return { kept: false, unread: `exception (${e.message})` };
+        }
+    },
+
+    /**
+     * A live push on rfed.link of a propagated message for this device's own
+     * lxmf.delivery. _bindRfedLinkForDistroPush binds the link with that
+     * hash (/propagation/stream/open), so rfed pushes this device's
+     * propagated messages there as they are stored, as well as the distro's
+     * fan-out (RFed-spec Link.md, path map: `/lxmf/delivery`). Taken exactly
+     * as a /get result is (_ingestPropagatedBlob), keyed by its transient id
+     * (the SHA-256 of these bytes, the id /get lists), so a message taken
+     * live is never downloaded or stored again: the next /get purges it
+     * without downloading it (PropagatedHeld). Until 2026-10-01 every such
+     * push went to _handleDistroBlob, which refused it as not the distro's,
+     * so each one (photos up to ~921 KB) crossed the relay twice: the
+     * refused push, then the /get.
+     *
+     * Returns the push's answer (Link.md "The response is the delivery
+     * proof"). True when this client holds the message: kept, or already
+     * taken (live or by a /get), or dropped by the privacy filter, which
+     * spends nothing past the decrypt. The filter's drop is answered true
+     * as the reference and the phones answer it: LXMF's lxmf_propagation
+     * returns True for a message lxmf_delivery then ignores and records it
+     * as delivered, so its next /get purges it, and Android's and iOS's
+     * stream link proves every push before the router sees it. Nobody but
+     * rfed hears this answer, and rfed only logs it (link_session.rs
+     * push_request): the sender is shown nothing either way. False when it
+     * could not be read at all: rfed logs the refusal, the message stays in
+     * its messagestore, and the next /get downloads it and purges it
+     * unread, as it does any unreadable message.
+     */
+    _onPropagatedPush(lxmfData) {
+        const tid = Cryptography.fullHash(lxmfData).toString("hex");
+        const tidHex = tid.slice(0, 8);
+        if (PropagatedHeld.has(tid)) {
+            console.log(`[retichat] rfed.link push ${tidHex}: already held here — not read again`);
+            return true;
+        }
+        const { kept, unread } = this._ingestPropagatedBlob(lxmfData, `rfed.link push ${tidHex}`);
+        if (unread !== null) {
+            console.warn(`[retichat] rfed.link push ${tidHex} ${unread}: refused, left to the next /get`);
+            return false;
+        }
+        PropagatedHeld.add(tid);
+        if (!kept) console.log(`[retichat] rfed.link push ${tidHex} dropped by the privacy filter: answered as taken, purged by the next /get`);
+        return true;
     },
 
     /** Wait for the response to a request sent on the given link; null if
@@ -5172,7 +5313,9 @@ const RnsClient = {
      * LXMF for this device's lxmf.delivery hash down this link. That is the
      * distro fan-out's first delivery tier; without it every fan-out goes to
      * the deferred queue and waits for the next /distro/pull — on staging,
-     * 40 s later. Payload: `[bin(16 delivery_hash), pubkey, sign(hash)]`
+     * 40 s later. The node also pushes this device's own propagated
+     * messages on it as they are stored (_onPropagatedPush), which the next
+     * /get then only purges. Payload: `[bin(16 delivery_hash), pubkey, sign(hash)]`
      * (LXMFProp.md). Re-sent on every link (re)establishment, since the
      * binding lives on the link.
      */
@@ -5223,13 +5366,29 @@ const RnsClient = {
             link.sendResponse(requestId, true);
             if (DistroManager.has) this._pullDistroMessages();
         } else if (hex === RFED_LINK_PUSH_HASHES.lxmf) {
-            // A live LXMF push for this device's lxmf.delivery — for this
-            // client that is a distro fan-out (the node's distro tier 1),
-            // carrying the bare blob `[dest_hash(16) | encrypted]` that
-            // /distro/pull would otherwise return. Same handler, same dedup.
+            // A live LXMF push, the bare blob `[dest_hash(16) | encrypted]`,
+            // for an lxmf.delivery hash this link bound (Link.md path map):
+            // the distro's, a fan-out (the node's distro tier 1) that
+            // /distro/pull would otherwise return; or this device's own, a
+            // propagated message that /get would otherwise return
+            // (_bindRfedLinkForDistroPush binds this device's hash). The
+            // destination hash decides which, as on Android
+            // (PropagationStream.onPush) and iOS (configurePropagationStream).
+            // Until 2026-10-01 both went to _handleDistroBlob, which refused
+            // every one of this device's own.
             if (!payload || payload.length < 48) { link.sendResponse(requestId, false); return; }
-            Harness.event("distro-link-push", { bytes: payload.length });
-            link.sendResponse(requestId, this._handleDistroBlob(payload.slice(0, 16), payload) === true);
+            const destHex = payload.subarray(0, 16).toString("hex");
+            const ownHex = this._lxmfRouter?.destination?.hash?.toString("hex");
+            if (DistroManager.has && destHex === DistroManager.lxmfDeliveryHash) {
+                Harness.event("distro-link-push", { bytes: payload.length });
+                link.sendResponse(requestId, this._handleDistroBlob(payload.slice(0, 16), payload) === true);
+            } else if (ownHex && destHex === ownHex) {
+                Harness.event("propagated-link-push", { bytes: payload.length });
+                link.sendResponse(requestId, this._onPropagatedPush(payload) === true);
+            } else {
+                console.log(`[retichat] rfed.link /lxmf push for ${destHex.slice(0, 12)}, neither this device's address nor its distro's — refused`);
+                link.sendResponse(requestId, false);
+            }
         } else {
             console.warn(`[retichat] unknown push path ${hex.slice(0, 12)} on rfed.link — not acknowledged`);
         }

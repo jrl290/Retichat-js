@@ -49,6 +49,7 @@ import EventEmitter from "./lib/rns/utils/events.js";
 import * as DN from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
+import { installPropagated } from "./test_app_source.mjs";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -425,10 +426,10 @@ test("propagated: a stranger's message is dropped after decryption and before an
             return ids;
         },
     };
-    const fetch = compile("async _fetchPropagatedMessages()", {
+    const fetch = installPropagated(self, {
         Link, Buffer, LXMessage, IdMgr: { id: r.me }, console: quiet,
         MsgPack: { unpack: (b) => { unpacks++; return MsgPack.unpack(b); } },
-    })(self);
+    })._fetchPropagatedMessages;
     const parses = watchParses(t);
 
     await fetch();
@@ -577,9 +578,9 @@ test("a co-member's DM over a link or fetched from the node is dropped unproved,
                 return wants ? [blob] : [Buffer.from([7])];
             },
         };
-        await compile("async _fetchPropagatedMessages()", {
+        await installPropagated(self, {
             Link, Buffer, MsgPack, LXMessage, IdMgr: { id: r.me }, console: quiet,
-        })(self)();
+        })._fetchPropagatedMessages();
         await settle();
         assert.deepEqual(purged, [7], "reported as had, so the node purges it");
         assert.equal(r.emitted.length, 0, "none of the three reached the handler");
@@ -695,9 +696,9 @@ async function fetchPropagated(r, packed) {
             return blobs.map((_, i) => Buffer.from([i + 1]));
         },
     };
-    await compile("async _fetchPropagatedMessages()", {
+    await installPropagated(self, {
         Link, Buffer, MsgPack, LXMessage, IdMgr: { id: r.me }, console: quiet,
-    })(self)();
+    })._fetchPropagatedMessages();
     await settle();
     return purged;
 }

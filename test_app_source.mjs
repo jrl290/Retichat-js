@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { addInOrder } from "./lib/message_order.js";
+import Cryptography from "./lib/rns/cryptography.js";
 
 export const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -113,4 +114,29 @@ export function memoryStorage() {
         sGet: (k) => (data.has(k) ? JSON.parse(data.get(k)) : null),
         sSet: (k, v) => data.set(k, JSON.stringify(v)),
     };
+}
+
+/** A PropagatedHeld of its own, on storage of its own (`storage`, or a
+ *  fresh memoryStorage), as the page builds it at load. */
+export function propagatedHeld(storage = memoryStorage()) {
+    const held = build("PropagatedHeld", { sGet: storage.sGet, sSet: storage.sSet });
+    held.init();
+    return held;
+}
+
+/**
+ * The shipped propagated-message path on `self`, over `env`:
+ * _fetchPropagatedMessages (/get), _onPropagatedPush (a live push on
+ * rfed.link) and the _ingestPropagatedBlob both hand each message to. `env`
+ * gives what they read from the page (IdMgr, LXMessage, Link, Buffer,
+ * MsgPack, console, …); PropagatedHeld is a fresh one unless `env` names
+ * one, and Cryptography the real one. Returns `self`.
+ */
+export function installPropagated(self, env) {
+    env = { Cryptography, PropagatedHeld: propagatedHeld(), ...env };
+    return install(self, env, [
+        "async _fetchPropagatedMessages()",
+        "_ingestPropagatedBlob(lxmfData, label)",
+        "_onPropagatedPush(lxmfData)",
+    ]);
 }

@@ -38,7 +38,7 @@ import * as DN from "./lib/display_name.js";
 import { AttachmentStore, attachmentKey, memoryBackend } from "./lib/attachment_store.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
-import { build, compile, constValue, install, memoryStorage, messageHandler } from "./test_app_source.mjs";
+import { build, compile, constValue, install, installPropagated, memoryStorage, messageHandler } from "./test_app_source.mjs";
 
 const quiet = { log() {}, warn() {}, error() {} };
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
@@ -220,7 +220,7 @@ test("propagated (/get): the fetched message keeps its attachment", async () => 
             return [Buffer.from([1])];
         },
     };
-    await compile("async _fetchPropagatedMessages()", { Link, Buffer, LXMessage, MsgPack, IdMgr: { id: r.me }, console: quiet })(self)();
+    await installPropagated(self, { Link, Buffer, LXMessage, MsgPack, IdMgr: { id: r.me }, console: quiet })._fetchPropagatedMessages();
     await settle();
     const rec = byHash(r, S, p.lxmfHash);
     assert.equal(rec.content, "from the node");
@@ -253,7 +253,7 @@ test("propagated (/get): a fields map that cannot be decoded costs the attachmen
             return [tid];
         },
     };
-    await compile("async _fetchPropagatedMessages()", { Link, Buffer, LXMessage, MsgPack, IdMgr: { id: r.me }, console: quiet })(self)();
+    await installPropagated(self, { Link, Buffer, LXMessage, MsgPack, IdMgr: { id: r.me }, console: quiet })._fetchPropagatedMessages();
     await settle();
     const [rec] = r.MsgStore.get(S);
     assert.ok(rec, "stored");
