@@ -273,6 +273,20 @@ test("§5.2 channel order: an older post pulled late never undoes a newer name o
     assert.equal(new ChannelSenderNames(storage).entry("c", "s").at, 7000, "the timestamp is persisted");
     assert.equal(names.apply("c", "s", DN.nameState("X"), undefined), false, "a post with no time cannot be ordered");
 
+    // A post at the very time of the one that set or cleared the name is not
+    // newer: ignored, as Android acceptChannelName (postAt <= currentAt is
+    // Unchanged) and iOS DisplayNames.isNewer (messageTime > heldAt).
+    assert.equal(names.apply("c", "s", DN.nameState("Same"), 7000), false, "a name at the clear's own time");
+    assert.equal(names.get("c", "s"), null);
+    names.apply("c", "s", DN.nameState("Set"), 8000);
+    assert.equal(names.apply("c", "s", DN.CLEAR, 8000), false, "a clear at the name's own time");
+    assert.equal(names.apply("c", "s", DN.nameState("Other"), 8000), false, "another name at the same time");
+    assert.equal(names.get("c", "s"), "Set");
+    assert.deepEqual(names.entry("c", "s"), { name: "Set", at: 8000 });
+    assert.equal(DN.acceptChannelName({ name: "Set", at: 8000 }, DN.nameState("Other"), 8000), null);
+    assert.deepEqual(DN.acceptChannelName({ name: "Set", at: 8000 }, DN.nameState("Other"), 8001), { name: "Other", at: 8001 },
+        "one millisecond later is newer");
+
     // Stored by the build before the order rule: a bare name of unknown age.
     const old = memoryStorage();
     old.set("channel_sender_names_v1", { c: { s: "Stored" } });
