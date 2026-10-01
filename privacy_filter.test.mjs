@@ -1106,55 +1106,79 @@ test("migration: rows stored before the filter — listed ones become allowliste
     assert.deepEqual([c, d].map((h) => again.get(h).hidden), [true, true], "and lists nothing");
 });
 
-test("migration, once: hidden rows of members of groups held as active become allowlisted; pending groups', channel posters' and name-only rows do not", () => {
-    // As the phones allowlisted every member at create or accept (iOS
-    // createGroupChat / acceptGroupInvite, Android NamesMigration).
-    const me = Identity.create();
-    const ME = lxmfHash(me);
+test("migration, once: every member of a group held as active passes the filter, rows created where none exist (the group trust rule); a pending group's and this device's do not", () => {
+    // James, 2026-10-01: "If the invite is accepted, the other group
+    // members are considered allowed." As the phones allowlisted every
+    // member at create or accept (iOS createGroupChat / acceptGroupInvite
+    // through ensureAllowlistedContact, Android NamesMigration).
+    const me = Identity.create(), distro = Identity.create();
+    const ME = lxmfHash(me), DISTRO = lxmfHash(distro);
     const row = (h, extra = {}) => ({ destHash: h, localName: null, messageName: null, messageNameAt: null, announceName: null,
         legacyName: null, lastSeen: 1, hidden: true, nameOnly: false, ...extra });
-    const [created, accepted, pending, poster, nameOnly, listed, later] = ["1", "2", "3", "4", "5", "6", "7"].map((x) => x.repeat(32));
+    const [created, accepted, pending, poster, nameOnly, listed, later, rowless] = ["1", "2", "3", "4", "5", "6", "7", "8"].map((x) => x.repeat(32));
+    const junk = "not a destination hash, 32 chars";
     const group = (groupId, groupStatus, members) => ({ groupId, groupName: "G", groupStatus, lastActivity: 1,
         members: [[ME, "accepted"], ...members].map(([hash, status]) => ({ hash, status })) });
     const groups = [
-        group("a".repeat(32), "active", [[created, "invited"], [nameOnly, "accepted"], [listed, "accepted"]]),   // created here
-        group("b".repeat(32), "active", [[accepted, "accepted"]]),                                             // accepted here
-        group("c".repeat(32), "pending", [[pending, "accepted"]]),                                             // not accepted
+        group("a".repeat(32), "active", [[created, "invited"], [nameOnly, "accepted"], [listed, "accepted"], [DISTRO, "invited"], [junk, "invited"]]),  // created here
+        group("b".repeat(32), "active", [[accepted, "accepted"], [rowless, "left"]]),                                                                // accepted here
+        group("c".repeat(32), "pending", [[pending, "accepted"]]),                                                                                    // not accepted
     ];
     const contacts = (allowlistedKey) => [
-        row(created), row(accepted), row(pending), row(poster), row(nameOnly, { nameOnly: true }),
+        row(created), row(accepted), row(pending), row(poster), row(nameOnly, { nameOnly: true, messageName: "Nell" }),
         row(listed, { hidden: false }), row(ME),
     ].map((c) => (allowlistedKey ? { ...c, allowlisted: false } : c));
+    const OWN = [ME, me.hash.toString("hex"), DISTRO];
 
-    // A user who already ran round 2's migration (every row has the key),
+    // A user who already ran round 2's first step (every row has the key),
     // and one who runs both now (no row has it).
     for (const ranFirstStep of [true, false]) {
         const s = memory();
         s.sSet("contacts_v2", contacts(ranFirstStep));
         s.sSet("groups_v1", groups);
         const { ContactStore, GroupStore } = stores(me, s);
-        assert.equal(ContactStore.allowHeldGroupMembers(GroupStore.getAll(), [ME]), 2, `allowlisted two (first step ran before: ${ranFirstStep})`);
+        assert.equal(ContactStore.allowHeldGroupMembers(GroupStore.getAll(), OWN), ranFirstStep ? 5 : 4,
+            `members allowed now (first step ran before: ${ranFirstStep})`);
         const allowed = (h) => ContactStore.allowlisted(h);
-        assert.deepEqual([created, accepted].map(allowed), [true, true], "members of groups held as active");
-        assert.deepEqual([pending, poster, nameOnly, ME].map(allowed), [false, false, false, false],
-            "a pending group's member, a channel poster, a name-only row and this device stay as they are");
-        assert.equal(allowed(listed), !ranFirstStep, "a listed row is the first step's (allowlisted only when it ran now)");
-        assert.deepEqual([created, accepted].map((h) => ContactStore.get(h).hidden), [true, true], "and lists nothing");
-        assert.equal(s.sGet("groupMembersAllowlisted"), true);
+        assert.deepEqual([created, accepted, nameOnly, listed, rowless].map(allowed), [true, true, true, true, true],
+            "every member of a group held as active: a hidden row, a name-only row, a listed one, and one with no row");
+        assert.deepEqual([pending, poster, ME].map(allowed), [false, false, false],
+            "a pending group's member, a channel poster and this device stay as they are");
+        assert.deepEqual([ContactStore.get(DISTRO), ContactStore.get(junk)], [null, null], "no row for this device's distro, nor for a member that is no hash");
+        const made = ContactStore.get(rowless);
+        assert.deepEqual([made.hidden, made.nameOnly, made.allowlisted, made.publicKey], [true, false, true, null],
+            "a member with no row gets a hidden, allowlisted one (iOS ensureAllowlistedContact)");
+        assert.deepEqual([ContactStore.get(nameOnly).nameOnly, ContactStore.get(nameOnly).messageName], [false, "Nell"], "a name-only row is one no longer; its name kept");
+        assert.deepEqual([created, accepted, nameOnly, rowless].map((h) => ContactStore.get(h).hidden), [true, true, true, true], "and nothing is listed");
+        assert.equal(ContactStore.isContact(listed), true, "a listed row stays listed");
+        assert.equal(s.sGet("groupMembersAllowlisted"), 2, "recorded with this version's marker");
+        assert.ok(s.sGet("contacts_v2").some((c) => c.destHash === rowless && c.allowlisted === true), "persisted");
 
         // Once: a member met afterwards is not allowlisted by a later load.
         ContactStore.keep(later);
         GroupStore.updateMember("b".repeat(32), later, "accepted");
         const again = stores(me, s);
-        assert.equal(again.ContactStore.allowHeldGroupMembers(again.GroupStore.getAll(), [ME]), 0);
-        assert.deepEqual([created, accepted, later].map((h) => again.ContactStore.allowlisted(h)), [true, true, false], "persisted, and run once");
+        assert.equal(again.ContactStore.allowHeldGroupMembers(again.GroupStore.getAll(), OWN), 0);
+        assert.deepEqual([created, rowless, later].map((h) => again.ContactStore.allowlisted(h)), [true, true, false], "persisted, and run once");
     }
 
+    // Who ran the narrower first version (23af39f: hidden rows only, marker
+    // `true`) runs this one once more: its name-only, listed and row-less
+    // members are allowed now.
+    const s = memory();
+    s.sSet("contacts_v2", contacts(true).map((c) => ([created, accepted].includes(c.destHash) ? { ...c, allowlisted: true } : c)));
+    s.sSet("groups_v1", groups);
+    s.sSet("groupMembersAllowlisted", true);
+    const narrow = stores(me, s);
+    assert.equal(narrow.ContactStore.allowHeldGroupMembers(narrow.GroupStore.getAll(), OWN), 3);
+    assert.deepEqual([nameOnly, listed, rowless].map((h) => narrow.ContactStore.allowlisted(h)), [true, true, true]);
+    assert.equal(s.sGet("groupMembersAllowlisted"), 2);
+
     // App.start runs it once the identity is loaded and the groups hold
-    // this device's delivery hash, with both of this device's hashes.
+    // this device's delivery hash, with this device's hashes and its distro's.
     const start = methodBody("async start()");
     const own = start.indexOf("GroupStore.migrateOwnMemberHash();");
-    const step = start.indexOf("ContactStore.allowHeldGroupMembers(GroupStore.getAll(), [ownLxmfDestinationHash(), IdMgr.hash].filter(Boolean));");
+    const step = start.indexOf("ContactStore.allowHeldGroupMembers(GroupStore.getAll(),\n            [ownLxmfDestinationHash(), IdMgr.hash, DistroManager.lxmfDeliveryHash].filter(Boolean));");
     assert.ok(own > start.indexOf("IdMgr.load()") && step > own, "after IdMgr.load() and migrateOwnMemberHash()");
     assert.ok(step < start.indexOf("ActiveTab.start"), "before the first message can arrive");
 });

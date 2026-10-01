@@ -603,43 +603,62 @@ const ContactStore = {
     allowlisted(destHash) { return this._contacts.get(destHash)?.allowlisted === true; },
 
     /**
-     * One-time step of the privacy filter's migration (James, 2026-09-30):
-     * the hidden rows of the members of every group the user holds as
-     * active (created or accepted) become allowlisted, as the phones
-     * allowlisted every member when the user created or accepted the group
-     * (iOS createGroupChat, ChatRepository.swift:2532-2536, and
-     * acceptGroupInvite, :1543-1548; Android allowlisted every contact row
-     * in NamesMigration.kt). Without it, a member of a group held before the
-     * filter could no longer send a DM here, where a phone in the same group
-     * still takes it. Since the filter, _acceptGroupInvite and group
+     * One-time step of the privacy filter's migration, under James's group
+     * trust rule (2026-10-01: "If the invite is accepted, the other group
+     * members are considered allowed"): every member of every group the
+     * user holds as active (created or accepted) passes the privacy filter,
+     * as the phones allowlisted every member when the user created or
+     * accepted the group (iOS createGroupChat, ChatRepository.swift
+     * :2532-2536, and acceptGroupInvite, :1543-1548, both through
+     * ensureAllowlistedContact; Android allowlisted every contact row in
+     * NamesMigration.kt). Without it, a member of a group held before the
+     * filter could no longer send a DM here, where a phone in the same
+     * group still takes it. Since the filter, _acceptGroupInvite and group
      * creation do this as they happen.
      *
-     * Only hidden rows that hold what the client learned about a member:
-     * a pending group's members, a channel poster's row and a name-only row
-     * (a group sender's name, never a contact) stay as they are, and no row
-     * is created. `ownHashes` are this device's own hashes, never a contact.
+     * Each member is allowed as allow() allows it (iOS
+     * ensureAllowlistedContact): a row of any kind is allowlisted, hidden,
+     * listed or name-only (the name-only mark goes), and a member with no
+     * row gets a hidden one. Listing is left as it is. A pending group's
+     * members are not touched: the user has not accepted it. `ownHashes`
+     * are this device's own hashes (and its distro's), never a contact; a
+     * member that is no destination hash is skipped.
      *
      * Runs once, for every user, whether or not the first step (listed rows,
-     * init()) ran in an earlier build: `groupMembersAllowlisted` records it,
-     * so a later run never allowlists a member the user met after it. A
-     * second run would change nothing anyway. Returns how many rows it
-     * allowlisted.
+     * init()) ran in an earlier build: `groupMembersAllowlisted` records it
+     * (as 2), so a later run never allowlists a member the user met after
+     * it. The narrower first version (23af39f, 2026-09-30: hidden rows only)
+     * recorded `true`, which is not this marker, so it runs again for anyone
+     * who ran that one. Returns how many members it allowed that were not
+     * allowed before.
      */
     allowHeldGroupMembers(groups, ownHashes = []) {
-        if (sGet("groupMembersAllowlisted") === true) return 0;
+        const done = 2;   // this version's marker; 23af39f's was `true`
+        if (sGet("groupMembersAllowlisted") === done) return 0;
+        const own = new Set(ownHashes.filter(Boolean).map((h) => String(h).toLowerCase()));
         let allowed = 0;
+        let changed = false;
         for (const g of groups) {
             if (g.groupStatus !== "active") continue;
-            for (const hash of g.members.keys()) {
-                if (ownHashes.includes(hash)) continue;
-                const c = this._contacts.get(hash);
-                if (!c || !c.hidden || c.nameOnly || c.allowlisted === true) continue;
-                c.allowlisted = true;
-                allowed++;
+            for (const raw of g.members.keys()) {
+                const hash = String(raw).toLowerCase();
+                if (own.has(hash) || !/^[0-9a-f]{32}$/.test(hash)) continue;
+                let c = this._contacts.get(hash);
+                if (!c) {
+                    c = this._row(hash, null, true, false);
+                    this._contacts.set(hash, c);
+                    changed = true;
+                }
+                if (c.nameOnly) { c.nameOnly = false; changed = true; }
+                if (c.allowlisted !== true) {
+                    c.allowlisted = true;
+                    allowed++;
+                    changed = true;
+                }
             }
         }
-        if (allowed > 0) this._save();
-        sSet("groupMembersAllowlisted", true);
+        if (changed) { this._save(); this._notify(); }
+        sSet("groupMembersAllowlisted", done);
         return allowed;
     },
 
@@ -668,8 +687,19 @@ const ContactStore = {
     _put(destHash, isDistro, publicKey, hidden, nameOnly = false) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         if (destHash.length !== 32) throw new Error("Destination hash must be exactly 32 hex characters");
+        const contact = this._row(destHash, publicKey, hidden, nameOnly, isDistro);
+        this._contacts.set(destHash, contact);
+        this._save();
+        this._notify();
+        return contact;
+    },
+
+    /** The row _put stores for `destHash` (32 lowercase hex): what an
+     *  existing row holds, names, key and allowlisting included, with the
+     *  given listing; nothing is stored. */
+    _row(destHash, publicKey, hidden, nameOnly = false, isDistro = false) {
         const existing = this._contacts.get(destHash);
-        const contact = {
+        return {
             destHash,
             localName: existing?.localName ?? null,
             messageName: existing?.messageName ?? null,
@@ -685,10 +715,6 @@ const ContactStore = {
             nameOnly,
             allowlisted: existing?.allowlisted === true,
         };
-        this._contacts.set(destHash, contact);
-        this._save();
-        this._notify();
-        return contact;
     },
 
     /** Update contact info from an announce (announce name, distro flag,
@@ -6257,8 +6283,10 @@ const App = {
         GroupStore.migrateOwnMemberHash();
         // Once, now that the groups hold this device's delivery hash: the
         // members of groups already held pass the privacy filter, as on the
-        // phones (ContactStore.allowHeldGroupMembers).
-        ContactStore.allowHeldGroupMembers(GroupStore.getAll(), [ownLxmfDestinationHash(), IdMgr.hash].filter(Boolean));
+        // phones (ContactStore.allowHeldGroupMembers), but this device's own
+        // hashes and its distro's address, which are never a contact.
+        ContactStore.allowHeldGroupMembers(GroupStore.getAll(),
+            [ownLxmfDestinationHash(), IdMgr.hash, DistroManager.lxmfDeliveryHash].filter(Boolean));
         this.state.view = "main";
         this.render();
         this._wire();
