@@ -1465,6 +1465,109 @@ test("_performGroupRelay sends nothing for a group the user has not joined, whoe
     assert.deepEqual(sent, [["fanout", [A, B], "hello", R], ["send", R, "relay_done"]]);
 });
 
+/**
+ * The user opening a group's chat, as `r`'s page does it: the real
+ * App.openChat, and behind it the real openGroupConversation,
+ * _requestGroupPeer, _waitForGroupPeer, _markGroupPeerReady and
+ * _ensureGroupLink over `r`'s stores, with a transport that records each
+ * path request and a Link that records each link opened (by its
+ * destination hash). `asked()` is everything asked of anyone so far.
+ */
+function openingChats(r) {
+    const paths = [];
+    const opened = [];
+    class RecordingLink {
+        static ACTIVE = Link.ACTIVE;
+        constructor() { this.status = 0; }
+        on() {}
+        establish(destination) { opened.push(destination.hash.toString("hex")); }
+    }
+    const rc = {
+        ownHash: lxmfHash(r.me),
+        _groupPathsRequested: new Set(), _groupPeerReady: new Set(), _groupPeerWaiters: new Map(),
+        _groupLinks: new Map(), _groupLinkPromises: new Map(),
+        _rns: {
+            transport: { requestPath: (hash) => paths.push(hash) },
+            registerDestination: (identity) => ({ hash: Destination.hash(identity, "lxmf", "delivery") }),
+        },
+    };
+    const env = { GroupStore: r.GroupStore, ContactStore: r.ContactStore, console: quiet, Identity, Destination, Link: RecordingLink };
+    for (const signature of ["async openGroupConversation(groupId)", "_requestGroupPeer(memberHash)", "_waitForGroupPeer(memberHash)",
+        "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)"]) {
+        rc[signature.replace(/^async /, "").split("(")[0]] = compile(signature, env)(rc);
+    }
+    const page = { state: { activeHash: null, isWide: true }, _closeAllModals() {}, render() {}, _scrollChatBottom() {}, _requestPathForContact() {} };
+    const openChat = compile("openChat(hash, activateChannel = true)", {
+        ChannelStore: { get: () => null }, GroupStore: r.GroupStore, ContactStore: r.ContactStore, RnsClient: rc, console: quiet,
+        document: { body: { classList: { add() {} } } }, requestAnimationFrame: () => {},
+    })(page);
+    const asked = () => ({ paths: [...paths].sort(), links: [...opened].sort(), linking: [...rc._groupLinkPromises.keys()].sort() });
+    return { rc, openChat: async (id) => { openChat(id); await settle(); }, asked };
+}
+
+test("group trust rule: opening a pending group's chat asks nothing of its members (no path request, no link, no row) until the user accepts; then opening it asks for each member's path and links to each, as for any joined group", async () => {
+    // James, 2026-10-01: the members an invite lists are allowed only once
+    // the invite is accepted. Until then opening a pending group's chat
+    // (App.openChat -> openGroupConversation) asked for every listed
+    // member's path, kept a row for each, and opened a link to each before
+    // the user had answered.
+    const c = answeringClient();
+    const { r } = c;
+    const [inviter, b, x] = [1, 2, 3].map(() => Identity.create());
+    const [I, B, X] = [inviter, b, x].map(lxmfHash);
+    r.ContactStore.add(I, false, inviter.getPublicKey().toString("hex"));
+    r.ContactStore.allow(I);
+    const G = "6".repeat(32);
+    const keyOf = (id) => `${lxmfHash(id)}:${id.getPublicKey().toString("base64")}`;
+    // The invite's first chunk lists I, B, X and this device, with I's and
+    // B's keys; X's key comes in a chunk of its own (sendGroupInvites).
+    r.packet(lxm(inviter, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_SENDER, I],
+        [GROUP_FIELDS.GROUP_MEMBERS, [I, B, X, c.ME].join(",")], [GROUP_FIELDS.GROUP_MEMBER_KEYS, [inviter, b].map(keyOf).join(",")]])));
+    await settle();
+    assert.equal(r.GroupStore.get(G)?.groupStatus, "pending");
+    assert.equal(r.ContactStore.get(X), null, "no row for X: his key has not come");
+
+    const chats = openingChats(r);
+    await chats.openChat(G);
+    assert.deepEqual(chats.asked(), { paths: [], links: [], linking: [] }, "pending: nothing asked of anyone, the keyed members included");
+    assert.equal(r.ContactStore.get(X), null, "and no row kept for the keyless one");
+
+    // X's key arrives, and the user accepts: the group is joined.
+    r.packet(c.invite(inviter, G, [x]));
+    await settle();
+    await chats.openChat(G);
+    assert.deepEqual(chats.asked(), { paths: [], links: [], linking: [] }, "still pending: still nothing");
+    c.acceptInvite(G);
+    assert.deepEqual([c.alerts, r.GroupStore.get(G).groupStatus], [[], "active"]);
+
+    // Joined: opening its chat asks for the path of every member, and links
+    // to each as its announce makes it ready; never to this device.
+    await chats.openChat(G);
+    assert.deepEqual(chats.asked(), { paths: [I, B, X].sort(), links: [], linking: [I, B, X].sort() }, "every member's path asked, a link to each started");
+    for (const h of [I, B, X]) chats.rc._markGroupPeerReady(h);
+    await settle();
+    assert.deepEqual(chats.asked().links, [I, B, X].sort(), "linked once each is ready");
+
+    // A member brought in later with no key (the inviter relays Y's accept):
+    // a hidden row is kept for him and his path asked, as before.
+    const y = Identity.create(), Y = lxmfHash(y);
+    r.packet(lxm(inviter, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "accept"], [GROUP_FIELDS.GROUP_SENDER, Y]])));
+    await settle();
+    assert.equal(r.GroupStore.get(G).members.get(Y), "accepted");
+    await chats.openChat(G);
+    assert.deepEqual(chats.asked().paths, [I, B, X, Y].sort(), "Y's path asked");
+    assert.equal(r.ContactStore.get(Y).publicKey ?? null, null);
+
+    // Only a joined group: one with no status (none is stored without one:
+    // GroupStore.init reads a missing one as "active") is asked nothing.
+    const z = Identity.create(), Z = lxmfHash(z);
+    const H = "7".repeat(32);
+    r.ContactStore.keep(Z, z.getPublicKey().toString("hex"));
+    r.GroupStore._groups.set(H, { groupId: H, groupName: "H", members: new Map([[Z, "accepted"], [c.ME, "accepted"]]), lastActivity: 0 });
+    await chats.openChat(H);
+    assert.ok(!chats.asked().paths.includes(Z) && !chats.asked().linking.includes(Z), "nothing asked of Z");
+});
+
 test("group trust rule: a plain post names its author (GROUP_SENDER) only from a source the group trusts; a stranger's is its own, whichever member, or this device, it names", async () => {
     // A stranger's plain post for a held group is kept and proved (James,
     // 2026-09-30); shown as written by a member it names, that would be a

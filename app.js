@@ -4580,9 +4580,24 @@ const RnsClient = {
         return promise;
     },
 
+    /** The chat of group `groupId` was opened (App.openChat): for a group
+     *  the user has joined, ask for the path of each member whose key is not
+     *  held and open a link to each member, so the first post goes at once.
+     *  Nothing for a group the user has not joined (pending), not even a
+     *  row: under James's group trust rule (2026-10-01) the members an
+     *  invite lists are allowed only once the user accepts it, and until
+     *  then this client sends nothing to them, nor asks the network for
+     *  them. The accept itself asks for their paths (_acceptGroupInvite)
+     *  and sends to each (sendGroupAccept). Until 2026-10-01 opening a
+     *  pending group's chat asked for every listed member's path and opened
+     *  a link to each before the user answered. */
     async openGroupConversation(groupId) {
         const group = GroupStore.get(groupId);
         if (!group) return;
+        if (group.groupStatus !== "active") {
+            console.log(`[retichat] 👥 Opened group ${groupId.slice(0,8)} the user has not joined: nothing asked of its members until the invite is accepted`);
+            return;
+        }
         const ownHash = this.ownHash;
         const links = [...group.members.keys()]
             .filter(hash => hash !== ownHash)
