@@ -226,6 +226,40 @@ test("propagated (/get): the fetched message keeps its attachment", async () => 
         [{ name: "report.pdf", sha256: sha(file), mime: "application/pdf" }]);
 });
 
+test("propagated (/get): a fields map that cannot be decoded costs the attachments, never the message, and it is purged", async () => {
+    // The task's "every receive path": /get ran its own msgpack pre-parse,
+    // which threw on such a map before fromBytes could fall back, so the
+    // message was lost, never purged, and downloaded again on every fetch
+    // (review of adee619).
+    const r = recipient();
+    const sender = Identity.create();
+    const S = lxmfHash(sender);
+    const head = MsgPack.pack([(clock += 1), Buffer.alloc(0), Buffer.from("keep this text")]);
+    const raw = Buffer.concat([Buffer.from([0x94]), head.subarray(1), Buffer.from([0x81, 0x05, 0xd4, 0x01, 0x00])]);
+    assert.throws(() => MsgPack.unpack(raw), "msgpack cannot decode this fields map");
+    const dest = Buffer.from(r.myHash, "hex"), src = Buffer.from(S, "hex");
+    const signature = sender.sign(Buffer.concat([dest, src, raw, LXMessage.hashOf(dest, src, raw)]));
+    const blob = Buffer.concat([dest, r.me.encrypt(Buffer.concat([src, signature, raw]))]);
+    const tid = Buffer.alloc(32, 0x5a);
+    const purged = [];
+    const self = {
+        _lxmfRouter: r.router,
+        _propLink: { status: Link.ACTIVE, sendRequest: (path, data) => data },
+        async _waitForResponse(link, [wants, haves]) {
+            if (haves) { purged.push(...haves.map((h) => Buffer.from(h).toString("hex"))); return true; }
+            if (wants) return [blob];
+            return [tid];
+        },
+    };
+    await compile("async _fetchPropagatedMessages()", { Link, Buffer, LXMessage, MsgPack, IdMgr: { id: r.me }, console: quiet })(self)();
+    await settle();
+    const [rec] = r.MsgStore.get(S);
+    assert.ok(rec, "stored");
+    assert.equal(rec.content, "keep this text");
+    assert.equal(rec.fieldsUnreadable, true, "and the bubble says part of it could not be read");
+    assert.deepEqual(purged, [tid.toString("hex")], "purged from the node, so it is not downloaded again");
+});
+
 // ── the ticket trap, on the router path ─────────────────────────────────────
 
 test("a captionless attachment with a ticket is a message, whoever's ticket it is (LXMF-rust 06c40e1)", async () => {

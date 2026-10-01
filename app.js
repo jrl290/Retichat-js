@@ -2557,13 +2557,16 @@ const RnsClient = {
                     // downloaded (its source is inside the ciphertext) but
                     // costs nothing more.
                     if (!this._lxmfRouter.acceptsSource(decrypted.subarray(0, 16), "propagated")) { had(); continue; }
-                    let payload;
-                    try { payload = MsgPack.unpack(decrypted.slice(80)); } catch(e) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
-                    if (!Array.isArray(payload) || payload.length < 3) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload shape`); continue; }
 
                     // Parsed as the router parses the direct paths: the same
                     // hash, so a copy of one already received is recognised,
                     // and the same signature check against the identity store.
+                    // fromBytes alone reads the payload: a fields map msgpack
+                    // cannot decode costs the attachments, never the message
+                    // (LXMessage.decodePayload). Until 2026-09-30 a msgpack
+                    // pre-parse here threw on such a map first, so the
+                    // message was lost, never purged, and downloaded again
+                    // on every fetch.
                     const message = LXMessage.fromBytes(decrypted, destHash);
                     if (!message) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
                     if (!this._lxmfRouter.acceptsMessage(message, "propagated")) { had(); continue; }
