@@ -293,7 +293,6 @@ function makeReceiver(distro, deviceHash) {
         ownHash: deviceHash,
         _pendingTickets: new Map(),
         _onMsg: [(m, peer) => events.push({ m, peer })],
-        _ticketFromFields: () => null,
     };
     const fn = new Function("DistroManager", "MsgPack", "Buffer", "DistroSeen", "Harness", "ContactStore", "MsgStore",
         "LXMF", "Cryptography", "ownLxmfDestinationHash", "LXMessage", "decodeDisplayName", "self", "distroHash", "blob",

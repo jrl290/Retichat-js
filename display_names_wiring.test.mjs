@@ -732,7 +732,7 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
             ? (d, s, sig, p) => LXMessage.verify(d, s, sig, p, recall) : t[k]) }),
     };
     const run = new Function(...Object.keys(env), "self", "distroHash", "blob", body);
-    const self = { ownHash: "e".repeat(32), _pendingTickets: new Map(), _onMsg: [], _ticketFromFields: () => null };
+    const self = { ownHash: "e".repeat(32), _pendingTickets: new Map(), _onMsg: [] };
     const blob = (signer, name, timestamp = tick()) => {
         const m = new LXMessage();
         m.timestamp = timestamp;

@@ -669,7 +669,7 @@ test("distro fan-out is never filtered: a stranger's message to the distro is st
         MsgPack, Buffer, DistroSeen: { check: () => false }, Harness: { event() {}, error() {} },
         ContactStore, MsgStore, LXMF, Cryptography, LXMessage, decodeDisplayName: DN.decodePayload,
         ownLxmfDestinationHash: () => lxmfHash(me), PrivacyFilter: trap, console: quiet,
-    })({ ownHash: lxmfHash(me), _pendingTickets: new Map(), _onMsg: [], _ticketFromFields: () => null });
+    })({ ownHash: lxmfHash(me), _pendingTickets: new Map(), _onMsg: [] });
     assert.equal(handleBlob(null, blob), true);
     assert.deepEqual(MsgStore.get(S).map((x) => x.content), ["to your distro"]);
     assert.deepEqual([ContactStore.isContact(S), ContactStore.allowlisted(S)], [true, false],
