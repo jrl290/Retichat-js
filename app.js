@@ -1326,10 +1326,13 @@ const GroupStore = {
             .sort((a, b) => b.lastActivity - a.lastActivity);
     },
     isGroupChat(id) { return this._groups.has(id); },
-    /** Whether `memberHash` is in the member list of any group this client
-     *  holds, pending or active, whatever its status. */
-    hasMember(memberHash) {
-        for (const g of this._groups.values()) if (g.members.has(memberHash)) return true;
+    /** Whether `memberHash` is in the member list of a group the user has
+     *  joined (accepted or created: active), whatever its status there. A
+     *  group still pending does not count: the group trust rule allows the
+     *  members an invite lists only once the user accepts it
+     *  (PrivacyFilter.knows). */
+    hasJoinedMember(memberHash) {
+        for (const g of this._groups.values()) if (g.groupStatus === "active" && g.members.has(memberHash)) return true;
         return false;
     },
     /** Whether `memberHash` is a current member of group `groupId`: in its
@@ -1464,10 +1467,20 @@ const PrivacyFilter = {
         return !this._on || ContactStore.allowlisted(srcHash);
     },
 
-    /** A source step 1 lets through on its hash alone: allowlisted (or the
-     *  filter is off), or in the member list of a group held here. */
+    /** A source step 1 lets through on its hash alone, and the one a distro
+     *  identity transfer is taken from: allowlisted (or the filter is off),
+     *  or in the member list of a group the user has joined. A member
+     *  listed only in a pending group is not one: the group trust rule
+     *  allows nobody an invite lists until the user accepts it ("If the
+     *  invite is accepted, the other group members are considered
+     *  allowed"), so its DM and its transfer are dropped as a stranger's
+     *  are, and its group messages pass only by the group rule on the
+     *  router's look at them (acceptsSource). Until 2026-10-01 every held
+     *  group's list counted, so an invite the user never answered let each
+     *  member it listed put the Import Distro Identity prompt in front of
+     *  the user. */
     knows(src) {
-        return this.allows(src) || GroupStore.hasMember(src);
+        return this.allows(src) || GroupStore.hasJoinedMember(src);
     },
 
     /** The facts the group trust rule asks about a message from `src`
@@ -1512,8 +1525,10 @@ const PrivacyFilter = {
      *  an allowlisted source, and any other action a source that is
      *  allowlisted or a current member of that group, which a stranger is
      *  neither; so only a plain group message, for a group held here. A
-     *  member listed in a pending group passes here on its hash (knows),
-     *  and step 2 decides on the parsed message, GROUP_SENDER included. */
+     *  member listed only in a pending group is not known either (knows):
+     *  it passes here only by that look, with its own accept or leave
+     *  (shouldProcessGroupMessage) or a plain group message, and step 2
+     *  decides on the parsed message, GROUP_SENDER included. */
     acceptsSource(sourceHash, path, peekGroup = null) {
         const src = Buffer.from(sourceHash).toString("hex");
         if (this.knows(src)) return true;
@@ -1548,7 +1563,8 @@ const PrivacyFilter = {
             // An offer the user answers, checked before the allowlist on iOS
             // (handleIncomingMessage, ChatRepository.swift:1926-1933) and
             // Android (onMessageReceived, ChatRepository.kt:1365-1373) —
-            // but only from a source step 1 knows: a stranger reaches this
+            // but only from a source step 1 knows: a stranger, or a member
+            // listed only in a group the user has not accepted, reaches this
             // step only as a group message, and a transfer that also carries
             // a group id is still a transfer, which "Add another device"
             // takes only from a device the user added (James, 2026-09-30).

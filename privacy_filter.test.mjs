@@ -487,7 +487,7 @@ test("filter off: a stranger's DM is kept and listed as before, but not allowlis
     assert.equal(r.ContactStore.get(S).messageName, "Sam", "and its name not taken");
 });
 
-test("a co-member who is not allowlisted: group traffic for a held group is kept; a DM is dropped unproved and records no name", async (t) => {
+test("a co-member who is not allowlisted: group traffic for a held group is kept; listed only in a pending group, its DM and its distro identity transfer are dropped at the look as a stranger's; in a joined group, its DM is dropped after the parse and its transfer offered", async (t) => {
     const r = recipient();
     const inviter = Identity.create(), member = Identity.create();
     const I = lxmfHash(inviter), M = lxmfHash(member);
@@ -495,6 +495,7 @@ test("a co-member who is not allowlisted: group traffic for a held group is kept
     r.GroupStore.addPending(G, "G", I, [M]);
     r.ContactStore.keep(M);                      // its key and names, hidden
     assert.equal(r.ContactStore.allowlisted(M), false);
+    const transfer = () => lxm(member, r.me, "", new Map([[LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_TRANSFER_TYPE], [LXMF.FIELD_CUSTOM_DATA, "a".repeat(128)]]));
 
     r.packet(lxm(member, r.me, "", named("Member", [[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "accept"]])));
     await settle();
@@ -502,11 +503,20 @@ test("a co-member who is not allowlisted: group traffic for a held group is kept
     assert.equal(r.self.groups.length, 1, "and reaches the group handler");
     assert.equal(r.ContactStore.get(M).messageName, "Member", "named after the policy kept it");
 
+    // Listed only in a group the user has not accepted, the member is not
+    // known (PrivacyFilter.knows; the group trust rule allows nobody an
+    // invite lists until the user accepts it): its DM and its distro
+    // identity transfer are dropped at the router's look, unparsed and
+    // unproved, as a stranger's are. Until 2026-10-01 its transfer put the
+    // Import Distro Identity prompt in front of the user.
+    assert.equal(r.PrivacyFilter.knows(M), false);
     const parses = watchParses(t);
     r.packet(lxm(member, r.me, "psst, a DM", named("Renamed")));
+    r.packet(transfer());
     await settle();
-    assert.equal(parses.length, 1, "the source passed step 1 (a member), so it was parsed ...");
-    assert.equal(r.proofs.length, 1, "... and then dropped before the proof");
+    assert.equal(parses.length, 0, "neither is parsed");
+    assert.equal(r.proofs.length, 1, "nor proved");
+    assert.deepEqual(r.self.transfers, [], "no Import Distro Identity prompt");
     assert.deepEqual(r.MsgStore.get(M), [], "nothing stored");
     assert.equal(r.ContactStore.get(M).messageName, "Member", "a dropped message records no name");
     assert.equal(r.ContactStore.isContact(M), false, "still not listed");
@@ -515,45 +525,67 @@ test("a co-member who is not allowlisted: group traffic for a held group is kept
     await settle();
     assert.equal(r.proofs.length, 1, "a group message for a group not held here is dropped unproved");
 
-    r.packet(lxm(member, r.me, "", new Map([[LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_TRANSFER_TYPE], [LXMF.FIELD_CUSTOM_DATA, "a".repeat(128)]])));
+    // A transfer that also names the pending group passes the look as a
+    // group message, and is still a transfer: dropped after the parse.
+    r.packet(lxm(member, r.me, "", new Map([[LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_TRANSFER_TYPE], [LXMF.FIELD_CUSTOM_DATA, "a".repeat(128)],
+        [GROUP_FIELDS.GROUP_ID, G]])));
     await settle();
-    assert.equal(r.proofs.length, 2, "a distro identity transfer is offered whoever sends it (iOS, Android)");
+    assert.deepEqual([r.proofs.length, r.self.transfers.length, r.self.groups.length], [1, 0, 1], "not proved, offered or put in the group");
+    assert.equal(parses.length, 1, "parsed: it passed the look as a group message");
+
+    // In a group the user has joined, the member is known: its DM passes
+    // step 1, is parsed, and is dropped before the proof (it is not
+    // allowlisted); its transfer is offered (iOS, Android).
+    r.GroupStore.accept(G);
+    assert.equal(r.PrivacyFilter.knows(M), true);
+    r.packet(lxm(member, r.me, "psst, a DM", named("Renamed")));
+    await settle();
+    assert.equal(parses.length, 2, "the source passed step 1 (a member of a joined group), so it was parsed ...");
+    assert.equal(r.proofs.length, 1, "... and then dropped before the proof");
+    assert.deepEqual(r.MsgStore.get(M), [], "nothing stored");
+    assert.equal(r.ContactStore.get(M).messageName, "Member", "a dropped message records no name");
+    r.packet(transfer());
+    await settle();
+    assert.equal(r.proofs.length, 2, "a distro identity transfer is offered from a source step 1 knows (iOS, Android)");
     assert.equal(r.self.transfers.length, 1);
-    assert.deepEqual(r.drops().map((d) => d.at), ["message", "message"]);
+    assert.deepEqual(r.drops().map((d) => d.at), ["source", "source", "source", "message", "message"]);
 });
 
-test("a co-member's DM over a link or fetched from the node is dropped after the parse: unproved, unanswered, still purged", async () => {
-    const r = recipient();
-    const inviter = Identity.create(), member = Identity.create();
-    const M = lxmfHash(member);
-    r.GroupStore.addPending("9".repeat(32), "G", lxmfHash(inviter), [M]);
-    const { a, wire } = await deliveryLink(r);
+test("a co-member's DM over a link or fetched from the node is dropped unproved, unanswered, still purged: after the parse in a joined group, at the look when listed only in a pending one", async () => {
+    for (const [joined, at] of [[true, "message"], [false, "source"]]) {
+        const r = recipient();
+        const inviter = Identity.create(), member = Identity.create();
+        const M = lxmfHash(member);
+        r.GroupStore.addPending("9".repeat(32), "G", lxmfHash(inviter), [M]);
+        if (joined) r.GroupStore.accept("9".repeat(32));
+        const { a, wire } = await deliveryLink(r);
 
-    a.send(lxm(member, r.me, "a DM on a link", ticketed()));
-    await settle(6);
-    assert.equal(wire.b.length, 0, "no proof and no ticket reply");
-    await within(a.sendResource(lxm(member, r.me, "y".repeat(3000), ticketed())), 5000, "the member's Resource");
-    await settle(6);
-    assert.equal(linkReplies(wire).length, 0, "no ticket reply for the Resource either");
+        a.send(lxm(member, r.me, "a DM on a link", ticketed()));
+        await settle(6);
+        assert.equal(wire.b.length, 0, "no proof and no ticket reply");
+        await within(a.sendResource(lxm(member, r.me, "y".repeat(3000), ticketed())), 5000, "the member's Resource");
+        await settle(6);
+        assert.equal(linkReplies(wire).length, 0, "no ticket reply for the Resource either");
 
-    const blob = Buffer.concat([r.destination.hash, r.me.encrypt(lxm(member, r.me, "a DM left on the node").subarray(16))]);
-    const purged = [];
-    const self = {
-        _lxmfRouter: r.router,
-        _propLink: { status: Link.ACTIVE, sendRequest: (path, data) => data },
-        async _waitForResponse(link, [wants, haves]) {
-            if (haves) { purged.push(...haves.map((h) => h[0])); return true; }
-            return wants ? [blob] : [Buffer.from([7])];
-        },
-    };
-    await compile("async _fetchPropagatedMessages()", {
-        Link, Buffer, MsgPack, LXMessage, IdMgr: { id: r.me }, console: quiet,
-    })(self)();
-    await settle();
-    assert.deepEqual(purged, [7], "reported as had, so the node purges it");
-    assert.equal(r.emitted.length, 0, "none of the three reached the handler");
-    assert.deepEqual(r.MsgStore.get(M), []);
-    assert.deepEqual(r.drops().map((d) => [d.path, d.at]), [["link", "message"], ["resource", "message"], ["propagated", "message"]]);
+        const blob = Buffer.concat([r.destination.hash, r.me.encrypt(lxm(member, r.me, "a DM left on the node").subarray(16))]);
+        const purged = [];
+        const self = {
+            _lxmfRouter: r.router,
+            _propLink: { status: Link.ACTIVE, sendRequest: (path, data) => data },
+            async _waitForResponse(link, [wants, haves]) {
+                if (haves) { purged.push(...haves.map((h) => h[0])); return true; }
+                return wants ? [blob] : [Buffer.from([7])];
+            },
+        };
+        await compile("async _fetchPropagatedMessages()", {
+            Link, Buffer, MsgPack, LXMessage, IdMgr: { id: r.me }, console: quiet,
+        })(self)();
+        await settle();
+        assert.deepEqual(purged, [7], "reported as had, so the node purges it");
+        assert.equal(r.emitted.length, 0, "none of the three reached the handler");
+        assert.deepEqual(r.MsgStore.get(M), []);
+        assert.deepEqual(r.drops().map((d) => [d.path, d.at]), [["link", at], ["resource", at], ["propagated", at]], joined ? "joined" : "pending");
+    }
 });
 
 test("a group invite is kept only from an allowlisted contact: a channel poster's or an auto-added stranger's is dropped unproved", async () => {
@@ -580,7 +612,7 @@ test("a group invite is kept only from an allowlisted contact: a channel poster'
     assert.equal(r.self.groups.length, 1, "the contact's invite is processed");
 });
 
-test("a group invite from a co-member who is not allowlisted passes step 1 and is dropped by the router at step 2, unproved", async () => {
+test("a group invite from a co-member who is not allowlisted is dropped unproved: at the look while it is listed only in a pending group, by the router at step 2 once the group is joined", async () => {
     // The router's own invite rule (acceptsMessage): the handler's check
     // would drop it too, but only after the router had proved it, telling
     // the inviter the invite was delivered.
@@ -592,11 +624,18 @@ test("a group invite from a co-member who is not allowlisted passes step 1 and i
     const invite = (groupId) => lxm(member, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, groupId], [GROUP_FIELDS.GROUP_ACTION, "invite"],
         [GROUP_FIELDS.GROUP_MEMBERS, `${M},${lxmfHash(r.me)}`]]));
 
+    r.packet(invite("3".repeat(32)));
+    await settle();
+    assert.deepEqual([r.proofs.length, r.self.groups.length], [0, 0], "not proved, not processed");
+    assert.deepEqual(r.drops(), [{ src: M.slice(0, 12), path: "opportunistic", at: "source" }],
+        "listed only in a pending group, it is not known: dropped at the look, as a stranger's invite");
+
+    r.GroupStore.accept("9".repeat(32));
     r.packet(invite("4".repeat(32)));
     await settle();
     assert.equal(r.proofs.length, 0, "not proved");
     assert.equal(r.self.groups.length, 0, "never reaches the group handler");
-    assert.deepEqual(r.drops(), [{ src: M.slice(0, 12), path: "opportunistic", at: "message" }], "a member, so dropped after the parse");
+    assert.deepEqual(r.drops().at(-1), { src: M.slice(0, 12), path: "opportunistic", at: "message" }, "a member of a joined group, so dropped after the parse");
 
     r.ContactStore.allow(M);
     r.packet(invite("5".repeat(32)));
@@ -1131,8 +1170,11 @@ async function pendingGroup() {
     const allowed = (...hs) => hs.map((h) => r.ContactStore.allowlisted(h));
     const incoming = () => (r.storage.sGet("gmsg_" + G) ?? []).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]);
 
-    // B, listed and not allowed, speaks for others: each is parsed (B is in
-    // a member list here, so step 1 lets it through) and dropped unproved.
+    // B, listed and not allowed, speaks for others: each is dropped
+    // unproved. B is listed only in a pending group, so step 1 does not
+    // know it (PrivacyFilter.knows): its accept and leave pass the look
+    // (they could be its own) and are dropped after the parse, where
+    // GROUP_SENDER is read; the rest are dropped at the look.
     r.packet(lxm(ids.b, r.me, "", control("accept", X)));
     r.packet(lxm(ids.b, r.me, "", control("leave", C)));
     r.packet(lxm(ids.b, r.me, "relay me", control("relay_req", B, [[GROUP_FIELDS.GROUP_RELAY_SEEN, B]])));
@@ -1140,8 +1182,8 @@ async function pendingGroup() {
     r.packet(lxm(ids.b, r.me, "", control("promote", B)));
     await settle();
     assert.equal(r.proofs.length, 0, "none is proved");
-    assert.deepEqual(r.drops().map((d) => [d.src, d.at]), Array(5).fill([B.slice(0, 12), "message"]),
-        "each dropped after the parse, before the proof");
+    assert.deepEqual(r.drops().map((d) => [d.src, d.at]), ["message", "message", "source", "source", "source"].map((at) => [B.slice(0, 12), at]),
+        "each dropped before the proof");
     assert.deepEqual([status(X), status(C)], [undefined, "invited"], "nobody added, nobody left");
     assert.deepEqual(relays, [], "nothing relayed for a pending group's listed member");
     assert.deepEqual(allowed(X, B, C), [false, false, false], "nobody allowed");
@@ -1280,14 +1322,16 @@ test("group trust rule: an invite allows nobody, its listed co-members and its i
     assert.deepEqual(c.allowed(b), [false], "but he is not allowed by the invite");
     assert.equal(r.ContactStore.get(B).hidden, true, "and is listed nowhere (audit L4)");
 
-    // Unanswered, B's DM is dropped unproved: he is listed in a held group,
-    // so step 1 lets him through, and step 2 drops a DM from a source that
-    // is not allowlisted.
+    // Unanswered, B's DM and his distro identity transfer are dropped
+    // unproved at the look: he is listed only in a group the user has not
+    // accepted, which lets nobody through (PrivacyFilter.knows).
     r.packet(lxm(b, r.me, "a DM while the invite waits"));
+    r.packet(lxm(b, r.me, "", new Map([[LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_TRANSFER_TYPE], [LXMF.FIELD_CUSTOM_DATA, "a".repeat(128)]])));
     await settle();
     assert.equal(r.proofs.length, 1, "unproved");
     assert.deepEqual(c.dms(b), []);
-    assert.deepEqual(r.drops().at(-1), { src: B.slice(0, 12), path: "opportunistic", at: "message" });
+    assert.deepEqual(r.self.transfers, [], "no Import Distro Identity prompt");
+    assert.deepEqual(r.drops().slice(-2), [{ src: B.slice(0, 12), path: "opportunistic", at: "source" }, { src: B.slice(0, 12), path: "opportunistic", at: "source" }]);
 
     // Declined: nobody is left allowed, and B's DM is still dropped.
     c.declineInvite(G1);
@@ -1355,8 +1399,9 @@ test("group trust rule: this client relays only for a group the user has joined;
     r.PrivacyFilter.set(true);
     assert.equal(r.proofs.length, proved, "none is proved");
     assert.deepEqual(c.relays, [], "nothing relayed");
-    assert.deepEqual(r.drops().slice(-4).map((d) => [d.src, d.at]), [[I, "message"], [B, "message"], [S, "message"], [I, "message"]]
-        .map(([h, at]) => [h.slice(0, 12), at]), "each dropped after the parse, before the proof");
+    assert.deepEqual(r.drops().slice(-4).map((d) => [d.src, d.at]), [[I, "message"], [B, "source"], [S, "message"], [I, "message"]]
+        .map(([h, at]) => [h.slice(0, 12), at]),
+        "each dropped before the proof: B, listed only in the pending group, at the look; the others, which the filter passes, after the parse");
     assert.deepEqual([...r.GroupStore.get(G).members.entries()].sort(),
         [[I, "accepted"], [B, "invited"], [c.ME, "invited"]].sort(), "the group as it was");
 
