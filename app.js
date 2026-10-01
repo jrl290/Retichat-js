@@ -3128,74 +3128,75 @@ const RnsClient = {
     /**
      * Dispatch every message stored "queued" until initialization finished
      * (waitFor "init"): DMs and group messages, oldest first. Each record is
-     * claimed — waitFor cleared and persisted — before it is dispatched, so
-     * a second "registered" (a 401 re-registration) or a reload mid-dispatch
-     * cannot send it twice. A DM whose contact has no public key stays
-     * queued for the next initialization.
+     * claimed — waitFor cleared and persisted — in the same tick it is
+     * dispatched, so a second "registered" (a 401 re-registration) or a
+     * reload mid-dispatch cannot send it twice. A DM whose contact has no
+     * public key stays queued for the next initialization.
+     *
+     * A queued DM with attachments may hold them only in the attachment
+     * store (it waited across a reload), and _sendPacket packs them
+     * synchronously from memory. So when any is queued, the bytes of all of
+     * them are read into memory first (Attachments.warm), and then every
+     * queued message goes in one pass, in order, and the bytes are let go.
+     * Until 2026-09-30 only those DMs waited for their bytes, so a text
+     * queued after a photo was sent, and stamped, before it. One whose bytes
+     * are gone (kept for an earlier session only) is not sent without them:
+     * it fails, saying why.
      */
     _dispatchQueued() {
         const queued = [];
-        const isQueued = (m) => m.dir === "out" && m.status === "queued" && m.waitFor === "init";
+        const isQueued = (m) => m?.dir === "out" && m.status === "queued" && m.waitFor === "init";
         for (const contact of ContactStore.getAll()) {
             for (const msg of MsgStore.get(contact.destHash).filter(isQueued)) {
-                queued.push({ msg, dispatch: () => {
+                queued.push({ msg, keys: (msg.attachments ?? []).map(a => a.key), dispatch: (missing) => {
                     if (!contact.publicKey) {
                         console.warn(`[retichat] ⏳ Queued message ${msg.id.slice(0,8)} to ${contact.destHash.slice(0,8)} stays queued: no public key for this contact yet`);
                         return;
                     }
+                    // Re-read: another run may have claimed it while this
+                    // one read the attachments.
+                    if (!isQueued(MsgStore.get(contact.destHash).find(m => m.id === msg.id))) return;
+                    const gone = (msg.attachments ?? []).filter(a => missing.has(a.key)).length;
+                    if (gone) {
+                        const why = `${gone === 1 ? "an attachment was" : "attachments were"} kept for an earlier session only and ${gone === 1 ? "is" : "are"} gone`;
+                        console.warn(`[retichat] ✗ Queued message ${msg.id.slice(0,8)} to ${contact.destHash.slice(0,8)} not sent: ${why}`);
+                        MsgStore.update(contact.destHash, msg.id, { status: "failed", waitFor: null, sendError: why });
+                        this._onMsg.forEach(fn => fn(null, contact.destHash));
+                        return;
+                    }
                     MsgStore.update(contact.destHash, msg.id, { waitFor: null });
-                    if (msg.attachments?.length) this._dispatchWarmed(contact, msg);
-                    else this._dispatchMessage(contact, msg);
+                    this._dispatchMessage(contact, msg);
                 }});
             }
         }
         for (const group of GroupStore.getAll()) {
             for (const msg of GroupMsgStore.get(group.groupId).filter(isQueued)) {
-                queued.push({ msg, dispatch: () => {
+                queued.push({ msg, keys: [], dispatch: () => {
+                    if (!isQueued(GroupMsgStore.get(group.groupId).find(m => m.id === msg.id))) return;
                     GroupMsgStore.update(group.groupId, msg.id, { waitFor: null });
                     this._dispatchGroupMessage(group.groupId, msg).catch(error =>
                         console.warn(`[retichat] 👥 Queued group send to ${group.groupId.slice(0,8)} failed:`, error.message));
                 }});
             }
         }
-        if (queued.length) console.log(`[retichat] ⏳ Initialization finished — dispatching ${queued.length} queued message(s)`);
+        if (!queued.length) return;
+        console.log(`[retichat] ⏳ Initialization finished — dispatching ${queued.length} queued message(s)`);
         queued.sort((a, b) => a.msg.timestamp - b.msg.timestamp);
-        for (const { msg, dispatch } of queued) {
-            try {
-                dispatch();
-            } catch (error) {
-                console.warn(`[retichat] ⚠️ Queued message ${msg.id.slice(0,8)} failed to dispatch:`, error.message);
-                Harness.error("queued-dispatch", error);
+        const dispatchAll = (missing) => {
+            for (const { msg, dispatch } of queued) {
+                try {
+                    dispatch(missing);
+                } catch (error) {
+                    console.warn(`[retichat] ⚠️ Queued message ${msg.id.slice(0,8)} failed to dispatch:`, error.message);
+                    Harness.error("queued-dispatch", error);
+                }
             }
-        }
-    },
-
-    /**
-     * Dispatch a queued DM whose attachments are in the attachment store and
-     * maybe not in memory (it waited for initialization, maybe across a
-     * reload): their bytes are held in memory while _sendPacket packs them,
-     * which it does synchronously, and let go after. One whose bytes are gone
-     * (kept for an earlier session only) is not sent without them: it fails,
-     * saying why.
-     */
-    async _dispatchWarmed(contact, msg) {
-        const keys = msg.attachments.map(a => a.key);
-        const missing = await Attachments.warm(keys);
-        try {
-            if (missing.length) {
-                const why = `${missing.length === 1 ? "an attachment was" : "attachments were"} kept for an earlier session only and ${missing.length === 1 ? "is" : "are"} gone`;
-                console.warn(`[retichat] ✗ Queued message ${msg.id.slice(0,8)} to ${contact.destHash.slice(0,8)} not sent: ${why}`);
-                MsgStore.update(contact.destHash, msg.id, { status: "failed", sendError: why });
-                this._onMsg.forEach(fn => fn(null, contact.destHash));
-                return;
-            }
-            this._dispatchMessage(contact, msg);
-        } catch (error) {
-            console.warn(`[retichat] ⚠️ Queued message ${msg.id.slice(0,8)} failed to dispatch:`, error.message);
-            Harness.error("queued-dispatch", error);
-        } finally {
-            Attachments.cool(keys);
-        }
+        };
+        const keys = queued.flatMap(q => q.keys);
+        if (!keys.length) { dispatchAll(new Set()); return; }
+        return Attachments.warm(keys)
+            .then((missing) => dispatchAll(new Set(missing)))
+            .finally(() => Attachments.cool(keys));
     },
 
     /**

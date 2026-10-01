@@ -144,7 +144,7 @@ function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = nul
         "attachmentRefusal(contact, content, attachments)", "_propagationLimits()",
         "_attachmentFieldNow(record)", "async _attachmentField(record)",
         "_sendWithProgress(link, data, convHash, msgId, label)",
-        "_dispatchQueued()", "async _dispatchWarmed(contact, msg)",
+        "_dispatchQueued()",
     ]);
     return { me, MsgStore, Attachments, backend, contacts, timers, direct, resources, self };
 }
@@ -210,7 +210,7 @@ test("its propagated copy is the same message, attachments and hash, even read b
     s.self.sendMessage(c, "photo", [file("a.png", 50_000, 2)]);
     await settle();
     const rec = s.MsgStore.get(c.destHash)[0];
-    assert.equal(s.Attachments.peek(rec.attachments[0].key), null, "no longer in memory: the copy reads it back");
+    assert.equal(s.Attachments.peek(rec.attachments[0].key) === null, true, "no longer in memory: the copy reads it back");
     await s.self._propagateMessage(c, rec);
     assert.equal(s.resources.length, 1, "a Resource on the propagation link");
     const copy = s.resources[0].subarray(Link.MDU + 1);
@@ -279,14 +279,15 @@ test("a DM queued before initialization (or a reload) is sent with its attachmen
     const queued = before.self.sendMessage(c, "later", [file("q.png", 30_000, 6)]);
     assert.equal(queued.status, "queued");
     await settle();
-    assert.equal(before.Attachments.peek(queued.attachments[0].key), null);
+    assert.equal(before.Attachments.peek(queued.attachments[0].key) === null, true);
     before.self._initialized = true;
     before.self._dispatchQueued();
     await settle();
     const [sent] = before.direct;
     assert.ok(sent, "dispatched");
     assert.equal(Buffer.from(fieldsOf(sent.packed).get(5)[0][1]).length, 30_000);
-    assert.equal(before.Attachments.peek(queued.attachments[0].key), null, "and let go after");
+    // A boolean: node's assert runs out of memory describing 30 KB of bytes.
+    assert.equal(before.Attachments.peek(queued.attachments[0].key) === null, true, "and let go after");
 
     // Session-only bytes do not survive the reload: the message fails, saying why.
     const session = sender({ backend: Promise.reject(new Error("no IndexedDB")), initialized: false });
@@ -301,6 +302,44 @@ test("a DM queued before initialization (or a reload) is sent with its attachmen
     assert.equal(after.status, "failed");
     assert.match(after.sendError, /kept for an earlier session only/);
     assert.equal(session.direct.length, 0, "never sent without its attachment");
+});
+
+test("queued messages go oldest first, a text queued after a photo after the photo, each once", async () => {
+    // _dispatchQueued's promise: until 2026-09-30 only a DM with attachments
+    // waited for its bytes, so a later text was sent, and stamped, before it
+    // (review of adee619).
+    const backend = memoryBackend({ persistent: true });
+    const s = sender({ backend, initialized: false });
+    const peer = Identity.create();
+    const c = contactOf(peer);
+    s.contacts.set(c.destHash, c);
+    s.self.sendMessage(c, "first", []);
+    s.self.sendMessage(c, "", [file("q.png", 30_000, 6)]);
+    s.self.sendMessage(c, "after the photo", []);
+    await settle();
+    s.MsgStore.get(c.destHash).forEach((m, i) => s.MsgStore.update(c.destHash, m.id, { timestamp: 1000 + i }));
+    // And a group message queued between the photo and the last text.
+    const storage = memoryStorage();
+    const GroupMsgStore = build("GroupMsgStore", { sGet: storage.sGet, sSet: storage.sSet, Date });
+    const groupId = "9".repeat(32);
+    GroupMsgStore.add(groupId, { dir: "out", content: "to the group", status: "queued", waitFor: "init" });
+    GroupMsgStore.update(groupId, GroupMsgStore.get(groupId)[0].id, { timestamp: 1001.5 });
+    install(s.self, {
+        ContactStore: { getAll: () => [c] }, MsgStore: s.MsgStore, GroupStore: { getAll: () => [{ groupId }] }, GroupMsgStore,
+        Attachments: s.Attachments, Harness: { error() {} }, console: quiet,
+    }, ["_dispatchQueued()"]);
+    const order = [];
+    const dispatch = s.self._dispatchMessage;
+    s.self._dispatchMessage = (contact, msg) => { order.push(msg.content || "[photo]"); return dispatch.call(s.self, contact, msg); };
+    s.self._dispatchGroupMessage = async (id, msg) => { order.push(`group: ${msg.content}`); };
+    s.self._initialized = true;
+    // A second initialization signal while the first run reads the photo.
+    await Promise.all([s.self._dispatchQueued(), s.self._dispatchQueued()]);
+    await settle();
+    assert.deepEqual(order, ["first", "[photo]", "group: to the group", "after the photo"], "in order, and none twice");
+    const stamps = s.MsgStore.get(c.destHash).map((m) => m.lxmfTimestamp);
+    assert.ok(stamps.every((t, i) => i === 0 || t >= stamps[i - 1]), `stamped in order: ${stamps}`);
+    assert.equal(s.MsgStore.get(c.destHash).filter((m) => m.status === "sending").length, 3);
 });
 
 // ── progress ────────────────────────────────────────────────────────────────
