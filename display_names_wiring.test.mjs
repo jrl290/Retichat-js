@@ -43,6 +43,7 @@ import * as RF from "./lib/retichat_field.js";
 const { applyGroupFields } = RF;
 import { SendTransfers } from "./lib/send_progress.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
+import { sentTimeMs } from "./lib/day_markers.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -262,7 +263,7 @@ function makeReceiver(me) {
     const handle = messageHandler({
         Buffer, LxmfSeen: { check: () => false }, Harness, console: quiet,
         RnsClient: { ownHash: lxmfHash(me) }, LXMF, LXMessage, ContactStore, MsgStore,
-        decodeDisplayName: DN.decodePayload,
+        decodeDisplayName: DN.decodePayload, sentTimeMs,
     })(self);
     const recall = recallFor({ contacts: ContactStore, device: me });
     /** Deliver `packed` (full packing) as the router would. */
@@ -727,7 +728,7 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
         DistroManager: { has: true, identity: distro, lxmfDeliveryHash: lxmfHash(distro) },
         MsgPack, Buffer, DistroSeen: { check: () => false }, Harness, ContactStore, MsgStore: msgStore(storage),
         LXMF, Cryptography, ownLxmfDestinationHash: () => "e".repeat(32), decodeDisplayName: DN.decodePayload,
-        console: quiet,
+        console: quiet, sentTimeMs,
         LXMessage: new Proxy(LXMessage, { get: (t, k) => (k === "verify"
             ? (d, s, sig, p) => LXMessage.verify(d, s, sig, p, recall) : t[k]) }),
     };
@@ -771,7 +772,7 @@ function makeChannelReceiver(me) {
         Buffer, DistroManager: { has: false }, Harness, console: quiet, channelLxmUnpack, ContactStore,
         ChannelStore: { getByHash: () => ({ channelName: CHANNEL }), touch() {} },
         ChannelMsgStore: { add: (c, m) => posts.push(m) },
-        ownLxmfDestinationHash: () => lxmfHash(me),
+        ownLxmfDestinationHash: () => lxmfHash(me), sentTimeMs,
         ...stores,
     };
     const self = { _rfedPendingEchoes: new Map(), _onMsg: [] };
@@ -797,11 +798,13 @@ test("§5.2 a post's 0xD1 sets that sender's channel name, never the contact's n
     const me = Identity.create(), alice = Identity.create();
     const r = makeChannelReceiver(me);
     const A = lxmfHash(alice);
-    assert.equal(r.handle(channelLxmPack(CHANNEL, alice, "hello", DN.nameState("Pseud")).wire), true);
+    const hello = channelLxmPack(CHANNEL, alice, "hello", DN.nameState("Pseud"));
+    assert.equal(r.handle(hello.wire), true);
     assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), "Pseud");
     assert.equal(r.ContactStore.get(A).messageName, null, "never the contact's messageName");
     assert.equal(r.ContactStore.get(A).publicKey, alice.getPublicKey().toString("hex"), "the bound key is kept");
-    assert.deepEqual(r.posts[0], { dir: "in", content: "hello", status: "delivered", srcHash: A }, "no frozen label");
+    assert.deepEqual(r.posts[0], { dir: "in", content: "hello", status: "delivered", srcHash: A, timestamp: hello.tsMs },
+        "no frozen label; the time the poster sent it");
     assert.equal(r.ChannelPostNamesStore.channels[CHANNEL].senders.includes(A), true, "noted as a sender (§4.2 rule 2)");
     r.handle(channelLxmPack(CHANNEL, alice, "bye", DN.CLEAR).wire);
     assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), null, "cleared");
@@ -926,7 +929,7 @@ test("§5.2 a message fetched from the propagation node is verified and named by
     const handle = messageHandler({
         Buffer, LxmfSeen: { check: () => false }, Harness, console: quiet,
         RnsClient: { ownHash: lxmfHash(me) }, LXMF, LXMessage, ContactStore: r.ContactStore, MsgStore: r.MsgStore,
-        decodeDisplayName: DN.decodePayload,
+        decodeDisplayName: DN.decodePayload, sentTimeMs,
     })(r.self);
     const ACTIVE = 2;
     const fetchAll = async (packedMessages) => {
@@ -1110,7 +1113,7 @@ function makeGroupReceiver(me, memberHashes) {
     })(r.self);
     r.self._handleGroupMessage = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
         GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, ownLxmfDestinationHash: own,
-        shouldProcessGroupMessage: groupPolicy(), PrivacyFilter,
+        shouldProcessGroupMessage: groupPolicy(), PrivacyFilter, sentTimeMs,
     })(r.self);
     const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
     const groupLabel = fn("groupSenderLabel", "m", { ContactStore: r.ContactStore });

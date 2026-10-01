@@ -61,7 +61,7 @@ import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.j
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
-import { dayMarkers, dayStamp, deviceDayContext } from "./lib/day_markers.js";
+import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
@@ -1886,7 +1886,8 @@ const RnsClient = {
             // on every path: direct packet, link packet, link Resource and
             // the propagated /get) go to the attachment store; a captionless
             // one keeps content "" and the bubble shows the attachment.
-            const stored = MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash, via: "direct", lxmfHash: lxmfHashHex });
+            const stored = MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash, via: "direct", lxmfHash: lxmfHashHex,
+                timestamp: sentTimeMs(lxmfMsg.timestamp) });
             if (lxmfMsg.attachments?.length || lxmfMsg.attachments?.skipped || lxmfMsg.fieldsUnreadable) {
                 this._keepAttachments(MsgStore, srcHash, stored, lxmfMsg.attachments, lxmfMsg.fieldsUnreadable);
             }
@@ -3641,7 +3642,8 @@ const RnsClient = {
                 const unreadable = found.skipped || lxmfMsg.fieldsUnreadable;
                 const displayContent = content || (found.length || unreadable ? "" : "(empty)");
                 const stored = GroupMsgStore.add(groupId, { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender,
-                    lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null });
+                    lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null,
+                    timestamp: sentTimeMs(lxmfMsg.timestamp) });
                 if (found.length || unreadable) this._keepAttachments(GroupMsgStore, groupId, stored, found, lxmfMsg.fieldsUnreadable);
                 // Update group last activity
                 group.lastActivity = Date.now();
@@ -4811,7 +4813,7 @@ const RnsClient = {
             // relabels earlier posts.
             ChannelMsgStore.add(ch.channelName, {
                 dir: "in", content, status: "delivered",
-                srcHash: srcHashHex,
+                srcHash: srcHashHex, timestamp: sentTimeMs(tsMs / 1000),
             });
             ChannelStore.touch(ch.channelName);
 
@@ -5200,7 +5202,7 @@ const RnsClient = {
                 const record = MsgStore.add(recipientHex, {
                     dir: "out", content: placeholder ? DISTRO_ATTACHMENT_PLACEHOLDER : content, status: "sent",
                     srcHash: myLxmfHash, destHash: recipientHex, via: "distro",
-                    timestamp: Number.isFinite(Number(ts)) ? Math.round(Number(ts) * 1000) : Date.now(),
+                    timestamp: sentTimeMs(ts),
                 });
                 const stored = found.length || unreadable
                     ? this._keepAttachments(MsgStore, recipientHex, record, found, payload.fieldsUnreadable)
@@ -5258,7 +5260,8 @@ const RnsClient = {
             // empty bubble.
             const placeholder = !content.trim() && !found.length && !unreadable;
             const record = MsgStore.add(srcHashHex, { dir: "in", content: placeholder ? DISTRO_ATTACHMENT_PLACEHOLDER : content,
-                status: "delivered", srcHash: srcHashHex, via: "distro", lxmfHash: signature.hash.toString("hex") });
+                status: "delivered", srcHash: srcHashHex, via: "distro", lxmfHash: signature.hash.toString("hex"),
+                timestamp: sentTimeMs(ts) });
             const stored = found.length || unreadable
                 ? this._keepAttachments(MsgStore, srcHashHex, record, found, payload.fieldsUnreadable)
                 : record;
@@ -6361,23 +6364,22 @@ const App = {
         const groups = GroupStore.getAll();
         const channels = ChannelStore.getAll();
 
-        // Build unified chat entry list (contacts + groups + channels), sorted by last activity
+        // Build unified chat entry list (contacts + groups + channels), sorted
+        // by last activity: the latest message's time (lastMessageTime; a
+        // message pulled late keeps the time it was sent).
         const entries = [];
         for (const c of contacts) {
-            const msgs = MsgStore.get(c.destHash);
-            const lastTs = msgs.length > 0 ? msgs[msgs.length-1].timestamp : c.lastSeen;
+            const lastTs = lastMessageTime(MsgStore.get(c.destHash), c.lastSeen);
             entries.push({ type: "dm", id: c.destHash, name: ContactStore.name(c.destHash),
                 lastTs, data: c, preview: MsgStore.preview(c.destHash) });
         }
         for (const g of groups) {
-            const msgs = GroupMsgStore.get(g.groupId);
-            const lastTs = msgs.length > 0 ? msgs[msgs.length-1].timestamp : g.lastActivity;
+            const lastTs = lastMessageTime(GroupMsgStore.get(g.groupId), g.lastActivity);
             entries.push({ type: "group", id: g.groupId, name: g.groupName,
                 lastTs, data: g, preview: GroupMsgStore.preview(g.groupId, systemMessageText) });
         }
         for (const ch of channels) {
-            const msgs = ChannelMsgStore.get(ch.channelName);
-            const lastTs = msgs.length > 0 ? msgs[msgs.length-1].timestamp : ch.lastActivity;
+            const lastTs = lastMessageTime(ChannelMsgStore.get(ch.channelName), ch.lastActivity);
             entries.push({ type: "channel", id: ch.channelName, name: "#" + ch.channelName,
                 lastTs, data: ch, preview: ChannelMsgStore.preview(ch.channelName) });
         }
@@ -6562,8 +6564,7 @@ const App = {
     _buildContactItem(c) {
         const name = ContactStore.name(c.destHash);
         const preview = MsgStore.preview(c.destHash);
-        const msgs = MsgStore.get(c.destHash);
-        const lastTs = msgs.length > 0 ? msgs[msgs.length - 1].timestamp : c.lastSeen;
+        const lastTs = lastMessageTime(MsgStore.get(c.destHash), c.lastSeen);
         const isActive = this.state.activeHash === c.destHash;
         const hue = avatarHue(name);
         const avatarText = name.charAt(0).toUpperCase();

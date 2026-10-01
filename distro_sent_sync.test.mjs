@@ -27,6 +27,7 @@ import LXMF from "./lib/rns/lxmf/lxmf.js";
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
 import { decodePayload as decodeDisplayName } from "./lib/display_name.js";
+import { sentTimeMs } from "./lib/day_markers.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -295,10 +296,10 @@ function makeReceiver(distro, deviceHash) {
         _onMsg: [(m, peer) => events.push({ m, peer })],
     };
     const fn = new Function("DistroManager", "MsgPack", "Buffer", "DistroSeen", "Harness", "ContactStore", "MsgStore",
-        "LXMF", "Cryptography", "ownLxmfDestinationHash", "LXMessage", "decodeDisplayName", "self", "distroHash", "blob",
+        "LXMF", "Cryptography", "ownLxmfDestinationHash", "LXMessage", "decodeDisplayName", "sentTimeMs", "self", "distroHash", "blob",
         `${body.replaceAll("this.", "self.")}`);
     const run = (blob) => fn(DistroManager, MsgPack, Buffer, DistroSeen, Harness, ContactStore, MsgStore,
-        LXMF, Cryptography, () => deviceHash, LXMessage, decodeDisplayName, self, null, blob);
+        LXMF, Cryptography, () => deviceHash, LXMessage, decodeDisplayName, sentTimeMs, self, null, blob);
     return { run, stored, contacts, events, seen, harness };
 }
 

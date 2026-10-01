@@ -36,6 +36,7 @@ import Packet from "./lib/rns/packet.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
 import { applyToFields as applyDisplayName, decodePayload as decodeDisplayName, ABSENT } from "./lib/display_name.js";
+import { sentTimeMs } from "./lib/day_markers.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -323,7 +324,7 @@ function makeRecipient({ me, storage = makeStorage() }) {
     self._handleGroupMessage = (...a) => self.groups.push(a);
     const handler = compileMessageHandler({
         Buffer, LxmfSeen, Harness, console: quiet, RnsClient: { ownHash: hex(destination.hash) },
-        LXMF, LXMessage, ContactStore, MsgStore, decodeDisplayName,
+        LXMF, LXMessage, ContactStore, MsgStore, decodeDisplayName, sentTimeMs,
     })(self);
     const emitted = [];
     router.on("message", (m) => { emitted.push(m); handler(m); });

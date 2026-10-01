@@ -36,6 +36,7 @@ import Link from "./lib/rns/link.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import * as DN from "./lib/display_name.js";
 import { AttachmentStore, attachmentKey, memoryBackend } from "./lib/attachment_store.js";
+import { sentTimeMs } from "./lib/day_markers.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 import { build, compile, constValue, install, memoryStorage, messageHandler } from "./test_app_source.mjs";
 
@@ -95,7 +96,7 @@ function page(me) {
         "async attachmentsFor(msgId)",
     ]);
     install(self, {
-        GroupStore, GroupMsgStore, ContactStore, console: quiet, Date, Buffer, LXMF,
+        GroupStore, GroupMsgStore, ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => lxmfHash(me),
         shouldProcessGroupMessage: () => true, PrivacyFilter: { allows: () => true },
     }, ["_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)"]);
@@ -112,7 +113,7 @@ function recipient() {
     const handle = messageHandler({
         Buffer, LxmfSeen: { check: () => false }, Harness: { event() {} }, console: quiet,
         RnsClient: { ownHash: lxmfHash(me) }, LXMF, LXMessage, ContactStore: p.ContactStore, MsgStore: p.MsgStore,
-        decodeDisplayName: DN.decodePayload,
+        decodeDisplayName: DN.decodePayload, sentTimeMs,
     })(p.self);
     router.on("message", handle);
     const proofs = [];
@@ -316,6 +317,7 @@ function distroPage({ device = Identity.create(), distro = Identity.create() } =
         MsgPack, Buffer, DistroSeen: p.DistroSeen, Harness: { event() {}, error() {} },
         ContactStore: p.ContactStore, MsgStore: p.MsgStore, LXMF, Cryptography, LXMessage, decodeDisplayName: DN.decodePayload,
         ownLxmfDestinationHash: () => lxmfHash(device), console: quiet, DISTRO_ATTACHMENT_PLACEHOLDER: PLACEHOLDER,
+        sentTimeMs,
     })(p.self);
     const D = lxmfHash(distro);
     /** A blob as rfed hands it over: D | encrypted(source | signature | payload). */

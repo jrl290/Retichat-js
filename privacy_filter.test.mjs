@@ -40,6 +40,7 @@ import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import * as DN from "./lib/display_name.js";
+import { sentTimeMs } from "./lib/day_markers.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -160,7 +161,7 @@ function recipient({ me = Identity.create(), storage } = {}) {
     const handle = messageHandler({
         Buffer, LxmfSeen: { check: () => false }, Harness: s.Harness, console: quiet,
         RnsClient: { ownHash: lxmfHash(me) }, LXMF, LXMessage, ContactStore: s.ContactStore, MsgStore: s.MsgStore,
-        decodeDisplayName: DN.decodePayload,
+        decodeDisplayName: DN.decodePayload, sentTimeMs,
     })(self);
     const emitted = [];
     router.on("message", (m) => { emitted.push(m); handle(m); });
@@ -668,7 +669,7 @@ test("distro fan-out is never filtered: a stranger's message to the distro is st
         DistroManager: { identity: distro, lxmfDeliveryHash: lxmfHash(distro) },
         MsgPack, Buffer, DistroSeen: { check: () => false }, Harness: { event() {}, error() {} },
         ContactStore, MsgStore, LXMF, Cryptography, LXMessage, decodeDisplayName: DN.decodePayload,
-        ownLxmfDestinationHash: () => lxmfHash(me), PrivacyFilter: trap, console: quiet,
+        ownLxmfDestinationHash: () => lxmfHash(me), PrivacyFilter: trap, console: quiet, sentTimeMs,
     })({ ownHash: lxmfHash(me), _pendingTickets: new Map(), _onMsg: [] });
     assert.equal(handleBlob(null, blob), true);
     assert.deepEqual(MsgStore.get(S).map((x) => x.content), ["to your distro"]);
