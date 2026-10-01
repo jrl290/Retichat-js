@@ -530,23 +530,52 @@ function ownLxmfDestinationHash() {
  *     whoever sent it (James, 2026-09-30, as iOS keeps it).
  *   - Any other action, accept, leave, relay_req, relay_done and any action
  *     this client does not know: when the group is held here and the
- *     packet's own source is allowed, that is passes the privacy filter or
- *     is a current member of that group (`sourceIsMember`:
- *     GroupStore.isCurrentMember). These change who is in the group or make
- *     this client act for someone (relay), so they are taken only from
- *     someone the user's trust reaches. Until 2026-10-01 they were
- *     processed from anyone who named a group held here, as the phones
- *     still do: a stranger who knew a group's id could add itself, or any
- *     hash it claimed, to the members and to the allowlist, and have this
- *     client relay for it.
+ *     packet's own source is allowed for it (groupTrustsSource). These
+ *     change who is in the group or make this client act for someone
+ *     (relay), so they are taken only from someone the user's trust
+ *     reaches. Until 2026-10-01 they were processed from anyone who named a
+ *     group held here, as the phones still do: a stranger who knew a
+ *     group's id could add itself, or any hash it claimed, to the members
+ *     and to the allowlist, and have this client relay for it.
+ *   - One exception: a member listed in a group the user has not accepted
+ *     yet (pending), who is not allowed, may still say that it accepted or
+ *     left, for itself only (`namesOther` false: no GROUP_SENDER, or its
+ *     own). Its accept must be recorded, since the group's messages fan out
+ *     to accepted members only (_dispatchGroupMessage) and nobody sends it
+ *     again once the user accepts. It is allowed nothing by it, and it
+ *     cannot speak for anyone else, leave in anyone's name or have this
+ *     client relay.
+ * @param {string|null} groupAction  GROUP_ACTION; null for a plain message
+ * @param {boolean} sourceAllowed  the packet's source passes the privacy
+ *   filter (PrivacyFilter.allows)
+ * @param {"active"|"pending"|null} groupStatus  the group as held here;
+ *   null when it is not held
+ * @param {boolean} sourceIsMember  the source is a current member of that
+ *   group (GroupStore.isCurrentMember)
+ * @param {boolean} namesOther  the message names a member other than its
+ *   source (GROUP_SENDER)
  * The source is the LXMF source of the packet, never GROUP_SENDER: an
  * allowed member's relayed accept brings in the member it names
  * (_handleGroupMessage).
  */
-function shouldProcessGroupMessage(groupAction, sourceAllowed, groupExists, sourceIsMember) {
+function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sourceIsMember, namesOther) {
     if (groupAction === "invite") return sourceAllowed;
-    if (!groupAction) return groupExists;
-    return groupExists && (sourceAllowed || sourceIsMember);
+    if (!groupStatus) return false;
+    if (!groupAction) return true;
+    if (groupTrustsSource(sourceAllowed, groupStatus, sourceIsMember)) return true;
+    return sourceIsMember && !namesOther && (groupAction === "accept" || groupAction === "leave");
+}
+
+/**
+ * The group trust rule's allowed source, for a group held here: one the
+ * privacy filter passes (an allowlisted contact while it is on), or a
+ * current member of a group the user has accepted ("If the invite is
+ * accepted, the other group members are considered allowed", James,
+ * 2026-10-01). A member listed in a group still pending is not allowed by
+ * that: the user has not accepted it, and declining leaves nothing behind.
+ */
+function groupTrustsSource(sourceAllowed, groupStatus, sourceIsMember) {
+    return sourceAllowed || (sourceIsMember && groupStatus === "active");
 }
 
 // =========================================================================
@@ -567,12 +596,12 @@ function shouldProcessGroupMessage(groupAction, sourceAllowed, groupExists, sour
 //  user allowlists a peer by adding it (Add Contact, New Conversation, an
 //  lxma:// link), by sending it a DM, by creating or accepting a group with
 //  it, by an allowlisted contact's invite that lists it with its key, and
-//  by an accept that names it, for a group held here, from an allowed
-//  source (allow(); the group trust rule, shouldProcessGroupMessage). A row a
-//  message created while the filter was off, a distro sender's and a distro
-//  sent-copy recipient's are listed but not allowlisted, as iOS and Android
-//  make a plain row for them. Listing and allowlisting are independent: a
-//  group member is allowlisted and stays hidden.
+//  by an accept that names it, for a group the user has accepted, from an
+//  allowed source (allow(); the group trust rule, shouldProcessGroupMessage).
+//  A row a message created while the filter was off, a distro sender's and a
+//  distro sent-copy recipient's are listed but not allowlisted, as iOS and
+//  Android make a plain row for them. Listing and allowlisting are
+//  independent: a group member is allowlisted and stays hidden.
 // =========================================================================
 const ContactStore = {
     _contacts: new Map(),
@@ -1252,7 +1281,8 @@ const GroupStore = {
     /** Whether `memberHash` is a current member of group `groupId`: in its
      *  member list and not marked as having left (invited or accepted).
      *  The group trust rule's "a current member of that group"
-     *  (shouldProcessGroupMessage). */
+     *  (shouldProcessGroupMessage), allowed for it only once the user has
+     *  accepted the group (groupTrustsSource). */
     isCurrentMember(groupId, memberHash) {
         const status = this._groups.get(groupId)?.members.get(memberHash);
         return status !== undefined && status !== "left";
@@ -1309,9 +1339,11 @@ GroupStore.init();
 //  shouldProcessGroupMessage), a group control message (accept, leave,
 //  relay_req and any other action) for a group held here is kept only when
 //  its source is allowed: passes the filter, or is a current member of that
-//  group; a stranger's is dropped like any other drop below, unproved and
-//  unnamed, with no membership change, no allowlisting and no relay. The
-//  phones still process it from anyone. Messages fanned out to the distro
+//  group once the user has accepted it (groupTrustsSource); a member listed
+//  in a pending group may only accept or leave for itself. A stranger's is
+//  dropped like any other drop below, unproved and unnamed, with no
+//  membership change, no allowlisting and no relay. The phones still
+//  process it from anyone. Messages fanned out to the distro
 //  address are never filtered:
 //  mail to the distro is mail to this person (iOS handleDistroMessage,
 //  ChatRepository.swift:2049-2055; Android onDistroMessageReceived,
@@ -1381,14 +1413,27 @@ const PrivacyFilter = {
         return this.allows(src) || GroupStore.hasMember(src);
     },
 
+    /** The facts the group trust rule asks about a message from `src`
+     *  (hex) naming group `groupId`. */
+    _groupStanding(groupId, src) {
+        const held = GroupStore.get(groupId);
+        const sourceAllowed = this.allows(src);
+        const groupStatus = held ? held.groupStatus : null;
+        const sourceIsMember = GroupStore.isCurrentMember(groupId, src);
+        return { sourceAllowed, groupStatus, sourceIsMember };
+    },
+
     /** The group rule (shouldProcessGroupMessage: iOS groupMessagePolicy
      *  under the group trust rule) for a message from `src` (hex) naming
-     *  `group` ({groupId, groupAction}): held here means pending or active
-     *  (iOS: a group ChatEntity, which a pending invite creates). */
+     *  `group` ({groupId, groupAction, groupSender?}: step 1's look carries
+     *  no GROUP_SENDER): held here means pending or active (iOS: a group
+     *  ChatEntity, which a pending invite creates). */
     groupAccepts(group, src) {
-        return shouldProcessGroupMessage(group.groupAction, this.allows(src),
-            GroupStore.get(group.groupId) !== null, GroupStore.isCurrentMember(group.groupId, src));
+        const s = this._groupStanding(group.groupId, src);
+        const named = group.groupSender ? String(group.groupSender).toLowerCase() : src;
+        return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, s.groupStatus, s.sourceIsMember, named !== src);
     },
+
 
     /** Step 1, for the router (LXMRouter.acceptsSource): may a message from
      *  `sourceHash` (16 bytes, straight from the decrypted plaintext) be
@@ -1398,7 +1443,9 @@ const PrivacyFilter = {
      *  rule is the group rule, as in step 2 (groupAccepts): an invite needs
      *  an allowlisted source, and any other action a source that is
      *  allowlisted or a current member of that group, which a stranger is
-     *  neither; so only a plain group message, for a group held here. */
+     *  neither; so only a plain group message, for a group held here. A
+     *  member listed in a pending group passes here on its hash (knows),
+     *  and step 2 decides on the parsed message, GROUP_SENDER included. */
     acceptsSource(sourceHash, path, peekGroup = null) {
         const src = Buffer.from(sourceHash).toString("hex");
         if (this.knows(src)) return true;
@@ -3816,18 +3863,18 @@ const RnsClient = {
         // source the privacy filter allows (an allowlisted contact while it
         // is on; iOS handleGroupInvite, ChatRepository.swift:2166-2171); a
         // plain message only for a group this client holds; any other action
-        // only for a group held here and from a source that is allowed or a
-        // current member of that group, the packet's own source, never
-        // GROUP_SENDER. The router has already asked the same
-        // (PrivacyFilter.acceptsMessage); asked again here so this handler
-        // holds the rule on its own. Until 2026-09-30 any row but a
-        // name-only one could invite, channel posters and every auto-added
-        // stranger included; until 2026-10-01 anyone could accept, leave or
-        // ask for a relay in a group held here.
-        if (!shouldProcessGroupMessage(groupAction, PrivacyFilter.allows(srcHash), !!group, GroupStore.isCurrentMember(groupId, srcHash))) {
+        // only for a group held here and from a source allowed for it, the
+        // packet's own source, never GROUP_SENDER (a pending group's listed
+        // member may still accept or leave for itself). The router has
+        // already asked the same (PrivacyFilter.acceptsMessage); asked again
+        // here so this handler holds the rule on its own. Until 2026-09-30
+        // any row but a name-only one could invite, channel posters and
+        // every auto-added stranger included; until 2026-10-01 anyone could
+        // accept, leave or ask for a relay in a group held here.
+        if (!PrivacyFilter.groupAccepts(groupInfo, srcHash)) {
             const why = !group && groupAction !== "invite" ? "a group not held here"
                 : groupAction === "invite" ? "a source the privacy filter does not allow"
-                : "a source that is neither allowed nor a member of the group";
+                : "a source that is not allowed for the group, or speaks for another member";
             console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: ${why}`);
             return;
         }
@@ -3879,20 +3926,23 @@ const RnsClient = {
             }
             case "accept": {
                 if (!group) return;
-                // From an allowed source (the rule above): the member it
-                // names, GROUP_SENDER when an allowed member relays someone
-                // else's accept, is in the group and passes the privacy
-                // filter (the group trust rule; iOS handleGroupAccept,
+                // The member it names (GROUP_SENDER when an allowed member
+                // relays someone else's accept, else the source) is in the
+                // group. In a group the user has accepted it also passes the
+                // privacy filter (the group trust rule; iOS handleGroupAccept,
                 // ChatRepository.swift:2260-2264, Android
-                // ChatRepository.kt:1643-1646). A hash that is none is
-                // ignored: it can be no member, and no row.
+                // ChatRepository.kt:1643-1646). In one still pending, nobody
+                // is allowed by membership: the user's accept allows every
+                // member then (_acceptGroupInvite), and a decline leaves no
+                // one allowed. A hash that is none is ignored: it can be no
+                // member, and no row.
                 const member = String(actualSender).toLowerCase();
                 if (!/^[0-9a-f]{32}$/.test(member)) {
                     console.log(`[retichat] 👥 Ignored accept for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: its member ${JSON.stringify(String(actualSender).slice(0, 40))} is no destination hash`);
                     return;
                 }
                 GroupStore.updateMember(groupId, member, "accepted");
-                if (member !== (this.ownHash ?? ownLxmfDestinationHash())) ContactStore.allow(member);
+                if (group.groupStatus === "active" && member !== (this.ownHash ?? ownLxmfDestinationHash())) ContactStore.allow(member);
                 GroupMsgStore.addSystem(groupId, "joined the group", member);
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
                 break;

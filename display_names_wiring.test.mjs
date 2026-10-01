@@ -123,13 +123,18 @@ function contactStore(storage) {
     return store;
 }
 const msgStore = (storage) => build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });
-const groupPolicy = () => fn("shouldProcessGroupMessage", "groupAction, sourceAllowed, groupExists, sourceIsMember", {});
+/** The group trust rule as app.js defines it: shouldProcessGroupMessage
+ *  over groupTrustsSource, each with its own parameter list. */
+function groupRule() {
+    const appFunction = (name, env) => fn(name, app.match(new RegExp(`\\nfunction ${name}\\(([^)]*)\\)`))[1], env);
+    const groupTrustsSource = appFunction("groupTrustsSource", {});
+    return { groupTrustsSource, shouldProcessGroupMessage: appFunction("shouldProcessGroupMessage", { groupTrustsSource }) };
+}
 /** The real PrivacyFilter over `storage` (on unless stored off), as a page
  *  load builds it. */
 function privacyFilter(storage, ContactStore, GroupStore) {
     const filter = build("PrivacyFilter", {
-        sGet: storage.sGet, sSet: storage.sSet, ContactStore, GroupStore, Harness, LXMF, LXMessage, Buffer,
-        shouldProcessGroupMessage: groupPolicy(),
+        sGet: storage.sGet, sSet: storage.sSet, ContactStore, GroupStore, Harness, LXMF, LXMessage, Buffer, ...groupRule(),
     });
     filter.init();
     return filter;
@@ -1165,7 +1170,7 @@ function makeGroupReceiver(me, memberHashes) {
     })(r.self);
     r.self._handleGroupMessage = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
         GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, ownLxmfDestinationHash: own,
-        shouldProcessGroupMessage: groupPolicy(), PrivacyFilter, sentTimeMs,
+        PrivacyFilter, sentTimeMs,
     })(r.self);
     const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
     const groupLabel = fn("groupSenderLabel", "m", { ContactStore: r.ContactStore });

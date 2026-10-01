@@ -119,8 +119,9 @@ test("a group message is stored at the time its sender sent it", () => {
     const handleGroup = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
         GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, isCurrentMember: () => false, _save() {} },
         GroupMsgStore: p.GroupMsgStore, ContactStore: p.ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
-        ownLxmfDestinationHash: () => lxmfHash(me), shouldProcessGroupMessage: () => true,
-        PrivacyFilter: { allows: () => true },
+        ownLxmfDestinationHash: () => lxmfHash(me),
+        // The filter off: every source passes.
+        PrivacyFilter: { allows: () => true, groupAccepts: () => true },
     })(self);
     const sent = twoDaysAgo();
     const packed = lxm(bob, lxmfHash(me), "to the group", new Map([[GROUP_FIELDS.GROUP_ID, G]]), sent);

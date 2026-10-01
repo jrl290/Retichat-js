@@ -98,7 +98,8 @@ function page(me) {
     install(self, {
         GroupStore, GroupMsgStore, ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => lxmfHash(me),
-        shouldProcessGroupMessage: () => true, PrivacyFilter: { allows: () => true },
+        // The filter off: every source passes.
+        PrivacyFilter: { allows: () => true, groupAccepts: () => true },
     }, ["_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)"]);
     return { me, storage, ContactStore, MsgStore, GroupMsgStore, DistroSeen, Attachments, backend, groups, self };
 }
