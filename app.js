@@ -7833,6 +7833,14 @@ const App = {
                         maxlength: "256",
                         value: c.localName ?? "",
                         placeholder: provided,
+                        // Return saves, as the Save button does (iOS
+                        // e138bbb). Not while an IME is composing: there
+                        // Return picks the candidate.
+                        onKeydown: (e) => {
+                            if (e.key !== "Enter" || e.isComposing) return;
+                            e.preventDefault();
+                            this._saveContactInfo();
+                        },
                     }),
                     h("div", { className: "field-hint" },
                         "Stored only on this device. Leave empty to show the name they provide."),
