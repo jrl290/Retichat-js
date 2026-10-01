@@ -208,6 +208,8 @@ export function installVirtualTime({ livelockTurns = LIVELOCK_TURNS, onLivelock 
         waiting: () => state.timers.length,
         /** Real macrotasks (setImmediate, 0 or 1 ms timers) queued and not yet run: the clock holds while any is. */
         pending: () => state.pending,
+        /** Counted macrotasks in a row, without the clock moving, that make a livelock. */
+        livelockTurns,
         /** The livelock, once declared: { at: its virtual ms, dropped: macrotasks not run since }; else null. */
         livelock: () => (state.livelock ? { ...state.livelock } : null),
         uninstall() {

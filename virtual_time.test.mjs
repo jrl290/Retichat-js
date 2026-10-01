@@ -42,13 +42,13 @@ async function realTurns(n) {
  * that asks for the same window forever: each hop is a delivery (an
  * immediate) and re-arms a watchdog. So that a broken clock makes these
  * tests red rather than hanging the file, the loop gives up by itself at
- * three times the livelock bound, and `stop()` ends it from outside.
+ * three times `livelockTurns`, and `stop()` ends it from outside.
  */
-function pingPong() {
+function pingPong(livelockTurns) {
     const loop = { hops: 0, watchdogs: 0, stopped: false, stop() { loop.stopped = true; } };
     let watchdog = null;
     const hop = () => {
-        if (loop.stopped || loop.hops === 3 * LIVELOCK_TURNS) return;
+        if (loop.stopped || loop.hops === 3 * livelockTurns) return;
         loop.hops++;
         clearTimeout(watchdog);
         watchdog = setTimeout(() => { loop.watchdogs++; }, 50);
@@ -71,8 +71,9 @@ const run = (n) => new Promise((resolve) => {
 
 // Should a broken clock still hang one of these tests, this per-test
 // timeout turns that into red. It is wall clock, so it is a failure bound
-// only and far beyond any load: the slowest of them, 100,000 hops, takes
-// about 1.5 s on an idle machine and 12 s under the suite at load 40.
+// only and far beyond any load: 100,000 hops of the ping-pong took 1.5 s on
+// an idle machine and up to 28 s inside the full suite at load 50, and these
+// tests run a tenth of that.
 const HANG_BOUND = { timeout: 600_000 };
 
 /** Burn `ms` of wall-clock time on the CPU, as a loaded machine would. */
@@ -176,21 +177,21 @@ test("uninstall() puts the real functions back and drops waiting timers; setInte
 
 test("a livelock is stopped where it is declared: the test's bound is reached, and uninstall() makes it red", HANG_BOUND, async () => {
     const said = [];
-    const clock = installVirtualTime({ onLivelock: (line) => said.push(line) });
-    const loop = pingPong();
+    const clock = installVirtualTime({ livelockTurns: 10_000, onLivelock: (line) => said.push(line) });
+    const loop = pingPong(clock.livelockTurns);
     try {
         await assert.rejects(within(new Promise(() => {}), 5_000, "the transfer"), /the transfer did not settle within 5000 ms/,
             "the bound is reached although the loop never waited for a timer");
-        assert.equal(loop.hops, LIVELOCK_TURNS, "the loop ran exactly LIVELOCK_TURNS macrotasks, then its next one was dropped");
+        assert.equal(loop.hops, 10_000, "the loop ran exactly livelockTurns macrotasks, then its next one was dropped");
         assert.deepEqual(clock.livelock(), { at: 0, dropped: 1 }, "declared before the clock ever moved");
         assert.deepEqual(said, [
-            "⚠ test_virtual_time.mjs: livelock: 100000 macrotasks ran one after another at 0 virtual ms without the clock " +
+            "⚠ test_virtual_time.mjs: livelock: 10000 macrotasks ran one after another at 0 virtual ms without the clock " +
             "moving (work that never waits for a timer); dropping every macrotask from here on: the loop stops, and the " +
             "test fails at its bound or as never settling",
         ], "said once, as it happened");
         assert.equal(clock.elapsed(), 5_000, "then the clock moved as it always does: the bound fired at its virtual time");
         assert.equal(loop.watchdogs, 1, "the loop's last watchdog ran on the way, at 50 ms");
-        assert.throws(() => clock.uninstall(), /virtual time: a livelock: 100000 macrotasks ran one after another at 0 virtual ms/,
+        assert.throws(() => clock.uninstall(), /virtual time: a livelock: 10000 macrotasks ran one after another at 0 virtual ms/,
             "uninstall() makes the test red, whatever happened after");
         const hops = loop.hops;
         await realTurns(20);
@@ -217,6 +218,10 @@ test("one macrotask short of the bound is not a livelock, and the count starts a
         clock.uninstall();                         // no livelock: does not throw
     }
     assert.throws(() => installVirtualTime({ livelockTurns: 0 }), /livelockTurns must be at least 1/);
+    const byDefault = installVirtualTime();
+    byDefault.uninstall();
+    assert.equal(byDefault.livelockTurns, LIVELOCK_TURNS, "the bound by default");
+    assert.equal(LIVELOCK_TURNS, 100_000, "about 35 times the suite's longest legitimate run (2,909)");
 });
 
 test("a run that reaches the bound is a livelock and red, even if it would have ended by itself", HANG_BOUND, async () => {
