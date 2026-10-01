@@ -291,7 +291,7 @@ test("a registration from an interface disconnect() stopped does not initialize 
 
 const PROPAGATION_METHODS = [
     "async _propagateMessage(contact, outMsg)", "async _flushPropagation()", "_signerFor(srcHash)",
-    "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
+    "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId, why = null)",
     "_sendWithProgress(link, data, convHash, msgId, label)",
 ];
 

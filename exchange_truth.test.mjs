@@ -531,7 +531,7 @@ const DM_METHODS = [
     "sendMessage(contact, content, attachments = [])", "_dispatchMessage(contact, outMsg)",
     "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
     "async _propagateMessage(contact, outMsg)", "_signerFor(srcHash)",
-    "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
+    "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId, why = null)",
     "_exchangeIsDown()", "_onPacketsLost({ packetHashes, reason })",
 ];
 

@@ -38,7 +38,7 @@ import { AttachmentStore, attachmentKey, memoryBackend } from "./lib/attachment_
 import {
     MAX_ATTACHMENTS, NAME_FIELD_MAX, PROPAGATION_UPLOAD_OVERHEAD, attachmentRefusal, estimatePackedSize, formatSize,
 } from "./lib/attachment_limits.js";
-import { SendTransfers, transferProgress, PROGRESS_START, QUIET_MS } from "./lib/send_progress.js";
+import { SendTransfers, transferProgress, propagationFailure, PROGRESS_START, QUIET_MS } from "./lib/send_progress.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 import { build, compile, constValue, install, memoryStorage, methodBody } from "./test_app_source.mjs";
 
@@ -111,7 +111,7 @@ function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = nul
     const timers = [];
     const env = {
         MsgStore, Attachments, attachmentKey, Cryptography, Identity, Buffer, Destination, LXMessage, LXMRouter, Link, Packet,
-        FIELD_FILE_ATTACHMENTS, mimeForName, formatSize, attachmentRefusal, estimatePackedSize, console: quiet,
+        FIELD_FILE_ATTACHMENTS, mimeForName, formatSize, attachmentRefusal, estimatePackedSize, propagationFailure, console: quiet,
         applyDisplayName: DN.applyToFields, crypto: globalThis.crypto, Harness: { error() {} },
         ContactStore: { allow() {}, touch() {}, setReachable() {}, propagationDelay: (h) => (contacts.get(h)?.isDistro ? 0 : 5), getAll: () => [...contacts.values()] },
         GroupStore: { getAll: () => [] }, GroupMsgStore: { get: () => [] },
@@ -138,7 +138,8 @@ function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = nul
         "sendMessage(contact, content, attachments = [])", "_dispatchMessage(contact, outMsg)",
         "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
         "async _propagateMessage(contact, outMsg)", "_signerFor(srcHash)",
-        "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
+        "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId, why = null)",
+        "_propagationFailed(contactHash, msgId, why)",
         "_keepAttachments(store, convHash, record, found, fieldsUnreadable = null)",
         "attachmentRefusal(contact, content, attachments)", "_propagationLimits()",
         "_attachmentFieldNow(record)", "async _attachmentField(record)",
@@ -407,7 +408,7 @@ function dispatcher() {
     const MsgStore = build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness: { recordInbound() {} }, Date });
     const timers = [];
     const env = {
-        MsgStore, Harness: { error() {} }, console: quiet,
+        MsgStore, Harness: { error() {} }, console: quiet, propagationFailure,
         ContactStore: { propagationDelay: () => 5, setReachable() {} },
         setTimeout: (f, ms) => { const t = { f, ms, at: clock.now() + ms }; timers.push(t); return t; },
         clearTimeout: (t) => { if (t) t.cleared = true; },
@@ -418,7 +419,7 @@ function dispatcher() {
         _decideMessageName: () => null, _recordNameDelivered() {},
         sendingIdentity: () => ({ hash: "a".repeat(32), isDistro: false }),
     };
-    install(self, env, ["_dispatchMessage(contact, outMsg)", "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)"]);
+    install(self, env, ["_dispatchMessage(contact, outMsg)", "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId, why = null)"]);
     const fire = (t) => { t.fired = true; t.f(); };
     const pending = (ms) => timers.filter((t) => t.ms === ms && !t.fired && !t.cleared);
     return { clock, MsgStore, timers, transfers, self, fire, pending };
@@ -428,15 +429,16 @@ test("the 30 s ceiling does not fail a send whose Resource is still moving; the 
     const d = dispatcher();
     const conv = "c".repeat(32);
     const rec = d.MsgStore.add(conv, { dir: "out", content: "", status: "sending" });
-    const transfer = d.transfers.begin(rec.id, "direct");
+    const transfer = d.transfers.begin(rec.id, "direct", "direct");
     d.self._armSendCeiling(conv, rec.id);
     for (let i = 1; i <= 10; i++) { d.clock.advance(3_000); d.transfers.progress(transfer, i / 20); }
     d.fire(d.pending(30_000)[0]);
     assert.equal(d.MsgStore.get(conv)[0].status, "sending", "still moving at 30 s: not failed");
     assert.equal(d.pending(30_000).length, 0, "nothing re-armed while it moves");
-    // It fails (its own watchdog, a refusal, the link closing): the ceiling
-    // runs again from there, giving the propagated copy the same 30 s.
-    d.transfers.end(transfer, false);
+    // The direct Resource fails (its own watchdog, a refusal, the link
+    // closing): the ceiling runs again from there, giving the propagated
+    // copy it starts the same 30 s.
+    d.transfers.end(transfer, false, new Error("the link closed"));
     assert.equal(d.pending(30_000).length, 1);
     d.fire(d.pending(30_000)[0]);
     assert.equal(d.MsgStore.get(conv)[0].status, "failed");
@@ -484,6 +486,179 @@ test("a fallback with nothing moving goes at once, as before", () => {
     d.self._dispatchMessage(peer, rec);
     d.fire(d.timers[0]);
     assert.deepEqual(copies, [rec.id]);
+});
+
+// ── the legs: the last way to deliver it failing is the outcome, at once ────
+
+test("legs: a message fails when the last open way to deliver it fails, not before, and never after its outcome", () => {
+    const t = new SendTransfers({ setTimer: () => null, clearTimer() {} });
+    t.openLeg("m", "direct");
+    t.openLeg("m", "propagated");
+    assert.equal(t.legFailed("m", "direct"), false, "the copy can still deliver it");
+    assert.equal(t.legFailed("m", "propagated"), true, "nothing left");
+    assert.equal(t.legFailed("m", "propagated"), false, "a leg fails once");
+    t.openLeg("n", "propagated");
+    assert.equal(t.legFailed("n", "direct"), false, "a leg never opened decides nothing");
+    t.begin("n", "a transfer still ending", "direct");
+    t.settle("n");
+    assert.equal(t.legFailed("n", "propagated"), false, "a message with its outcome is not failed again");
+    t.openLeg("n", "direct");
+    assert.equal(t.legFailed("n", "direct"), false, "nor by a leg opened after it");
+    assert.equal(t.legFailed("never", "direct"), false);
+    // The ceiling's deferral is told which leg ended, and why.
+    const ended = [];
+    const h = t.begin("o", "propagated transfer of o", "propagated");
+    t.deferCeiling("o", (...a) => ended.push(a));
+    const error = new Error("the peer rejected the resource");
+    t.end(h, false, error);
+    assert.deepEqual(ended, [[false, "propagated", error]]);
+});
+
+/** The sender with a propagation link whose Resources the test ends, and a
+ *  direct attempt whose failure the test reports. */
+function legged(options = {}) {
+    const s = sender(options);
+    const uploads = [];
+    const link = {
+        status: Link.ACTIVE,
+        sendResource: (data, { onProgress } = {}) => new Promise((resolve, reject) => uploads.push({ data, onProgress, resolve, reject })),
+    };
+    s.self._ensurePropagationLink = async () => link;
+    s.self._propLink = link;
+    const directs = [];
+    s.self._sendOverPeerLink = (contactHash, key, packed, representation, messageId, onProof, onError) =>
+        directs.push({ messageId, prove: () => onProof(messageId), fail: () => onError(messageId) });
+    const status = (c, id) => s.MsgStore.get(c.destHash).find((m) => m.id === id);
+    return { ...s, link, uploads, directs, status };
+}
+
+test("to a distro address, its upload failing fails the message at once, saying why; no ceiling decides it", async () => {
+    const s = legged();
+    const peer = Identity.create();
+    const c = contactOf(peer, { isDistro: true });
+    s.contacts.set(c.destHash, c);
+    const rec = s.self.sendMessage(c, "", [file("x.png", 2000, 5)]);
+    await s.timers.find((t) => t.ms === 0).f();
+    await settle();
+    assert.equal(s.uploads.length, 1, "the copy is moving");
+    assert.equal(s.status(c, rec.id).status, "sending");
+    s.uploads[0].reject(new Error("the peer rejected the resource"));
+    await settle();
+    const after = s.status(c, rec.id);
+    assert.equal(after.status, "failed", "the Resource's failure is the outcome, now");
+    assert.equal(after.sendError, "the upload to the propagation node failed (the peer rejected the resource)");
+    assert.equal(s.self._pendingTimeouts.has(rec.id), false, "its ceiling has nothing left to do");
+});
+
+test("to a distro address, the ceiling ran out while its upload moved: the upload's failure fails it then, with why", async () => {
+    const s = legged();
+    const peer = Identity.create();
+    const c = contactOf(peer, { isDistro: true });
+    s.contacts.set(c.destHash, c);
+    const rec = s.self.sendMessage(c, "", [file("x.png", 2000, 5)]);
+    await s.timers.find((t) => t.ms === 0).f();
+    await settle();
+    s.timers.find((t) => t.ms === 30_000).f();
+    assert.equal(s.status(c, rec.id).status, "sending", "moving at 30 s: its transfer decides");
+    s.uploads[0].reject(new Error("the link closed"));
+    await settle();
+    assert.equal(s.status(c, rec.id).status, "failed");
+    assert.equal(s.status(c, rec.id).sendError, "the upload to the propagation node failed (the link closed)");
+    assert.equal(s.timers.filter((t) => t.ms === 30_000).length, 1, "no second 30 s");
+});
+
+test("direct failed, then its copy's upload failed: failed at once; while the copy moves it is still sending", async () => {
+    const s = legged();
+    const peer = Identity.create();
+    const c = contactOf(peer);
+    s.contacts.set(c.destHash, c);
+    const rec = s.self.sendMessage(c, "", [file("p.png", 50_000, 3)]);
+    assert.equal(s.directs.length, 1);
+    s.directs[0].fail();
+    await settle();
+    assert.equal(s.uploads.length, 1, "the direct failure started the copy");
+    assert.equal(s.status(c, rec.id).status, "sending", "the copy can still deliver it");
+    s.uploads[0].reject(new Error("the link closed"));
+    await settle();
+    assert.equal(s.status(c, rec.id).status, "failed");
+    assert.match(s.status(c, rec.id).sendError, /the upload to the propagation node failed \(the link closed\)/);
+});
+
+test("the copy's upload failed while the direct attempt was still open: the direct decides, and its failure is the outcome at once", async () => {
+    const s = legged();
+    const peer = Identity.create();
+    const c = contactOf(peer);
+    s.contacts.set(c.destHash, c);
+    const rec = s.self.sendMessage(c, "", [file("p.png", 50_000, 3)]);
+    await s.timers.find((t) => t.ms === 5_000).f();   // the propagation delay, nothing moving
+    await settle();
+    s.uploads[0].reject(new Error("the peer rejected the resource"));
+    await settle();
+    assert.equal(s.status(c, rec.id).status, "sending", "the direct attempt is still open");
+    s.directs[0].fail();
+    await settle();
+    assert.equal(s.uploads.length, 1, "no second copy");
+    assert.equal(s.status(c, rec.id).status, "failed");
+    assert.match(s.status(c, rec.id).sendError, /the peer rejected the resource/, "why, from the copy");
+
+    // And a direct proof after the copy failed still delivers it.
+    const t = legged();
+    t.contacts.set(c.destHash, c);
+    const ok = t.self.sendMessage(c, "", [file("p.png", 50_000, 3)]);
+    await t.timers.find((x) => x.ms === 5_000).f();
+    await settle();
+    t.uploads[0].reject(new Error("the peer rejected the resource"));
+    await settle();
+    t.directs[0].prove();
+    assert.equal(t.status(c, ok.id).status, "proved");
+});
+
+test("a parked copy flushed after a reload: its upload failing fails it at once", async () => {
+    const s = legged();
+    const peer = Identity.create();
+    const c = contactOf(peer, { isDistro: true });
+    s.contacts.set(c.destHash, c);
+    install(s.self, { MsgStore: s.MsgStore, ContactStore: { getAll: () => [c] }, Link, console: quiet }, ["async _flushPropagation()"]);
+    const rec = s.MsgStore.add(c.destHash, { dir: "out", content: "", status: "queued", waitFor: "propagation", srcHash: lxmfHash(s.me) });
+    s.self._keepAttachments(s.MsgStore, c.destHash, rec, [{ name: "q.png", mime: "image/png", bytes: Buffer.alloc(3000, 1), field: 5 }]);
+    await settle();
+    const flushed = s.self._flushPropagation();
+    await settle();
+    assert.equal(s.uploads.length, 1);
+    s.uploads[0].reject(new Error("the peer rejected the resource"));
+    await flushed;
+    await settle();
+    assert.equal(s.status(c, rec.id).status, "failed");
+});
+
+test("the node's per-sync limit refusing the copy, with no direct attempt open: failed at once, with why", async () => {
+    const s = legged({ perSyncKb: 10_240 });
+    const peer = Identity.create();
+    const c = contactOf(peer, { isDistro: true });
+    s.contacts.set(c.destHash, c);
+    const rec = s.self.sendMessage(c, "", [file("x.png", 30_000, 5)]);
+    s.self._cfg.propagationLimits = { perTransferKb: 256, perSyncKb: 10 };   // the node announced less meanwhile
+    await s.timers.find((t) => t.ms === 0).f();
+    await settle();
+    assert.equal(s.uploads.length, 0, "not uploaded");
+    assert.equal(s.status(c, rec.id).status, "failed");
+    assert.match(s.status(c, rec.id).sendError, /over the 10 KB the propagation node takes/);
+});
+
+test("the ceiling ran out while the copy moved: the copy's failure fails it then, not 30 s later", () => {
+    const d = dispatcher();
+    const conv = "c".repeat(32);
+    const rec = d.MsgStore.add(conv, { dir: "out", content: "", status: "sending" });
+    d.transfers.openLeg(rec.id, "direct");      // a direct packet with no proof yet
+    d.transfers.openLeg(rec.id, "propagated");
+    const copy = d.transfers.begin(rec.id, "propagated", "propagated");
+    d.self._armSendCeiling(conv, rec.id);
+    d.fire(d.pending(30_000)[0]);
+    assert.equal(d.MsgStore.get(conv)[0].status, "sending", "moving at 30 s");
+    d.transfers.end(copy, false, new Error("the peer rejected the resource"));
+    assert.equal(d.MsgStore.get(conv)[0].status, "failed", "its ceiling has run out and nothing else is to come");
+    assert.match(d.MsgStore.get(conv)[0].sendError, /the peer rejected the resource/);
+    assert.equal(d.pending(30_000).length, 0, "no second 30 s");
 });
 
 // ── groups take no attachment ───────────────────────────────────────────────

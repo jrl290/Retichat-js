@@ -58,7 +58,7 @@ import {
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
 import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.js";
-import { SendTransfers } from "./lib/send_progress.js";
+import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
@@ -1595,11 +1595,12 @@ const RnsClient = {
     /**
      * A Resource carrying message `msgId` (to `convHash`): sent on `link`,
      * its progress reported as the message's (_onSendProgress) and counted
-     * as transfer activity (_sendTransfers), its end recorded. Resolves or
-     * rejects as the Resource does.
+     * as transfer activity (_sendTransfers), its end recorded. `label` is
+     * its leg, "direct" or "propagated". Resolves or rejects as the Resource
+     * does.
      */
     _sendWithProgress(link, data, convHash, msgId, label) {
-        const transfer = this._sendTransfers.begin(msgId, `${label} transfer of ${msgId.slice(0, 8)} to ${convHash.slice(0, 8)}`);
+        const transfer = this._sendTransfers.begin(msgId, `${label} transfer of ${msgId.slice(0, 8)} to ${convHash.slice(0, 8)}`, label);
         return link.sendResource(data, {
             onProgress: (fraction) => {
                 const value = this._sendTransfers.progress(transfer, fraction);
@@ -1607,7 +1608,7 @@ const RnsClient = {
             },
         }).then(
             (resource) => { this._sendTransfers.end(transfer, true); return resource; },
-            (error) => { this._sendTransfers.end(transfer, false); throw error; });
+            (error) => { this._sendTransfers.end(transfer, false, error); throw error; });
     },
 
     /**
@@ -2746,13 +2747,20 @@ const RnsClient = {
                 },
                 (msgId) => {
                     // Direct send error after the dispatch returned (the
-                    // link or resource failed): the copy goes now. One that
-                    // throws out of _sendPacket never left, and fails as
-                    // before (see the §17.11 note below).
-                    if (directDispatched) propagate();
-                    else this._failSending(contact.destHash, msgId);
+                    // link or resource failed): the copy goes now, and is
+                    // still to go. A copy that went earlier may have failed
+                    // already: then nothing is left to deliver it, and this
+                    // failure is its outcome now, not the ceiling's later.
+                    // One that throws out of _sendPacket never left, and
+                    // fails as before (see the §17.11 note below).
+                    if (!directDispatched) { this._failSending(contact.destHash, msgId); return; }
+                    const copyWentEarlier = propagationStarted;
+                    propagate();
+                    const nothingLeft = this._sendTransfers.legFailed(msgId, "direct");
+                    if (copyWentEarlier && nothingLeft) this._failSending(contact.destHash, msgId);
                 }
             );
+            this._sendTransfers.openLeg(outMsg.id, "direct");
             directDispatched = true;
         }
 
@@ -2823,6 +2831,12 @@ const RnsClient = {
             this._onMsg.forEach(fn => fn(null, contact.destHash));
         };
         if (settled(stored())) return;
+        // The copy is a way to deliver the message from here until its proof
+        // or its failure (_propagationFailed), parked or not: a direct
+        // failure while it waits for its link, its stamp or its upload sees
+        // it still to go (legFailed in _dispatchMessage). Never opened for a
+        // message already delivered or failed.
+        this._sendTransfers.openLeg(outMsg.id, "propagated");
         // Wait for the link instead of sampling its status. A distro send
         // always propagates, so it can reach this point while the link is
         // still being established (observed: B started its link 6s before
@@ -2911,13 +2925,13 @@ const RnsClient = {
         }
         // The node refuses an upload over the per-sync limit it announces
         // (lib/attachment_limits.js). The composer checked an estimate; this
-        // is the copy as built. Not uploaded: the direct attempt, if any,
-        // still decides, and the send ceiling otherwise fails it, with why.
+        // is the copy as built. Not uploaded: a direct attempt still open
+        // decides; with none, the message has failed, now, with why.
         const perSyncKb = record.attachments?.length ? this._propagationLimits()?.perSyncKb : undefined;
         if (perSyncKb !== undefined && propagationPacked.length > perSyncKb * 1000) {
             const why = `the propagated copy is ${formatSize(propagationPacked.length)}, over the ${formatSize(perSyncKb * 1000)} the propagation node takes`;
             console.warn(`[retichat] ✗ ${outMsg.id.slice(0,8)} to ${contact.destHash.slice(0,8)}: ${why} — not uploaded`);
-            MsgStore.update(contact.destHash, outMsg.id, { sendError: why });
+            this._propagationFailed(contact.destHash, outMsg.id, why);
             return;
         }
         const markPropagated = () => {
@@ -2937,10 +2951,13 @@ const RnsClient = {
         if (propagationPacked.length > Link.MDU) {
             console.log(`[retichat] 📡 Propagation upload of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
             // Its progress is the message's (0.10 + 0.90 x fraction), and
-            // while it moves the send ceiling waits for its end.
+            // while it moves the send ceiling waits for its end. Its failure
+            // is the copy's (_propagationFailed).
             this._sendWithProgress(link, propagationPacked, contact.destHash, outMsg.id, "propagated")
-                .then(markPropagated)
-                .catch(error => console.warn(`[retichat] ⚠️ Propagation resource failed for ${contact.destHash.slice(0,8)}:`, error.message));
+                .then(markPropagated, (error) => {
+                    console.warn(`[retichat] ⚠️ Propagation resource failed for ${contact.destHash.slice(0,8)}:`, error.message);
+                    this._propagationFailed(contact.destHash, outMsg.id, propagationFailure(error));
+                });
             if (contact.reachable !== false) {
                 ContactStore.setReachable(contact.destHash, false);
             }
@@ -3020,19 +3037,24 @@ const RnsClient = {
      *  A Resource of the message still in flight when it expires decides
      *  instead (DESIGN_PRINCIPLES §1, bulk transfers): its proof delivers
      *  the message, its failure (its own watchdog, a refusal, the link
-     *  closing) ends it. The ceiling waits for that end, then runs again
-     *  from it: the failed direct Resource has started the propagated copy,
-     *  which gets the same 30 s to go. A moving transfer is never failed
-     *  for its length, and a silence in it is logged as a §1 violation by
-     *  _sendTransfers. Until 2026-09-30 a photo whose Resource was still
-     *  moving was failed at 30 s, then shown delivered at its late proof. */
+     *  closing) ends it. The ceiling waits for that end. A failed direct
+     *  Resource has started the propagated copy, which gets the same 30 s
+     *  from there. A failed propagated Resource leaves nothing to come, and
+     *  the ceiling, already run out, fails the message at that failure. A
+     *  moving transfer is never failed for its length, and a silence in it
+     *  is logged as a §1 violation by _sendTransfers. Until 2026-09-30 a
+     *  photo whose Resource was still moving was failed at 30 s, then shown
+     *  delivered at its late proof. */
     _armSendCeiling(contactHash, msgId) {
         clearTimeout(this._pendingTimeouts.get(msgId));
         const timeoutId = setTimeout(() => {
             this._pendingTimeouts.delete(msgId);
             if (this._sendTransfers.inFlight(msgId)) {
                 console.log(`[retichat] ⏳ ${msgId.slice(0,8)} to ${contactHash.slice(0,8)} is still transferring at the send ceiling — its transfer decides`);
-                this._sendTransfers.deferCeiling(msgId, () => this._armSendCeiling(contactHash, msgId));
+                this._sendTransfers.deferCeiling(msgId, (ok, leg, error) => {
+                    if (!ok && leg === "propagated") this._failSending(contactHash, msgId, propagationFailure(error));
+                    else this._armSendCeiling(contactHash, msgId);
+                });
                 return;
             }
             this._failSending(contactHash, msgId);
@@ -3040,15 +3062,32 @@ const RnsClient = {
         this._pendingTimeouts.set(msgId, timeoutId);
     },
 
-    /** Fail a DM send that is still "sending". Anything else outranks the
-     *  failure: a delivery (proved, propagated), or a copy parked for the
-     *  propagation link ("queued"), which _flushPropagation still sends. */
-    _failSending(contactHash, msgId) {
+    /** Fail a DM send that is still "sending", saying `why` when given.
+     *  Anything else outranks the failure: a delivery (proved, propagated),
+     *  or a copy parked for the propagation link ("queued"), which
+     *  _flushPropagation still sends. Its ceiling has nothing left to do. */
+    _failSending(contactHash, msgId, why = null) {
         const msg = MsgStore.get(contactHash).find(m => m.id === msgId);
         if (msg?.status !== "sending") return;
+        clearTimeout(this._pendingTimeouts.get(msgId));
+        this._pendingTimeouts.delete(msgId);
+        if (why) MsgStore.update(contactHash, msgId, { sendError: why });
         MsgStore.updateStatus(contactHash, msgId, "failed");
         this._sendTransfers.settle(msgId);
         this._onMsg.forEach(fn => fn(null, contactHash));
+    },
+
+    /** The propagated copy of a DM failed: its Resource failed, or the node
+     *  would not take it. Its reason goes on the record (shown if the
+     *  message fails). A direct attempt still open decides the outcome; with
+     *  none, nothing can deliver the message any more, and it fails now, on
+     *  this event (DESIGN_PRINCIPLES §1, bulk transfers: the Resource's own
+     *  events decide). Until 2026-09-30 only the 30 s ceiling failed it,
+     *  so a distro send stayed "sending" after its upload had failed. */
+    _propagationFailed(contactHash, msgId, why) {
+        const msg = MsgStore.get(contactHash).find(m => m.id === msgId);
+        if (msg?.status === "sending") MsgStore.update(contactHash, msgId, { sendError: why });
+        if (this._sendTransfers.legFailed(msgId, "propagated")) this._failSending(contactHash, msgId);
     },
 
     /** True while this connection's exchange is down: its last exchange or

@@ -539,7 +539,7 @@ function makeSender({ me, messageName = "Alice", storage = memory() }) {
         "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
         "async _propagateMessage(contact, outMsg)", "_signerFor(srcHash)",
         "_decideMessageName(sourceHex, recipientHex)", "_recordNameDelivered(contactHash, msgId)",
-        "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
+        "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId, why = null)",
         "_sendWithProgress(link, data, convHash, msgId, label)",
     ]) self[methodName(signature)] = compile(signature, env)(self);
     const send = (contact, content) => {
