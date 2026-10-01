@@ -1510,6 +1510,10 @@ const RnsClient = {
     _rfedLinkGeneration: 0,
     _propReopenArmed: false,
     _distroPullInFlight: null,
+    // The distro (its hash) whose registration with RFed has been asked for
+    // and not yet answered yes in this connection. Every new rfed.link
+    // registers it again, once, until one does (_registerOwedDistro).
+    _distroRegistrationOwed: null,
     _pageHooks: null,
     _rfedOpenedChannelHashes: new Set(),
     // channelHash → { inFlight, morePending, gen }: gen is the rfed.link
@@ -4482,11 +4486,14 @@ const RnsClient = {
      * re-binds on every link", tiers 1 and 4):
      *   1. identify: already sent by the "established" handler;
      *   2. /propagation/stream/open (distro push) and /channel/stream/open
-     *      for every opened channel;
-     *   3. once both have answered, /channel/pull for every opened channel
-     *      and /distro/pull when a distro exists (iOS and Android pull once
-     *      per fresh rfed link: Android ConversationScreen.kt:603-615, iOS
-     *      ConversationView.swift:596-612).
+     *      for every opened channel, and the distro registration when it is
+     *      owed (_registerOwedDistro: one that failed with an earlier link,
+     *      or was refused, goes again once on each new link until it is
+     *      answered yes);
+     *   3. once all of them have answered, /channel/pull for every opened
+     *      channel and /distro/pull when a distro exists (iOS and Android
+     *      pull once per fresh rfed link: Android ConversationScreen.kt:
+     *      603-615, iOS ConversationView.swift:596-612).
      */
     async _onRfedLinkEstablished(key, link) {
         this._rfedReopenArmed.add(key);
@@ -4495,7 +4502,11 @@ const RnsClient = {
             return;
         }
         this._rfedLinkGeneration++;
-        await Promise.allSettled([this._bindRfedLinkForDistroPush(), this._rebindChannelStream()]);
+        await Promise.allSettled([
+            this._registerOwedDistro("new rfed.link"),
+            this._bindRfedLinkForDistroPush(),
+            this._rebindChannelStream(),
+        ]);
         // Closed or replaced while the bindings were answered: the next
         // link's own "established" pulls.
         if (this._rfedLinks.get(key) !== link || link.status !== Link.ACTIVE) return;
@@ -4978,8 +4989,21 @@ const RnsClient = {
         // device for the same distro twice is meaningless. Do not "fix" a slow
         // or missing response by retrying — that reproduces the exact condition
         // that wedges the server (DESIGN_PRINCIPLES.md Rule #1).
-        if (this._registerDistroInFlight) return this._registerDistroInFlight;
-        this._registerDistroInFlight = (async () => {
+        //
+        // Until it is answered yes, the registration is owed: every new
+        // rfed.link sends it again, once (_registerOwedDistro). A call for a
+        // different distro while one is in flight (imported or generated
+        // meanwhile) is owed too, and goes as soon as the one in flight is
+        // done (iOS RfedDistroClient registerAgain).
+        const distroHash = DistroManager.hash;
+        if (this._registerDistroInFlight) {
+            if (this._registerDistroInFlight.distroHash !== distroHash) this._distroRegistrationOwed = distroHash;
+            return this._registerDistroInFlight;
+        }
+        this._distroRegistrationOwed = distroHash;
+        // Declared first: the body below reads it in its finally.
+        let inFlight = null;
+        inFlight = (async () => {
             try {
                 const distroPubKey = DistroManager.identity.getPublicKey();
                 const devicePubKey = IdMgr.id.getPublicKey();
@@ -4987,36 +5011,81 @@ const RnsClient = {
                 const payload = MsgPack.pack([devicePubKey, distroPubKey, sig]);
                 const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/register", payload);
                 if (response === true || (Array.isArray(response) && response[0] === true)) {
+                    if (this._distroRegistrationOwed === distroHash) this._distroRegistrationOwed = null;
                     this._bindRfedLinkForDistroPush();
-                console.log(`[distro] ✅ Registered device with RFed (distro=${DistroManager.hash.slice(0,12)}...)`);
+                    console.log(`[distro] ✅ Registered device with RFed (distro=${distroHash.slice(0,12)}...)`);
                     // Registration must land first: RFed refuses an announce for
                     // a distro with no registered device, since it would be
                     // advertising a route it cannot serve.
                     await this._publishDistroAnnounce();
                     return true;
                 } else {
-                    console.warn(`[distro] RFed refused registration:`, response);
+                    // Stays owed: the next rfed.link sends it again, once, as
+                    // iOS and Android re-register on their register link's
+                    // next ACTIVE edge after a refusal (iOS RfedDistroClient
+                    // register: "a refusal while the link stays up waits for
+                    // that edge"). Never again at once: that is a retry (§3).
+                    console.warn(`[distro] RFed refused registration — the next rfed.link sends it again:`, response);
                     return false;
                 }
             } catch(e) {
                 console.error(`[distro] Registration failed:`, e);
                 // A link that never established is transient on this transport
-                // (one lost LINKREQUEST/LRPROOF ends the attempt). Park the
-                // intent for the next rfed.distro.register announce rather
-                // than leaving the device unregistered for the whole session.
-                if (this._rfedLinkState.get("distro.register") === RFED_LINK_FAILED) {
-                    this._rfedDeferUntilAnnounce(
-                        "distro.register",
-                        "distro registration",
-                        () => this._registerDistro(),
-                    );
+                // (one lost LINKREQUEST/LRPROOF ends the attempt). The request
+                // travels on rfed.link (RFED_LINK_PATHS), so it is that link's
+                // re-open that is parked for its next announce — the one
+                // intent the pull and the persistent link park as well
+                // (_rfedDeferUntilAnnounce keeps one per key) — and the link
+                // that comes back, by whatever event, sends the owed
+                // registration (_onRfedLinkEstablished). Until 2026-09-30 this
+                // parked only when "distro.register" had FAILED, a state no
+                // mapped request ever sets, so a registration that failed on
+                // a dead rfed.link was lost for the session.
+                const linkKey = this._rfedLinkKeyFor(["distro", "register"], "/rfed/distro/register");
+                if (this._rfedLinkState.get(linkKey) === RFED_LINK_FAILED) {
+                    if (linkKey === "link") {
+                        this._rfedDeferUntilAnnounce(linkKey, "rfed.link re-open", () => this._redriveRfedLink(linkKey, "announce"));
+                    } else {
+                        this._rfedDeferUntilAnnounce(linkKey, "distro registration", () => this._registerDistro());
+                    }
                 }
                 return false;
             } finally {
-                this._registerDistroInFlight = null;
+                if (this._registerDistroInFlight === inFlight) this._registerDistroInFlight = null;
             }
         })();
-        return this._registerDistroInFlight;
+        inFlight.distroHash = distroHash;
+        this._registerDistroInFlight = inFlight;
+        // A different distro was asked for while this one was in flight:
+        // register it now, after this one (never two at once on one link).
+        inFlight.then(() => {
+            const owed = this._distroRegistrationOwed;
+            if (owed && owed !== distroHash && DistroManager.has && DistroManager.hash === owed) this._registerDistro();
+        });
+        return inFlight;
+    },
+
+    /**
+     * A new rfed.link is up (_onRfedLinkEstablished): send the distro
+     * registration again if it is owed — asked for, and not yet answered
+     * yes in this connection (a request lost with a link, a refusal) —
+     * once per link, until one answers yes. iOS and Android re-register on
+     * their register link's next ACTIVE edge (iOS RfedDistroClient
+     * armRetryOnActive, Android armRetryOnActive); rfed.link is that link
+     * here. A registration already in flight is that one (the coalescing
+     * in _registerDistro). Returns its promise, or null when nothing is
+     * owed. No timer re-sends it (DESIGN_PRINCIPLES §3): only a new link.
+     */
+    _registerOwedDistro(trigger) {
+        const owed = this._distroRegistrationOwed;
+        if (!owed) return null;
+        if (!DistroManager.has || DistroManager.hash !== owed) {
+            // Forgotten or replaced since: nothing of it is owed.
+            this._distroRegistrationOwed = null;
+            return null;
+        }
+        console.log(`[distro] Registration not yet answered yes — sending it on the new rfed.link (${trigger})`);
+        return this._registerDistro();
     },
 
     /**
@@ -5677,6 +5746,9 @@ const RnsClient = {
         this._rfedReopenArmed.clear();
         this._propReopenArmed = false;
         this._distroPullInFlight = null;
+        // A stopped tab owes nothing; the next connection's registration
+        // (_onExchangeRegistered) is owed afresh.
+        this._distroRegistrationOwed = null;
         this._pendingTickets.clear();
         this._pendingPacketHashes.clear();
         for (const tid of this._pendingTimeouts.values()) clearTimeout(tid);

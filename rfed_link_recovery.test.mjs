@@ -230,6 +230,7 @@ const PERSISTENT_METHODS = [
     "_pullOpenedChannels(trigger, generation = null)", "_rfedLinkKeyFor(aspects, path)", "_closeRefusedRfedLink(key, what)",
     "_rfedDeferUntilAnnounce(key, label, run)", "_rfedRunPending(key)", "_onPageResume(trigger)",
     "async pullChannel(channelName)", "async openChannel(channelName)", "_exchangeIsDown()",
+    "_registerOwedDistro(trigger)",
 ];
 
 /**
@@ -292,6 +293,7 @@ function makePersistent({ channels = ["general"], opened = channels, distro = fa
         _rfedServiceReady: new Set(["link", "channel", "channel.stream", "channel.pull", "distro.register"]),
         _rfedReopenArmed: new Set(),
         _rfedLinkGeneration: 0,
+        _distroRegistrationOwed: null,
         _rfedOpenedChannelHashes: new Set(channelRows.filter((c) => opened.includes(c.channelName)).map((c) => c.channelHash)),
         _rfedPullState: new Map(),
         _rfedStreamPromises: new Map(),
@@ -666,6 +668,144 @@ test("a distro pull that fails on a dead rfed.link parks the link's re-open, and
     await c.establish(c.links[1]);
     assert.deepEqual(c.calls.filter((x) => x.startsWith("request")), ["request distro.register:/rfed/pull"],
         "the new link pulls the distro");
+});
+
+// ── The distro registration rides on rfed.link ────────────────────────────
+//
+// /rfed/distro/register is a mapped path: it travels on rfed.link, whose
+// state is keyed "link". Until 2026-09-30 _registerDistro parked itself only
+// when "distro.register" had FAILED, a state no mapped request sets, so a
+// registration that failed on a dead rfed.link was lost for the session.
+// Now the link's re-open is parked (the one intent per key the pull and the
+// persistent link park too), and a registration not yet answered yes is
+// owed: every new rfed.link sends it once, until one is answered yes (iOS
+// and Android re-register on their register link's next ACTIVE edge).
+
+const DISTRO_A = "a1".repeat(16);
+const DISTRO_B = "b2".repeat(16);
+
+/**
+ * The real _registerDistro on a makePersistent client holding a distro.
+ * Each /rfed/distro/register travels on rfed.link (opening it if need be)
+ * and is answered from `answers`: true, false (a refusal), or "lost" (the
+ * link closes under it, as the keepalive watchdog closes it).
+ */
+function withRegistration(c, { hash = DISTRO_A } = {}) {
+    Object.assign(c.DistroManager, {
+        has: true, hash,
+        identity: { getPublicKey: () => Buffer.alloc(64, 1), sign: () => Buffer.alloc(64, 2) },
+    });
+    c.env.IdMgr.id.getPublicKey = () => Buffer.alloc(64, 3);
+    const answers = [];
+    const gates = [];
+    c.self._registerDistroInFlight = null;
+    c.self._rfedRequest = async (aspects, path) => {
+        const link = await c.self._ensureRfedLink(["link"]);
+        const on = c.links.indexOf(link);
+        if (path !== "/rfed/distro/register") { c.calls.push(`request ${path} on ${on}`); return [[], false]; }
+        c.calls.push(`register ${c.DistroManager.hash.slice(0, 2)} on ${on}`);
+        if (gates.length) await gates.shift();
+        const answer = answers.shift();
+        if (answer === "lost") {
+            await c.closeUnder(link, Link.TIMEOUT);
+            throw new Error(`${path}: the link closed before a response`);
+        }
+        return answer;
+    };
+    c.self._publishDistroAnnounce = async () => { c.calls.push("distro-announce"); return true; };
+    c.self._registerDistro = compileMethod("async _registerDistro()", c.env)(c.self);
+    return { answers, gates, registers: () => c.calls.filter((x) => x.startsWith("register")) };
+}
+
+test("a distro registration that fails on a dead rfed.link parks the link's re-open, and every new rfed.link sends it once until it is answered yes", async () => {
+    const c = makePersistent({ opened: [], distro: true });
+    const r = withRegistration(c);
+
+    // Startup: the registration opens rfed.link, whose LINKREQUEST is lost.
+    const first = c.self._registerDistro();
+    assert.equal(c.links.length, 1);
+    await c.closeUnder(c.links[0], Link.TIMEOUT);
+    assert.equal(await first, false);
+    assert.equal(c.self._rfedLinkState.get("link"), APP_CONSTS.RFED_LINK_FAILED);
+    assert.equal(c.self._rfedPending.get("link")?.label, "rfed.link re-open",
+        "the link the request travels on is parked for its announce");
+    assert.equal(c.self._rfedPending.has("distro.register"), false, "not a key no mapped request fails on");
+    assert.equal(c.self._distroRegistrationOwed, DISTRO_A, "and the registration is owed");
+    assert.deepEqual(r.registers(), [], "nothing was sent");
+
+    // The rfed.link announce brings the link back; the node refuses.
+    r.answers.push(false);
+    c.self._rfedRunPending("link");
+    await settle();
+    assert.equal(c.links.length, 2, "one attempt");
+    await c.establish(c.links[1]);
+    assert.deepEqual(r.registers(), ["register a1 on 1"], "the new link sends the owed registration, once");
+    assert.equal(c.self._distroRegistrationOwed, DISTRO_A, "a refusal leaves it owed: never sent again at once (§3)");
+
+    // The node closes that link: re-opened once; the request is lost with it.
+    r.answers.push("lost");
+    await c.closeUnder(c.links[1], Link.DESTINATION_CLOSED);
+    assert.equal(c.links.length, 3);
+    await c.establish(c.links[2]);
+    await settle();
+    assert.deepEqual(r.registers(), ["register a1 on 1", "register a1 on 2"]);
+    assert.equal(c.links.length, 4, "the link it was lost with was re-opened once");
+    assert.equal(c.self._distroRegistrationOwed, DISTRO_A);
+
+    // The next link: answered yes, before anything is pulled.
+    r.answers.push(true);
+    c.calls.length = 0;
+    await c.establish(c.links[3]);
+    assert.deepEqual(r.registers(), ["register a1 on 3"]);
+    const at = (x) => c.calls.indexOf(x);
+    assert.ok(at("register a1 on 3") < at("distro-announce") && at("distro-announce") < at("distro-pull"),
+        `registered, then the pre-signed announce, and only then the distro pull: ${c.calls}`);
+    assert.equal(c.self._distroRegistrationOwed, null, "answered yes: nothing owed");
+
+    // Every later link: nothing to register.
+    c.calls.length = 0;
+    await c.closeUnder(c.links[3], Link.TIMEOUT);
+    await c.establish(c.links[4]);
+    assert.deepEqual(r.registers(), [], "registered once is registered");
+    assert.ok(c.calls.includes("distro-pull"), "the new link still pulls");
+});
+
+test("a registration for another distro, asked for while one is in flight, goes after it; a forgotten distro owes nothing", async () => {
+    const c = makePersistent({ opened: [], distro: true });
+    const r = withRegistration(c, { hash: DISTRO_A });
+    await c.up();
+    c.calls.length = 0;
+    let release;
+    r.gates.push(new Promise((resolve) => { release = resolve; }));
+    r.answers.push(true, true);
+    const a = c.self._registerDistro();
+    await settle();
+    c.DistroManager.hash = DISTRO_B; // imported while A's registration is in flight
+    const b = c.self._registerDistro();
+    await settle();
+    assert.deepEqual(r.registers(), ["register a1 on 0"], "never two registrations at once on one link");
+    release();
+    assert.equal(await a, true);
+    await settle();
+    assert.equal(await b, true, "the caller for B has the registration in flight");
+    assert.deepEqual(r.registers(), ["register a1 on 0", "register b2 on 0"], "B goes once A is answered");
+    assert.equal(c.self._distroRegistrationOwed, null);
+
+    // Owed for a distro that is then forgotten: the next link sends nothing.
+    r.answers.push(false);
+    await c.self._registerDistro();
+    assert.equal(c.self._distroRegistrationOwed, DISTRO_B);
+    c.DistroManager.has = false;
+    c.calls.length = 0;
+    await c.closeUnder(c.links[0], Link.TIMEOUT);
+    assert.equal(c.links.length, 1, "nothing is bound to the link any more");
+    c.DistroManager.has = true;
+    c.DistroManager.hash = DISTRO_A; // another distro, never asked for
+    c.self._redriveRfedLink("link", "visible");
+    await settle();
+    await c.establish(c.links[1]);
+    assert.deepEqual(r.registers(), [], "nothing of the forgotten distro is owed");
+    assert.equal(c.self._distroRegistrationOwed, null);
 });
 
 test("the persistent-link paths schedule nothing", () => {
