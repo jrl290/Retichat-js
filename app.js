@@ -7714,10 +7714,22 @@ const App = {
             // address, and the privacy filter drops it unseen unless that
             // device is a contact here (PrivacyFilter: strict, James
             // 2026-09-30), so say so where the user waits for it, and show
-            // the address the other device sends to.
+            // the address the other device sends to. Say which of its
+            // addresses: a device that can send one holds a distro, and on
+            // the phones the Distro address section, with its own Contact
+            // link and "Give senders the contact link", comes first and
+            // holds the "Add another device" button (Android
+            // IdentityScreen.kt, iOS IdentityView.swift). A contact made
+            // from that link allowlists the distro, which the transfer does
+            // not come from (signed as the device: Android
+            // RfedDistroClient.sendIdentityTo, iOS sendIdentity, this
+            // page's _sendDistroViaLxmf).
             section.appendChild(h("div", { className: "field-hint", id: "distro-receive-hint" },
-                "To receive it from another of your devices, first add that device as a contact here " +
-                "(or turn the Privacy filter off in Settings). Otherwise its transfer is dropped and nothing appears. " +
+                "To receive it from another of your devices, first add that device as a contact here, " +
+                "by its own address: the Contact link under “This device” on its Identity screen " +
+                "(“Device Identity” on a web page), not its Distro address. The transfer comes from the device's own address, " +
+                "so a contact made from its Distro address does not let it through. " +
+                "Or turn the Privacy filter off in Settings. Otherwise the transfer is dropped and nothing appears. " +
                 "Then, on that device, choose “Add another device” and send to this device's address:"));
             section.appendChild(kvRow("This device", RnsClient.ownHash || ownLxmfDestinationHash(), { empty: "unavailable" }));
             return section;

@@ -915,6 +915,15 @@ test("the Identity screen says where a distro identity is received: add the send
     const hint = receive.find((c) => c.attrs.id === "distro-receive-hint");
     assert.ok(hint, "a hint where the user receives it (no distro identity yet: Generate / Import)");
     assert.match(hint.text, /first add that device as a contact here/);
+    // By which address: the phones show the Distro address first, with its
+    // own Contact link and the "Add another device" button, but the
+    // transfer is signed as the device, so a contact made from the distro
+    // link leaves it dropped (review of 23af39f).
+    assert.match(hint.text, /by its own address: the Contact link under “This device” on its Identity screen/,
+        "the section the phones call “This device”");
+    assert.match(hint.text, /\(“Device Identity” on a web page\)/, "and this page calls “Device Identity”");
+    assert.match(methodBody("_buildDeviceIdentitySection()"), /h\("h3", \{\}, "Device Identity"\)/, "as this page titles it");
+    assert.match(hint.text, /not its Distro address\. The transfer comes from the device's own address, so a contact made from its Distro address does not let it through/);
     assert.match(hint.text, /turn the Privacy filter off/);
     assert.match(hint.text, /dropped and nothing appears/);
     assert.match(hint.text, /“Add another device”/, "named as the phones and this page name it");
