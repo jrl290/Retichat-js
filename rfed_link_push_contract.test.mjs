@@ -92,8 +92,13 @@ test("a new rfed.link re-binds the channel stream, from its established handler"
     assert.notEqual(rebind, -1, "the channel stream is re-bound on every new link");
     assert.match(established, /this\._bindRfedLinkForDistroPush\(\)/, "and the distro push");
     assert.ok(rebind < pull, "bindings before pulls");
-    assert.match(established, /await Promise\.allSettled\(\[\s*this\._registerOwedDistro\("new rfed\.link"\),\s*this\._bindRfedLinkForDistroPush\(\),\s*this\._rebindChannelStream\(\),\s*\]\)/,
-        "the pulls wait for both bindings, and an owed distro registration, to be answered");
+    // Two orders on the link, each pulling once its own bindings answered:
+    // the distro pull waits for an owed registration and the distro push
+    // binding; the channel pulls wait for the channel stream binding only.
+    assert.match(established, /Promise\.allSettled\(\[\s*this\._registerOwedDistro\("new rfed\.link"\),\s*this\._bindRfedLinkForDistroPush\(\),\s*\]\)\.then\(\(\) => \{\s*if \(current\(\) && DistroManager\.has\) this\._pullDistroMessages\(\);/,
+        "the distro pull waits for an owed registration and the distro push binding");
+    assert.match(established, /Promise\.allSettled\(\[\s*this\._rebindChannelStream\(\),\s*\]\)\.then\(\(\) => \{\s*if \(current\(\)\) this\._pullOpenedChannels\(/,
+        "the channel pulls wait for the channel stream binding, and for nothing of the distro's");
 });
 
 test("a /notify wake is acknowledged and runs /distro/pull", () => {

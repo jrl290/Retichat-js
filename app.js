@@ -4481,19 +4481,29 @@ const RnsClient = {
      * A new persistent link is up (a new rfed.link generation). Its re-open
      * is armed again (app-links: reconnect_armed on each ACTIVE), and the
      * bindings the node dropped with the last link are sent again before
-     * anything is pulled, so a post fanned out after a binding comes live
-     * and one deferred before it comes in the pull (Link.md "The client
-     * re-binds on every link", tiers 1 and 4):
+     * what they cover is pulled, so a post fanned out after a binding comes
+     * live and one deferred before it comes in the pull (Link.md "The
+     * client re-binds on every link", tiers 1 and 4):
      *   1. identify: already sent by the "established" handler;
-     *   2. /propagation/stream/open (distro push) and /channel/stream/open
-     *      for every opened channel, and the distro registration when it is
-     *      owed (_registerOwedDistro: one that failed with an earlier link,
-     *      or was refused, goes again once on each new link until it is
-     *      answered yes);
-     *   3. once all of them have answered, /channel/pull for every opened
-     *      channel and /distro/pull when a distro exists (iOS and Android
-     *      pull once per fresh rfed link: Android ConversationScreen.kt:
-     *      603-615, iOS ConversationView.swift:596-612).
+     *   2. then two orders that depend on nothing of each other's (§5
+     *      allows fan-out only between those), each pulling once its own
+     *      bindings have answered:
+     *      - channels: /channel/stream/open for every opened channel, then
+     *        /channel/pull for each (iOS and Android pull once per fresh
+     *        rfed link: Android ConversationScreen.kt:603-615, iOS
+     *        ConversationView.swift:596-612);
+     *      - the distro: /propagation/stream/open (distro push) and the
+     *        registration when it is owed (_registerOwedDistro: one that
+     *        failed with an earlier link, or was refused, goes again once
+     *        on each new link until it is answered yes), then /distro/pull.
+     * Channel history needs neither the distro registration nor the distro
+     * announce sent after its yes, and neither phone makes its channel pull
+     * wait for them (Android LaunchedEffect(rfedLinkGeneration), iOS
+     * .task(id: rfedLinkGeneration)). Until 2026-10-01 every pull waited for
+     * both bindings and the owed registration, so that registration held
+     * the channel pulls back by two round trips, and a register callback
+     * that rfed stalls (the 2026-08-09 wedge in _registerDistro) by a whole
+     * request timeout.
      */
     async _onRfedLinkEstablished(key, link) {
         this._rfedReopenArmed.add(key);
@@ -4501,17 +4511,23 @@ const RnsClient = {
             await this._rebindChannelStream().catch(e => console.warn(`[retichat] Channel stream re-bind failed: ${e.message}`));
             return;
         }
-        this._rfedLinkGeneration++;
-        await Promise.allSettled([
-            this._registerOwedDistro("new rfed.link"),
-            this._bindRfedLinkForDistroPush(),
-            this._rebindChannelStream(),
-        ]);
+        const generation = ++this._rfedLinkGeneration;
         // Closed or replaced while the bindings were answered: the next
         // link's own "established" pulls.
-        if (this._rfedLinks.get(key) !== link || link.status !== Link.ACTIVE) return;
-        this._pullOpenedChannels("new rfed.link", this._rfedLinkGeneration);
-        if (DistroManager.has) this._pullDistroMessages();
+        const current = () => this._rfedLinks.get(key) === link && link.status === Link.ACTIVE;
+        await Promise.allSettled([
+            Promise.allSettled([
+                this._registerOwedDistro("new rfed.link"),
+                this._bindRfedLinkForDistroPush(),
+            ]).then(() => {
+                if (current() && DistroManager.has) this._pullDistroMessages();
+            }),
+            Promise.allSettled([
+                this._rebindChannelStream(),
+            ]).then(() => {
+                if (current()) this._pullOpenedChannels("new rfed.link", generation);
+            }),
+        ]);
     },
 
     /**

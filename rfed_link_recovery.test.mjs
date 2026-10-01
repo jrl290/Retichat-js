@@ -449,7 +449,7 @@ test("a new rfed.link re-sends the stream open, then pulls the opened channels a
         "both bindings, one /channel/stream/open for the whole filter set, and no pull before they are answered");
     gates.splice(0).forEach((open) => open());
     await settle();
-    assert.deepEqual(c.calls.slice(2), ["pull #alpha", "pull #beta", "distro-pull"],
+    assert.deepEqual(c.calls.slice(2).sort(), ["distro-pull", "pull #alpha", "pull #beta"],
         "then every opened channel (not gamma, which was never opened) and the distro");
     assert.equal(c.self._rfedLinkGeneration, 1);
 
@@ -463,14 +463,16 @@ test("a new rfed.link re-sends the stream open, then pulls the opened channels a
     c.self._rfedPullState.set(c.channelRows[0].channelHash, { inFlight: false, morePending: false, gen: 2 });
     gates.splice(0).forEach((open) => open());
     await settle();
-    assert.deepEqual(c.calls.slice(2), ["pull #beta", "distro-pull"], "and pulled again, each channel once per link");
+    assert.deepEqual(c.calls.slice(2).sort(), ["distro-pull", "pull #beta"], "and pulled again, each channel once per link");
     assert.equal(c.self._rfedLinkGeneration, 2);
 });
 
 test("a new link that closes while its bindings are answered pulls nothing; the next one does", async () => {
     const c = makePersistent({ distro: true });
-    let release;
-    c.self._configureChannelStream = async () => { c.calls.push("stream-open"); await new Promise((r) => { release = r; }); };
+    const gates = [];
+    const release = () => gates.splice(0).forEach((open) => open());
+    c.self._configureChannelStream = async () => { c.calls.push("stream-open"); await new Promise((r) => gates.push(r)); };
+    c.self._bindRfedLinkForDistroPush = async () => { c.calls.push("distro-bind"); await new Promise((r) => gates.push(r)); };
     const first = await c.up();
     await c.closeUnder(first, Link.TIMEOUT);
     release();
@@ -481,8 +483,8 @@ test("a new link that closes while its bindings are answered pulls nothing; the 
     await c.establish(c.links[1]);
     release();
     await settle();
-    assert.deepEqual(c.calls.filter((x) => x.startsWith("request") || x === "distro-pull"),
-        ["request channel.pull:/rfed/pull", "distro-pull"]);
+    assert.deepEqual(c.calls.filter((x) => x.startsWith("request") || x === "distro-pull").sort(),
+        ["distro-pull", "request channel.pull:/rfed/pull"]);
 });
 
 test("every explicit open pulls one page; a new rfed.link pulls each opened channel once more", async () => {
@@ -632,9 +634,10 @@ test("an exchange outage that times out rfed.link: nothing starts while it is do
     await settle();
     assert.equal(c.links.length, 2, "an up with no down before it is not a return");
     await c.establish(c.links[1]);
-    assert.deepEqual(c.calls.filter((x) => !x.startsWith("prop-")),
-        ["distro-bind", "stream-open", "request channel.pull:/rfed/pull", "distro-pull"],
-        "the new link re-binds, then pulls what the node deferred during the outage");
+    const calls = c.calls.filter((x) => !x.startsWith("prop-"));
+    assert.deepEqual(calls.slice(0, 2), ["distro-bind", "stream-open"], "the new link re-binds,");
+    assert.deepEqual(calls.slice(2).sort(), ["distro-pull", "request channel.pull:/rfed/pull"],
+        "then pulls what the node deferred during the outage");
     assert.equal(c.self._rfedReopenArmed.has("link"), true, "and is armed for its own next close");
 });
 
@@ -797,6 +800,36 @@ test("a distro registration that fails on a dead rfed.link parks the link's re-o
     await c.establish(c.links[4]);
     assert.deepEqual(r.registers(), [], "registered once is registered");
     assert.ok(c.calls.includes("distro-pull"), "the new link still pulls");
+});
+
+test("an owed registration holds back the distro pull, not the channel pulls: channel history needs neither it nor the distro announce", async () => {
+    // Review of 2026-09-30: each new rfed.link's channel pulls waited for the
+    // owed registration and the distro announce sent after its yes, and for
+    // a whole request timeout when rfed stalls the register callback. Neither
+    // phone makes its channel pull wait on the distro registration (Android
+    // LaunchedEffect(rfedLinkGeneration), iOS .task(id: rfedLinkGeneration)).
+    const c = makePersistent({ channels: ["general"], opened: ["general"], distro: true });
+    const r = withRegistration(c);
+    c.self._distroRegistrationOwed = DISTRO_A; // refused on an earlier link
+    let release;
+    r.gates.push(new Promise((resolve) => { release = resolve; }));
+    r.answers.push(true);
+    const pending = c.self._ensureRfedLink(["link"]);
+    await c.establish(c.links[0]);
+    await pending;
+    await settle();
+    assert.deepEqual(r.registers(), ["register a1 on 0"], "the owed registration goes on the new link");
+    assert.ok(c.calls.includes("request /rfed/pull on 0"),
+        `the opened channel is pulled once its own binding has answered, while the registration is not: ${c.calls}`);
+    assert.ok(c.calls.indexOf("stream-open") < c.calls.indexOf("request /rfed/pull on 0"), "after /channel/stream/open");
+    assert.equal(c.calls.includes("distro-pull"), false, "the distro pull waits for the registration");
+
+    release();
+    await settle();
+    const at = (x) => c.calls.indexOf(x);
+    assert.ok(at("register a1 on 0") < at("distro-announce") && at("distro-announce") < at("distro-pull"),
+        `then the pre-signed announce, and only then the distro pull: ${c.calls}`);
+    assert.equal(c.calls.filter((x) => x === "request /rfed/pull on 0").length, 1, "the channel was pulled once");
 });
 
 test("a registration for another distro, asked for while one is in flight, goes after it; a forgotten distro owes nothing", async () => {
