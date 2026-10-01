@@ -59,6 +59,7 @@ import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_led
 import { applyGroupFields } from "./lib/retichat_field.js";
 import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.js";
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
+import { ChannelPublishes } from "./lib/channel_publish.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
@@ -1894,7 +1895,9 @@ const RnsClient = {
     _rfedStampRefreshed: new Set(),
     _rfedSubscriptionPromises: new Map(),
     _rfedStreamPromises: new Map(),
-    _rfedPendingEchoes: new Map(),
+    // This device's channel posts until rfed's echo of each decides it
+    // (lib/channel_publish.js).
+    _channelPublishes: new ChannelPublishes(),
     _rfedSendChain: Promise.resolve(),
     _groupLinks: new Map(),
     _groupLinkPromises: new Map(),
@@ -3812,11 +3815,20 @@ const RnsClient = {
      * settled for the propagated copy (_propagateMessage). The proof entry
      * stays: the node may have taken the batch before the exchange failed,
      * and a proof that still arrives is the truth and outranks the failure.
+     * A channel post whose publish packet was lost fails now the same way,
+     * and rfed's echo of it outranks that failure (lib/channel_publish.js).
      * Link keepalives, proofs and requests are left to the link protocol.
      */
     _onPacketsLost({ packetHashes, reason }) {
         for (const packetHash of packetHashes) {
             const pending = this._pendingPacketHashes.get(packetHash.slice(0, 32));
+            if (pending?.channelPost) {
+                // A channel post's publish went down with the exchange: it
+                // fails now, and rfed's echo, should rfed have taken the
+                // batch after all, still makes it "sent" (lib/channel_publish.js).
+                this._channelPublishes.failed(pending.channelPost, `its packet was lost (${reason})`);
+                continue;
+            }
             if (!pending?.dm) continue;
             const { contactHash, messageId } = pending;
             const msg = MsgStore.get(contactHash).find(m => m.id === messageId);
@@ -5553,10 +5565,9 @@ const RnsClient = {
             if (!this._chanSeenIds) this._chanSeenIds = new Set();
             const dedupKey = `${srcHashHex}:${tsMs}`;
             if (this._chanSeenIds.has(dedupKey)) {
-                const pendingEcho = this._rfedPendingEchoes.get(dedupKey);
-                if (pendingEcho) {
-                    this._rfedPendingEchoes.delete(dedupKey);
-                    pendingEcho.resolve();
+                // rfed's echo of a post this device published: rfed has it,
+                // and the post is "sent" (lib/channel_publish.js).
+                if (this._channelPublishes.echoed(dedupKey)) {
                     console.log(`[retichat] 📡 Channel publish accepted by RFed: ${dedupKey.slice(0,20)}...`);
                 }
                 console.log(`[retichat] 📡 Channel dedup: already seen ${srcHashHex.slice(0,8)} ts=${tsMs}`);
@@ -6315,7 +6326,9 @@ const RnsClient = {
         this._onMsg.forEach(fn => fn({kind: "channel-left"}, channelName));
     },
 
-    /** Send a message to a channel. */
+    /** Send a message to a channel. Resolves once rfed has it (its echo of
+     *  the post, lib/channel_publish.js) and rejects when it failed; the
+     *  bubble follows each status (_setChannelPostStatus). */
     async sendChannelMessage(channelName, content) {
         if (!IdMgr.has) throw new Error("No identity");
 
@@ -6345,6 +6358,7 @@ const RnsClient = {
         this._rfedSendChain = new Promise(resolve => { releaseSend = resolve; });
         await previousSend;
 
+        let post = null;
         try {
             const ch = ChannelStore.get(channelName);
             if (!ch) throw new Error("Channel not found");
@@ -6382,27 +6396,62 @@ const RnsClient = {
             this._chanSeenIds.add(echoKey);
 
             const link = await this._ensureRfedLink(["channel"]);
-            const echoPromise = this._waitForRfedPublishEcho(echoKey, channelName, link);
+            // rfed's echo of the post makes it "sent"; a definite failure,
+            // or last the ceiling, "failed" (lib/channel_publish.js). Tracked
+            // before the publish can go, so no echo outruns it.
+            let proofKey = null;
+            post = this._channelPublishes.track(echoKey, {
+                sent: ({ waitedMs, late, proved }) => {
+                    if (proofKey) this._pendingPacketHashes.delete(proofKey);
+                    // RFed has the post, so what it carried is recorded for
+                    // the channel rule (§4.2).
+                    ChannelPostNamesStore.recordIncluded(channelName, postName, nameDecidedAt);
+                    this._setChannelPostStatus(channelName, outMsg.id, "sent");
+                    console.log(`[retichat] 📡 Channel message accepted by RFed on #${channelName}, ${waitedMs} ms after it left `
+                        + `(${finalPayload.length}B, stamp=${!!stamp}, resource=${oversized}, proof ${proved ? "came" : "not seen"})`
+                        + (late ? "; it had been shown failed" : ""));
+                },
+                failed: (why, { proved }) => {
+                    if (proofKey) this._pendingPacketHashes.delete(proofKey);
+                    this._setChannelPostStatus(channelName, outMsg.id, "failed");
+                    console.warn(`[retichat] 📡 Channel post to #${channelName} failed: ${why}`
+                        + (proved ? " (rfed received it, its proof came, and has not accepted it)" : ""));
+                },
+            });
             if (oversized) {
-                // A resource has no single packet hash to prove against, so
-                // the resource's own proof is the delivery evidence.
-                await Promise.all([link.sendResource(finalPayload), echoPromise]);
+                // A Resource has no single packet hash to prove against. Its
+                // own proof says rfed holds every part, and only then can
+                // rfed take the post in; its failure is the post's.
+                await link.sendResource(finalPayload);
+                this._channelPublishes.proved(post);
             } else {
                 const packet = link.send(finalPayload);
-                await Promise.all([
-                    this._waitForRfedPublishProof(packet, channelName, outMsg.id, link),
-                    echoPromise,
-                ]);
+                // Its proof says rfed received the post, not that it took it
+                // in: noted. The entry also lets an exchange that lost the
+                // packet fail the post (_onPacketsLost). Nothing can arrive
+                // between the send and this line.
+                const tracked = post;
+                proofKey = packet.packetHash.slice(0, 16).toString("hex");
+                this._pendingPacketHashes.set(proofKey, {
+                    contactHash: channelName,
+                    messageId: outMsg.id,
+                    channelPost: tracked,
+                    onProof: () => this._channelPublishes.proved(tracked),
+                });
             }
-
-            // Mark as sent. RFed has the post, so what it carried is recorded
-            // for the channel rule (§4.2).
-            ChannelMsgStore.updateStatus(channelName, outMsg.id, "sent");
-            ChannelPostNamesStore.recordIncluded(channelName, postName, nameDecidedAt);
-            console.log(`[retichat] 📡 Channel message proved to #${channelName} (${finalPayload.length}B, stamp=${!!stamp}, resource=${oversized})`);
+            // The publish has left: the §1 clock and the ceiling start now.
+            await this._channelPublishes.left(post, rfedRequestTimeoutMs(link));
         } catch(e) {
-            ChannelMsgStore.updateStatus(channelName, outMsg.id, "failed");
-            console.warn(`[retichat] 📡 Channel send failed for #${channelName}:`, e.message);
+            if (post) {
+                // The post's own failure (a no-op once it has an outcome).
+                // rfed's echo may have come before its Resource reported a
+                // failure: rfed has the post, and it stays "sent".
+                this._channelPublishes.failed(post, e.message);
+                if (post.status === "sent") return outMsg;
+            } else {
+                this._setChannelPostStatus(channelName, outMsg.id, "failed");
+                console.warn(`[retichat] 📡 Channel send failed for #${channelName}:`, e.message);
+            }
             throw e;
         } finally {
             releaseSend();
@@ -6411,41 +6460,17 @@ const RnsClient = {
         return outMsg;
     },
 
-    _waitForRfedPublishProof(packet, channelName, messageId, link) {
-        const proofKey = packet.packetHash.slice(0, 16).toString("hex");
-        const timeoutMs = rfedRequestTimeoutMs(link);
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this._pendingPacketHashes.delete(proofKey);
-                reject(new Error(`No RFed publish proof for #${channelName} within ${Math.round(timeoutMs)}ms`));
-            }, timeoutMs);
-            this._pendingPacketHashes.set(proofKey, {
-                contactHash: channelName,
-                messageId,
-                // A proof that arrives at all is a proof. Only the timer fails.
-                onProof: () => { clearTimeout(timer); resolve(); },
-            });
-        });
-    },
-
-    _waitForRfedPublishEcho(echoKey, channelName, link) {
-        const timeoutMs = rfedRequestTimeoutMs(link);
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this._rfedPendingEchoes.delete(echoKey);
-                reject(new Error(`No RFed stream acceptance for #${channelName} within ${Math.round(timeoutMs)}ms`));
-            }, timeoutMs);
-            this._rfedPendingEchoes.set(echoKey, {
-                resolve: () => {
-                    clearTimeout(timer);
-                    resolve();
-                },
-                reject: (error) => {
-                    clearTimeout(timer);
-                    reject(error);
-                },
-            });
-        });
+    /**
+     * The one way a channel post's status changes: the store, then the
+     * status event (msg null) the open chat repaints its bubbles from
+     * (App._wire), as for a DM or a group message. Until 2026-10-01 a
+     * channel post's "sent" and "failed" reached the store and no event
+     * said so, so its bubble kept "sending" (lib/channel_publish.js).
+     */
+    _setChannelPostStatus(channelName, msgId, status) {
+        const m = ChannelMsgStore.updateStatus(channelName, msgId, status);
+        if (m) this._onMsg.forEach(fn => fn(null, channelName));
+        return m;
     },
 
     disconnect() {
@@ -6487,10 +6512,7 @@ const RnsClient = {
         this._rfedStampRefreshed.clear();
         this._rfedSubscriptionPromises.clear();
         this._rfedStreamPromises.clear();
-        for (const pendingEcho of this._rfedPendingEchoes.values()) {
-            pendingEcho.reject?.(new Error("Disconnected before RFed stream acceptance"));
-        }
-        this._rfedPendingEchoes.clear();
+        this._channelPublishes.clear("the connection stopped before rfed accepted the post");
         this._rfedSendChain = Promise.resolve();
         for (const entry of this._groupLinks.values()) {
             try { entry.link.close(); } catch(e) {}
@@ -9673,6 +9695,28 @@ const App = {
         }
     },
 
+    /** Bring every outgoing bubble of the open chat to its record's status,
+     *  patching only those that differ. A status change comes with its own
+     *  event (msg null, in _wire); this runs on every other message event
+     *  too, so a change that came without one is not left on screen until
+     *  the chat is rebuilt. Until 2026-10-01 a channel post's "sent" was
+     *  followed only by channel-send-complete, which adds rows that are
+     *  missing and leaves the others, and its bubble kept "sending". */
+    _syncOpenChatStatuses() {
+        const id = this.state.activeHash;
+        const list = id ? document.getElementById("msg-list") : null;
+        if (!list) return;
+        const rows = new Map([...list.querySelectorAll(".msg-row[data-msg-id]")].map(el => [el.getAttribute("data-msg-id"), el]));
+        for (const m of this._chatRecords(id)) {
+            if (m.dir !== "out") continue;
+            const row = rows.get(m.id);
+            if (!row) continue;
+            const shown = row.querySelector(".msg-status")?.getAttribute("data-msg-status") ?? "";
+            const want = this._statusIcon(m.status) ? m.status : "";
+            if (shown !== want) this._updateMsgStatusDOM(id, m.id, m.status, m);
+        }
+    },
+
     // ===== REACTIVE WIRING =====
 
     _wire() {
@@ -9744,6 +9788,8 @@ const App = {
             // bottom; one pulled late goes in above, and the reader's view
             // stays where it was (_holdView).
             const appended = this._syncOpenChatMessages();
+            // And the bubbles already on screen show their records' status.
+            this._syncOpenChatStatuses();
             // A channel post can carry a new Channel Display Name for a
             // sender whose earlier posts are on screen.
             if (inActiveChat) this._refreshNameLabels();

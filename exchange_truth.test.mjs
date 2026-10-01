@@ -739,7 +739,7 @@ function makeChannelClient(iface) {
         _onMsg: [(event, name) => notified.push({ kind: event?.kind, name })],
         _ensureChannelSubscribed: async (ch) => { subscribing.push(ch); throw new Error("sent on (test stops here)"); },
     };
-    for (const signature of ["async sendChannelMessage(channelName, content)", "_exchangeIsDown()"]) {
+    for (const signature of ["async sendChannelMessage(channelName, content)", "_exchangeIsDown()", "_setChannelPostStatus(channelName, msgId, status)"]) {
         self[methodName(signature)] = compile(signature, env)(self);
     }
     return { self, channel, ChannelMsgStore, subscribing, notified };

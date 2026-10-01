@@ -186,6 +186,7 @@ test("distro registration and pull both park on a failed link", () => {
 // skipped; any app-level setTimeout/setInterval on these paths fails them.
 
 import Link from "./lib/rns/link.js";
+import { ChannelPublishes } from "./lib/channel_publish.js";
 import MsgPack from "./lib/rns/msgpack.js";
 import Identity from "./lib/rns/identity.js";
 import LXMRouter from "./lib/rns/lxmf/lxmf_router.js";
@@ -915,7 +916,7 @@ function disconnectFor(c) {
     Object.assign(c.self, {
         _annTimer: null, _unhookPageLifecycle() {}, _pendingTickets: new Map(), _pendingPacketHashes: new Map(),
         _pendingTimeouts: new Map(), _rfedServiceWaiters: new Map(), _rfedStampRefreshed: new Set(),
-        _rfedSubscriptionPromises: new Map(), _rfedPendingEchoes: new Map(), _groupLinks: new Map(),
+        _rfedSubscriptionPromises: new Map(), _channelPublishes: new ChannelPublishes(), _groupLinks: new Map(),
         _groupLinkPromises: new Map(), _groupPeerReady: new Set(), _groupPeerWaiters: new Map(),
         _groupPathsRequested: new Set(), _groupFallbacks: new Map(), _propLinkUpWaiters: [], _setStatus() {},
     });

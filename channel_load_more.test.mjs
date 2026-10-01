@@ -120,6 +120,7 @@ function openChannel() {
         state: { view: "main", activeHash: CHANNEL.channelName },
         _checkDayTurn() {},
         _syncOpenChatMessages: () => { ui.push("sync messages"); return true; },
+        _syncOpenChatStatuses: () => ui.push("sync statuses"),
         _refreshNameLabels: () => ui.push("labels"),
         _refreshSidebar: () => ui.push("sidebar"),
         _scrollChatBottom: () => ui.push("scroll"),
@@ -213,7 +214,7 @@ test("a pull's start and completion repaint only the open channel's control: not
     // A post still goes through the message path.
     v.app.state.activeHash = CHANNEL.channelName;
     v.client._onMsg[0]({ kind: "channel-receive" }, CHANNEL.channelName);
-    assert.deepEqual(v.ui, ["sync messages", "labels", "sidebar", "scroll"]);
+    assert.deepEqual(v.ui, ["sync messages", "sync statuses", "labels", "sidebar", "scroll"]);
 });
 
 test("/distro/pull still drains on its own, one pull per non-empty page; /channel/pull takes one page", async () => {

@@ -33,6 +33,7 @@ import LXMF, { GROUP_FIELDS } from "./lib/rns/lxmf/lxmf.js";
 import { channelLxmPack, channelLxmUnpack } from "./lib/rns/rfed_channel.js";
 import * as DN from "./lib/display_name.js";
 import { ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
+import { ChannelPublishes } from "./lib/channel_publish.js";
 import { dayMarkers, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { build, compile, constValue, memoryStorage, messageHandler } from "./test_app_source.mjs";
 
@@ -143,7 +144,7 @@ test("a channel post pulled late is stored at the time its poster sent it", () =
         ChannelStore: { getByHash: () => ({ channelName: CHANNEL }), touch() {} },
         ChannelMsgStore: p.ChannelMsgStore, ownLxmfDestinationHash: () => lxmfHash(me), sentTimeMs,
         ChannelSenderNamesStore: new ChannelSenderNames(names), ChannelPostNamesStore: new ChannelPostNames(names),
-    })({ _rfedPendingEchoes: new Map(), _onMsg: [] });
+    })({ _channelPublishes: new ChannelPublishes(), _onMsg: [] });
     // channelLxmPack stamps a post with the clock: the poster's, two days ago.
     const realNow = Date.now;
     const postedAt = Math.round(twoDaysAgo() * 1000);
