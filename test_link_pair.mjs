@@ -113,7 +113,9 @@ export async function sendSplit(link, data, { requestId = null, isResponse = fal
 /**
  * Fail the test if `promise` has not settled within `ms` (a test-failure
  * bound only). Under test_virtual_time.mjs the bound is virtual time: it is
- * reached when nothing else can happen, however slow the machine is.
+ * reached when nothing else can happen, however slow the machine is; in a
+ * livelock (packets exchanged forever), once the clock has declared it and
+ * stopped the loop.
  */
 export function within(promise, ms, label = "promise") {
     let timer;

@@ -29,6 +29,23 @@
  * bound (within()) is a virtual timer too, so a test that hangs fails as
  * soon as nothing else can happen, at the bound's virtual time.
  *
+ * A livelock is a hang that keeps busy: two ends that exchange packets
+ * forever over the in-process wire always have a delivery pending, so the
+ * clock would never move and the bound would never be reached (on the wall
+ * clock it was: Node runs a due timer between immediates). So the clock
+ * counts the counted macrotasks that run without it moving. At
+ * LIVELOCK_TURNS in a row (`livelockTurns`) it declares a livelock, says so
+ * on stderr, and from then on drops every counted macrotask instead of
+ * running it, until uninstall(): the loop stops, nothing is pending, and
+ * the clock moves as it always does, so the test's bound is reached and
+ * fails it. A test with no bound fails too: its promise can no longer
+ * settle, and node:test fails a test whose event loop runs dry. uninstall()
+ * then throws, so the test is red even if the loop would have ended by
+ * itself, and the loop's macrotasks still queued are dropped as well, so it
+ * does not outlive its test and keep the file's process alive. The count is
+ * of macrotasks, not of milliseconds, so it does not depend on how loaded
+ * the machine is.
+ *
  * Async work the clock cannot count (file I/O, worker threads, WebCrypto)
  * must not be in flight while it is installed: the clock would move past
  * timers that such work should have beaten. setInterval is not supported
@@ -60,17 +77,33 @@ class VirtualTimer {
     [Symbol.toPrimitive]() { return this.id; }
 }
 
+/**
+ * Counted macrotasks that may run in a row without the clock moving before
+ * the clock declares a livelock: about 35 times the suite's longest
+ * legitimate run (2,909, a 1 MiB split response in
+ * link_request_resource.test.mjs). Work that legitimately runs longer
+ * without waiting for a timer passes a larger `livelockTurns`.
+ */
+export const LIVELOCK_TURNS = 100_000;
+
 let installed = null;
 
 /**
  * Install virtual time. Returns the clock: now() and elapsed() read it,
  * uninstall() puts the real timers and Date.now back and drops every
- * virtual timer still waiting (they belonged to the test).
+ * virtual timer still waiting (they belonged to the test), and throws if
+ * the clock declared a livelock. `onLivelock(line)` is told when it does
+ * (by default the line goes to stderr).
  */
-export function installVirtualTime() {
+export function installVirtualTime({ livelockTurns = LIVELOCK_TURNS, onLivelock = (line) => process.stderr.write(`${line}\n`) } = {}) {
     if (installed) throw new Error("virtual time is already installed");
+    if (!(livelockTurns >= 1)) throw new Error(`livelockTurns must be at least 1, not ${livelockTurns}`);
     const start = real.now();
-    const state = { now: start, seq: 0, timers: [], pending: 0, checkQueued: false, live: true };
+    const state = {
+        now: start, seq: 0, timers: [], pending: 0, checkQueued: false, live: true,
+        turns: 0,         // counted macrotasks run since the clock last moved
+        livelock: null,   // once declared: { at: virtual ms, dropped: macrotasks not run }
+    };
     const jobs = new WeakMap();   // real handle → counted job
 
     const queueCheck = () => {
@@ -91,6 +124,7 @@ export function installVirtualTime() {
         }
         const timer = state.timers.splice(next, 1)[0];
         if (timer.at > state.now) state.now = timer.at;
+        state.turns = 0;
         try {
             timer.fn(...timer.args);
         } finally {
@@ -98,11 +132,18 @@ export function installVirtualTime() {
         }
     }
 
-    /** The end of a counted real macrotask, run or cleared. */
-    const finish = (job) => {
+    /** The end of a counted real macrotask: run (`ran`), dropped or cleared. */
+    const finish = (job, ran) => {
         if (job.done) return;
         job.done = true;
         state.pending--;
+        if (ran && ++state.turns >= livelockTurns && !state.livelock && state.live) {
+            state.livelock = { at: state.now - start, dropped: 0 };
+            onLivelock(
+                `⚠ test_virtual_time.mjs: livelock: ${livelockTurns} macrotasks ran one after another at ` +
+                `${state.now - start} virtual ms without the clock moving (work that never waits for a timer); ` +
+                "dropping every macrotask from here on: the loop stops, and the test fails at its bound or as never settling");
+        }
         if (state.pending === 0) queueCheck();
     };
 
@@ -111,12 +152,17 @@ export function installVirtualTime() {
         state.pending++;
         const handle = schedule(() => {
             if (job.done) return;
+            if (state.livelock) {
+                state.livelock.dropped++;
+                finish(job, false);
+                return;
+            }
             // Counted until its callback has returned: what it schedules is
             // counted before this job stops holding the clock.
             try {
                 fn(...args);
             } finally {
-                finish(job);
+                finish(job, true);
             }
         });
         jobs.set(handle, job);
@@ -141,13 +187,13 @@ export function installVirtualTime() {
         }
         const job = handle && typeof handle === "object" ? jobs.get(handle) : undefined;
         real.clearTimeout(handle);
-        if (job) finish(job);
+        if (job) finish(job, false);
     };
     globalThis.setImmediate = (fn, ...args) => counted((cb) => real.setImmediate(cb), fn, args);
     globalThis.clearImmediate = (handle) => {
         const job = handle && typeof handle === "object" ? jobs.get(handle) : undefined;
         real.clearImmediate(handle);
-        if (job) finish(job);
+        if (job) finish(job, false);
     };
     globalThis.setInterval = () => {
         throw new Error("setInterval under virtual time (test_virtual_time.mjs) is not supported");
@@ -162,6 +208,8 @@ export function installVirtualTime() {
         waiting: () => state.timers.length,
         /** Real macrotasks (setImmediate, 0 or 1 ms timers) queued and not yet run: the clock holds while any is. */
         pending: () => state.pending,
+        /** The livelock, once declared: { at: its virtual ms, dropped: macrotasks not run since }; else null. */
+        livelock: () => (state.livelock ? { ...state.livelock } : null),
         uninstall() {
             if (!state.live) return;
             state.live = false;
@@ -173,15 +221,22 @@ export function installVirtualTime() {
             globalThis.setInterval = real.setInterval;
             Date.now = real.now;
             installed = null;
+            if (state.livelock) {
+                throw new Error(
+                    `virtual time: a livelock: ${livelockTurns} macrotasks ran one after another at ` +
+                    `${state.livelock.at} virtual ms without the clock moving, so nothing waited for a timer; ` +
+                    `${state.livelock.dropped} macrotask(s) were dropped after it. Work that legitimately runs ` +
+                    "that long without waiting passes a larger livelockTurns to installVirtualTime().");
+            }
         },
     };
     installed = clock;
     return clock;
 }
 
-/** installVirtualTime() for the test `t`, uninstalled when it ends. */
-export function useVirtualTime(t) {
-    const clock = installVirtualTime();
+/** installVirtualTime(options) for the test `t`, uninstalled when it ends. */
+export function useVirtualTime(t, options) {
+    const clock = installVirtualTime(options);
     t.after(() => clock.uninstall());
     return clock;
 }
