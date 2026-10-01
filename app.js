@@ -1459,6 +1459,7 @@ const RnsClient = {
     _sendTransfers: new SendTransfers(),
     _onSendProgress: [],      // (convHash, msgId, progress)
     _onAttachmentState: [],   // (convHash, msgId): an attachment's `stored` changed
+    _onTick: [],              // (): the announce interval came round (_tick)
 
     get status() { return this._status; },
     get connType() { return this._connType; },
@@ -1501,6 +1502,7 @@ const RnsClient = {
     onMessage(fn) { this._onMsg.push(fn); },
     onSendProgress(fn) { this._onSendProgress.push(fn); },
     onAttachmentState(fn) { this._onAttachmentState.push(fn); },
+    onTick(fn) { this._onTick.push(fn); },
 
     /**
      * Keep the attachments a received (or sent) message carries: each one's
@@ -1979,7 +1981,7 @@ const RnsClient = {
         });
 
         if (this._cfg.announceIntervalMs > 0) {
-            this._annTimer = setInterval(() => this._announce(), this._cfg.announceIntervalMs);
+            this._annTimer = setInterval(() => this._tick(), this._cfg.announceIntervalMs);
         }
 
         // The page events that re-drive the persistent links (online,
@@ -2061,6 +2063,23 @@ const RnsClient = {
         // pollPropagationNode(force: true) on .active), or bring it back.
         if (this._propLink?.status === Link.ACTIVE) this._fetchPropagatedMessages();
         else this._redrivePropagationLink(trigger);
+    },
+
+    /**
+     * The announce interval came round (connect() arms it, disconnect()
+     * clears it): announce, then tell the onTick listeners. It is the page's
+     * one interval; a listener rides on it rather than arming a timer of
+     * its own. The UI checks the date markers' day here (_checkDayTurn), so
+     * a tab left open and idle across midnight relabels within one interval
+     * (announceIntervalMs, 300 s by default). The phones relabel on the
+     * OS's date-change events (iOS ConversationView.swift
+     * NSCalendarDayChanged, Android DayMarkerUi.kt ACTION_DATE_CHANGED);
+     * the browser has none. The listeners run whether or not the announce
+     * went out.
+     */
+    _tick() {
+        this._announce();
+        this._onTick.forEach(fn => fn());
     },
 
     _announce() {
@@ -6251,13 +6270,14 @@ const App = {
      * labelled (render, or the last turn): relabel the open chat's date
      * markers in place, so a chat left open across midnight shows
      * yesterday's "Today" as "Yesterday". Run on the page's own events
-     * (_listenDayTurn) and from the client's update callbacks (_wire: a
+     * (_listenDayTurn), from the client's update callbacks (_wire: a
      * message or proof, a status change, a send's progress, a contact
-     * change); a message appended to the open chat relabels the whole list
-     * itself (_syncOpenChatMessages). There is no timer of its own, and the
-     * browser has no date-change event, so a visible tab that nothing
-     * happens to keeps its labels until the next of these. Returns whether
-     * it relabelled.
+     * change) and from the announce interval's tick (RnsClient.onTick); a
+     * message appended to the open chat relabels the whole list itself
+     * (_syncOpenChatMessages). The browser has no date-change event and
+     * this has no timer of its own: a visible tab that nothing happens to
+     * relabels at the next tick, within announceIntervalMs (300 s) of
+     * midnight. Returns whether it relabelled.
      */
     _checkDayTurn() {
         if (this.state.view !== "main") return false;
@@ -8610,6 +8630,11 @@ const App = {
     // ===== REACTIVE WIRING =====
 
     _wire() {
+        // The announce interval came round: the date markers' day may have
+        // turned with nothing else happening (an idle tab left open across
+        // midnight). The page's one interval, not a timer of its own.
+        RnsClient.onTick(() => this._checkDayTurn());
+
         // Status dot updates
         RnsClient.onStatus(status => {
             this._checkDayTurn();

@@ -427,7 +427,7 @@ test("the day is checked on the page's events and the open chat's updates, never
 
     assert.match(methodBody("async start()"), /this\._listenDayTurn\(\);/);
     const wire = methodBody("_wire()");
-    for (const hook of ["RnsClient.onStatus(", "RnsClient.onMessage(", "RnsClient.onSendProgress(", "ContactStore.onChange("]) {
+    for (const hook of ["RnsClient.onTick(", "RnsClient.onStatus(", "RnsClient.onMessage(", "RnsClient.onSendProgress(", "ContactStore.onChange("]) {
         const at = wire.indexOf(hook);
         assert.notEqual(at, -1, hook);
         assert.ok(wire.slice(at, at + 260).includes("this._checkDayTurn();"), `${hook} checks the day`);
@@ -437,4 +437,42 @@ test("the day is checked on the page's events and the open chat's updates, never
         .map(methodBody)].join("\n");
     assert.doesNotMatch(code, /setInterval|setTimeout|requestAnimationFrame/, "no timer");
     assert.equal(app.match(/setInterval\(/g).length, 1, "app.js keeps its one interval, the announce");
+});
+
+test("an idle tab left open across midnight relabels on the announce interval's tick, the page's one interval", () => {
+    // Review of 505d0ed: with nothing arriving and no focus or visibility
+    // change, yesterday's "Today" stayed until the next event, for hours.
+    // The phones relabel on the OS's date-change events; the browser has
+    // none, so the check rides on the interval the page already runs.
+    const device = deviceClock(at(NY, 2026, 9, 30, 23, 50));
+    const records = [{ id: "a", timestamp: at(NY, 2026, 9, 30, 9) }];
+    const stores = { records, list: null };
+    const self = appOver(device, stores);
+    self.state.activeHash = "a".repeat(32);
+    stores.list = self._applyDayMarkers(h("div", { id: "msg-list" }, ...records.map(row)), records);
+    self._dayStamp = dayStamp(device.deviceDayContext());
+
+    // The client as connect() runs it: _tick() is what the interval calls.
+    let announces = 0;
+    const rns = { _onTick: [], _announce() { announces++; } };
+    install(rns, {}, ["_tick()"]);
+    const registered = {};
+    const recorder = (owner) => new Proxy({}, { get: (_, name) => (f) => { registered[`${owner}.${String(name)}`] = f; } });
+    compile("_wire()", {
+        RnsClient: new Proxy({}, { get: (_, name) => (name === "onTick" ? (f) => rns._onTick.push(f) : recorder("RnsClient")[name]) }),
+        ContactStore: recorder("ContactStore"), GroupStore: recorder("GroupStore"), ChannelStore: recorder("ChannelStore"),
+    })(self)();
+    assert.equal(rns._onTick.length, 1, "_wire() listens to the tick");
+
+    rns._tick();
+    assert.equal(announces, 1, "the tick still announces");
+    assert.equal(markerOf(rowsOf(stores.list)[0]), "Today", "the same day: unchanged");
+    device.clock.now = at(NY, 2026, 10, 1, 0, 3);
+    rns._tick();
+    assert.equal(announces, 2);
+    assert.equal(markerOf(rowsOf(stores.list)[0]), "Yesterday", "the first tick after midnight relabels the open list");
+    assert.equal(stores.list.children.length, 1, "in place: still one row");
+
+    assert.match(methodBody("async connect()"), /setInterval\(\(\) => this\._tick\(\), this\._cfg\.announceIntervalMs\)/,
+        "the announce interval runs _tick(), not _announce() alone");
 });
