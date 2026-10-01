@@ -779,6 +779,74 @@ test("a stranger's packet let in as a group message but not parseable is not pro
     assert.equal(r.router.admission(lxm(stranger, r.me, "z").subarray(16), "t"), null);
 });
 
+test("a distro sent copy reaching this device's own address is dropped before the group policy, whoever sent it and filter on or off: unproved, unanswered, unnamed, unstored (iOS)", async () => {
+    // RFed SPEC §17.11: a sent copy is addressed to the distro and arrives
+    // only as fan-out (_handleDistroBlob). iOS handleIncomingMessage drops
+    // one that reaches its router, before it asks the group policy. Review
+    // of 1553d80: a stranger's that named a group held here was let in by
+    // the look at its group id, then kept and proved (a contact's or a
+    // member's always had been, shown as their incoming message).
+    const r = recipient();
+    const posts = withGroupHandler(r);
+    const member = Identity.create(), stranger = Identity.create(), friend = Identity.create();
+    const S = lxmfHash(stranger), F = lxmfHash(friend), M = lxmfHash(member);
+    r.ContactStore.add(F);
+    r.ContactStore.allow(F);
+    const G = r.GroupStore.create("G", [M]).groupId;
+    const inG = [[GROUP_FIELDS.GROUP_ID, G]];
+    const sentCopy = (extra = []) => named("Me", [[LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_SENT_TYPE],
+        [LXMF.FIELD_CUSTOM_DATA, "c".repeat(32)], [LXMF.FIELD_CUSTOM_META, "d".repeat(32)], ...extra]);
+    const copyDrops = () => r.events.filter((e) => e.kind === "sent-copy-drop").map((e) => [e.detail.src, e.detail.path]);
+    const groupIn = () => posts.get(G).filter((m) => m.dir === "in").map((m) => m.content);
+
+    // Opportunistic: a stranger's naming a held group (let in by the look),
+    // a contact's DM and a member's group message.
+    r.packet(lxm(stranger, r.me, "stranger, held group", sentCopy(inG)));
+    r.packet(lxm(friend, r.me, "contact, a DM", sentCopy()));
+    r.packet(lxm(member, r.me, "member, held group", sentCopy(inG)));
+    await settle();
+    assert.equal(r.proofs.length, 0, "none is proved");
+    assert.equal(r.emitted.length, 0, "none reaches the message handler");
+
+    // A link packet with a ticket, a link Resource with a ticket, a /get.
+    const { a, wire } = await deliveryLink(r);
+    a.send(lxm(stranger, r.me, "on a link", ticketed([...sentCopy(inG)])));
+    await settle(6);
+    await within(a.sendResource(lxm(friend, r.me, "s".repeat(3000), ticketed([...sentCopy()]))), 5000, "the Resource");
+    await settle(6);
+    assert.equal(linkProofs(wire).length, 0, "no proof on the link");
+    assert.equal(linkReplies(wire).length, 0, "no ticket reply");
+    const purged = await fetchPropagated(r, [lxm(member, r.me, "left on the node", sentCopy(inG))]);
+    assert.deepEqual(purged, [1], "still purged from the node");
+
+    // Filter off: still dropped (it is no privacy rule).
+    r.PrivacyFilter.set(false);
+    r.packet(lxm(stranger, r.me, "filter off", sentCopy()));
+    await settle();
+    r.PrivacyFilter.set(true);
+
+    assert.deepEqual(copyDrops(), [[S, "opportunistic"], [F, "opportunistic"], [M, "opportunistic"],
+        [S, "link"], [F, "resource"], [M, "propagated"], [S, "opportunistic"]].map(([h, p]) => [h.slice(0, 12), p]));
+    assert.deepEqual(r.drops(), [], "none is counted a privacy drop");
+    assert.equal(r.proofs.length, 0);
+    assert.equal(r.emitted.length, 0);
+    assert.deepEqual(groupIn(), [], "nothing in the group");
+    assert.deepEqual([r.MsgStore.get(F), r.MsgStore.get(S)], [[], []], "no DM");
+    assert.equal(r.ContactStore.get(S), null, "no row for the stranger");
+    assert.equal(r.ContactStore.get(F).messageName, null, "no name taken");
+    assert.equal(r.ContactStore.get(M), null);
+
+    // The marker is what dropped them: the same messages without it are kept.
+    r.packet(lxm(stranger, r.me, "stranger, held group", named("Stan", inG)));
+    r.packet(lxm(friend, r.me, "contact, a DM", named("Fran")));
+    r.packet(lxm(member, r.me, "member, held group", named("Mo", inG)));
+    await settle();
+    assert.equal(r.proofs.length, 3);
+    assert.deepEqual(groupIn(), ["stranger, held group", "member, held group"]);
+    assert.deepEqual(r.MsgStore.get(F).map((m) => m.content), ["contact, a DM"]);
+    assert.equal(r.ContactStore.get(F).messageName, "Fran");
+});
+
 test("LXMessage.peekGroupFields reads the group id and action as the full parse does: every Retichat-field vector", async () => {
     const fieldVectors = JSON.parse(await readFile(new URL("../LXMF-rust/tests/retichat_field_vectors.json", import.meta.url), "utf8"));
     // [timestamp, title, content, fields], the fields as the vector's bytes.

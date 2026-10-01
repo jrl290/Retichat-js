@@ -1182,7 +1182,10 @@ GroupStore.init();
 //       else from a stranger is dropped there, and costs no proof, no full
 //       parse, no signature check, no ticket reply and no write.
 //    2. acceptsMessage, after the parse and before the proof: the whole
-//       rule above, for the messages step 1 let through.
+//       rule above, for the messages step 1 let through. First of all it
+//       drops a distro sent copy (RFed SPEC §17.11), which belongs to the
+//       fan-out and never to this router, whoever sent it and filter on or
+//       off, as iOS handleIncomingMessage does before its group policy.
 //  A dropped message is never proved and never reaches the router's
 //  listeners, so it records nothing, its 0xD1 name included (iOS applies
 //  the name only once its policy accepts the message). A link Resource is
@@ -1249,6 +1252,22 @@ const PrivacyFilter = {
      *  message kept? */
     acceptsMessage(lxmfMsg, path) {
         const src = Buffer.from(lxmfMsg.sourceHash ?? []).toString("hex");
+        // A distro sent copy (RFed SPEC §17.11) is addressed to the distro
+        // and reaches this client only as fan-out (_handleDistroBlob, never
+        // this router, which serves the device's own address). One that
+        // arrives here is forged or misrouted, and kept it would show the
+        // user's own message as someone's incoming one, or put it in a
+        // group. So it is dropped first, whoever sent it and filter on or
+        // off: before the group policy, as iOS does (handleIncomingMessage,
+        // ChatRepository.swift:1935-1942, "DROPPED distro sent-copy marker
+        // outside fan-out"), and like every drop here, unproved, unnamed and
+        // unstored. Android's onMessageReceived has no such check; this
+        // follows iOS, since Android's way would show a false message.
+        if (LXMF.distroSentCopyFromFields(lxmfMsg.fields) !== null) {
+            console.log(`[retichat] ${path} message from ${src.slice(0, 12)}: DROPPED distro sent-copy marker outside fan-out (RFed SPEC §17.11)`);
+            Harness.event("sent-copy-drop", { src: src.slice(0, 12), path });
+            return false;
+        }
         let accepted;
         if (LXMF.distroTransferKeyFromFields(lxmfMsg.fields) !== null) {
             // An offer the user answers, checked before the allowlist on iOS
