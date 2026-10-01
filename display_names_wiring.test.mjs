@@ -1153,6 +1153,7 @@ function makeGroupReceiver(me, memberHashes) {
         get: (id) => groups.get(id) ?? null,
         addPending: (id, groupName, inviter, members) => groups.set(id, {
             groupId: id, groupName, groupStatus: "pending", members: new Map(members.map((h) => [h, "invited"])) }),
+        accept: (id) => { groups.get(id).groupStatus = "active"; groups.get(id).members.set(lxmfHash(me), "accepted"); },
         updateMember: (id, h, status) => groups.get(id).members.set(h, status),
         isCurrentMember: (id, h) => !["left", undefined].includes(groups.get(id)?.members.get(h)),
         _save() {},
@@ -1174,7 +1175,13 @@ function makeGroupReceiver(me, memberHashes) {
     })(r.self);
     const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
     const groupLabel = fn("groupSenderLabel", "m", { ContactStore: r.ContactStore });
-    return { ...r, groups, notices, posts, systemText, groupLabel, PrivacyFilter };
+    /** The user pressing Accept on a pending invite (the real _acceptGroupInvite). */
+    const acceptInvite = compile("_acceptGroupInvite(groupId)", {
+        GroupStore, ContactStore: r.ContactStore, GroupMsgStore, console: quiet,
+        RnsClient: { ownHash: own(), _requestGroupPeer() {}, sendGroupAccept: async () => {} },
+        alert: (m) => assert.fail(`the accept was held back: ${m}`),
+    })({ render() {} });
+    return { ...r, groups, notices, posts, systemText, groupLabel, PrivacyFilter, acceptInvite };
 }
 const groupFields = (name, action = null, extra = []) => new Map([
     ...(name === null ? [] : [[0xD1, new Map([[0, Buffer.from(name)]])]]),
@@ -1241,15 +1248,26 @@ test("§5.2 a message the group branch drops creates no row; an invite needs an 
     r.deliver(inviteFrom(bob, other, `${B},${lxmfHash(me)}`));
     assert.equal(r.groups.has(other), false, "a member's hidden row does not vouch for an invite");
 
-    // Alice is a contact the user added: her invite is processed, and she
-    // and the co-member whose key checked out (Bob) pass the filter from
-    // now on (iOS handleGroupInvite, Android INVITE).
+    // Alice is a contact the user added: her invite is processed. The
+    // co-member whose key checked out (Bob) is kept, key and all, and is
+    // allowed only when the user accepts (James's group trust rule,
+    // 2026-10-01: "If the invite is accepted, the other group members are
+    // considered allowed"). Until 2026-10-01 the invite itself allowlisted
+    // him, as iOS handleGroupInvite and Android INVITE still do, and a
+    // declined invite left him allowed.
     r.ContactStore.add(A, false, alice.getPublicKey().toString("hex"));
     r.ContactStore.allow(A);
     r.deliver(inviteFrom(alice, other, `${A},${B},${lxmfHash(me)}`));
     assert.equal(r.groups.get(other)?.groupStatus, "pending", "the invite from an allowlisted contact arrives");
-    assert.equal(r.ContactStore.allowlisted(B), true, "the co-member whose key checked out is allowlisted");
+    assert.deepEqual([r.ContactStore.get(B).publicKey, r.ContactStore.allowlisted(B)], [bob.getPublicKey().toString("hex"), false],
+        "the co-member's key is kept, and he is not allowed by the invite");
     assert.equal(r.ContactStore.get(B).hidden, true, "and still not listed (audit L4)");
+    r.deliver(inviteFrom(bob, third, `${B},${lxmfHash(me)}`));
+    assert.equal(r.groups.has(third), false, "so Bob's own invite is still dropped");
+    // The user accepts Alice's group: Bob is allowed, and his invite arrives.
+    r.acceptInvite(other);
+    assert.equal(r.groups.get(other).groupStatus, "active");
+    assert.equal(r.ContactStore.allowlisted(B), true, "accepting allows every member");
     r.deliver(inviteFrom(bob, third, `${B},${lxmfHash(me)}`));
     assert.equal(r.groups.get(third)?.groupStatus, "pending", "now Bob's own invite arrives");
     assert.equal(r.systemText(r.notices.at(-1)), "Inviter invited you to \"Group\"", "named by the validated 0xD1");
@@ -1268,7 +1286,8 @@ test("§5.2 a message the group branch drops creates no row; an invite needs an 
     r.PrivacyFilter.set(false);
     r.deliver(inviteFrom(dave, "5".repeat(32), `${D},${lxmfHash(me)}`));
     assert.equal(r.groups.get("5".repeat(32))?.groupStatus, "pending", "filter off: a stranger's invite arrives");
-    assert.equal(r.ContactStore.allowlisted(D), true, "and the inviter passes the filter from now on (iOS handleGroupInvite)");
+    assert.equal(r.ContactStore.allowlisted(D), false,
+        "and allows nobody, the inviter included, until the user accepts it (iOS handleGroupInvite still allowlists him)");
 });
 
 test("§5.2 a row created only for a group sender's name never lets that sender invite; allowlisting does", () => {

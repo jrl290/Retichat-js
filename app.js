@@ -599,9 +599,11 @@ function groupTrustsSource(sourceAllowed, groupStatus, sourceIsMember) {
 //  keeps direct messages and group invites only from allowlisted rows. The
 //  user allowlists a peer by adding it (Add Contact, New Conversation, an
 //  lxma:// link), by sending it a DM, by creating or accepting a group with
-//  it, by an allowlisted contact's invite that lists it with its key, and
-//  by an accept that names it, for a group the user has accepted, from an
-//  allowed source (allow(); the group trust rule, shouldProcessGroupMessage).
+//  it, and by an accept that names it, for a group the user has accepted,
+//  from an allowed source (allow(); the group trust rule,
+//  shouldProcessGroupMessage). An invite allows nobody until the user
+//  accepts it: until 2026-10-01 an allowlisted contact's invite allowlisted
+//  every co-member it listed with its key as it arrived.
 //  A row a message created while the filter was off, a distro sender's and a
 //  distro sent-copy recipient's are listed but not allowlisted, as iOS and
 //  Android make a plain row for them. Listing and allowlisting are
@@ -3924,17 +3926,21 @@ const RnsClient = {
 
         switch (groupAction) {
             case "invite": {
-                const verified = this._rememberGroupMemberKeys(memberKeys);
+                // Each member key that checks out is kept: the user's accept
+                // waits for every member's (_acceptGroupInvite). Nobody is
+                // allowed by the invite itself. Under James's group trust
+                // rule (2026-10-01) "If the invite is accepted, the other
+                // group members are considered allowed": the user's accept
+                // allows every member, the inviter included, and a decline,
+                // or no answer, leaves nobody allowed. Until 2026-10-01 the
+                // inviter and each listed co-member whose key checked out
+                // were allowlisted as the invite arrived, as iOS
+                // handleGroupInvite (ChatRepository.swift:2183-2191,
+                // 2220-2221) and Android handleGroupMessage
+                // (ChatRepository.kt:1545-1552, 1596-1599) still do.
+                this._rememberGroupMemberKeys(memberKeys);
                 // If we already have this group active, ignore
                 if (group && group.groupStatus === "active") return;
-                // The inviter, and each co-member the invite lists whose key
-                // checked out, pass the privacy filter from now on: iOS
-                // handleGroupInvite (ChatRepository.swift:2183-2191, 2220-2221),
-                // Android handleGroupMessage (ChatRepository.kt:1545-1552,
-                // 1596-1599).
-                const listed = new Set([...(members || []), srcHash]);
-                ContactStore.allow(srcHash);
-                for (const hash of verified) if (listed.has(hash)) ContactStore.allow(hash);
                 // Create pending group entry. The inviter is named when the
                 // notice is shown, through the contact resolver: its 0xD1
                 // was already taken under §5.2 above, and the raw field is

@@ -1211,6 +1211,114 @@ test("group trust rule: once the user accepts, every member is allowed, the one 
     assert.equal(p.relays.length, 1, "relayed");
 });
 
+/**
+ * A web client that holds a group invite and answers it with the real
+ * handlers: _handleGroupMessage behind the router, the real
+ * _rememberGroupMemberKeys, _acceptGroupInvite and _declineGroupInvite.
+ */
+function answeringClient() {
+    const r = recipient();
+    const posts = withGroupHandler(r);
+    const relays = [];
+    r.self._performGroupRelay = (...a) => relays.push(a);
+    const ME = lxmfHash(r.me);
+    r.self._rememberGroupMemberKeys = compile("_rememberGroupMemberKeys(memberKeys)", {
+        Buffer, Identity, Destination, ContactStore: r.ContactStore, console: quiet, ownLxmfDestinationHash: () => ME,
+    })(r.self);
+    const alerts = [];
+    const acceptInvite = compile("_acceptGroupInvite(groupId)", {
+        GroupStore: r.GroupStore, ContactStore: r.ContactStore, GroupMsgStore: posts, console: quiet,
+        RnsClient: { ownHash: ME, _requestGroupPeer() {}, sendGroupAccept: async () => {} },
+        alert: (m) => alerts.push(m),
+    })({ render() {} });
+    const declineInvite = compile("_declineGroupInvite(groupId)", {
+        confirm: () => true, GroupMsgStore: posts, GroupStore: r.GroupStore,
+        document: { body: { classList: { remove() {} } } },
+    })({ state: { activeHash: null }, render() {} });
+    /** `from`'s invite to group `groupId` listing `members` (identities),
+     *  each with its key, as one invite chunk. */
+    const invite = (from, groupId, members) => lxm(from, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, groupId],
+        [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_SENDER, lxmfHash(from)],
+        [GROUP_FIELDS.GROUP_MEMBERS, [...members.map(lxmfHash), ME].join(",")],
+        [GROUP_FIELDS.GROUP_MEMBER_KEYS, members.map((id) => `${lxmfHash(id)}:${id.getPublicKey().toString("base64")}`).join(",")]]));
+    const relayRequest = (from, groupId) => lxm(from, r.me, "relay this", new Map([[GROUP_FIELDS.GROUP_ID, groupId],
+        [GROUP_FIELDS.GROUP_ACTION, "relay_req"], [GROUP_FIELDS.GROUP_SENDER, lxmfHash(from)],
+        [GROUP_FIELDS.GROUP_RELAY_FOR, lxmfHash(from)], [GROUP_FIELDS.GROUP_RELAY_SEEN, lxmfHash(from)]]));
+    const allowed = (...ids) => ids.map((id) => r.ContactStore.allowlisted(lxmfHash(id)));
+    const dms = (id) => r.MsgStore.get(lxmfHash(id)).map((m) => m.content);
+    return { r, ME, posts, relays, alerts, acceptInvite, declineInvite, invite, relayRequest, allowed, dms };
+}
+
+test("group trust rule: an invite allows nobody, its listed co-members and its inviter included, until the user accepts it; a decline, or no answer, leaves them as they were", async () => {
+    // James, 2026-10-01: "If the invite is accepted, the other group
+    // members are considered allowed." Until then an allowlisted contact's
+    // invite allowlisted every co-member whose key checked out the moment
+    // it arrived (iOS handleGroupInvite and Android still do), so a
+    // declined or never-answered invite left them allowed. The keys are
+    // still kept as the invite arrives: the accept needs every one.
+    const c = answeringClient();
+    const { r } = c;
+    const [inviter, b, d] = [1, 2, 3].map(() => Identity.create());
+    const [I, B] = [inviter, b].map(lxmfHash);
+    r.ContactStore.add(I, false, inviter.getPublicKey().toString("hex"));
+    r.ContactStore.allow(I);                                         // the user's contact
+    const G1 = "1".repeat(32), G2 = "2".repeat(32), G3 = "3".repeat(32);
+
+    r.packet(c.invite(inviter, G1, [inviter, b]));
+    await settle();
+    assert.equal(r.proofs.length, 1, "the allowlisted contact's invite is proved");
+    assert.equal(r.GroupStore.get(G1)?.groupStatus, "pending");
+    assert.equal(r.ContactStore.get(B)?.publicKey, b.getPublicKey().toString("hex"), "the co-member's key is kept as the invite arrives");
+    assert.deepEqual(c.allowed(b), [false], "but he is not allowed by the invite");
+    assert.equal(r.ContactStore.get(B).hidden, true, "and is listed nowhere (audit L4)");
+
+    // Unanswered, B's DM is dropped unproved: he is listed in a held group,
+    // so step 1 lets him through, and step 2 drops a DM from a source that
+    // is not allowlisted.
+    r.packet(lxm(b, r.me, "a DM while the invite waits"));
+    await settle();
+    assert.equal(r.proofs.length, 1, "unproved");
+    assert.deepEqual(c.dms(b), []);
+    assert.deepEqual(r.drops().at(-1), { src: B.slice(0, 12), path: "opportunistic", at: "message" });
+
+    // Declined: nobody is left allowed, and B's DM is still dropped.
+    c.declineInvite(G1);
+    assert.equal(r.GroupStore.get(G1), null);
+    assert.deepEqual(c.allowed(b), [false], "a decline leaves nobody allowed");
+    r.packet(lxm(b, r.me, "a DM after the decline"));
+    await settle();
+    assert.deepEqual([r.proofs.length, c.dms(b)], [1, []], "dropped unproved");
+
+    // Accepted: every member is allowed, and B's DM is kept.
+    r.packet(c.invite(inviter, G2, [inviter, b]));
+    await settle();
+    assert.deepEqual(c.allowed(b), [false], "a second invite allows nobody either");
+    c.acceptInvite(G2);
+    assert.deepEqual(c.alerts, [], "every member's key arrived with the invite");
+    assert.equal(r.GroupStore.get(G2).groupStatus, "active");
+    assert.deepEqual(c.allowed(inviter, b), [true, true], "the user's accept allows every member");
+    r.packet(lxm(b, r.me, "a DM once the group is accepted"));
+    await settle();
+    assert.deepEqual(c.dms(b), ["a DM once the group is accepted"]);
+    assert.equal(r.proofs.length, 3, "proved");
+
+    // With the filter off an invite is taken from anyone (as iOS), and still
+    // allows nobody: back on, the stranger who invited, and the member it
+    // listed, are dropped like any stranger.
+    const s = Identity.create();
+    r.PrivacyFilter.set(false);
+    r.packet(c.invite(s, G3, [s, d]));
+    await settle();
+    assert.equal(r.GroupStore.get(G3)?.groupStatus, "pending", "filter off: the stranger's invite is taken");
+    assert.deepEqual(c.allowed(s, d), [false, false], "and allows nobody, the inviter included");
+    r.PrivacyFilter.set(true);
+    const proofs = r.proofs.length;
+    r.packet(lxm(s, r.me, "a DM from the inviter"));
+    r.packet(lxm(d, r.me, "a DM from the member it listed"));
+    await settle();
+    assert.deepEqual([r.proofs.length, c.dms(s), c.dms(d)], [proofs, [], []], "both dropped unproved");
+});
+
 test("group trust rule: a plain post names its author (GROUP_SENDER) only from a source the group trusts; a stranger's is its own, whichever member, or this device, it names", async () => {
     // A stranger's plain post for a held group is kept and proved (James,
     // 2026-09-30); shown as written by a member it names, that would be a
