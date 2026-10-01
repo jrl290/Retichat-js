@@ -2659,6 +2659,7 @@ const RnsClient = {
 
             // ── Step 2+3: Download and decrypt one at a time (avoids MTU limits) ──
             const deliveredIds = [];
+            const unread = [];   // "<id> <why>" for each purged without being read
             const myDeliverHash = this._lxmfRouter?.destination?.hash;
             if (!myDeliverHash) {
                 console.log("[retichat] 📬 No local delivery hash — cannot decrypt");
@@ -2679,21 +2680,38 @@ const RnsClient = {
                 const lxmfData = Buffer.from(blobResp[0]);
                 console.log(`[retichat] 📬 [3/4] ${tidHex} blob ${lxmfData.length}B dest=${lxmfData.slice(0,16).toString("hex").slice(0,12)}`);
 
-                if (lxmfData.length < 48) { console.log(`[retichat] 📬 [3/4] ${tidHex} too short`); continue; }
-                const destHash = lxmfData.slice(0, 16);
-                if (!destHash.equals(myDeliverHash)) { console.log(`[retichat] 📬 [3/4] ${tidHex} not for us`); continue; }
-
-                // A message this client had, delivered or dropped: the node
-                // purges it. LXMF does the same with every message a /get
-                // returns, whatever lxmf_propagation made of it
-                // (LXMRouter.py message_get_response: haves).
+                // Every message the node returned is purged from it, whatever
+                // this client made of it: kept, dropped by the privacy filter,
+                // or not readable at all. LXMF puts each one in the haves of
+                // its next /get, read or not (LXMRouter.py
+                // message_get_response: haves.append for every lxmf_data,
+                // whatever lxmf_propagation returned). Until 2026-10-01 one
+                // that was too short, not for this destination, could not be
+                // decrypted, or whose payload could not be read stayed on the
+                // node and was downloaded again on every fetch, for ever. One
+                // purged unread says so here and in step 4.
                 const had = () => {
                     this._propSeenIds.add(Buffer.from(tid).toString("hex"));
                     deliveredIds.push(tid);
                 };
+                const purgeUnread = (why) => {
+                    console.log(`[retichat] 📬 [3/4] ${tidHex} ${why}: purged unread`);
+                    unread.push(`${tidHex} ${why}`);
+                    had();
+                };
+
+                if (lxmfData.length < 48) { purgeUnread("too short"); continue; }
+                const destHash = lxmfData.slice(0, 16);
+                if (!destHash.equals(myDeliverHash)) { purgeUnread("not for us"); continue; }
+
+                let decrypted;
                 try {
-                    const decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
-                    if (!decrypted || decrypted.length < 80) { console.log(`[retichat] 📬 [3/4] ${tidHex} decrypt failed`); continue; }
+                    decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
+                } catch (e) {
+                    purgeUnread(`decrypt failed (${e.message})`); continue;
+                }
+                if (!decrypted || decrypted.length < 80) { purgeUnread("decrypt failed"); continue; }
+                try {
                     // The privacy filter on the decrypted bytes (source |
                     // signature | payload), before any parse, as the router
                     // applies it on every direct path (LXMRouter
@@ -2713,19 +2731,19 @@ const RnsClient = {
                     // message was lost, never purged, and downloaded again
                     // on every fetch.
                     const message = LXMessage.fromBytes(decrypted, destHash);
-                    if (!message) { console.log(`[retichat] 📬 [3/4] ${tidHex} bad payload`); continue; }
+                    if (!message) { purgeUnread("bad payload"); continue; }
                     if (!this._lxmfRouter.acceptsMessage(message, "propagated")) { had(); continue; }
                     console.log(`[retichat] 📬 [3/4] ✅ ${tidHex} from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
                     this._lxmfRouter.emit("message", message);
                     had();
                 } catch(e) {
-                    console.warn(`[retichat] 📬 [3/4] ${tidHex} exception:`, e.message);
+                    purgeUnread(`exception (${e.message})`);
                 }
             }
 
-            // ── Step 4: Purge delivered ──
+            // ── Step 4: Purge every message the node returned ──
             if (deliveredIds.length > 0) {
-                console.log(`[retichat] 📬 [4/4] Purging ${deliveredIds.length} delivered...`);
+                console.log(`[retichat] 📬 [4/4] Purging ${deliveredIds.length} returned, ${unread.length} of them unread${unread.length ? `: ${unread.join("; ")}` : ""}...`);
                 const haveReqId = link.sendRequest("/get", [null, deliveredIds]);
                 await this._waitForResponse(link, haveReqId);
                 console.log("[retichat] 📬 [4/4] Purge complete");
