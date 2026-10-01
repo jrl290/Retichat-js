@@ -609,6 +609,29 @@ html, body {
 .msg-row.own  { align-self: flex-end; }
 .msg-row.their { align-self: flex-start; }
 
+/* Date marker (App._setDayMarker): above the first message of each day,
+   inside that message's row, never a row of its own. Such a row spans the
+   list so the marker can centre; its bubble keeps its side and its 75%. */
+.msg-row.has-day-marker {
+    max-width: 100%;
+    align-self: stretch;
+    flex-direction: column;
+}
+.msg-row.has-day-marker.own   { align-items: flex-end; }
+.msg-row.has-day-marker.their { align-items: flex-start; }
+.msg-row.has-day-marker.system { align-items: center; }
+.msg-row.has-day-marker > .msg-bubble { max-width: 75%; }
+.day-marker {
+    align-self: center;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 8px 0 2px;
+    pointer-events: none;
+    user-select: none;
+}
+
 .msg-bubble {
     padding: 8px 14px;
     border-radius: 18px;

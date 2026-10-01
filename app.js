@@ -61,6 +61,7 @@ import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.j
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
+import { dayMarkers, dayStamp, deviceDayContext } from "./lib/day_markers.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
@@ -5889,6 +5890,9 @@ const App = {
     // chat id -> attachments picked for the next message there: [{name, bytes, mime}]
     _pendingAttachments: new Map(),
     _fileInput: null,
+    // The day, time zone and locale the date markers on screen were labelled
+    // in (dayStamp): set by render(), moved by _checkDayTurn().
+    _dayStamp: null,
 
     // ===== LIFECYCLE =====
 
@@ -5904,6 +5908,7 @@ const App = {
         this.render();
         this._wire();
         this._listenResize();
+        this._listenDayTurn();
         await ActiveTab.start(() => RnsClient.connect());
     },
 
@@ -5928,6 +5933,19 @@ const App = {
         window.addEventListener("keydown", (e) => {
             if (e.key === "Escape" && this._closeAllModals()) this.render();
         });
+    },
+
+    /** The page events after which the day may have turned or the time
+     *  zone or language changed (_checkDayTurn): the page visible again,
+     *  the window focused, the page restored from the back/forward cache,
+     *  and a change of the browser's languages. The browser has no
+     *  date-change event; any update of the open chat checks too. */
+    _listenDayTurn() {
+        const check = () => this._checkDayTurn();
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible") check();
+        });
+        for (const type of ["focus", "pageshow", "languagechange"]) window.addEventListener(type, check);
     },
 
     /** Clear every modal flag. Returns true if anything was actually open, so
@@ -5991,6 +6009,8 @@ const App = {
     render() {
         this._saveComposerFocus();
         clear(this.root);
+        // Everything below is built, date markers included, as of this day.
+        this._dayStamp = dayStamp(deviceDayContext());
         if (this.state.view === "onboarding") {
             // Center the onboarding card in the viewport
             this.root.style.justifyContent = "center";
@@ -6108,6 +6128,9 @@ const App = {
         // now that there is something real to show.
         list.querySelector(".empty-chat")?.remove();
         for (const m of missing) list.appendChild(build(m));
+        // A new day starts with a marker; one sent late above an earlier
+        // day's message moves the marker below it.
+        this._applyDayMarkers(list, records);
         return true;
     },
 
@@ -6176,6 +6199,75 @@ const App = {
             const sender = isGroup ? groupSenderLabel(m) : channelSenderLabel(id, m);
             if (el && sender) el.replaceWith(this._buildSenderLabel(sender));
         }
+    },
+
+    // ===== DATE MARKERS =====
+    //
+    // A marker above the first message of each day, in the device's time
+    // zone and locale (lib/day_markers.js; iOS d891c2d DayMarkers.swift,
+    // Android 5ac43d2 DayMarkers.kt): "Today", "Yesterday", or the weekday,
+    // day and month, with the year outside the current one. It is part of
+    // its message's row (.msg-row[data-msg-id]) and never a row of its own,
+    // so whatever counts, finds or scrolls to rows sees the messages alone.
+
+    /** Label the rows of a message list from their records, in display
+     *  (DOM) order: above the first row and above each row whose day
+     *  differs from the row's above it. Patches only what changed, in
+     *  place. Returns `list`. */
+    _applyDayMarkers(list, records) {
+        const byId = new Map(records.map(m => [m.id, m]));
+        const rows = [...list.querySelectorAll("[data-msg-id]")];
+        const labels = dayMarkers(rows.map(r => byId.get(r.getAttribute("data-msg-id"))?.timestamp), deviceDayContext());
+        rows.forEach((row, i) => this._setDayMarker(row, labels[i]));
+        return list;
+    },
+
+    /** One row's date marker, its first child (style.css .day-marker:
+     *  small, centred, secondary, not clickable, read as a heading), or
+     *  none when `label` is null. */
+    _setDayMarker(row, label) {
+        const first = row.firstChild;
+        const marker = first?.classList?.contains("day-marker") ? first : null;
+        if (!label) {
+            marker?.remove();
+            row.classList.remove("has-day-marker");
+            return;
+        }
+        if (!marker) row.insertBefore(h("div", { className: "day-marker", role: "heading", "aria-level": "3" }, label), first);
+        else if (marker.textContent !== label) marker.textContent = label;
+        row.classList.add("has-day-marker");
+    },
+
+    /** The stored messages of a conversation: a group's, a channel's or a
+     *  DM's. */
+    _chatRecords(id) {
+        if (GroupStore.isGroupChat(id)) return GroupMsgStore.get(id);
+        if (ChannelStore.get(id)) return ChannelMsgStore.get(id);
+        return MsgStore.get(id);
+    },
+
+    /**
+     * The day, the time zone or the locale has moved since the screen was
+     * labelled (render, or the last turn): relabel the open chat's date
+     * markers in place, so a chat left open across midnight shows
+     * yesterday's "Today" as "Yesterday". Run on the page's own events
+     * (_listenDayTurn) and from the client's update callbacks (_wire: a
+     * message or proof, a status change, a send's progress, a contact
+     * change); a message appended to the open chat relabels the whole list
+     * itself (_syncOpenChatMessages). There is no timer of its own, and the
+     * browser has no date-change event, so a visible tab that nothing
+     * happens to keeps its labels until the next of these. Returns whether
+     * it relabelled.
+     */
+    _checkDayTurn() {
+        if (this.state.view !== "main") return false;
+        const stamp = dayStamp(deviceDayContext());
+        if (stamp === this._dayStamp) return false;
+        this._dayStamp = stamp;
+        const id = this.state.activeHash;
+        const list = document.getElementById("msg-list");
+        if (id && list) this._applyDayMarkers(list, this._chatRecords(id));
+        return true;
     },
 
     /** Rebuild only the detail pane, keeping the composer draft and the scroll
@@ -6529,12 +6621,12 @@ const App = {
                     onClick: () => { this.state.showContactInfo = true; this.state.contactInfoHash = c.destHash; this.render(); } }, "ℹ"),
             ),
 
-            // Messages
-            h("div", { className: "message-list", id: "msg-list" },
+            // Messages, each first of its day under its date marker
+            this._applyDayMarkers(h("div", { className: "message-list", id: "msg-list" },
                 ...(msgs.length === 0
                     ? []
                     : msgs.map(m => this._buildMsgBubble(m))),
-            ),
+            ), msgs),
 
             // Attachments waiting to go, and the composer's notices
             this._buildComposerExtras(c.destHash),
@@ -6612,15 +6704,15 @@ const App = {
                 ),
             ] : []),
 
-            // Messages
-            h("div", { className: "message-list", id: "msg-list" },
+            // Messages, each first of its day under its date marker
+            this._applyDayMarkers(h("div", { className: "message-list", id: "msg-list" },
                 ...(msgs.length === 0
                     ? [h("div", { className: "empty-chat" },
                         h("p", {}, isPending ? "Accept the invite to start chatting." : "No messages yet. Say hello!"))]
                     : msgs.map(m => m.dir === "system"
                         ? this._buildSystemMsg(m)
                         : this._buildMsgBubble(m, groupSenderLabel(m)))),
-            ),
+            ), msgs),
 
             // Composer (hidden for pending groups)
             ...(isPending ? [] : [
@@ -6814,7 +6906,11 @@ const App = {
             m = MsgStore.get(convHash).find(x => x.id === msgId);
         }
         if (!m || m.dir === "system") return;
-        row.replaceWith(this._buildMsgBubble(m, sender));
+        // The rebuilt row keeps its date marker (_applyDayMarkers).
+        const marker = row.firstChild?.classList?.contains("day-marker") ? row.firstChild.textContent : null;
+        const next = this._buildMsgBubble(m, sender);
+        this._setDayMarker(next, marker);
+        row.replaceWith(next);
         AttachmentUrls.sweep();
     },
 
@@ -6946,15 +7042,15 @@ const App = {
                     onClick: () => { this.state.showChannelInfo = true; this.state.channelInfoName = ch.channelName; this.render(); } }, "ℹ"),
             ),
 
-            // Messages
-            h("div", { className: "message-list", id: "msg-list" },
+            // Messages, each first of its day under its date marker
+            this._applyDayMarkers(h("div", { className: "message-list", id: "msg-list" },
                 ...(msgs.length === 0
                     ? [h("div", { className: "empty-chat" },
                         h("p", {}, "No messages yet. Be the first to speak!"))]
                     : msgs.map(m => m.dir === "system"
                         ? this._buildSystemMsg(m)
                         : this._buildMsgBubble(m, channelSenderLabel(ch.channelName, m)))),
-            ),
+            ), msgs),
 
             // Composer
             h("div", { className: "composer" },
@@ -8516,6 +8612,7 @@ const App = {
     _wire() {
         // Status dot updates
         RnsClient.onStatus(status => {
+            this._checkDayTurn();
             const dot = document.getElementById("status-dot");
             if (dot) {
                 dot.className = `status-dot ${status}`;
@@ -8529,6 +8626,7 @@ const App = {
         // user notices when a distro message or a path response lands.
         RnsClient.onMessage((msg, peerHash) => {
             if (this.state.view !== "main") return;
+            this._checkDayTurn();
             const inActiveChat = this.state.activeHash === peerHash;
 
             // Proof-only event (msg is null): update status icons in place.
@@ -8574,6 +8672,7 @@ const App = {
         // A send's transfer moved: its bar follows, in the open chat only.
         RnsClient.onSendProgress((convHash, msgId, progress) => {
             if (this.state.view !== "main" || this.state.activeHash !== convHash) return;
+            this._checkDayTurn();
             this._updateMsgProgressDOM(msgId, progress);
         });
 
@@ -8588,6 +8687,7 @@ const App = {
         // the composer's enabled state follow the newly learned public key.
         ContactStore.onChange(() => {
             if (this.state.view !== "main") return;
+            this._checkDayTurn();
             this._refreshSidebar();
             this._syncOpenChatChrome();
             this._refreshGroupInfoNames();
