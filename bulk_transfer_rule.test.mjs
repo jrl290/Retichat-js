@@ -8,13 +8,19 @@
  * (concluded, failed, cancelled, link closed) decide that. A
  * re-advertisement is not progress.
  *
- * Every Resource watches itself (lib/rns/resource.js bulkStart … bulkStop):
- * sent or received, bare data, request or response. Until 2026-10-01 only
- * the Resources of a DM the web sent were watched (lib/send_progress.js
- * SendTransfers), so the photos, rfed.link pushes, /get responses and
- * distro fan-out it received were never asserted (round 3 staging). A
- * message's Resource is now watched by the Resource alone, under the
- * message's label: SendTransfers keeps no watch, so nothing is logged twice.
+ * Every Resource watches itself (lib/rns/resource.js, Resource.bulk, a
+ * BulkWatch): sent or received, bare data, request or response; and a link
+ * reassembling a split Resource watches each wait between one segment's
+ * proof and the next segment's advertisement (link.js _betweenSegments).
+ * "Longer than 5 seconds": exactly 5 s is within the rule, the first
+ * millisecond past it is not (as the harness measures it).
+ *
+ * Until 2026-10-01 only the Resources of a DM the web sent were watched
+ * (lib/send_progress.js SendTransfers), so the photos, rfed.link pushes,
+ * /get responses and distro fan-out it received were never asserted (round 3
+ * staging). A message's Resource is now watched by the Resource alone, under
+ * the message's label: SendTransfers keeps no watch, so nothing is logged
+ * twice.
  *
  * Two real Links joined in process (test_link_pair.mjs), on virtual time
  * (test_virtual_time.mjs): a silence is exactly the delay a test injects.
@@ -30,7 +36,7 @@ import MsgPack from "./lib/rns/msgpack.js";
 import Packet from "./lib/rns/packet.js";
 import Resource from "./lib/rns/resource.js";
 import { SendTransfers } from "./lib/send_progress.js";
-import { linkPair, once, within } from "./test_link_pair.mjs";
+import { linkPair, once, sendSplit, within } from "./test_link_pair.mjs";
 import { installVirtualTime } from "./test_virtual_time.mjs";
 import { install } from "./test_app_source.mjs";
 
@@ -95,10 +101,10 @@ test("a received and a sent Resource silent for 7 s: each logged once, at 5 s, t
     for (const line of r) assert.match(line.m, /progress again after 7\.0 s of silence$/);
     for (const line of v) {
         const again = r.find((x) => x.m.includes(line.m.match(/Resource ([0-9a-f]{12})/)[1]) && x.m.includes(line.m.includes(" sent ") ? " sent " : " received "));
-        assert.equal(again.at - line.at, 2_000, "the silence was asserted at 5 s and ended at 7 s");
+        assert.equal(again.at - line.at, 1_999, "the silence was asserted on the first millisecond past 5 s and ended at 7 s");
     }
     assert.equal(clock.elapsed() - start, 7_000, "the stall was all the time it took");
-    assert.deepEqual(sent.bulkSilences.map((s) => s.silentMs), [7_000], "its bookkeeping: one silence, 7 s");
+    assert.deepEqual(sent.bulk.silences.map((s) => s.silentMs), [7_000], "its bookkeeping: one silence, 7 s");
 });
 
 test("a silence is logged once however long it lasts, and the Resource's own watchdog decides the outcome: a re-advertisement is not progress", async () => {
@@ -113,8 +119,8 @@ test("a silence is logged once however long it lasts, and the Resource's own wat
     const resource = a.outgoingResources[0];
 
     await sleep(5_100);
-    assert.equal(violations().length, 1, "asserted at 5 s");
-    assert.equal(violations()[0].at - start, 5_000);
+    assert.equal(violations().length, 1, "asserted just past 5 s");
+    assert.equal(violations()[0].at - start, 5_001);
     assert.equal(resource.status, Resource.ADVERTISED, "and nothing failed for it");
     assert.equal(failedAt, null);
 
@@ -123,6 +129,48 @@ test("a silence is logged once however long it lasts, and the Resource's own wat
     assert.equal(violations().length, 1, "once per silence: 35 s of it, four re-advertisements and all");
     assert.equal(resumed().length, 0, "a re-advertisement is not progress");
     assert.match(lines.at(-1).m, /^\[§1\] sent Resource [0-9a-f]{12} \(2000 B, link [0-9a-f]{12}\): failed: no response to the resource advertisement after 35\.0 s of silence$/);
+});
+
+test("exactly 5 s without progress is within the rule; the first millisecond past it is a violation", async () => {
+    // DESIGN_PRINCIPLES §1: a silence "longer than 5 seconds". The harness
+    // measures it the same way (test-harnesses distro-pipeline
+    // resource_watch.mjs resourceGaps: "exactly 5 s is within the rule").
+    // Until 2026-10-01 the page logged a VIOLATION at exactly 5.000 s, so its
+    // own lines and the harness's verdict disagreed at the boundary.
+    const { a, b } = linkPair({ drop: (packet, from) => from === "b" });   // nothing reaches the sender
+    const sender = new Resource(a);
+    sender.initiator = true;
+    sender.prepareOutgoing(bytes(464 * 300, 9));
+    const receiver = Resource.accept(b, MsgPack.unpack(sender.packAdvertisement(0)));
+    const start = clock.elapsed();
+    for (const segment of [1, 2]) {
+        await sleep(5_000);
+        const from = segment * Resource.HASHMAP_MAX_LEN * Resource.MAPHASH_LEN;
+        receiver.waitingForHashmapUpdate = true;
+        receiver.onHashmapUpdate(Buffer.concat([sender.hash, MsgPack.pack([segment, sender.hashmapRaw.subarray(from, from + Resource.HASHMAP_MAX_LEN * Resource.MAPHASH_LEN)])]));
+    }
+    assert.deepEqual(lines, [], "two silences of exactly 5 s, neither a violation");
+    await sleep(5_002);
+    assert.equal(violations().length, 1, "5 s and 1 ms is");
+    assert.equal(violations()[0].at - start, 15_001, "asserted on its first millisecond past 5 s");
+    receiver.cancel("done");
+
+    // A real timer can run a millisecond early (it rounds its start): one
+    // that finds exactly 5 s of silence waits out the rest instead of
+    // asserting. (Under virtual time timers never run early; check() is
+    // called here as such a timer would.)
+    lines.length = 0;
+    const watch = new Resource.BulkWatch(() => "a transfer");
+    watch.start();
+    watch.lastProgressAt = Date.now() - Resource.QUIET_MS;
+    watch.check();
+    assert.deepEqual(lines, [], "exactly 5 s, found by a timer that ran early");
+    assert.notEqual(watch.timer, null, "re-armed");
+    watch.lastProgressAt = Date.now() - Resource.QUIET_MS - 1;
+    watch.check();
+    assert.equal(violations().length, 1, "5 s and 1 ms, found the same way");
+    watch.stop("done");
+    assert.equal(watch.timer, null);
 });
 
 test("a transfer that moves for over 20 s with a window every 0.8 s is never a violation", async () => {
@@ -173,8 +221,8 @@ test("the watch ends with the Resource: concluded, failed or its link closed, no
     const done = await pair.a.sendResource(bytes(9_000));
     const { resource: got } = await incoming;
     for (const r of [done, got]) {
-        assert.equal(r.bulkEnded, true);
-        assert.equal(r.bulkTimer, null, "its timer cleared");
+        assert.equal(r.bulk.ended, true);
+        assert.equal(r.bulk.timer, null, "its timer cleared");
     }
 
     // The link closed mid-transfer: the parts never arrive.
@@ -190,11 +238,130 @@ test("the watch ends with the Resource: concluded, failed or its link closed, no
     assert.equal(await within(incFailed, 2_000, "the receiving Resource"), "link closed");
     for (const r of [out, inc]) {
         assert.equal(r.status, Resource.FAILED);
-        assert.equal(r.bulkTimer, null, "its timer cleared");
+        assert.equal(r.bulk.timer, null, "its timer cleared");
     }
     await sleep(60_000);
     assert.deepEqual(lines, [], "nothing after its end: the watch is the Resource's, and ends with it");
 });
+
+// ── Split Resources: the wait between segments ───────────────────────────
+//
+// A split Resource (a /distro/pull page of photos, a large /get answer: over
+// MAX_EFFICIENT_SIZE) is one transfer from its first advertisement to its
+// last proof. Between one segment's proof and the next segment's
+// advertisement no Resource is running, so until 2026-10-01 nothing watched
+// that wait; the reassembly does now (link.js _betweenSegments).
+
+/** Run `body` with segments of `size` bytes, as link_request_resource does. */
+async function withSegmentSize(size, body) {
+    const saved = Resource.MAX_EFFICIENT_SIZE;
+    Resource.MAX_EFFICIENT_SIZE = size;
+    try { return await body(); } finally { Resource.MAX_EFFICIENT_SIZE = saved; }
+}
+
+/** The watches a link starts on waits between segments, as it starts them. */
+function waitsOf(link) {
+    const waits = [];
+    const between = link._betweenSegments.bind(link);
+    link._betweenSegments = (resource, assembly) => { between(resource, assembly); waits.push(assembly.wait); };
+    return waits;
+}
+
+test("a split Resource whose next segment comes 7 s after the last proof: one violation for the wait, ended by the advertisement; delivered whole", () => withSegmentSize(5_000, async () => {
+    const { a, b } = linkPair();
+    b.setResourceStrategy(Link.ACCEPT_ALL);
+    const waits = waitsOf(b);
+    const payload = bytes(9_000);
+    const received = once(b, "resource").then(({ data }) => data);
+    let provedAt = null;
+    await within(sendSplit(a, payload, { between: async () => { provedAt = clock.elapsed(); await sleep(7_000); } }), 120_000, "the split transfer");
+    assert.ok((await received).equals(payload), "received whole: the wait decided nothing");
+
+    const v = violations();
+    assert.equal(v.length, 1, `only the wait was silent: ${JSON.stringify(lines)}`);
+    assert.match(v[0].m, /^\[§1\] VIOLATION received split Resource [0-9a-f]{12} \(9000 B, link [0-9a-f]{12}\), waiting for segment 2\/2: no progress for 5 s \(\d+\.\d s since it started, 1 of 2 segments received\); the Resource's own events decide its outcome$/);
+    assert.equal(v[0].at - provedAt, 5_001, "asserted just past 5 s after segment 1's proof");
+    const ended = lines.filter((l) => l.level === "warn");
+    assert.equal(ended.length, 1, JSON.stringify(lines));
+    assert.match(ended[0].m, /^\[§1\] received split Resource [0-9a-f]{12} \(9000 B, link [0-9a-f]{12}\), waiting for segment 2\/2: segment 2\/2 advertised after 7\.0 s of silence$/);
+    assert.equal(ended[0].at - provedAt, 7_000);
+    assert.equal(waits.length, 1);
+    assert.equal(waits[0].ended, true);
+    assert.equal(waits[0].timer, null, "its timer cleared");
+    assert.deepEqual(waits[0].silences.map((s) => s.silentMs), [7_000]);
+    assert.equal(b._splitAssemblies.size, 0);
+}));
+
+test("a wait between segments shorter than 5 s is no violation, and the segments' own watches end with them", () => withSegmentSize(5_000, async () => {
+    const { a, b } = linkPair();
+    b.setResourceStrategy(Link.ACCEPT_ALL);
+    const waits = waitsOf(b);
+    const payload = bytes(14_000, 5);
+    const received = once(b, "resource").then(({ data }) => data);
+    await within(sendSplit(a, payload, { between: () => sleep(4_000) }), 120_000, "the split transfer");
+    assert.ok((await received).equals(payload));
+    assert.equal(waits.length, 2, "one wait for each later segment");
+    for (const w of waits) assert.equal(w.ended, true);
+    await sleep(60_000);
+    assert.deepEqual(lines, [], "8 s of waits in all, each under 5 s: nothing to assert");
+}));
+
+test("the wait for a next segment ends with its reassembly: its request failing, the link closing, or the Resource sent again from segment 1", () => withSegmentSize(5_000, async () => {
+    // The request fails 100 ms into the wait (its timeout runs again between
+    // segments, link.js _betweenSegments): the wait ends, before any silence.
+    {
+        const { a, b } = linkPair();
+        const waits = waitsOf(a);
+        b.on("request", (request) => {
+            sendSplit(b, MsgPack.pack([request.requestId, bytes(9_000)]), { requestId: request.requestId, isResponse: true, segments: 1 });
+        });
+        const id = a.sendRequest("/pull", null, { timeoutMs: 100 });
+        await assert.rejects(within(a.responseFor(id), 3_000, "the request"), /no response within 100 ms/);
+        assert.equal(waits.length, 1);
+        assert.equal(waits[0].ended, true, "the request's failure ended the wait");
+        assert.equal(waits[0].timer, null);
+        assert.equal(a._splitAssemblies.size, 0);
+    }
+    // The link closes 6 s into the wait: one violation, and the close ends it.
+    {
+        const { a, b } = linkPair();
+        b.setResourceStrategy(Link.ACCEPT_ALL);
+        const waits = waitsOf(b);
+        await within(sendSplit(a, bytes(9_000), { segments: 1 }), 60_000, "segment 1");
+        await sleep(6_000);
+        b.close();
+        assert.equal(violations().length, 1);
+        assert.match(lines.at(-1).m, /^\[§1\] received split Resource [0-9a-f]{12} \(9000 B, link [0-9a-f]{12}\), waiting for segment 2\/2: link closed after 6\.0 s of silence$/);
+        assert.equal(waits[0].ended, true);
+        assert.equal(waits[0].timer, null);
+        assert.equal(b._splitAssemblies.size, 0);
+    }
+    // Segment 1 concludes again (the same Resource sent from its start): the
+    // first reassembly's wait ends with it, and one wait is left running.
+    {
+        lines.length = 0;
+        const { b } = linkPair();
+        const waits = waitsOf(b);
+        const originalHash = Buffer.alloc(32, 0x5a);
+        const segmentOne = () => ({
+            totalSegments: 2, segmentIndex: 1, originalHash, totalSize: 9_000, data: bytes(5_000),
+            isRequest: false, isResponse: false, bulk: { startedAt: Date.now() },
+        });
+        b._incomingResourceConcluded(segmentOne());
+        await sleep(1_000);
+        b._incomingResourceConcluded(segmentOne());
+        assert.equal(waits.length, 2);
+        assert.equal(waits[0].ended, true, "the first wait ended with its reassembly");
+        assert.equal(waits[1].ended, false);
+        await sleep(6_000);
+        assert.equal(violations().length, 1, `one wait, one violation: ${JSON.stringify(lines)}`);
+        b.close();
+        assert.equal(waits[1].timer, null);
+    }
+    lines.length = 0;
+    await sleep(60_000);
+    assert.deepEqual(lines, [], "nothing after a wait has ended");
+}));
 
 test("request and response Resources are watched like any other (an rfed.link push, a /get answer)", async () => {
     // b answers a's request with a response over the MDU. The request

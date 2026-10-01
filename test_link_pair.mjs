@@ -82,13 +82,16 @@ export function settle(rounds = 3) {
  * Send `data` from `link` as a split Resource, segment by segment, the way
  * RNS/Resource.py does: each segment is advertised when the previous one is
  * proved. `declaredSize` overrides the advertised total (`d`);
- * `segments` stops after that many segments.
+ * `segments` stops after that many segments; `between(i)`, awaited after
+ * segment i is proved and before the next is advertised, holds the sender
+ * there (a slow sender preparing its next segment).
  */
-export async function sendSplit(link, data, { requestId = null, isResponse = false, isRequest = false, declaredSize = null, segments = Infinity } = {}) {
+export async function sendSplit(link, data, { requestId = null, isResponse = false, isRequest = false, declaredSize = null, segments = Infinity, between = null } = {}) {
     const segmentSize = Resource.MAX_EFFICIENT_SIZE;
     const total = Math.floor((data.length - 1) / segmentSize) + 1;
     let originalHash = null;
     for (let i = 1; i <= Math.min(total, segments); i++) {
+        if (i > 1 && between) await between(i - 1);
         const segment = new Resource(link);
         segment.initiator = true;
         segment.segmentIndex = i;
