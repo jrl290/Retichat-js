@@ -502,7 +502,7 @@ async function runConnect({ held, takenOverWhileLoading = false }) {
         PrivacyFilter: {},
         OutboundTickets: {},
     };
-    const self = { _setStatus() {}, _followExchange() {} };
+    const self = { _setStatus() {}, _followExchange() {}, _watchExchangeRefusal() {} };
     let outcome;
     try {
         outcome = await compile("async connect()", env)(self)();

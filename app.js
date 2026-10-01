@@ -63,7 +63,7 @@ import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } fr
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
-import { exchangeUrlRefusal } from "./lib/connect_policy.js";
+import { exchangeUrlRefusal, exchangeRefusalFromViolation } from "./lib/connect_policy.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
@@ -346,7 +346,10 @@ async function loadConfig() {
  * again; at load the saved URL stays connected, unchecked, as before the
  * check, and the console says so. Nothing waits on the read at load (the
  * page connects at once), so a read its server never answers holds nothing
- * back; it decides nothing either, and is a §1 failure said at 5 s.
+ * back; it decides nothing either, and is a §1 failure said at 5 s. A
+ * blocked exchange is said all the same: the browser refuses its first
+ * request and says so in a securitypolicyviolation event, which the page
+ * hears (RnsClient._watchExchangeRefusal).
  */
 const PagePolicy = {
     _header: undefined,   // the policy header; null when the page is served with none
@@ -1795,11 +1798,13 @@ const ChannelMsgStore = {
 const RnsClient = {
     _rns: null, _lxmfRouter: null, _cfg: null,
     _status: "offline", _connType: "none", // "direct" | "websocket" | "none"
-    // Why the page's own Content-Security-Policy blocks the saved exchange
-    // URL this connection was given (_checkSavedExchange), which stopped its
+    // Why the page's own Content-Security-Policy blocks the exchange URL
+    // this connection was given (found by _checkSavedExchange, or by the
+    // browser's refusal, _watchExchangeRefusal), which stopped its
     // interface; the status is then "blocked". null otherwise.
     exchangeBlocked: null,
     _exchangeCheck: null,     // that check, for this connection's saved URL (a promise that never rejects); null for the node's own
+    _exchangeRefusalWatch: null, // unhooks this connection's securitypolicyviolation listener (_watchExchangeRefusal)
     _annTimer: null,
     _rfedLinks: new Map(),
     _rfedLinkPromises: new Map(),
@@ -2099,10 +2104,19 @@ const RnsClient = {
         // stays visible and idle (rfed announces every 6 h). The
         // connection's first "up" is not one: that is initialization, which
         // the registration and the announces drive (§5).
+        //
+        // Neither moves the status once this connection's exchange is found
+        // blocked by the page's policy (exchangeBlocked, _exchangeIsBlocked):
+        // it stays "blocked". The interface's events are heard on a later
+        // task (EventEmitter.emit), so the "down" of the first request the
+        // browser refused can be heard after the refusal's
+        // securitypolicyviolation has stopped the interface; until
+        // 2026-10-01 it then turned "blocked" back to "offline", and the
+        // line under the status dot went.
         let wasUp = false;
         let wentDown = false;
         iface.on("up", () => {
-            if (!current()) return;
+            if (!current() || this.exchangeBlocked) return;
             this._setStatus("online");
             const back = wasUp && wentDown;
             wasUp = true;
@@ -2110,7 +2124,7 @@ const RnsClient = {
             if (back) this._onPageResume("exchange back");
         });
         iface.on("down", () => {
-            if (!current()) return;
+            if (!current() || this.exchangeBlocked) return;
             this._setStatus("offline");
             wentDown = true;
         });
@@ -2134,19 +2148,64 @@ const RnsClient = {
      * changes the URL in Settings. The client behind it stays as built, as
      * it is while the exchange is down. Run alongside the connection
      * (connect), so the interface's first request, refused by the browser,
-     * is made before this answer: a page load with a blocked saved URL
-     * costs a securitypolicyviolation (one, unless the read takes longer
-     * than the interface's reconnect wait). A policy that cannot be read decides
-     * nothing (blockedReason). Only for this connection: one a disconnect
-     * has ended (Settings saved another URL, another tab took over) is not
-     * this check's to stop.
+     * is made before this answer; the browser's refusal is heard on its
+     * own (_watchExchangeRefusal), whichever comes first stops the
+     * interface (_exchangeIsBlocked), and a page load with a blocked URL
+     * costs one securitypolicyviolation. A policy that cannot be read
+     * decides nothing (blockedReason). Only for this connection: one a
+     * disconnect has ended (Settings saved another URL, another tab took
+     * over) is not this check's to stop.
      */
     async _checkSavedExchange(iface, exchangeUrl) {
         const blocked = await PagePolicy.blockedReason(exchangeUrl);
-        if (!blocked || !this._rns?.interfaces?.includes(iface)) return;
-        this.exchangeBlocked = blocked;
-        console.warn(`[retichat] The saved exchange URL ${exchangeUrl} is blocked by this page's Content-Security-Policy: its interface is stopped. ${blocked}`);
-        Harness.event("exchange-blocked", { exchangeUrl });
+        if (blocked) this._exchangeIsBlocked(iface, exchangeUrl, blocked, "policy");
+    },
+
+    /**
+     * The browser's own word that this page's Content-Security-Policy blocks
+     * connection `iface`'s exchange at `exchangeUrl`: a securitypolicyviolation
+     * event on the document naming one of the requests the interface makes
+     * there, refused under a policy the browser enforces
+     * (exchangeRefusalFromViolation, lib/connect_policy.js). The browser
+     * refuses the first request to a blocked exchange before it is sent and
+     * fires the event for it, a definite event with no read and no wait, so
+     * a blocked exchange is said even when the page's server never answers
+     * the policy read (_checkSavedExchange): its interface is stopped and
+     * the page says so (_exchangeIsBlocked), with the reason the event's
+     * policy gives. Heard for any exchange URL, the node's own included (it
+     * costs no request; deploy.sh's boot gate keeps the node's own
+     * unblocked). Hooked before addInterface() makes the first request,
+     * unhooked by disconnect() or the next connection's hook. Until
+     * 2026-10-01 a blocked saved URL whose policy read went unanswered left
+     * the page offline with nothing said, its interface asking again every
+     * reconnect wait, each request refused.
+     */
+    _watchExchangeRefusal(iface, exchangeUrl) {
+        this._exchangeRefusalWatch?.();
+        const listener = (event) => {
+            const reason = exchangeRefusalFromViolation(event, exchangeUrl, location.href);
+            if (reason) this._exchangeIsBlocked(iface, exchangeUrl, reason, "violation");
+        };
+        document.addEventListener("securitypolicyviolation", listener);
+        this._exchangeRefusalWatch = () => document.removeEventListener("securitypolicyviolation", listener);
+    },
+
+    /**
+     * Connection `iface`'s exchange at `exchangeUrl` is blocked by this
+     * page's own Content-Security-Policy, for `reason`, as `found` ("policy":
+     * the policy read says so, _checkSavedExchange; "violation": the browser
+     * refused a request to it, _watchExchangeRefusal). The interface is
+     * stopped (PostInterface.block: nothing is asked of that URL again, and
+     * what is sent through it fails at once), the reason kept for Settings
+     * and the status set "blocked". Once per connection, whichever is found
+     * first, and only while `iface` is this connection's.
+     */
+    _exchangeIsBlocked(iface, exchangeUrl, reason, found) {
+        if (this.exchangeBlocked || !this._rns?.interfaces?.includes(iface)) return;
+        this.exchangeBlocked = reason;
+        const how = found === "violation" ? "the browser refused a request to it" : "found by reading the policy";
+        console.warn(`[retichat] The exchange URL ${exchangeUrl} is blocked by this page's Content-Security-Policy (${how}): its interface is stopped. ${reason}`);
+        Harness.event("exchange-blocked", { exchangeUrl, found });
         iface.block("the exchange URL is blocked by this page's Content-Security-Policy");
         this._setStatus("blocked");
     },
@@ -2191,6 +2250,9 @@ const RnsClient = {
             this._cfg.exchangeUrl,
             IdMgr.hash
         );
+        // The browser's refusal of this exchange under the page's policy, a
+        // definite event, heard from the interface's first request on.
+        this._watchExchangeRefusal(iface, this._cfg.exchangeUrl);
         this._followExchange(iface);
         this._rns.addInterface(iface);
         this._connType = "exchange";
@@ -6303,6 +6365,8 @@ const RnsClient = {
         }
         this._rns = null; this._lxmfRouter = null;
         this._connType = "none";
+        this._exchangeRefusalWatch?.();
+        this._exchangeRefusalWatch = null;
         this.exchangeBlocked = null;
         this._exchangeCheck = null;
         this._setStatus("offline");
@@ -6734,10 +6798,10 @@ const App = {
 
     /** The connection status where the page shows it, after a render
      *  destroys the old DOM and whenever it changes (_wire, RnsClient
-     *  .onStatus): the status dot, and, while the saved exchange URL is
-     *  blocked by the page's own Content-Security-Policy (status "blocked",
-     *  RnsClient._checkSavedExchange), the line under it that says so and opens
-     *  Settings. Until 2026-10-01 such a page sat offline, the dot red, with
+     *  .onStatus): the status dot, and, while the exchange URL is blocked
+     *  by the page's own Content-Security-Policy (status "blocked",
+     *  RnsClient._exchangeIsBlocked), the line under it that says so and
+     *  opens Settings. Until 2026-10-01 such a page sat offline, the dot red, with
      *  nothing to say why. */
     _applyStatusDot() {
         const status = RnsClient._status;

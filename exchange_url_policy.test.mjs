@@ -17,7 +17,10 @@
  * One test asks Chromium itself (RETICHAT_BOOT_TESTS=1, as deploy.sh runs
  * the suite): under the .htaccess policy, with its hosts renamed to .invalid
  * ones so nothing leaves this machine, the browser lets through exactly the
- * exchanges these rules allow.
+ * exchanges these rules allow, and each it refuses is told to the page in a
+ * securitypolicyviolation event that exchangeRefusalFromViolation reads as
+ * that exchange's refusal, in the words Settings gives
+ * (RnsClient._watchExchangeRefusal, exchange_url_at_load.test.mjs).
  *
  * Run: node --test exchange_url_policy.test.mjs
  */
@@ -25,7 +28,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { connectSourceLists, exchangeUrlRefusal, sourceListAllows, EXCHANGE_PATHS } from "./lib/connect_policy.js";
+import { connectSourceLists, exchangeUrlRefusal, exchangeRefusalFromViolation, isExchangeRequest, sourceListAllows, EXCHANGE_PATHS } from "./lib/connect_policy.js";
 import { app, build, compile, methodBody } from "./test_app_source.mjs";
 
 const htaccess = readFileSync(new URL("./.htaccess", import.meta.url), "utf8");
@@ -100,6 +103,63 @@ test("the requests checked are the ones PostInterface makes: the base without a 
         const policy = exact(EXCHANGE_PATHS.filter((path) => path !== missing));
         assert.match(exchangeUrlRefusal("https://n.example/reticulum", policy, "https://p.example/") ?? "", /not among/, `without ${missing}`);
     }
+});
+
+test("a securitypolicyviolation names the exchange when its URL is one of the requests PostInterface makes there, as fetch resolves it and CSP reports it", () => {
+    const page = "https://p.example/retichat/";
+    for (const base of ["https://n.example/reticulum", "https://n.example/reticulum/", "  https://n.example/reticulum/  "]) {
+        for (const path of EXCHANGE_PATHS) {
+            assert.equal(isExchangeRequest(`https://n.example/reticulum${path}`, base, page), true, `${JSON.stringify(base)} ${path}`);
+        }
+    }
+    // A relative exchange URL resolves against the page, as fetch does it.
+    assert.equal(isExchangeRequest("https://p.example/reticulum/v1/interfaces/register", "/reticulum", page), true);
+    assert.equal(isExchangeRequest("https://p.example/retichat/x/v1/interfaces/exchange", "./x", page), true);
+    // CSP reports a URL without its fragment; one given with it still matches.
+    assert.equal(isExchangeRequest("https://n.example/reticulum/v1/interfaces/goodbye#f", "https://n.example/reticulum", page), true);
+    // Anything else is not the exchange's: another path, host, port or
+    // scheme, the base alone, an origin only (a redirect's target, as CSP
+    // reports it), a keyword CSP reports for inline code, nothing at all.
+    for (const blocked of ["https://n.example/reticulum/v1/interfaces/registers", "https://n.example/reticulum/v1/interfaces",
+        "https://n.example/reticulum", "https://n.example/other/v1/interfaces/register", "https://m.example/reticulum/v1/interfaces/register",
+        "https://n.example:8443/reticulum/v1/interfaces/register", "http://n.example/reticulum/v1/interfaces/register",
+        "https://n.example", "https://n.example/", "inline", "eval", "", undefined, null]) {
+        assert.equal(isExchangeRequest(blocked, "https://n.example/reticulum", page), false, String(blocked));
+    }
+    assert.equal(isExchangeRequest("https://n.example/reticulum/v1/interfaces/register", "not a url at all", "not a page"), false);
+});
+
+test("exchangeRefusalFromViolation: the browser refusing the exchange under a policy it enforces gives the reason Settings gives; any other violation gives nothing", () => {
+    const page = "https://retichat.com/";
+    const exchange = "https://other-node.example/reticulum";
+    const refused = (over = {}) => ({ blockedURI: `${exchange}/v1/interfaces/register`, effectiveDirective: "connect-src", violatedDirective: "connect-src",
+        disposition: "enforce", originalPolicy: POLICY, ...over });
+    // The reason is exchangeUrlRefusal's for the policy the event carries.
+    assert.equal(exchangeRefusalFromViolation(refused(), exchange, page), exchangeUrlRefusal(exchange, POLICY, page));
+    assert.match(exchangeRefusalFromViolation(refused(), exchange, page), /The exchange https:\/\/other-node\.example\/reticulum is not among them/);
+    for (const path of EXCHANGE_PATHS) {
+        assert.notEqual(exchangeRefusalFromViolation(refused({ blockedURI: `${exchange}${path}` }), `${exchange}/`, page), null, path);
+    }
+    // Not the exchange's refusal: a report-only policy refuses nothing;
+    // another directive is no connection; another URL is not this exchange.
+    for (const [what, event] of [
+        ["report-only", refused({ disposition: "report" })],
+        ["no disposition", refused({ disposition: undefined })],
+        ["img-src", refused({ effectiveDirective: "img-src", violatedDirective: "img-src" })],
+        ["script-src", refused({ effectiveDirective: "script-src-elem" })],
+        ["another URL", refused({ blockedURI: "https://esm.sh/x" })],
+        ["inline code", refused({ blockedURI: "inline", effectiveDirective: "script-src-elem" })],
+        ["no event", null],
+    ]) {
+        assert.equal(exchangeRefusalFromViolation(event, exchange, page), null, what);
+    }
+    assert.equal(exchangeRefusalFromViolation(refused(), "https://retichat.com/reticulum", page), null, "another exchange's refusal is not this one's");
+    // Should these rules allow what the browser refused (a source they read
+    // otherwise), the reason is the event's own facts, not silence.
+    const policy = "connect-src https://other-node.example/reticulum/";
+    assert.equal(exchangeUrlRefusal(exchange, policy, page), null, "(the rules allow it)");
+    assert.equal(exchangeRefusalFromViolation(refused({ originalPolicy: policy }), exchange, page),
+        `The browser refused the request to ${exchange}/v1/interfaces/register under this page's Content-Security-Policy ("${policy}"), so the page would stay offline.`);
 });
 
 test("CSP Level 3 matching: default-src stands in, every policy must allow, 'none', schemes, wildcards, ports, paths, 'self' upgrades", () => {
@@ -230,7 +290,7 @@ test("the Settings field: the refusal shows under it, and editing it clears it",
     // The check comes first in Save: a refused URL saves nothing at all.
     const save = methodBody("async _saveSettings()");
     assert.ok(save.indexOf("PagePolicy.exchangeRefusal(exchangeUrl)") < save.indexOf("OwnNames[setter]"), "before anything is saved");
-    assert.match(app, /\nimport \{ exchangeUrlRefusal \} from "\.\/lib\/connect_policy\.js";\n/);
+    assert.match(app, /\nimport \{ exchangeUrlRefusal, exchangeRefusalFromViolation \} from "\.\/lib\/connect_policy\.js";\n/);
 });
 
 // ── against Chromium's own enforcement ─────────────────────────────────────
@@ -281,6 +341,13 @@ chromiumTest("Chromium lets through exactly the exchanges these rules allow, und
             });
             const page = await context.newPage();
             await page.goto(pageUrl);
+            // What the page hears of each refusal (RnsClient._watchExchangeRefusal).
+            await page.evaluate(() => {
+                window.__violations = [];
+                document.addEventListener("securitypolicyviolation", (e) => window.__violations.push({ blockedURI: e.blockedURI,
+                    effectiveDirective: e.effectiveDirective, disposition: e.disposition, originalPolicy: e.originalPolicy }));
+            });
+            const refusedUrls = new Map();   // each URL Chromium refused -> the base it is a request of
             for (const base of bases) {
                 const want = exchangeUrlRefusal(base, policy, pageUrl) === null;
                 const urls = EXCHANGE_PATHS.map((path) => new URL(base.replace(/\/$/, "") + path, pageUrl).href);
@@ -288,6 +355,20 @@ chromiumTest("Chromium lets through exactly the exchanges these rules allow, und
                     fetch(u, { method: "POST", body: "{}" }).then(() => "sent", () => "refused"))), urls);
                 assert.deepEqual(outcomes, urls.map(() => (want ? "sent" : "refused")),
                     `${base} from ${pageUrl}: the rules say ${want ? "allowed" : "refused"}, Chromium ${outcomes.join("/")}`);
+                if (!want) for (const u of urls) refusedUrls.set(u, base);
+            }
+            // Each refusal is told to the page, once, and read as the refusal
+            // of exactly the exchange it is a request of, with Settings' words.
+            await page.waitForFunction((n) => window.__violations.length >= n, refusedUrls.size, { timeout: 10_000 });
+            const violations = await page.evaluate(() => window.__violations);
+            assert.deepEqual(violations.map((v) => v.blockedURI).sort(), [...refusedUrls.keys()].sort(), "one event per refused request");
+            for (const v of violations) {
+                const base = refusedUrls.get(v.blockedURI);
+                assert.deepEqual([v.effectiveDirective, v.disposition, v.originalPolicy], ["connect-src", "enforce", policy]);
+                assert.equal(exchangeRefusalFromViolation(v, base, pageUrl), exchangeUrlRefusal(base, policy, pageUrl), `${v.blockedURI} read for ${base}`);
+                for (const other of bases.filter((b) => b !== base && !EXCHANGE_PATHS.some((path) => new URL(b.replace(/\/$/, "") + path, pageUrl).href === v.blockedURI))) {
+                    assert.equal(exchangeRefusalFromViolation(v, other, pageUrl), null, `${v.blockedURI} is not ${other}'s`);
+                }
             }
             assert.ok(reached.every((u) => new URL(u).hostname.endsWith(".invalid")), `only .invalid hosts were asked for: ${reached}`);
             await context.close();

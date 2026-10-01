@@ -8,7 +8,12 @@
  * dot only turned red. Now, as the page connects, a saved exchange URL other
  * than the node's own is checked with the same check Settings makes
  * (PagePolicy, lib/connect_policy.js), alongside the connection
- * (RnsClient._checkSavedExchange): nothing waits on it. A blocked one has
+ * (RnsClient._checkSavedExchange): nothing waits on it. The browser's own
+ * refusal of a request to the exchange, the securitypolicyviolation event
+ * it fires on the document, is heard too, for any exchange URL
+ * (RnsClient._watchExchangeRefusal), so a blocked one is found even when
+ * the page's server never answers the policy read. Whichever comes first,
+ * a blocked one has
  * its interface stopped (PostInterface.block: never asked again), the
  * status is "blocked", and the page says so where it shows the connection
  * status, under the status dot ("This exchange is blocked by the page's
@@ -27,13 +32,18 @@
  * served beside the policy, and deploy.sh's boot gate fails on any
  * violation. A policy that cannot be read decides nothing: the saved URL
  * stays connected, unchecked, and the console says so. A read that has not
- * answered in 5 s is a §1 failure, said then.
+ * answered in 5 s is a §1 failure, said then. Until 2026-10-01 (b9f525a) a
+ * blocked saved URL whose policy read went unanswered was said nowhere,
+ * its interface asking again every reconnect wait, each request refused.
  *
  * These run the real shipped code from app.js (loadConfig, PagePolicy,
  * RnsClient.connect up to its router, _checkSavedExchange,
- * App._applyStatusDot, h) over stubs. Two tests (RETICHAT_BOOT_TESTS=1, as
- * deploy.sh runs the suite) load the real page in Chromium under the
- * .htaccess policy. PostInterface.block is in exchange_truth.test.mjs.
+ * _watchExchangeRefusal, _exchangeIsBlocked, App._applyStatusDot, h) over
+ * stubs. Three tests (RETICHAT_BOOT_TESTS=1, as deploy.sh runs the suite)
+ * load the real page in Chromium under the .htaccess policy.
+ * PostInterface.block is in exchange_truth.test.mjs; how a violation is
+ * read (exchangeRefusalFromViolation), against Chromium's own events, in
+ * exchange_url_policy.test.mjs.
  *
  * Run: node --test exchange_url_at_load.test.mjs
  */
@@ -45,8 +55,9 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { exchangeUrlRefusal } from "./lib/connect_policy.js";
+import { exchangeUrlRefusal, exchangeRefusalFromViolation } from "./lib/connect_policy.js";
 import { Identity, Destination } from "./lib/rns/reticulum.js";
+import EventEmitter from "./lib/rns/utils/events.js";
 import { app, build, compile, constValue, fn, methodBody } from "./test_app_source.mjs";
 
 const htaccess = readFileSync(new URL("./.htaccess", import.meta.url), "utf8");
@@ -170,7 +181,10 @@ test("loadConfig marks the exchange URL as saved only when one saved in this bro
  * runs it), with the real _checkSavedExchange and PagePolicy over `serve`,
  * and a config whose exchange URL is `exchangeUrl`, saved or the node's.
  * `duringRead(self)` runs as the policy is read (a disconnect meanwhile).
- * The check is awaited unless `awaitCheck` is false.
+ * The check is awaited unless `awaitCheck` is false. The real
+ * _watchExchangeRefusal and _exchangeIsBlocked hear the page's document
+ * (`doc`): `doc.fire(event)` dispatches a securitypolicyviolation to its
+ * listeners, `doc.listeners` holds them.
  */
 async function runConnect({ exchangeUrl, saved, serve = servedWithPolicy, duringRead = null, awaitCheck = true }) {
     const made = [];
@@ -186,20 +200,24 @@ async function runConnect({ exchangeUrl, saved, serve = servedWithPolicy, during
     }, PAGE, warnings);
     const Harness = { event: (kind, detail) => events.push([kind, detail]) };
     const console = { log() {}, error() {}, warn: (m) => warnings.push(m) };
+    const doc = documentHeard();
+    let listenersAtAdd = null;
     const env = {
         IdMgr: { has: true, hash: "ab".repeat(16) },
         ActiveTab: { held: true },
         loadConfig: async () => ({ lxmfPropagationOverride: "b".repeat(32), exchangeUrl, exchangeUrlSaved: saved, interfaceName: "Retichat Web" }),
         Harness, console,
         ContactStore: { resetPropagationTimers() {} },
-        Reticulum: class { constructor() { this.interfaces = []; made.push("Reticulum"); } addInterface(i) { this.interfaces.push(i); made.push("addInterface"); } },
+        Reticulum: class { constructor() { this.interfaces = []; made.push("Reticulum"); } addInterface(i) { listenersAtAdd = doc.listeners.length; this.interfaces.push(i); made.push("addInterface"); } },
         PostInterface: class { constructor(name, url) { made.push(`PostInterface ${url}`); } on() {} block(reason) { blocks.push(reason); } },
         LXMRouter: class { constructor() { made.push("LXMRouter"); throw STOP; } },
         PrivacyFilter: {},
         OutboundTickets: {},
     };
     self = { exchangeBlocked: "stale", _setStatus(s) { statuses.push(s); }, _followExchange() {} };
-    self._checkSavedExchange = compile("async _checkSavedExchange(iface, exchangeUrl)", { PagePolicy: p.PagePolicy, Harness, console })(self);
+    self._checkSavedExchange = compile("async _checkSavedExchange(iface, exchangeUrl)", { PagePolicy: p.PagePolicy })(self);
+    self._watchExchangeRefusal = compile("_watchExchangeRefusal(iface, exchangeUrl)", { document: doc, location: { href: PAGE }, exchangeRefusalFromViolation })(self);
+    self._exchangeIsBlocked = compile("_exchangeIsBlocked(iface, exchangeUrl, reason, found)", { Harness, console })(self);
     // Everything connect() does up to the router is synchronous once the
     // config is loaded (a settled promise here), so by the next macrotask it
     // has returned or thrown, unless it waits on something outside it (the
@@ -211,9 +229,27 @@ async function runConnect({ exchangeUrl, saved, serve = servedWithPolicy, during
     ]);
     const atReturn = { made: [...made], statuses: [...statuses], blocks: [...blocks] };
     if (awaitCheck) await self._exchangeCheck;
-    return { made, statuses, events, warnings, blocks, outcome, STOP, self, atReturn, fetched: p.fetched };
+    return { made, statuses, events, warnings, blocks, outcome, STOP, self, atReturn, fetched: p.fetched, doc, listenersAtAdd };
 }
 const PENDING = Symbol("connect() still waiting");
+
+/** A document as _watchExchangeRefusal uses it: its securitypolicyviolation
+ *  listeners, and `fire(event)` to dispatch one to them. */
+function documentHeard() {
+    const listeners = [];
+    return {
+        listeners,
+        addEventListener(type, fn) { assert.equal(type, "securitypolicyviolation"); listeners.push(fn); },
+        removeEventListener(type, fn) { assert.equal(type, "securitypolicyviolation"); const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); },
+        fire(event) { for (const fn of [...listeners]) fn(event); },
+    };
+}
+
+/** The securitypolicyviolation Chromium fires on the document when it
+ *  refuses PostInterface's first request to `exchangeUrl` under POLICY
+ *  (as exchange_url_policy.test.mjs records them). */
+const refusal = (exchangeUrl, over = {}) => ({ blockedURI: `${exchangeUrl}/v1/interfaces/register`, effectiveDirective: "connect-src",
+    violatedDirective: "connect-src", disposition: "enforce", originalPolicy: POLICY, ...over });
 
 test("connect(): with a saved exchange URL the page's policy blocks, the client is built as for any URL, and the check alongside stops the interface; the status is \"blocked\" and the reason kept", async () => {
     const run = await runConnect({ exchangeUrl: BLOCKED, saved: true });
@@ -224,8 +260,8 @@ test("connect(): with a saved exchange URL the page's policy blocks, the client 
     assert.deepEqual(run.blocks, ["the exchange URL is blocked by this page's Content-Security-Policy"], "then its interface is stopped, saying why");
     assert.deepEqual(run.statuses, ["connecting", "blocked"]);
     assert.equal(run.self.exchangeBlocked, exchangeUrlRefusal(BLOCKED, POLICY, PAGE), "the reason, for Settings");
-    assert.deepEqual(run.events, [["exchange-blocked", { exchangeUrl: BLOCKED }]], "the harness hears of it");
-    assert.match(run.warnings[0], /^\[retichat\] The saved exchange URL https:\/\/other-node\.example\/reticulum is blocked by this page's Content-Security-Policy: its interface is stopped\. This page's/);
+    assert.deepEqual(run.events, [["exchange-blocked", { exchangeUrl: BLOCKED, found: "policy" }]], "the harness hears of it, and how it was found");
+    assert.match(run.warnings[0], /^\[retichat\] The exchange URL https:\/\/other-node\.example\/reticulum is blocked by this page's Content-Security-Policy \(found by reading the policy\): its interface is stopped\. This page's/);
     assert.deepEqual(run.fetched, [[PAGE, "no-store"]], "the policy read once");
 });
 
@@ -269,8 +305,111 @@ test("connect(): an allowed saved URL is left connected; the node's own URL is n
     const connect = methodBody("async connect()");
     const check = connect.indexOf("this._checkSavedExchange(iface, this._cfg.exchangeUrl)");
     assert.ok(connect.indexOf("this._rns.addInterface(iface);") < check && check < connect.indexOf("new LXMRouter("));
+    assert.equal(own.listenersAtAdd, 1, "the browser's refusal is heard from before the interface's first request");
     assert.doesNotMatch(connect, /\bawait\s+[^;]*(_checkSavedExchange|PagePolicy|_exchangeCheck)/);
-    assert.match(methodBody("disconnect()"), /this\.exchangeBlocked = null;\n\s+this\._exchangeCheck = null;\n\s+this\._setStatus\("offline"\);/);
+    assert.match(methodBody("disconnect()"), /this\._exchangeRefusalWatch\?\.\(\);\n\s+this\._exchangeRefusalWatch = null;\n\s+this\.exchangeBlocked = null;\n\s+this\._exchangeCheck = null;\n\s+this\._setStatus\("offline"\);/);
+});
+
+test("connect(): the browser's refusal of the exchange, a securitypolicyviolation on the document, stops its interface and says so while the policy read is never answered; nothing else does, and it counts once", async () => {
+    // The case the policy read cannot close: the page's server never
+    // answers it. Until 2026-10-01 the page then sat offline with nothing
+    // said, its interface asking again every reconnect wait.
+    const run = await runConnect({ exchangeUrl: BLOCKED, saved: true, serve: () => new Promise(() => {}), awaitCheck: false });
+    assert.equal(run.outcome, run.STOP, "connect() went on to the router");
+    assert.equal(run.listenersAtAdd, 1, "heard from before the interface's first request");
+    // Violations that are not this exchange refused: a report-only policy,
+    // another URL, another directive, another exchange.
+    run.doc.fire(refusal(BLOCKED, { disposition: "report" }));
+    run.doc.fire(refusal(BLOCKED, { blockedURI: "https://esm.sh/msgpackr" }));
+    run.doc.fire(refusal(BLOCKED, { effectiveDirective: "img-src", violatedDirective: "img-src" }));
+    run.doc.fire(refusal(ALLOWED));
+    assert.deepEqual([run.statuses, run.blocks, run.events, run.self.exchangeBlocked], [["connecting"], [], [], null], "none of them stops anything");
+
+    run.doc.fire(refusal(BLOCKED));
+    assert.deepEqual(run.blocks, ["the exchange URL is blocked by this page's Content-Security-Policy"], "its interface is stopped");
+    assert.deepEqual(run.statuses, ["connecting", "blocked"], "and the page says so (the line under the status dot)");
+    assert.equal(run.self.exchangeBlocked, exchangeUrlRefusal(BLOCKED, POLICY, PAGE), "Settings' words, from the policy the event carries");
+    assert.deepEqual(run.events, [["exchange-blocked", { exchangeUrl: BLOCKED, found: "violation" }]]);
+    assert.match(run.warnings.at(-1), /^\[retichat\] The exchange URL https:\/\/other-node\.example\/reticulum is blocked by this page's Content-Security-Policy \(the browser refused a request to it\): its interface is stopped\. This page's/);
+    const pending = Symbol("pending");
+    assert.equal(await Promise.race([run.self._exchangeCheck, new Promise((resolve) => setImmediate(() => resolve(pending)))]), pending, "while the read is still out");
+
+    // Once per connection: a second refusal (the goodbye beacon, another
+    // request) changes nothing.
+    run.doc.fire(refusal(BLOCKED, { blockedURI: `${BLOCKED}/v1/interfaces/exchange` }));
+    assert.deepEqual([run.blocks.length, run.events.length, run.statuses], [1, 1, ["connecting", "blocked"]]);
+});
+
+test("connect(): whichever finds the blocked exchange first, the policy read or the browser's refusal, stops it; the other changes nothing", async () => {
+    // The refusal first, then the read answers.
+    let answer;
+    const first = await runConnect({ exchangeUrl: BLOCKED, saved: true, serve: () => new Promise((resolve) => { answer = resolve; }), awaitCheck: false });
+    first.doc.fire(refusal(BLOCKED));
+    answer(servedWithPolicy());
+    await first.self._exchangeCheck;
+    assert.deepEqual([first.blocks.length, first.events.map(([, d]) => d.found), first.statuses], [1, ["violation"], ["connecting", "blocked"]]);
+
+    // The read first (awaited), then the refusal.
+    const second = await runConnect({ exchangeUrl: BLOCKED, saved: true });
+    second.doc.fire(refusal(BLOCKED));
+    assert.deepEqual([second.blocks.length, second.events.map(([, d]) => d.found), second.statuses], [1, ["policy"], ["connecting", "blocked"]]);
+});
+
+test("connect(): the node's own URL is never read against the policy, but the browser's refusal of it is still heard and said", async () => {
+    const own = await runConnect({ exchangeUrl: BLOCKED, saved: false });
+    assert.deepEqual([own.fetched, own.self._exchangeCheck], [[], null], "no policy read");
+    assert.equal(own.listenersAtAdd, 1);
+    own.doc.fire(refusal(BLOCKED));
+    assert.deepEqual([own.blocks.length, own.statuses, own.events], [1, ["connecting", "blocked"], [["exchange-blocked", { exchangeUrl: BLOCKED, found: "violation" }]]]);
+    assert.equal(own.self.exchangeBlocked, exchangeUrlRefusal(BLOCKED, POLICY, PAGE));
+});
+
+test("_watchExchangeRefusal: one listener per connection; disconnect() or the next connection's hook removes it; a refusal heard for a connection that has ended stops nothing", async () => {
+    const run = await runConnect({ exchangeUrl: BLOCKED, saved: true });
+    // A refusal of the previous connection's exchange lands after it ended
+    // (Settings saved another URL): not this listener's to act on.
+    const ended = await runConnect({ exchangeUrl: BLOCKED, saved: false });
+    const iface = ended.self._rns.interfaces[0];
+    ended.self._rns = null;
+    ended.doc.fire(refusal(BLOCKED));
+    assert.deepEqual([ended.blocks, ended.statuses, ended.self.exchangeBlocked], [[], ["connecting"], null], "nothing stopped, nothing said");
+
+    // The next connection's hook replaces the old one; unhooking leaves none.
+    assert.equal(run.doc.listeners.length, 1);
+    run.self._watchExchangeRefusal(iface, ALLOWED);
+    assert.equal(run.doc.listeners.length, 1, "the earlier one removed");
+    run.self._exchangeRefusalWatch();
+    assert.equal(run.doc.listeners.length, 0, "and disconnect() removes the last (its unhook line is checked above)");
+});
+
+test("a down or up the interface emitted before it was found blocked, heard after, leaves the status \"blocked\"; for an exchange not blocked they move it as before", async () => {
+    // PostInterface emits each event after a setTimeout, so the "down" of
+    // the first request the browser refused can be heard after the
+    // refusal's securitypolicyviolation stopped the interface. Until
+    // 2026-10-01 that down turned "blocked" back to "offline", and the
+    // line under the status dot went (seen in Chromium, where the event
+    // usually lands first).
+    for (const blocked of [true, false]) {
+        const statuses = [];
+        const Harness = { event: (kind, detail) => { if (kind === "status") statuses.push(detail.status); }, markReady() {} };
+        const iface = new EventEmitter();
+        iface.block = () => {};
+        const self = { _rns: { interfaces: [iface] }, _status: "connecting", _connType: "exchange", _onStatus: [], exchangeBlocked: null,
+            _onExchangeRegistered() {}, _onPacketsLost() {}, _onPageResume() {} };
+        self._setStatus = compile("_setStatus(s, type)", { Harness })(self);
+        self._exchangeIsBlocked = compile("_exchangeIsBlocked(iface, exchangeUrl, reason, found)", { Harness, console: { warn() {} } })(self);
+        compile("_followExchange(iface)", {})(self)(iface);
+
+        iface.emit("down", "Failed to fetch");          // the refused first request: heard on the next macrotask
+        if (blocked) self._exchangeIsBlocked(iface, BLOCKED, "why", "violation");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(self._status, blocked ? "blocked" : "offline", blocked ? "the late down leaves it blocked" : "down: offline, as before");
+        iface.emit("up");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(self._status, blocked ? "blocked" : "online", blocked ? "and so does a late up" : "up: online, as before");
+        assert.deepEqual(statuses, blocked ? ["blocked"] : ["offline", "online"]);
+    }
 });
 
 // ── where the page shows it ────────────────────────────────────────────────
@@ -587,6 +726,52 @@ chromiumTest("the real page: a policy read the page's server never answers holds
         assert.equal(await page.locator("#exchange-blocked").textContent(), "", "nothing said: nothing is known to be blocked");
         assert.deepEqual(await page.evaluate(() => [window.__violations, !!window.RetichatTest.state().exchangeBlocked]), [[], false]);
         assert.deepEqual([pageErrors, elsewhere], [[], []]);
+        await context.close();
+    } finally {
+        await browser.close();
+        served.close();
+    }
+});
+
+chromiumTest("the real page: a saved exchange the policy blocks is said from the browser's refusal alone while the page's server never answers the policy read; the interface is stopped at that first refusal, and Settings says why", async (t) => {
+    // The case the policy read cannot close (b9f525a's last open one): the
+    // read is held, so only the browser's securitypolicyviolation, fired
+    // when it refuses the interface's first request, can say it. Until
+    // 2026-10-01 the page sat offline here, the dot red, nothing said, its
+    // interface asking again every reconnect wait (5 s), each refused.
+    const browser = await launchChromium(t);
+    if (!browser) return;
+    const served = await servePage({ holdPolicyRead: true });
+    const { origin, exchangeHits, held } = served;
+    try {
+        const { context, page, pageErrors, elsewhere, until } = await openPage(browser, origin, {
+            identity_private_key: OWN_KEY,
+            exchangeUrl: BLOCKED,
+        });
+        await page.goto(`${origin}/index.html`);
+        await until("the line under the status dot", (notice) => document.getElementById("exchange-blocked")?.textContent.startsWith(notice), NOTICE);
+        assert.equal(held.length, 1, "while the policy read is still held");
+        const state = () => page.evaluate(() => {
+            const s = window.RetichatTest.state();
+            return { status: s.status, exchangeBlocked: s.exchangeBlocked, exchange: s.exchange, ownHash: s.ownHash };
+        });
+        const s = await state();
+        assert.deepEqual([s.status, s.exchange, s.ownHash], ["blocked", "down", deliveryHash(Identity.fromPrivateKey(Buffer.from(OWN_KEY, "hex")))],
+            "blocked, its interface stopped, the client built");
+        assert.match(s.exchangeBlocked, /^This page's Content-Security-Policy lets it connect only to .*The exchange https:\/\/other-node\.example\/reticulum is not among them/,
+            "the reason, from the policy the browser's event carries");
+        assert.equal(await page.locator("#status-dot").getAttribute("class"), "status-dot blocked");
+
+        // Stopped at the first refusal: the network "coming back" asks
+        // nothing more, so the one violation stays the only one.
+        await page.evaluate(() => window.dispatchEvent(new Event("online")));
+        await page.locator("#exchange-blocked").getByRole("button", { name: "Open Settings" }).click();
+        await until("Settings on the exchange field", () => document.activeElement?.id === "cfg-exchange");
+        assert.equal(await page.locator("#cfg-exchange-refusal").textContent(), s.exchangeBlocked, "Settings says why");
+        const violations = await page.evaluate(() => window.__violations);
+        assert.deepEqual(violations, [`connect-src ${BLOCKED}/v1/interfaces/register`], "one refusal, of the first request; none since");
+        assert.equal(held.length, 1, "the read is still held");
+        assert.deepEqual([exchangeHits, pageErrors, elsewhere], [[], [], []], "no exchange reached, no error, nothing left this machine but esm.sh");
         await context.close();
     } finally {
         await browser.close();
