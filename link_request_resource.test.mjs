@@ -30,11 +30,18 @@
  * whose response is already arriving is not put back to waiting when the
  * promise of its own Resource settles late.
  *
+ * Every test runs on virtual time (test_virtual_time.mjs): a request's
+ * budget, a Resource's watchdog and a delay on the wire count only the
+ * delays the test injects, never the time the machine takes to pack,
+ * encrypt and hash. Until 2026-09-30 these budgets ran on the wall clock,
+ * and under load (npm test, the deploy gate, runs every file at once) a
+ * 100 ms budget ran out before an in-process response could start.
+ *
  * Run: node --test link_request_resource.test.mjs
  */
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import test from "node:test";
+import test, { afterEach, beforeEach } from "node:test";
 
 import Cryptography from "./lib/rns/cryptography.js";
 import Link from "./lib/rns/link.js";
@@ -42,6 +49,14 @@ import MsgPack from "./lib/rns/msgpack.js";
 import Packet from "./lib/rns/packet.js";
 import Resource from "./lib/rns/resource.js";
 import { linkPair, once, sendSplit, settle, within } from "./test_link_pair.mjs";
+import { installVirtualTime } from "./test_virtual_time.mjs";
+
+// Read before any test runs: file I/O is work the virtual clock cannot see.
+const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
+
+let clock = null;
+beforeEach(() => { clock = installVirtualTime(); });
+afterEach(() => { clock.uninstall(); clock = null; });
 
 const bytes = (n, k = 7) => Buffer.from(Array.from({ length: n }, (_, i) => (i * k) % 251));
 const advertisementsFrom = (wire) => wire.filter((p) => p.context === Packet.RESOURCE_ADV);
@@ -211,10 +226,10 @@ test("a response Resource's transfer does not run into the request's timeout", a
     const page = bytes(200_000, 3);
     respondWith(b, () => page);
     const progress = [];
-    const started = Date.now();
+    const started = clock.now();
     const id = a.sendRequest("/distro/pull", null, { timeoutMs: 150, onProgress: (p) => progress.push(p) });
     const response = await within(a.responseFor(id), 20_000, "the response");
-    assert.ok(Date.now() - started > 300, "the transfer outlasted the request timeout");
+    assert.ok(clock.now() - started > 300, "the transfer outlasted the request timeout");
     assert.ok(Buffer.from(response).equals(page));
     assert.ok(progress.length > 2 && progress.at(-1) === 1, "the request reports the response's progress");
     assert.equal(a.pendingRequests.length, 0);
@@ -224,11 +239,11 @@ test("a request sent as a Resource starts its timeout only once the peer has pro
     // The request itself (40 KB) takes longer to upload than its timeout.
     const { a, b } = linkPair({ delay: (p, from) => (from === "a" && p.context === Packet.RESOURCE ? 10 : 0) });
     respondWith(b, () => "got it");
-    const started = Date.now();
+    const started = clock.now();
     const id = a.sendRequest("/lxmf/delivery", bytes(40_000), { timeoutMs: 40 });
     assert.equal(a._pendingRequest(id).status, Link.REQUEST_SENT, "no clock while the request uploads");
     assert.equal(await within(a.responseFor(id), 20_000, "the response"), "got it");
-    assert.ok(Date.now() - started > 80, "the upload took longer than the request's timeout");
+    assert.ok(clock.now() - started > 80, "the upload took longer than the request's timeout");
 });
 
 test("a request whose response is already arriving is not put back to waiting when its own Resource settles", async () => {
@@ -272,8 +287,10 @@ test("a request whose response is already arriving is not put back to waiting wh
 
 test("a request whose response never starts fails after its timeout", async () => {
     const { a } = linkPair();
+    const sentAt = clock.now();
     const id = a.sendRequest("/nobody/home", null, { timeoutMs: 60 });
     await assert.rejects(within(a.responseFor(id), 2000), /no response within 60 ms/);
+    assert.equal(clock.now() - sentAt, 60, "at its timeout, not before");
     assert.equal(a.pendingRequests.length, 0);
 });
 
@@ -381,9 +398,14 @@ test("between two segments of a response the request waits again, times out if t
             sendSplit(b, packed, { requestId: request.requestId, isResponse: true, segments: 1 });
         });
         const progress = [];
-        const id = a.sendRequest("/pull", null, { timeoutMs: 100, onProgress: (p) => progress.push(p) });
+        let halfAt = null;
+        const id = a.sendRequest("/pull", null, { timeoutMs: 100, onProgress: (p) => {
+            progress.push(p);
+            if (p >= 0.5) halfAt ??= clock.now();
+        } });
         await assert.rejects(within(a.responseFor(id), 3000), /no response within 100 ms/);
         assert.ok(Math.max(...progress) >= 0.5, "the first segment (half the response) arrived before the wait began");
+        assert.equal(clock.now() - halfAt, 100, "the wait for the next segment is the request's whole timeout, from the first segment's end");
         // The half-assembled response can never complete now (its request is
         // gone, so later segments are ignored): it is released at once, not
         // held until the link closes.
@@ -395,7 +417,6 @@ test("between two segments of a response the request waits again, times out if t
 
 // ── app.js waits on the link's receipt ────────────────────────────────────
 
-const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 function appMethod(signature, env) {
     const start = app.indexOf(`\n    ${signature} {`);
     assert.notEqual(start, -1, `${signature} is missing from app.js`);
@@ -421,9 +442,9 @@ test("app.js _rfedRequest resolves with a response that takes longer than its bu
     const rfedRequest = appMethod("async _rfedRequest(aspects, path, packedValue)", {
         RFED_LINK_PATHS: {}, rfedRequestTimeoutMs: () => 150, Buffer, console: quiet,
     })(self);
-    const started = Date.now();
+    const started = clock.now();
     const response = await within(rfedRequest(["link"], "/rfed/pull", MsgPack.pack(null)), 20_000, "_rfedRequest");
-    assert.ok(Date.now() - started > 300);
+    assert.ok(clock.now() - started > 300, "the transfer outlasted the 150 ms budget");
     assert.ok(Buffer.from(response).equals(page));
 });
 

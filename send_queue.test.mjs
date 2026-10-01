@@ -572,10 +572,22 @@ function parkedRecords(c, contact, texts) {
     });
 }
 
-/** Resolves "hung" if `p` has not settled by the next few macrotasks: a failure mechanism only. */
+/**
+ * Resolves "hung" if `p` has not settled by the next few macrotasks: a
+ * failure mechanism only. Counted in event-loop turns (20 rounds of a 0 ms
+ * timer, which runs after the link events, then an immediate), not in
+ * milliseconds: until 2026-09-30 it was a 50 ms timer, which a loaded machine
+ * could let run out before a flush that was ending anyway.
+ */
 const settledOrHung = (p) => Promise.race([
     p.then(() => "settled"),
-    new Promise((resolve) => setTimeout(() => resolve("hung"), 50)),
+    (async () => {
+        for (let i = 0; i < 20; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            await new Promise((resolve) => setImmediate(resolve));
+        }
+        return "hung";
+    })(),
 ]);
 
 test("a flush that loses its link leaves the rest parked and starts no link of its own", async () => {

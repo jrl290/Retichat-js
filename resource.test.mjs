@@ -20,13 +20,19 @@
  * the receiver's window is capped by the measured rate, the sender
  * re-advertises, and both ends report progress.
  *
- * Everything runs over two real Links joined in process (test_link_pair.mjs).
+ * Everything runs over two real Links joined in process (test_link_pair.mjs),
+ * on virtual time (test_virtual_time.mjs): a watchdog's deadline (1.3 s for
+ * an advertisement, 4 s for a part, at the pair's 50 ms RTT) and a test's
+ * failure bound are reached only by the delays a test injects, never by the
+ * machine being slow. Until 2026-09-30 those margins, and a 1 s bound on a
+ * failure that must come at once, were all that kept a loaded machine (npm
+ * test, the deploy gate, runs every file at once) from deciding a test.
  *
  * Run: node --test resource.test.mjs
  */
 
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach, beforeEach } from "node:test";
 
 import Cryptography from "./lib/rns/cryptography.js";
 import Destination from "./lib/rns/destination.js";
@@ -36,6 +42,11 @@ import Packet from "./lib/rns/packet.js";
 import Resource from "./lib/rns/resource.js";
 import Transport from "./lib/rns/transport.js";
 import { linkPair, once, settle, within } from "./test_link_pair.mjs";
+import { installVirtualTime } from "./test_virtual_time.mjs";
+
+let clock = null;
+beforeEach(() => { clock = installVirtualTime(); });
+afterEach(() => { clock.uninstall(); clock = null; });
 
 const bytes = (n, k = 7) => Buffer.from(Array.from({ length: n }, (_, i) => (i * k) % 251));
 const advOf = (resource) => MsgPack.unpack(resource.packAdvertisement(0));
@@ -367,14 +378,16 @@ test("timers read the link's RTT in milliseconds", () => {
 // ── The link's state ──────────────────────────────────────────────────────
 
 test("a Resource on a link that is not ACTIVE fails at once and advertises nothing", async () => {
+    // A failure that waited for a timer would move the virtual clock; how
+    // long the machine takes does not.
     for (const status of [Link.CLOSED, Link.STALE, Link.PENDING]) {
         const { a, wire } = linkPair();
         a.status = status;
         // A PENDING link has no keys yet: nothing may be encrypted with it.
         if (status === Link.PENDING) a.derivedKey = null;
-        const started = Date.now();
+        const started = clock.now();
         await assert.rejects(a.sendResource(bytes(2000)), /link is not active/);
-        assert.ok(Date.now() - started < 1000, "at once, not when a timer runs out");
+        assert.equal(clock.now() - started, 0, "at once, not when a timer runs out");
         assert.equal(wire.a.length, 0, `nothing on the wire from a ${status} link`);
         assert.equal(a.outgoingResources.length, 0);
     }
