@@ -3,11 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test *.test.mjs",
-    "test:full": "RETICHAT_BOOT_TESTS=1 node --test *.test.mjs"
+    "test": "node --test --test-timeout=600000 *.test.mjs",
+    "test:full": "RETICHAT_BOOT_TESTS=1 node --test --test-timeout=600000 *.test.mjs"
   },
   "comment": "The browser loads dependencies from the importmap in index.html; this file exists only so the test suite can resolve them under Node. Keep msgpackr pinned to the same version as the importmap.",
-  "comment-scripts": "npm test skips the boot-gate tests that start headless Chromium (deploy_gates.test.mjs) and says so; npm run test:full runs them with RETICHAT_BOOT_TESTS=1. deploy.sh sets RETICHAT_BOOT_TESTS=1 when it runs the suite, so every deploy runs them.",
+  "comment-scripts": "npm test skips the boot-gate tests that start headless Chromium (deploy_gates.test.mjs) and says so; npm run test:full runs them with RETICHAT_BOOT_TESTS=1. deploy.sh sets RETICHAT_BOOT_TESTS=1 when it runs the suite, so every deploy runs them. --test-timeout=600000 (10 min per test) is a failure bound only, never a pass path: a test that hangs fails instead of hanging npm test, and with it deploy.sh's suite step.",
   "devDependencies": {
     "@noble/curves": "^1.6.0",
     "@noble/hashes": "^1.7.1",

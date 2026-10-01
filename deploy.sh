@@ -51,7 +51,10 @@
 #   1. refuse a dirty working tree      — you cannot ship what isn't committed
 #   2. run the test suite               — and refuse on any failure; with
 #      RETICHAT_BOOT_TESTS=1, so the boot gate's own Chromium tests run too
-#      (a plain `npm test` skips them)
+#      (a plain `npm test` skips them). First, refuse while ../LXMF-rust has
+#      uncommitted changes under tests/: the suite reads its shared vectors
+#      from that working tree, so a green suite there could be green against
+#      vectors that are committed nowhere
 #   3. deploy from `git archive <ref>`  — never from the working directory
 #   4. boot the staged export in headless Chromium — refuse on a pageerror or a
 #      failed module import in the first 10 s (0760960 passed 1–3 and died at
@@ -147,6 +150,11 @@ BACKUP_SUFFIXES=('.bak*' '.orig*' '.old*' '.save*' '~')
 STRAY_ARCHIVE="retichat-web-strays"
 
 PLAYWRIGHT_DIR="${DEPLOY_PLAYWRIGHT_DIR:-$REPO_DIR/../test-harnesses/distro-pipeline}"
+
+# The sibling working tree whose tests/ the suite reads: the shared vectors
+# (tests/display_name_vectors.json, tests/retichat_field_vectors.json) every
+# client is tested against.
+LXMF_DIR="$REPO_DIR/../LXMF-rust"
 
 die() { echo "${RED}✗ $*${NC}" >&2; exit 1; }
 step() { echo; echo "${CYAN}▸ $*${NC}"; }
@@ -385,6 +393,31 @@ cmd_clean_strays() { # <node> [--yes]
     return 0
   fi
   die "strays remain on ${NODE_NAME}"
+}
+
+# ── The shared vectors ────────────────────────────────────────────────────
+
+# check_lxmf_vectors <dir> — the suite reads <dir>/tests/ (the shared
+# vectors), so they must be committed there. Prints every uncommitted entry
+# under tests/ (modified, staged, deleted or untracked, as git status
+# --porcelain names it). Returns 0 clean, 1 uncommitted changes, 2 when
+# <dir> is no git working tree (nothing then shows they are committed).
+check_lxmf_vectors() {
+  local dir="$1" out
+  if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "${RED}✗ ${dir} is not a git working tree: the suite reads its tests/ vectors, and nothing shows they are committed${NC}" >&2
+    return 2
+  fi
+  if ! out="$(git -C "$dir" status --porcelain --untracked-files=all -- tests/)"; then
+    echo "${RED}✗ git status failed in ${dir}${NC}" >&2
+    return 2
+  fi
+  if [[ -n "$out" ]]; then
+    echo "${RED}Uncommitted changes under ../LXMF-rust/tests/, whose vectors the suite reads:${NC}"
+    sed 's/^/    /' <<< "$out"
+    return 1
+  fi
+  return 0
 }
 
 # ── The boot gate ─────────────────────────────────────────────────────────
@@ -678,6 +711,17 @@ else
   fi
   if [[ ! -d "$REPO_DIR/node_modules" ]]; then
     die "node_modules missing — run 'npm install' first (the browser uses the importmap; this is test-only)"
+  fi
+  # The suite reads ../LXMF-rust/tests/ from the working tree, not from a
+  # commit: a vector edited there and not committed would test this deploy
+  # against something no one can name or reproduce.
+  if check_lxmf_vectors "$LXMF_DIR"; then
+    echo "  ${GREEN}✓${NC} ../LXMF-rust/tests/ is committed ($(git -C "$LXMF_DIR" rev-parse --short HEAD))"
+  else
+    echo
+    echo "${DIM}Commit them in LXMF-rust (on a branch if they are not ready), so the"
+    echo "suite tests this deploy against vectors that are committed somewhere.${NC}"
+    die "refusing to deploy: the suite would read uncommitted vectors from ../LXMF-rust/tests/"
   fi
   # RETICHAT_BOOT_TESTS=1: deploy_gates.test.mjs runs its Chromium tests,
   # the ones that prove this script's boot gate works (`npm run test:full`).

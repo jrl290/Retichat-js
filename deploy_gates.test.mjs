@@ -200,10 +200,28 @@ document.getElementById("app").append(Object.assign(document.createElement("p"),
 }
 
 const git = (dir, ...args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+const commitAll = (dir, message) => {
+    git(dir, "add", "-A", "--", ".", ":!node_modules");
+    git(dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", message);
+};
+
+/** An LXMF-rust working tree as the suite reads it: tests/ holding the
+ *  shared vectors, committed. */
+function lxmfFixture(dir) {
+    write(join(dir, "tests/display_name_vectors.json"), '{"clean": []}\n');
+    write(join(dir, "tests/retichat_field_vectors.json"), '{"decode": []}\n');
+    write(join(dir, "README.md"), "LXMF-rust\n");
+    git(dir, "init", "-q");
+    commitAll(dir, "vectors");
+    return dir;
+}
+// Every fixture repo is a directory of TMP, so its ../LXMF-rust is this one:
+// clean, so the deploys below are not refused for it.
+lxmfFixture(join(TMP, "LXMF-rust"));
 
 /** A git repo holding a payload and copies of the scripts under test. */
-function fixtureRepo(name, extra = {}) {
-    const repo = scratch(name);
+function fixtureRepo(name, extra = {}, repo = scratch(name)) {
+    mkdirSync(repo, { recursive: true });
     goodSite(repo, {
         "debug.html": "<!-- harness page: never deployed -->\n",
         "debug-standalone.html": "<!-- harness page: never deployed -->\n",
@@ -212,8 +230,7 @@ function fixtureRepo(name, extra = {}) {
     });
     mkdirSync(join(repo, "node_modules"));
     git(repo, "init", "-q");
-    git(repo, "add", "-A", "--", ".", ":!node_modules");
-    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "fixture");
+    commitAll(repo, "fixture");
     copyFileSync(join(ROOT, "deploy.sh"), join(repo, "deploy.sh"));
     copyFileSync(join(ROOT, "verify-deploy.sh"), join(repo, "verify-deploy.sh"));
     chmodSync(join(repo, "deploy.sh"), 0o755);
@@ -837,6 +854,89 @@ describe("deploy gates", { concurrency: 2 }, () => {
             const r = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env });
             assert.equal(r.code, 0, r.out);
             assert.match(r.out, /suite green — ℹ pass 1/);
+        });
+
+        // ── the shared vectors: the suite reads ../LXMF-rust/tests/ ─────────
+
+        test("the deploy refuses while ../LXMF-rust has uncommitted changes under tests/, naming them, before the suite runs or any node is contacted", async () => {
+            // The suite reads LXMF-rust/tests/display_name_vectors.json and
+            // retichat_field_vectors.json from the sibling working tree: a
+            // vector edited there and not committed would let a deploy pass
+            // against something committed nowhere.
+            const parent = scratch("lxmf-dirty");
+            const repo = fixtureRepo("lxmf-dirty", {}, join(parent, "Retichat-js"));
+            const lxmf = lxmfFixture(join(parent, "LXMF-rust"));
+            write(join(lxmf, "tests/display_name_vectors.json"), '{"clean": ["edited"]}\n');   // modified
+            write(join(lxmf, "tests/new_vectors.json"), "{}\n");                              // untracked
+            write(join(lxmf, "README.md"), "edited, outside tests/\n");                       // not the suite's
+            const nodes = fakeNodes("lxmf-dirty");
+            const before = snapshot(nodes.root);
+            const { env, logs } = scriptEnv(nodes, { DEPLOY_PLAYWRIGHT_DIR: NO_BROWSER });
+
+            const r = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env });
+            assert.equal(r.code, 1, r.out);
+            assert.match(r.out, /Uncommitted changes under \.\.\/LXMF-rust\/tests\/, whose vectors the suite reads:\n {4} M tests\/display_name_vectors\.json\n {4}\?\? tests\/new_vectors\.json\n/,
+                "each file named, modified and untracked");
+            assert.doesNotMatch(r.out, /README/, "a change outside tests/ is not the suite's business");
+            assert.match(r.out, /refusing to deploy: the suite would read uncommitted vectors from \.\.\/LXMF-rust\/tests\//);
+            assert.doesNotMatch(r.out, /suite green|Booting/, "refused before the suite ran");
+            assert.equal(sshCalls(logs).length, 0, "no node contacted");
+            assert.deepEqual(snapshot(nodes.root), before);
+
+            // A staged change is still uncommitted.
+            git(lxmf, "add", "tests/new_vectors.json");
+            const staged = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env });
+            assert.equal(staged.code, 1, staged.out);
+            assert.match(staged.out, / {4}A {2}tests\/new_vectors\.json\n/);
+
+            // Committed (the change outside tests/ still not): the deploy goes on.
+            git(lxmf, "add", "tests/");
+            git(lxmf, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "vectors");
+            const clean = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env });
+            assert.equal(clean.code, 0, clean.out);
+            assert.match(clean.out, /✓ \.\.\/LXMF-rust\/tests\/ is committed \([0-9a-f]{7,}\)/);
+            assert.match(clean.out, /suite green/);
+        });
+
+        test("no ../LXMF-rust working tree: refused, since nothing shows the suite's vectors are committed; DEPLOY_SKIP_TESTS=1 skips the check with the suite", async () => {
+            const parent = scratch("lxmf-missing");
+            const repo = fixtureRepo("lxmf-missing", {}, join(parent, "Retichat-js"));
+            const nodes = fakeNodes("lxmf-missing");
+            const { env, logs } = scriptEnv(nodes, { DEPLOY_PLAYWRIGHT_DIR: NO_BROWSER });
+            const r = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env });
+            assert.equal(r.code, 1, r.out);
+            assert.match(r.out, /\.\.\/LXMF-rust is not a git working tree: the suite reads its tests\/ vectors, and nothing shows they are committed/);
+            assert.equal(sshCalls(logs).length, 0);
+
+            // The suite's own bypass skips the check that exists for it, loudly.
+            const skipped = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env: { ...env, DEPLOY_SKIP_TESTS: "1" } });
+            assert.equal(skipped.code, 0, skipped.out);
+            assert.match(skipped.out, /⚠ skipped \(DEPLOY_SKIP_TESTS=1\)/);
+            assert.match(readFileSync(join(repo, ".deploy.log"), "utf8"), /tests_skipped=1/);
+        });
+
+        test("npm test and test:full bound each test at 10 minutes, a failure bound only: a hung test fails instead of hanging the run", async () => {
+            const scripts = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts;
+            assert.equal(scripts.test, "node --test --test-timeout=600000 *.test.mjs");
+            assert.equal(scripts["test:full"], "RETICHAT_BOOT_TESTS=1 node --test --test-timeout=600000 *.test.mjs");
+            assert.match(readFileSync(join(ROOT, "deploy.sh"), "utf8"), /RETICHAT_BOOT_TESTS=1 npm test 2>&1/, "the deploy runs npm test, so the bound");
+
+            // The flag, with a bound short enough to watch: a test that never
+            // settles (an interval keeps its process alive) is red, and the run ends.
+            const dir = scratch("hung-test");
+            write(join(dir, "hung.test.mjs"), `import test from "node:test";\ntest("never settles", () => new Promise(() => { setInterval(() => {}, 1000); }));\n`);
+            const { NODE_TEST_CONTEXT, ...outside } = process.env;
+            const flags = scripts.test.split(" ").filter((a) => a.startsWith("--")).map((a) => a.replace(/=600000$/, "=300"));
+            assert.deepEqual(flags, ["--test", "--test-timeout=300"]);
+            const r = await new Promise((ok) => {
+                const p = spawn(process.execPath, [...flags, "--test-reporter=spec", "hung.test.mjs"], { cwd: dir, env: outside });
+                let out = "";
+                p.stdout.on("data", (d) => { out += d; });
+                p.stderr.on("data", (d) => { out += d; });
+                p.on("close", (code) => ok({ code, out }));
+            });
+            assert.equal(r.code, 1, r.out);
+            assert.match(r.out, /test timed out after 300ms/);
         });
 
         test("npm test leaves the Chromium tests out and says so; npm run test:full runs them", async () => {
