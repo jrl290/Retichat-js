@@ -22,7 +22,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { dayKey, dayLabel, dayMarkers, dayStamp, deviceDayContext } from "./lib/day_markers.js";
+import { DAY_KEYS_MAX, dayKey, dayLabel, dayMarkers, dayStamp, deviceDayContext } from "./lib/day_markers.js";
 import { app, compile, fn, install, methodBody } from "./test_app_source.mjs";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
@@ -199,6 +199,49 @@ test("the stamp moves at midnight, with the time zone and with the locale, and n
     assert.equal(typeof device.timeZone, "string", "the device's zone, resolved, never left implicit");
     assert.equal(typeof device.locale, "string");
     assert.ok(Math.abs(device.now - Date.now()) < 1000);
+});
+
+test("a relabel costs a lookup per row, not a date formatting: the day of each timestamp is remembered", () => {
+    // Review of 505d0ed: every message appended relabels the whole list, and
+    // each row cost a formatToParts, so a burst of n channel posts cost n x
+    // the list's length on the main thread.
+    const now = at(UTC, 2026, 9, 30, 12);
+    const ts = Array.from({ length: 500 }, (_, i) => now - (500 - i) * 600_000);
+    const formatToParts = Intl.DateTimeFormat.prototype.formatToParts;
+    let calls = 0;
+    const count = (zone) => {
+        calls = 0;
+        Intl.DateTimeFormat.prototype.formatToParts = function (...args) { calls++; return formatToParts.apply(this, args); };
+        try { return dayMarkers(ts, { now, timeZone: zone, locale: EN }); } finally {
+            Intl.DateTimeFormat.prototype.formatToParts = formatToParts;
+        }
+    };
+    const zone = "Pacific/Chatham"; // a zone no other test labels in, so the first pass starts cold
+    const first = count(zone);
+    const cold = calls;
+    const again = count(zone);
+    const marks = first.filter((m) => m !== null).length;
+    assert.deepEqual(again, first, "the same labels");
+    assert.ok(cold >= ts.length, `(fixture) the first pass worked each row out: ${cold}`);
+    assert.ok(calls <= marks + 2, `a relabel: ${calls} formatToParts for ${marks} markers over ${ts.length} rows`);
+    assert.notDeepEqual(dayMarkers(ts, { now, timeZone: "Asia/Tokyo", locale: EN }).map((m) => m !== null),
+        first.map((m) => m !== null), "remembered per zone: Tokyo's days are its own, not Chatham's");
+});
+
+test("what is remembered is bounded: past DAY_KEYS_MAX answers the old ones are forgotten", () => {
+    const zone = "Pacific/Marquesas";
+    const base = at(UTC, 2026, 1, 1);
+    const formatToParts = Intl.DateTimeFormat.prototype.formatToParts;
+    const callsFor = (f) => {
+        let calls = 0;
+        Intl.DateTimeFormat.prototype.formatToParts = function (...args) { calls++; return formatToParts.apply(this, args); };
+        try { f(); } finally { Intl.DateTimeFormat.prototype.formatToParts = formatToParts; }
+        return calls;
+    };
+    const day = dayKey(base, zone);
+    assert.equal(callsFor(() => dayKey(base, zone)), 0, "remembered");
+    for (let i = 1; i <= DAY_KEYS_MAX; i++) dayKey(base + i * 1000, zone);
+    assert.equal(callsFor(() => assert.equal(dayKey(base, zone), day)), 1, "forgotten once the memory was full, and the same day again");
 });
 
 // ── the wiring in app.js, over a fake DOM ──────────────────────────────────
