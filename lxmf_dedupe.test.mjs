@@ -22,6 +22,7 @@
  * Run: node --test lxmf_dedupe.test.mjs
  */
 import { SendTransfers } from "./lib/send_progress.js";
+import { addInOrder } from "./lib/message_order.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -122,8 +123,8 @@ function makeStorage() {
 }
 
 const Harness = { recordInbound() {}, event() {}, error() {} };
-const realMsgStore = (storage) => new Function("sGet", "sSet", "Harness", `return ${extractObject("MsgStore")};`)(
-    storage.sGet, storage.sSet, Harness);
+const realMsgStore = (storage) => new Function("sGet", "sSet", "Harness", "addInOrder", `return ${extractObject("MsgStore")};`)(
+    storage.sGet, storage.sSet, Harness, addInOrder);
 /** A fresh LxmfSeen over `storage`, as a page load builds it. */
 const loadLxmfSeen = (storage) => {
     const seen = new Function("sGet", "sSet", `return ${extractObject("LxmfSeen")};`)(storage.sGet, storage.sSet);

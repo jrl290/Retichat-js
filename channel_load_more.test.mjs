@@ -1,5 +1,5 @@
 /**
- * CHANNEL PAGING BY HAND — "Load more messages".
+ * CHANNEL PAGING BY HAND — "Load earlier messages".
  *
  * RFed-spec/Channel.md /rfed/pull: "Client should display a 'load more'
  * control if more_pending == true". Android and iOS page channel history by
@@ -9,7 +9,8 @@
  * control. Now:
  *   - a channel is pulled one page per explicit open and once per new
  *     rfed.link (rfed_link_recovery.test.mjs), and one page per click;
- *   - the control, under the open channel's messages, appears once the node
+ *   - the control, first in the open channel's message list (at the top,
+ *     where the phones have it), appears once the node
  *     has said it holds more, says "Loading…" while a pull runs, and follows
  *     the pull's start and completion in place;
  *   - /distro/pull, which is message delivery and not history, still
@@ -131,9 +132,9 @@ function openChannel() {
         requestAnimationFrame: (f) => f(),
     })(app));
 
-    // The channel view: its list, then the control, then the composer.
-    page.appendChild(h("div", { className: "message-list", id: "msg-list" }));
-    page.appendChild(app._buildChannelLoadMore(CHANNEL.channelName));
+    // The channel view: its list, the control first in it (at the top, as
+    // on the phones), then the composer.
+    page.appendChild(h("div", { className: "message-list", id: "msg-list" }, app._buildChannelLoadMore(CHANNEL.channelName)));
     page.appendChild(h("div", { className: "composer" }));
     const control = () => document.getElementById("channel-load-more");
     const button = () => control().find((e) => e.tagName === "BUTTON");
@@ -156,7 +157,7 @@ test("the control appears once the node says it holds more, pulls one page per c
     assert.deepEqual(v.handled, ["post-1"]);
     assert.equal(v.requests.length, 1, "nothing pulls the next page on its own");
     assert.doesNotMatch(v.control().className, /\bhidden\b/);
-    assert.equal(v.button().textContent, "Load more messages");
+    assert.equal(v.button().textContent, "Load earlier messages");
     assert.equal(v.button().disabled, false);
 
     // A click: the next page, and the control says so until it is answered.
@@ -188,7 +189,7 @@ test("a pull that fails leaves the control as the last answer left it, ready for
     v.client._rfedRequest = async () => { throw new Error("/channel/pull: the link closed before a response"); };
     v.button().click();
     await settle();
-    assert.equal(v.button().textContent, "Load more messages");
+    assert.equal(v.button().textContent, "Load earlier messages");
     assert.equal(v.button().disabled, false);
     assert.equal(v.warnings.length, 1, "the failure is logged");
 });
@@ -200,7 +201,7 @@ test("a pull's start and completion repaint only the open channel's control: not
     await pull;
     await settle();
     assert.deepEqual(v.ui, [], "the posts a pull brings repaint the list with their own event (channel-receive)");
-    assert.equal(v.button().textContent, "Load more messages");
+    assert.equal(v.button().textContent, "Load earlier messages");
 
     // Another chat is open: its view is left alone.
     v.app.state.activeHash = "someone else";

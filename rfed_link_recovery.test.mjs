@@ -512,7 +512,7 @@ test("every explicit open pulls one page; a new rfed.link pulls each opened chan
     assert.deepEqual(pulls, ["general"], "a new link pulls it once");
 });
 
-test("a channel pull is one at a time and one page: more_pending is recorded for \"Load more messages\", never followed", async () => {
+test("a channel pull is one at a time and one page: more_pending is recorded for \"Load earlier messages\", never followed", async () => {
     // Channel.md /rfed/pull: the client shows a "load more" control while
     // more_pending is true; Android and iOS page channel history by hand.
     // Until 2026-09-30 the web followed more_pending on its own and drained
@@ -551,7 +551,7 @@ test("a channel pull is one at a time and one page: more_pending is recorded for
     assert.equal(c.self._rfedPullState.get(row.channelHash).gen, 3, "the generation it was pulled on");
     assert.deepEqual(events, ["channel-pull-start general", "channel-pull-complete general"]);
 
-    // "Load more messages": the next page, which is the last.
+    // "Load earlier messages": the next page, which is the last.
     assert.equal(await c.self.pullChannel("general"), false);
     await settle();
     assert.equal(c.calls.length, 2);

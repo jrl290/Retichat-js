@@ -44,6 +44,7 @@ const { applyGroupFields } = RF;
 import { SendTransfers } from "./lib/send_progress.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { sentTimeMs } from "./lib/day_markers.js";
+import { addInOrder } from "./lib/message_order.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -87,6 +88,7 @@ function compile(signature, env) {
     return (self) => (...args) => fn(...names.map((n) => env[n]), self, ...args);
 }
 function build(name, env) {
+    env = { addInOrder, ...env };   // the message stores' order (lib/message_order.js)
     const names = Object.keys(env);
     return new Function(...names, `return ${objectLiteral(name)};`)(...names.map((n) => env[n]));
 }

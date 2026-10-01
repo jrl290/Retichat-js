@@ -62,6 +62,7 @@ import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
+import { addInOrder } from "./lib/message_order.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
@@ -858,12 +859,16 @@ const MsgStore = {
     // bytes go with them (discardAttachments, wired after the stores).
     onDiscard: null,
     get(hash) { return sGet("msg_"+hash) ?? []; },
+    /** Store `msg` in conversation order (lib/message_order.js: by
+     *  timestamp, then arrival, as iOS and Android list a conversation), so
+     *  a message pulled late sits among the messages of its time. Returns
+     *  the stored record. */
     add(hash, msg) {
         const msgs = this.get(hash);
-        msgs.push({ id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg });
-        if (msgs.length > 500) this.onDiscard?.(msgs.splice(0, msgs.length-500));
+        const stored = { id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg };
+        const dropped = addInOrder(msgs, stored, 500);
+        if (dropped.length) this.onDiscard?.(dropped);
         sSet("msg_"+hash, msgs);
-        const stored = msgs[msgs.length-1];
         // In-memory mirror so headless harnesses can assert without reparsing localStorage.
         if (stored.dir === "in") Harness.recordInbound(hash, stored);
         return stored;
@@ -1329,12 +1334,14 @@ const GroupMsgStore = {
     // As MsgStore.onDiscard: the attachment bytes of dropped records go too.
     onDiscard: null,
     get(groupId) { return sGet("gmsg_"+groupId) ?? []; },
+    /** As MsgStore.add: in conversation order; returns the stored record. */
     add(groupId, msg) {
         const msgs = this.get(groupId);
-        msgs.push({ id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg });
-        if (msgs.length > 500) this.onDiscard?.(msgs.splice(0, msgs.length-500));
+        const stored = { id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg };
+        const dropped = addInOrder(msgs, stored, 500);
+        if (dropped.length) this.onDiscard?.(dropped);
         sSet("gmsg_"+groupId, msgs);
-        return msgs[msgs.length-1];
+        return stored;
     },
     updateStatus(groupId, msgId, newStatus) {
         const msgs = this.get(groupId);
@@ -1490,12 +1497,15 @@ ChannelStore.init();
 // =========================================================================
 const ChannelMsgStore = {
     get(channelName) { return sGet("cmsg_"+channelName) ?? []; },
+    /** As MsgStore.add: in conversation order (a post carries its post
+     *  time), so history pulled late sits under its own day; returns the
+     *  stored record. */
     add(channelName, msg) {
         const msgs = this.get(channelName);
-        msgs.push({ id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg });
-        if (msgs.length > 500) msgs.splice(0, msgs.length-500);
+        const stored = { id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg };
+        addInOrder(msgs, stored, 500);
         sSet("cmsg_"+channelName, msgs);
-        return msgs[msgs.length-1];
+        return stored;
     },
     updateStatus(channelName, msgId, newStatus) {
         const msgs = this.get(channelName);
@@ -5548,14 +5558,14 @@ const RnsClient = {
         // ConversationView.swift:596-612: their per-screen generation guard
         // starts empty on each open); a new rfed.link pulls each opened
         // channel once more (_onRfedLinkEstablished). The pages after the
-        // first are the user's: "Load more messages" (pullChannel). Until
+        // first are the user's: "Load earlier messages" (pullChannel). Until
         // 2026-09-30 a channel was pulled at most once per page load, then
         // at most once per rfed.link generation, opens included.
         const pull = this.pullChannel(channelName);
         await Promise.all([stream, pull]);
     },
 
-    /** What the channel's "Load more messages" control shows
+    /** What the channel's "Load earlier messages" control shows
      *  (App._buildChannelLoadMore): whether a pull is running, and whether
      *  the last one that completed said the node holds more (more_pending
      *  true). Nothing is known before the first pull completes. */
@@ -5581,8 +5591,8 @@ const RnsClient = {
      * time (the in-flight guard). The page's more_pending is recorded, never
      * followed: Channel.md has the client show a "load more" control while
      * it is true, and Android and iOS page channel history by hand ("Load
-     * earlier messages"), so the next page is the user's ("Load more
-     * messages", App._buildChannelLoadMore). Until 2026-09-30 the web
+     * earlier messages"), so the next page is the user's (the same
+     * "Load earlier messages", App._buildChannelLoadMore). Until 2026-09-30 the web
      * followed it, one pull per completed non-empty page, which drained the
      * whole deferred queue after an idle gap. /distro/pull, which is message
      * delivery and not history, still follows it (_pullDistroMessages). The
@@ -5624,7 +5634,7 @@ const RnsClient = {
             }
             const morePending = response[1] === true;
             this._rfedPullState.set(key, {inFlight: false, morePending, gen: this._rfedLinkGeneration});
-            if (morePending) console.log(`[retichat] 📡 More is queued for #${channelName} — "Load more messages" pulls the next page`);
+            if (morePending) console.log(`[retichat] 📡 More is queued for #${channelName} — "Load earlier messages" pulls the next page`);
             return morePending;
         } catch(e) {
             this._rfedPullState.set(key, {inFlight: false, morePending: current?.morePending, gen: current?.gen});
@@ -6368,15 +6378,25 @@ const App = {
         }
     },
 
-    /** Append to the open chat's message list any records that reached the
-     *  store but aren't on screen yet.
+    /** Show in the open chat's message list any records that reached the
+     *  store but aren't on screen yet, each at its place in the
+     *  conversation's order (the store's: by timestamp, then arrival; lib/
+     *  message_order.js), as iOS and Android list a conversation. A message
+     *  sent a while ago and pulled late (a propagated /get, /distro/pull, a
+     *  channel page) goes in among the messages of its time, under its own
+     *  day's date marker, not at the bottom where it arrived.
      *
      *  Reads from the store rather than from the event payload: the `msg`
      *  argument handed to onMessage listeners is not consistent across senders
      *  (some pass the LXMF message, some the stored record, some null), and
      *  the DOM is the only reliable statement of what has already been shown.
      *
-     *  Returns false when there is no open chat list to append to. */
+     *  What the reader is looking at stays where it is when rows go in above
+     *  it (_holdView). Returns true when the list now ends with a row it
+     *  added: a message arrived at the bottom, and the caller follows it
+     *  down. False when there is no open chat list, nothing was missing, or
+     *  every new row went in above the last one: a late message must not
+     *  pull the reader away from where they are. */
     _syncOpenChatMessages() {
         const id = this.state.activeHash;
         if (!id) return false;
@@ -6397,20 +6417,55 @@ const App = {
             build = (m) => this._buildMsgBubble(m);
         }
 
-        const onScreen = new Set(
-            [...list.querySelectorAll("[data-msg-id]")].map(el => el.getAttribute("data-msg-id"))
-        );
-        const missing = records.filter(m => !onScreen.has(m.id));
-        if (missing.length === 0) return true;
+        const rows = [...list.querySelectorAll("[data-msg-id]")];
+        const onScreen = new Map(rows.map(el => [el.getAttribute("data-msg-id"), el]));
+        if (records.every(m => onScreen.has(m.id))) return false;
 
         // Group and channel views seed an "empty-chat" placeholder — drop it
         // now that there is something real to show.
         list.querySelector(".empty-chat")?.remove();
-        for (const m of missing) list.appendChild(build(m));
+        const held = this._holdView(list, rows);
+        // Each missing record goes in after the row of the record before it
+        // in the store, or above the first row when it comes first (under
+        // the channel's "Load earlier messages", which is not a row).
+        let previous = null;
+        let added = null;
+        for (const m of records) {
+            const shown = onScreen.get(m.id);
+            if (shown) { previous = shown; continue; }
+            const row = build(m);
+            if (previous) previous.after(row);
+            else list.insertBefore(row, rows[0] ?? null);
+            previous = added = row;
+        }
         // A new day starts with a marker; one sent late above an earlier
         // day's message moves the marker below it.
         this._applyDayMarkers(list, records);
-        return true;
+        held?.();
+        const all = list.querySelectorAll("[data-msg-id]");
+        return all.length > 0 && all[all.length - 1] === added;
+    },
+
+    /** Keep what the reader is looking at in the message list where it is
+     *  while rows go in above it. A list scrolled to its bottom (as
+     *  _rebuildDetail reads it) stays at its bottom, as iOS anchors a
+     *  conversation to its bottom (.defaultScrollAnchor(.bottom)).
+     *  Otherwise the first row in view is measured now, and the returned
+     *  function scrolls the list by however far that row has moved since
+     *  (nothing when the browser's own scroll anchoring has already kept it
+     *  in place, or when it has not moved). Null when no row is in view. */
+    _holdView(list, rows) {
+        if (list.scrollHeight - list.scrollTop - list.clientHeight < 40) {
+            return () => { list.scrollTop = list.scrollHeight; };
+        }
+        const top = list.getBoundingClientRect().top;
+        const anchor = rows.find(r => r.getBoundingClientRect().bottom > top);
+        if (!anchor) return null;
+        const before = anchor.getBoundingClientRect().top;
+        return () => {
+            const moved = anchor.getBoundingClientRect().top - before;
+            if (moved) list.scrollTop += moved;
+        };
     },
 
     /** Bring the open DM's header and composer in line with the contact store.
@@ -7320,8 +7375,11 @@ const App = {
                     onClick: () => { this.state.showChannelInfo = true; this.state.channelInfoName = ch.channelName; this.render(); } }, "ℹ"),
             ),
 
-            // Messages, each first of its day under its date marker
+            // Messages, each first of its day under its date marker, under
+            // the control that pulls the next page of what the node
+            // deferred, by hand
             this._applyDayMarkers(h("div", { className: "message-list", id: "msg-list" },
+                this._buildChannelLoadMore(ch.channelName),
                 ...(msgs.length === 0
                     ? [h("div", { className: "empty-chat" },
                         h("p", {}, "No messages yet. Be the first to speak!"))]
@@ -7329,9 +7387,6 @@ const App = {
                         ? this._buildSystemMsg(m)
                         : this._buildMsgBubble(m, channelSenderLabel(ch.channelName, m)))),
             ), msgs),
-
-            // The next page of what the node deferred, by hand
-            this._buildChannelLoadMore(ch.channelName),
 
             // Composer
             h("div", { className: "composer" },
@@ -7356,18 +7411,23 @@ const App = {
     },
 
     /**
-     * The open channel's "Load more messages" control, under its messages:
-     * Channel.md /rfed/pull ("Client should display a 'load more' control
-     * if more_pending == true"), as Android and iOS page channel history by
-     * hand ("Load earlier messages", ConversationScreen.kt:739-760,
-     * ConversationView.swift:478-507). One click is one /channel/pull, the
-     * next page (RnsClient.pullChannel); while a pull runs it says
-     * "Loading…" and takes no click. The phones also show it before the
-     * first pull has answered; here every open pulls (openChannel), so it
-     * appears only once the node has said it holds more. Pulled posts are
-     * stored in the order they arrive, so they appear at the bottom, here.
-     * The slot is always present (hidden when there is nothing more), so
-     * _syncChannelLoadMore can replace it in place.
+     * The open channel's "Load earlier messages" control, at the top of its
+     * message list: Channel.md /rfed/pull ("Client should display a 'load
+     * more' control if more_pending == true"), as Android and iOS page
+     * channel history by hand, with the same words in the same place
+     * (ConversationScreen.kt:738-773, the list's top; ConversationView.swift
+     * :480-507). One click is one /channel/pull, the next page
+     * (RnsClient.pullChannel); while a pull runs it says "Loading…" and
+     * takes no click. The phones also show it before the first pull has
+     * answered; here every open pulls (openChannel), so it appears only once
+     * the node has said it holds more. The posts a pull brings carry their
+     * post times and go in among the messages of their time
+     * (_syncOpenChatMessages), above what the reader is looking at, which
+     * stays in view (_holdView), as iOS scrolls back to the first message
+     * it showed. Until 2026-10-01 posts were listed in the order they
+     * arrived, so the control sat under the list. The slot is always
+     * present (hidden when there is nothing more), so _syncChannelLoadMore
+     * can replace it in place; it is not a row ([data-msg-id]).
      */
     _buildChannelLoadMore(channelName) {
         const { inFlight, morePending } = RnsClient.channelPullState(channelName);
@@ -7377,12 +7437,12 @@ const App = {
                 className: "btn btn-secondary btn-sm",
                 disabled: inFlight,
                 onClick: () => RnsClient.pullChannel(channelName).catch(e =>
-                    console.warn(`[retichat] 📡 Load more for #${channelName} failed: ${e.message}`)),
-            }, inFlight ? "Loading…" : "Load more messages"),
+                    console.warn(`[retichat] 📡 Load earlier for #${channelName} failed: ${e.message}`)),
+            }, inFlight ? "Loading…" : "Load earlier messages"),
         );
     },
 
-    /** Bring the open channel's "Load more messages" control in line with
+    /** Bring the open channel's "Load earlier messages" control in line with
      *  its pull state (a pull started or completed), without touching the
      *  message list or the draft. */
     _syncChannelLoadMore() {
@@ -9001,7 +9061,7 @@ const App = {
             }
 
             // A channel pull started or completed: only the open channel's
-            // "Load more messages" control follows. The posts it brings each
+            // "Load earlier messages" control follows. The posts it brings each
             // come with their own event (channel-receive), below, so this one
             // leaves the list, the sidebar and the scroll position alone.
             if (msg.kind === "channel-pull-start" || msg.kind === "channel-pull-complete") {
@@ -9009,10 +9069,14 @@ const App = {
                 return;
             }
 
-            // New message (DM, distro, group or channel): append the bubbles
-            // that aren't on screen yet and repaint the sidebar for preview
-            // and ordering. Both are safe with a modal open, so unlike before
-            // a message arriving mid-dialog is no longer dropped from the UI.
+            // New message (DM, distro, group or channel): show the bubbles
+            // that aren't on screen yet, each at its place in the
+            // conversation's order, and repaint the sidebar for preview and
+            // ordering. Both are safe with a modal open, so unlike before a
+            // message arriving mid-dialog is no longer dropped from the UI.
+            // The list is followed down only when a message arrived at its
+            // bottom; one pulled late goes in above, and the reader's view
+            // stays where it was (_holdView).
             const appended = this._syncOpenChatMessages();
             // A channel post can carry a new Channel Display Name for a
             // sender whose earlier posts are on screen.

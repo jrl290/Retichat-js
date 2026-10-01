@@ -287,6 +287,8 @@ class El {
         return c;
     }
     remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; }
+    after(node) { const list = this.parent.children; node.parent = this.parent; list.splice(list.indexOf(this) + 1, 0, node); }
+    getBoundingClientRect() { return { top: 0, bottom: 0 }; }   // no layout here: message_order.test.mjs has one
     replaceWith(other) {
         const list = this.parent.children;
         list[list.indexOf(this)] = other;
@@ -418,10 +420,10 @@ test("the DM, group and channel lists label their rows; appends and rebuilt rows
         assert.match(body, /\), msgs\),\n/, `${view}: labelled from the records it shows`);
     }
     const sync = methodBody("_syncOpenChatMessages()");
-    const append = sync.indexOf("for (const m of missing) list.appendChild(build(m));");
-    assert.notEqual(append, -1);
+    const append = sync.indexOf("if (previous) previous.after(row);");
+    assert.notEqual(append, -1, "each new row goes in at its place (message_order.test.mjs)");
     assert.ok(sync.indexOf("this._applyDayMarkers(list, records);", append) > append,
-        "an append labels the whole list after it, as of now");
+        "a new row labels the whole list after it, as of now");
     assert.match(methodBody("render()"), /this\._dayStamp = dayStamp\(deviceDayContext\(\)\);/, "render() labels as of now");
 });
 
@@ -434,7 +436,7 @@ test("a message appended to the open chat (sent or received) is labelled, after 
         document: { getElementById: (id) => (id === "msg-list" ? stores.list : null) },
         GroupStore: { isGroupChat: () => false }, ChannelStore: { get: () => null },
         MsgStore: { get: () => records },
-    }, ["_syncOpenChatMessages()"]);
+    }, ["_syncOpenChatMessages()", "_holdView(list, rows)"]);
     self._buildMsgBubble = (m) => row(m);
     self.state.activeHash = "d".repeat(32);
     stores.list = self._applyDayMarkers(h("div", { id: "msg-list" }, ...records.map(row)), records);

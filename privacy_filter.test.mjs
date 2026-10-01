@@ -48,6 +48,7 @@ import Packet from "./lib/rns/packet.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import * as DN from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
+import { addInOrder } from "./lib/message_order.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -91,6 +92,7 @@ function compile(signature, env) {
     return (self) => (...args) => f(...names.map((n) => env[n]), self, ...args);
 }
 function build(name, env) {
+    env = { addInOrder, ...env };   // the message stores' order (lib/message_order.js)
     const names = Object.keys(env);
     return new Function(...names, `return ${objectLiteral(name)};`)(...names.map((n) => env[n]));
 }

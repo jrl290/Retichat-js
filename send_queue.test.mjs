@@ -29,6 +29,7 @@
  * Run: node --test send_queue.test.mjs
  */
 import { SendTransfers } from "./lib/send_progress.js";
+import { addInOrder } from "./lib/message_order.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -108,10 +109,10 @@ function makeClient({ storage = makeStorage(), contacts = [], groups = [], metho
     let clock = 1_000;
     const FakeDate = { now: () => ++clock };
     const Harness = { recordInbound() {}, event() {}, error() {} };
-    const MsgStore = new Function("sGet", "sSet", "Harness", "Date", `return ${extractObject("MsgStore")};`)(
-        storage.sGet, storage.sSet, Harness, FakeDate);
-    const GroupMsgStore = new Function("sGet", "sSet", "Date", `return ${extractObject("GroupMsgStore")};`)(
-        storage.sGet, storage.sSet, FakeDate);
+    const MsgStore = new Function("sGet", "sSet", "Harness", "Date", "addInOrder", `return ${extractObject("MsgStore")};`)(
+        storage.sGet, storage.sSet, Harness, FakeDate, addInOrder);
+    const GroupMsgStore = new Function("sGet", "sSet", "Date", "addInOrder", `return ${extractObject("GroupMsgStore")};`)(
+        storage.sGet, storage.sSet, FakeDate, addInOrder);
     const contactMap = new Map(contacts.map((c) => [c.destHash, c]));
     const ContactStore = {
         get: (h) => contactMap.get(h) ?? null,

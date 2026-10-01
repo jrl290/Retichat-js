@@ -7,6 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { addInOrder } from "./lib/message_order.js";
 
 export const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -63,8 +64,15 @@ export function install(self, env, signatures) {
     return self;
 }
 
+/** What the message stores (MsgStore, GroupMsgStore, ChannelMsgStore)
+ *  import from lib/ for their order (lib/message_order.js), bound under
+ *  every build unless `env` names it, so a store built here keeps the
+ *  shipped conversation order. */
+const STORE_IMPORTS = { addInOrder };
+
 /** An object literal (MsgStore, Harness, …) built over `env`. */
 export function build(name, env) {
+    env = { ...STORE_IMPORTS, ...env };
     const names = Object.keys(env);
     return new Function(...names, `return ${objectLiteral(name)};`)(...names.map((n) => env[n]));
 }

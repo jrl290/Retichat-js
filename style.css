@@ -1306,9 +1306,9 @@ a.msg-file:hover { border-color: var(--primary); }
     font-size: 14px;
 }
 
-/* A channel's "Load more messages" control (App._buildChannelLoadMore):
-   between the message list and the composer, while the node says it holds
-   more for this channel (Channel.md more_pending). */
+/* A channel's "Load earlier messages" control (App._buildChannelLoadMore):
+   the first item of its message list, above the messages, while the node
+   says it holds more for this channel (Channel.md more_pending). */
 .load-more {
     display: flex;
     justify-content: center;

@@ -29,6 +29,7 @@
  * Run: node --test exchange_truth.test.mjs
  */
 import { SendTransfers } from "./lib/send_progress.js";
+import { addInOrder } from "./lib/message_order.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -545,7 +546,7 @@ function makeDmClient(iface) {
     const sSet = (k, v) => data.set(k, JSON.stringify(v));
     const events = [];
     const Harness = { recordInbound() {}, event: (kind, detail) => events.push({ kind, detail }), error() {} };
-    const MsgStore = new Function("sGet", "sSet", "Harness", `return ${extractObject("MsgStore")};`)(sGet, sSet, Harness);
+    const MsgStore = new Function("sGet", "sSet", "Harness", "addInOrder", `return ${extractObject("MsgStore")};`)(sGet, sSet, Harness, addInOrder);
     const appTimers = [];
     const cleared = [];
     const propagationLinks = [];
@@ -663,7 +664,7 @@ function memoryStorage() {
 /** The real sendGroupMessage over the real GroupMsgStore; the fan-out is recorded, not run. */
 function makeGroupClient(iface) {
     const { sGet, sSet } = memoryStorage();
-    const GroupMsgStore = new Function("sGet", "sSet", `return ${extractObject("GroupMsgStore")};`)(sGet, sSet);
+    const GroupMsgStore = new Function("sGet", "sSet", "addInOrder", `return ${extractObject("GroupMsgStore")};`)(sGet, sSet, addInOrder);
     const group = { groupId: "9".repeat(32), groupName: "G", members: new Map() };
     const env = {
         GroupMsgStore, GroupStore: { get: (id) => (id === group.groupId ? group : null), _save() {} },
@@ -683,7 +684,7 @@ function makeGroupClient(iface) {
 /** The real sendChannelMessage over the real ChannelMsgStore; anything past the down check stops at the subscription. */
 function makeChannelClient(iface) {
     const { sGet, sSet } = memoryStorage();
-    const ChannelMsgStore = new Function("sGet", "sSet", `return ${extractObject("ChannelMsgStore")};`)(sGet, sSet);
+    const ChannelMsgStore = new Function("sGet", "sSet", "addInOrder", `return ${extractObject("ChannelMsgStore")};`)(sGet, sSet, addInOrder);
     const channel = { channelName: "general", channelHash: "c".repeat(32) };
     const env = {
         ChannelMsgStore, IdMgr: { has: true, hash: "a".repeat(32) },
