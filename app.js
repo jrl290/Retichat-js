@@ -519,14 +519,9 @@ const ContactStore = {
      * the user's own contacts. A hidden row (a group member's, a channel
      * poster's, a name-only one) does not: it was never a contact.
      *
-     * Consequence, open with James (2026-09-30): Android allowlisted every
-     * row, group members' included, and the phones allowlist every member
-     * of a group the user creates or accepts. A member of a group the user
-     * held before this migration keeps a hidden, not allowlisted row here,
-     * so its DMs are dropped (unproved) where a phone that accepted the
-     * same group keeps them. Members of groups created or accepted from now
-     * on are allowlisted (_acceptGroupInvite, group creation), as on the
-     * phones.
+     * Members of groups the user already held are allowlisted by a second,
+     * one-time step once the groups and this device's hash are loaded
+     * (allowHeldGroupMembers, from App.start).
      */
     init() {
         const data = sGet("contacts_v2");
@@ -576,6 +571,47 @@ const ContactStore = {
 
     /** Whether the user allowlisted `destHash` (allow()). */
     allowlisted(destHash) { return this._contacts.get(destHash)?.allowlisted === true; },
+
+    /**
+     * One-time step of the privacy filter's migration (James, 2026-09-30):
+     * the hidden rows of the members of every group the user holds as
+     * active (created or accepted) become allowlisted, as the phones
+     * allowlisted every member when the user created or accepted the group
+     * (iOS createGroupChat, ChatRepository.swift:2532-2536, and
+     * acceptGroupInvite, :1543-1548; Android allowlisted every contact row
+     * in NamesMigration.kt). Without it, a member of a group held before the
+     * filter could no longer send a DM here, where a phone in the same group
+     * still takes it. Since the filter, _acceptGroupInvite and group
+     * creation do this as they happen.
+     *
+     * Only hidden rows that hold what the client learned about a member:
+     * a pending group's members, a channel poster's row and a name-only row
+     * (a group sender's name, never a contact) stay as they are, and no row
+     * is created. `ownHashes` are this device's own hashes, never a contact.
+     *
+     * Runs once, for every user, whether or not the first step (listed rows,
+     * init()) ran in an earlier build: `groupMembersAllowlisted` records it,
+     * so a later run never allowlists a member the user met after it. A
+     * second run would change nothing anyway. Returns how many rows it
+     * allowlisted.
+     */
+    allowHeldGroupMembers(groups, ownHashes = []) {
+        if (sGet("groupMembersAllowlisted") === true) return 0;
+        let allowed = 0;
+        for (const g of groups) {
+            if (g.groupStatus !== "active") continue;
+            for (const hash of g.members.keys()) {
+                if (ownHashes.includes(hash)) continue;
+                const c = this._contacts.get(hash);
+                if (!c || !c.hidden || c.nameOnly || c.allowlisted === true) continue;
+                c.allowlisted = true;
+                allowed++;
+            }
+        }
+        if (allowed > 0) this._save();
+        sSet("groupMembersAllowlisted", true);
+        return allowed;
+    },
 
     /** The row for a peer the user has not added (a group member, a channel
      *  poster): created hidden when there is none, returned as it is when
@@ -1157,7 +1193,8 @@ GroupStore.init();
 //  another device" is strict): a distro identity transfer from a device
 //  that is neither allowlisted nor a co-member is dropped (the phones
 //  offer it whoever sent it). The user adds the sending device first, or
-//  turns the filter off, or the key is pasted (Identity, Import).
+//  turns the filter off; the Identity screen says so where the transfer is
+//  received (_buildDistroIdentitySection), or the key is pasted (Import).
 // =========================================================================
 const PrivacyFilter = {
     _on: true,
@@ -5956,6 +5993,10 @@ const App = {
 
         if (!IdMgr.load()) { this.state.view = "onboarding"; this.render(); return; }
         GroupStore.migrateOwnMemberHash();
+        // Once, now that the groups hold this device's delivery hash: the
+        // members of groups already held pass the privacy filter, as on the
+        // phones (ContactStore.allowHeldGroupMembers).
+        ContactStore.allowHeldGroupMembers(GroupStore.getAll(), [ownLxmfDestinationHash(), IdMgr.hash].filter(Boolean));
         this.state.view = "main";
         this.render();
         this._wire();
@@ -7668,6 +7709,17 @@ const App = {
                         onClick: () => this._showDistroImport() }, "📥 Import"),
                 ),
             );
+            // Receiving it from another device ("Add another device" there,
+            // RFed SPEC §17.9). The transfer comes from that device's own
+            // address, and the privacy filter drops it unseen unless that
+            // device is a contact here (PrivacyFilter: strict, James
+            // 2026-09-30), so say so where the user waits for it, and show
+            // the address the other device sends to.
+            section.appendChild(h("div", { className: "field-hint", id: "distro-receive-hint" },
+                "To receive it from another of your devices, first add that device as a contact here " +
+                "(or turn the Privacy filter off in Settings). Otherwise its transfer is dropped and nothing appears. " +
+                "Then, on that device, choose “Add another device” and send to this device's address:"));
+            section.appendChild(kvRow("This device", RnsClient.ownHash || ownLxmfDestinationHash(), { empty: "unavailable" }));
             return section;
         }
 

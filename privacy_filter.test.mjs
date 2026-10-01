@@ -22,6 +22,9 @@
  * the source is inside) and messages fetched from the propagation node
  * (still purged).
  *
+ * Also here: the migration's one-time allowlisting of held groups' members,
+ * and the Identity screen's hint for receiving a distro identity.
+ *
  * These run the real shipped code: lib/rns/lxmf/lxmf_router.js, and
  * ContactStore, GroupStore, PrivacyFilter, MsgStore, the router's message
  * handler, _fetchPropagatedMessages, sendMessage and _handleDistroBlob
@@ -825,6 +828,104 @@ test("migration: rows stored before the filter — listed ones become allowliste
     const again = stores(me, s).ContactStore;
     assert.deepEqual([a, b, c, d, e].map((h) => again.allowlisted(h)), [true, true, false, false, false], "a second load changes nothing");
     assert.deepEqual([c, d].map((h) => again.get(h).hidden), [true, true], "and lists nothing");
+});
+
+test("migration, once: hidden rows of members of groups held as active become allowlisted; pending groups', channel posters' and name-only rows do not", () => {
+    // As the phones allowlisted every member at create or accept (iOS
+    // createGroupChat / acceptGroupInvite, Android NamesMigration).
+    const me = Identity.create();
+    const ME = lxmfHash(me);
+    const row = (h, extra = {}) => ({ destHash: h, localName: null, messageName: null, messageNameAt: null, announceName: null,
+        legacyName: null, lastSeen: 1, hidden: true, nameOnly: false, ...extra });
+    const [created, accepted, pending, poster, nameOnly, listed, later] = ["1", "2", "3", "4", "5", "6", "7"].map((x) => x.repeat(32));
+    const group = (groupId, groupStatus, members) => ({ groupId, groupName: "G", groupStatus, lastActivity: 1,
+        members: [[ME, "accepted"], ...members].map(([hash, status]) => ({ hash, status })) });
+    const groups = [
+        group("a".repeat(32), "active", [[created, "invited"], [nameOnly, "accepted"], [listed, "accepted"]]),   // created here
+        group("b".repeat(32), "active", [[accepted, "accepted"]]),                                             // accepted here
+        group("c".repeat(32), "pending", [[pending, "accepted"]]),                                             // not accepted
+    ];
+    const contacts = (allowlistedKey) => [
+        row(created), row(accepted), row(pending), row(poster), row(nameOnly, { nameOnly: true }),
+        row(listed, { hidden: false }), row(ME),
+    ].map((c) => (allowlistedKey ? { ...c, allowlisted: false } : c));
+
+    // A user who already ran round 2's migration (every row has the key),
+    // and one who runs both now (no row has it).
+    for (const ranFirstStep of [true, false]) {
+        const s = memory();
+        s.sSet("contacts_v2", contacts(ranFirstStep));
+        s.sSet("groups_v1", groups);
+        const { ContactStore, GroupStore } = stores(me, s);
+        assert.equal(ContactStore.allowHeldGroupMembers(GroupStore.getAll(), [ME]), 2, `allowlisted two (first step ran before: ${ranFirstStep})`);
+        const allowed = (h) => ContactStore.allowlisted(h);
+        assert.deepEqual([created, accepted].map(allowed), [true, true], "members of groups held as active");
+        assert.deepEqual([pending, poster, nameOnly, ME].map(allowed), [false, false, false, false],
+            "a pending group's member, a channel poster, a name-only row and this device stay as they are");
+        assert.equal(allowed(listed), !ranFirstStep, "a listed row is the first step's (allowlisted only when it ran now)");
+        assert.deepEqual([created, accepted].map((h) => ContactStore.get(h).hidden), [true, true], "and lists nothing");
+        assert.equal(s.sGet("groupMembersAllowlisted"), true);
+
+        // Once: a member met afterwards is not allowlisted by a later load.
+        ContactStore.keep(later);
+        GroupStore.updateMember("b".repeat(32), later, "accepted");
+        const again = stores(me, s);
+        assert.equal(again.ContactStore.allowHeldGroupMembers(again.GroupStore.getAll(), [ME]), 0);
+        assert.deepEqual([created, accepted, later].map((h) => again.ContactStore.allowlisted(h)), [true, true, false], "persisted, and run once");
+    }
+
+    // App.start runs it once the identity is loaded and the groups hold
+    // this device's delivery hash, with both of this device's hashes.
+    const start = methodBody("async start()");
+    const own = start.indexOf("GroupStore.migrateOwnMemberHash();");
+    const step = start.indexOf("ContactStore.allowHeldGroupMembers(GroupStore.getAll(), [ownLxmfDestinationHash(), IdMgr.hash].filter(Boolean));");
+    assert.ok(own > start.indexOf("IdMgr.load()") && step > own, "after IdMgr.load() and migrateOwnMemberHash()");
+    assert.ok(step < start.indexOf("ActiveTab.start"), "before the first message can arrive");
+});
+
+test("the Identity screen says where a distro identity is received: add the sending device first, and this device's address", () => {
+    // "Add another device" onto the web is strict (James, 2026-09-30): the
+    // transfer comes from the other device's own address, which the filter
+    // drops unless that device is a contact here.
+    class El {
+        constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.style = {}; this.className = ""; }
+        appendChild(c) { this.children.push(c); return c; }
+        setAttribute(k, v) { this.attrs[k] = String(v); }
+        addEventListener() {}
+        get text() { return this.children.map((c) => (c instanceof El ? c.text : c.textContent)).join(" "); }
+        find(pred) {
+            for (const c of this.children) {
+                if (!(c instanceof El)) continue;
+                if (pred(c)) return c;
+                const f = c.find(pred);
+                if (f) return f;
+            }
+            return null;
+        }
+    }
+    const document = { createElement: (tag) => new El(tag), createTextNode: (text) => ({ textContent: text }) };
+    const h = fn("h", "tag, a={}, ...kids", { document });
+    const kvRow = fn("kvRow", "key, value, opts = {}", { h, navigator: {}, setTimeout });
+    const OWN = "0123456789abcdef0123456789abcdef";
+    const section = (DistroManager, ownHash = OWN) => compile("_buildDistroIdentitySection()", {
+        h, kvRow, DistroManager, RnsClient: { ownHash }, ownLxmfDestinationHash: () => OWN,
+    })({ state: {} })();
+
+    const receive = section({ has: false });
+    const hint = receive.find((c) => c.attrs.id === "distro-receive-hint");
+    assert.ok(hint, "a hint where the user receives it (no distro identity yet: Generate / Import)");
+    assert.match(hint.text, /first add that device as a contact here/);
+    assert.match(hint.text, /turn the Privacy filter off/);
+    assert.match(hint.text, /dropped and nothing appears/);
+    assert.match(hint.text, /“Add another device”/, "named as the phones and this page name it");
+    const address = receive.find((c) => c.className === "kv-row" && /This device/.test(c.text));
+    assert.ok(address, "this device's address, to give the other device");
+    assert.match(address.text, new RegExp(OWN));
+    assert.match(section({ has: false }, null).find((c) => c.className === "kv-row" && /This device/.test(c.text)).text,
+        new RegExp(OWN), "before the router is up, from the identity");
+
+    const sending = section({ has: true, lxmfDeliveryHash: "d".repeat(32), hash: "e".repeat(32), pubKey: "f".repeat(128), exportLxmaUri: () => "lxma://x" });
+    assert.equal(sending.find((c) => c.attrs.id === "distro-receive-hint"), null, "not on the sending side");
 });
 
 test("the user allowlists a peer by adding it, writing to it, or creating a group with it", () => {
