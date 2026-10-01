@@ -1490,3 +1490,13 @@ a.msg-file:hover { border-color: var(--primary); }
 }
 .channel-name-actions { margin-top: 10px; }
 .channel-name-actions .btn.copied { color: var(--success); }
+
+/* Why Settings refused a value (App._saveSettings): shown under its field
+   until the field is edited; takes no room while empty. */
+.settings-field .field-error {
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--danger);
+    margin-top: 4px;
+}
+.settings-field .field-error:empty { display: none; }

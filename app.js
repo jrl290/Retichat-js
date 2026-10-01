@@ -63,6 +63,7 @@ import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } fr
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
+import { exchangeUrlRefusal } from "./lib/connect_policy.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
@@ -319,6 +320,51 @@ async function loadConfig() {
     cfg.rfedNodePubKey = sGet("rfedNodePubKey") || "";
     return cfg;
 }
+
+/**
+ * What this page's Content-Security-Policy lets it connect to, for Settings
+ * (App._saveSettings): an exchange URL it does not allow is refused when
+ * entered, with the reason, since the page would otherwise sit offline
+ * with nothing to say why (the browser refuses each request before it is
+ * sent). The policy is the header the page is served with, read by
+ * fetching the page's own URL again (same origin, which every policy here
+ * allows), so it is the nodes' .htaccess line as served and cannot drift
+ * from it; the rules are lib/connect_policy.js. A page served with none (a
+ * local server) refuses nothing. Read once per page load, when an exchange
+ * URL is first changed. A read that fails (no answer, or not a 2xx: Apache
+ * sets the header on successful responses only) decides nothing and is not
+ * kept: the change is refused with that reason, and the next Save reads
+ * again.
+ */
+const PagePolicy = {
+    _header: undefined,   // the policy header; null when the page is served with none
+
+    /** The Content-Security-Policy header the page is served with, or
+     *  null. Rejects when its own server does not answer with a 2xx. */
+    async header() {
+        if (this._header !== undefined) return this._header;
+        const started = Date.now();
+        const resp = await fetch(location.href, { cache: "no-store" });
+        resp.body?.cancel().catch(() => {});
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        if (Date.now() - started > 5000) console.error(`[settings] §1: reading this page's Content-Security-Policy took ${Date.now() - started} ms (a late success is a failure)`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        this._header = resp.headers.get("content-security-policy");
+        return this._header;
+    },
+
+    /** Why the exchange at `exchangeUrl` cannot be used from this page, or
+     *  null when it can (exchangeUrlRefusal). */
+    async exchangeRefusal(exchangeUrl) {
+        let header;
+        try {
+            header = await this.header();
+        } catch (e) {
+            return `Could not check the exchange URL against this page's Content-Security-Policy: the page's own server did not answer (${e?.message || e}). Not saved.`;
+        }
+        return exchangeUrlRefusal(exchangeUrl, header, location.href);
+    },
+};
 
 // =========================================================================
 //  STORE — localStorage helpers
@@ -7954,9 +8000,12 @@ const App = {
                 h("div", { className: "settings-field" },
                     h("label", { htmlFor: "cfg-exchange" }, "HTTP exchange URL"),
                     h("input", { id: "cfg-exchange", type: "text", value: cfg.exchangeUrl || "",
-                        placeholder: "https://your-host.com/reticulum" }),
+                        placeholder: "https://your-host.com/reticulum",
+                        onInput: () => { const el = document.getElementById("cfg-exchange-refusal"); if (el) el.textContent = ""; } }),
                     h("div", { className: "field-hint" },
                         "HTTP POST polling — no WebSocket or open ports needed."),
+                    // Why Save refused the URL (PagePolicy), until it is edited.
+                    h("div", { className: "field-error", id: "cfg-exchange-refusal", role: "alert" }),
                 ),
             ),
         );
@@ -8179,6 +8228,19 @@ const App = {
 
     async _saveSettings() {
         const exchangeUrl = document.getElementById("cfg-exchange")?.value?.trim();
+        // A new exchange URL that this page's Content-Security-Policy does
+        // not let it connect to is refused, and nothing is saved: the page
+        // would otherwise sit offline with nothing to say why (PagePolicy).
+        // The reason shows under the field until it is edited.
+        if (exchangeUrl && exchangeUrl !== RnsClient._cfg?.exchangeUrl) {
+            const refusal = await PagePolicy.exchangeRefusal(exchangeUrl);
+            if (refusal) {
+                console.warn(`[settings] exchange URL ${exchangeUrl} refused: ${refusal}`);
+                const el = document.getElementById("cfg-exchange-refusal");
+                if (el) el.textContent = refusal;
+                return;
+            }
+        }
         // The names apply on their own, when each field changes (§6); a
         // pending edit still in a focused field is applied here too.
         const names = [["cfg-announce-name", "setAnnounce"], ["cfg-message-name", "setMessage"], ["cfg-channel-name", "setChannel"]];
