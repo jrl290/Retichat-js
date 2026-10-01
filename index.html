@@ -15,6 +15,12 @@
         Import map: redirects Node.js built-in module imports to browser
         polyfills served from CDN (esm.sh). No npm, no build step, no tooling.
         Just copy this folder to any static web server.
+
+        msgpackr is its no-eval build (the package's "./index-no-eval"
+        export): the same code with its one `new Function` replaced, so the
+        page evaluates no string and its Content-Security-Policy (.htaccess)
+        needs no 'unsafe-eval'. Changing a byte of the map below changes the
+        hash that policy must carry (content_security_policy.test.mjs).
     -->
     <script type="importmap">
     {
@@ -23,7 +29,7 @@
             "buffer": "https://esm.sh/buffer@6.0.3",
             "@noble/curves/": "https://esm.sh/@noble/curves@1.6.0/",
             "@noble/hashes/": "https://esm.sh/@noble/hashes@1.7.1/",
-            "msgpackr": "https://esm.sh/msgpackr@1.11.2",
+            "msgpackr": "https://esm.sh/msgpackr@1.11.2/index-no-eval",
             "aes-js": "https://esm.sh/aes-js@3.1.2",
             "net": "./lib/shims/net.js",
             "ws": "./lib/shims/ws.js"

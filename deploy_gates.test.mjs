@@ -505,8 +505,9 @@ describe("deploy gates", { concurrency: 2 }, () => {
         });
 
         chromiumTest("boot gate: a string evaluated under a policy without 'unsafe-eval' is a violation, even one the page catches", async (t) => {
-            // What msgpackr does at load (unpack.mjs: new Function('') in a
-            // try), which is why the page's policy carries 'unsafe-eval'.
+            // What msgpackr's default build does at load (unpack.mjs: new
+            // Function('') in a try), which is why the page's importmap names
+            // its no-eval build and the policy carries no 'unsafe-eval'.
             const r = await booted(t, goodSite(scratch("boot-csp-eval"), { "app.js": `try { new Function(""); } catch (e) {}\n${RENDER}` }));
             if (!r) return;
             assert.equal(r.code, 1, r.out);

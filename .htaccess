@@ -85,15 +85,14 @@ RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
 #                           'unsafe-inline' (the page has no other inline
 #                           script). The hash is of the importmap's exact
 #                           text: change a byte of it and the hash here must
-#                           change too (module_graph.test.mjs checks they
-#                           agree). 'unsafe-eval' because msgpackr evaluates:
-#                           at load it tries `new Function('')` to learn
-#                           whether it may build its record readers that way
-#                           (esm.sh msgpackr@1.11.2 unpack.mjs). It catches
-#                           the refusal and carries on without them, but the
-#                           refusal is a violation in every tab's console on
-#                           every load, and the boot gate fails on any
-#                           violation. No code of ours evaluates a string.
+#                           change too (content_security_policy.test.mjs
+#                           checks they agree and prints the hash). No
+#                           'unsafe-eval': nothing the page runs evaluates a
+#                           string. msgpackr's default build would (at load
+#                           it tries `new Function('')`, a violation even
+#                           though it catches the refusal), so the importmap
+#                           names its no-eval build (index-no-eval), the same
+#                           code with that call replaced.
 #   style-src 'self'        style.css; the app sets styles through the DOM
 #                           (el.style), which a policy does not restrict
 #   img-src, media-src      this origin and the object URLs (blob:) attachments
@@ -113,7 +112,7 @@ RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
 # deployed. verify-deploy.sh does not yet check that the header is live.
 <IfModule mod_headers.c>
   <Files "index.html">
-    Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'sha256-IbbZfblD0wDC391LFBjVOBb4HW+qfutKAfnuqxf8XBA=' https://esm.sh; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https://retichat.com/reticulum/ https://selectivesubconscious.com/reticulum/ https://esm.sh; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-Eyd3KhCPggb2Qnt8eEr1TDRiz/Oyc/+my5Z9xS6kLpA=' https://esm.sh; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https://retichat.com/reticulum/ https://selectivesubconscious.com/reticulum/ https://esm.sh; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
   </Files>
 </IfModule>
 

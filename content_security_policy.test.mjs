@@ -7,6 +7,11 @@
  *     exact text; no 'unsafe-inline', and index.html has no other inline
  *     script. Change a byte of the importmap and this test says which hash
  *     the policy must carry;
+ *   - no 'unsafe-eval': the importmap names msgpackr's no-eval build, which
+ *     is the default build's code with its `new Function` calls replaced and
+ *     which, unlike the default, attempts no string evaluation at load or
+ *     while reading; the harness pages (debug.html, debug-standalone.html)
+ *     map every module as index.html does, so they run the build it ships;
  *   - the directives the page needs and the walls it must keep (object-src,
  *     base-uri, frame-ancestors, img/media for attachment blobs, connect-src
  *     for this origin, each production node's exchange and esm.sh);
@@ -23,6 +28,9 @@ import test from "node:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import vm from "node:vm";
 
 const read = (f) => readFileSync(new URL(`./${f}`, import.meta.url), "utf8");
 const htaccess = read(".htaccess");
@@ -62,8 +70,82 @@ test("script-src: this origin, exactly the importmap's hosts, and the inline imp
     assert.deepEqual(hosts, ["https://esm.sh"], "(the importmap's hosts today)");
     const sources = scriptSrc.filter((s) => !s.startsWith("'"));
     assert.deepEqual(sources.sort(), hosts, "script-src names exactly those hosts");
-    assert.deepEqual(scriptSrc.filter((s) => s.startsWith("'") && !s.startsWith("'sha")).sort(), ["'self'", "'unsafe-eval'"],
-        "this origin, and eval for msgpackr's probe (see .htaccess)");
+    assert.deepEqual(scriptSrc.filter((s) => s.startsWith("'") && !s.startsWith("'sha")), ["'self'"],
+        "this origin; no 'unsafe-eval' (msgpackr is its no-eval build, below)");
+});
+
+/** The importmap of an HTML page in this repo, parsed. */
+const importmap = (page) => JSON.parse(read(page).match(/<script type="importmap">([\s\S]*?)<\/script>/)[1]).imports;
+
+test("msgpackr is its no-eval build, at the version the suite tests; the harness pages map every module as the app does", () => {
+    const url = importmap("index.html").msgpackr;
+    const m = url.match(/^https:\/\/esm\.sh\/msgpackr@([\d.]+)\/index-no-eval$/);
+    assert.ok(m, `the importmap's msgpackr is the package's "./index-no-eval" export, not ${url}`);
+    const pinned = JSON.parse(read("package.json")).devDependencies.msgpackr;
+    assert.equal(m[1], pinned, "the version package.json pins, which node_modules holds and the suite tests");
+    assert.equal(JSON.parse(readFileSync(join(msgpackrDir(), "package.json"), "utf8")).version, pinned);
+    // debug.html says it carries an "Identical import map to index.html: the
+    // harness runs the REAL stack", and debug-standalone.html loads the same
+    // stack: neither may run a different build of anything.
+    for (const page of ["debug.html", "debug-standalone.html"]) {
+        assert.deepEqual(importmap(page), importmap("index.html"), `${page} maps every module as index.html does`);
+    }
+});
+
+/** node_modules/msgpackr. */
+const msgpackrDir = () => dirname(dirname(createRequire(import.meta.url).resolve("msgpackr/index-no-eval")));
+
+/**
+ * Load a UMD build of msgpackr into a realm that refuses string evaluation
+ * as the page's policy does: `Function` there throws, as a CSP without
+ * 'unsafe-eval' makes it, and counts each attempt. Then pack and read back
+ * an LXMF-shaped payload and a run of plain objects (msgpackr's records,
+ * whose reader the default build compiles with `new Function`, where it may,
+ * once it has read the same shape twice). Returns the attempts and the
+ * read-back values as JSON text.
+ */
+function underNoEval(file) {
+    const context = vm.createContext({ exports: {}, module: {}, TextDecoder, TextEncoder, attempts: 0 });
+    vm.runInContext(`Function = new Proxy(Function, {
+        construct() { attempts++; throw new EvalError("refused: no 'unsafe-eval'"); },
+        apply() { attempts++; throw new EvalError("refused: no 'unsafe-eval'"); },
+    });`, context);
+    vm.runInContext(readFileSync(join(msgpackrDir(), file), "utf8"), context, { filename: file });
+    const out = vm.runInContext(`(() => {
+        const p = new exports.Packr({ mapsAsObjects: false });
+        const title = new Uint8Array([0x68, 0x69]);
+        const fields = new Map([[0xD1, new Map([[0, "Zoë, a name of more than sixteen bytes"]])], [5, [[ "a.jpg", new Uint8Array(3) ]]]]);
+        const lxmf = p.unpack(p.pack([1790000000.25, title, new Uint8Array([0xe2, 0x82, 0xac]), fields]));
+        const records = [];
+        for (let i = 0; i < 5; i++) records.push(p.unpack(p.pack({ seq: i, text: "same shape" })));
+        return JSON.stringify([lxmf[0], [...lxmf[1]], [...lxmf[2]], [...lxmf[3].get(0xD1)], lxmf[3].get(5)[0][0], records],
+            (k, v) => v instanceof Map ? [...v] : v);
+    })()`, context);
+    return { attempts: context.attempts, out };
+}
+
+test("msgpackr's no-eval build: the default build's code with only its string evaluation removed, and it never attempts one", (t) => {
+    const dist = (f) => readFileSync(join(msgpackrDir(), "dist", f), "utf8").replace(/\n\/\/# sourceMappingURL=.*\n?$/, "\n");
+    const noEval = dist("index-no-eval.cjs");
+    // Undo the build's one edit (rollup replace: Function -> "BlockedFunction ",
+    // msgpackr rollup.config.js) at the evaluation sites only.
+    const undone = noEval
+        .replace(/^\s*var BlockedFunction;.*\n/m, "")
+        .replaceAll("new BlockedFunction (", "new Function(");
+    assert.equal(undone, dist("index.js"),
+        "apart from its `new Function` calls, the no-eval build is the default build, line for line");
+    assert.equal((noEval.match(/new BlockedFunction \(/g) ?? []).length, 2, "the probe at load and the record reader");
+    assert.doesNotMatch(noEval, /\bnew Function\b|\bFunction\s*\(|\beval\s*\(/, "no evaluation left");
+
+    // Run both where evaluation is refused, as under the page's policy.
+    const plain = underNoEval("dist/index.js");
+    const safe = underNoEval("dist/index-no-eval.cjs");
+    t.diagnostic(`evaluation attempts: default build ${plain.attempts}, no-eval build ${safe.attempts}; read back ${safe.out}`);
+    assert.equal(plain.attempts, 1, "the premise: the default build tries once, at load, a violation under the policy even though it "
+        + "catches the refusal (and, refused, never compiles a record reader)");
+    assert.equal(safe.attempts, 0, "the no-eval build never tries, at load or reading records");
+    assert.equal(safe.out, plain.out, "and both read back the same values");
+    assert.match(safe.out, /Zoë, a name of more than sixteen bytes/);
 });
 
 test("the walls and what the page needs: objects, base, framing, forms, styles, attachment blobs, the exchanges", () => {
