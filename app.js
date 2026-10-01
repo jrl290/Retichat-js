@@ -1631,6 +1631,11 @@ const RnsClient = {
     _distroRegistrationOwed: null,
     _pageHooks: null,
     _rfedOpenedChannelHashes: new Set(),
+    // The name of the channel whose screen is open, or null: the UI's to
+    // say (App._wire sets it). A page event and a new rfed.link pull that
+    // channel alone, as the phones pull a channel only while its screen is
+    // open (_pullChannelOnScreen).
+    channelOnScreen: () => null,
     // channelHash → { inFlight, morePending, gen }: gen is the rfed.link
     // generation of the last pull that completed.
     _rfedPullState: new Map(),
@@ -2232,7 +2237,9 @@ const RnsClient = {
      * The page is back (online, visible, or restored from the cache), or
      * the exchange is (_followExchange): arm every persistent link's
      * one-shot re-open, re-drive the ones that are down, and collect what
-     * the node deferred meanwhile on the ones that are up. A link that is
+     * the node deferred meanwhile on the ones that are up: the distro's,
+     * the propagation node's, and the channel on screen's (a channel opened
+     * earlier and left is pulled when it is opened again). A link that is
      * coming up, or STALE and waiting on its keepalive watchdog, is left
      * alone: its "established" pulls, and a second link would break rfed's
      * one binding per subscriber. Only the tab holding the identity does
@@ -2255,12 +2262,12 @@ const RnsClient = {
             return;
         }
 
-        // rfed.link: pull the opened channels and the distro (Android
+        // rfed.link: pull the channel on screen and the distro (Android
         // ON_RESUME, iOS scenePhase .active), or bring the link back, whose
         // "established" does the same (_onRfedLinkEstablished).
         const link = this._rfedLinks.get("link");
         if (link?.status === Link.ACTIVE) {
-            this._pullOpenedChannels(trigger);
+            this._pullChannelOnScreen(trigger);
             if (DistroManager.has) this._pullDistroMessages();
         } else {
             this._redriveRfedLink("link", trigger);
@@ -4639,10 +4646,13 @@ const RnsClient = {
      *   2. then two orders that depend on nothing of each other's (§5
      *      allows fan-out only between those), each pulling once its own
      *      bindings have answered:
-     *      - channels: /channel/stream/open for every opened channel, then
-     *        /channel/pull for each (iOS and Android pull once per fresh
-     *        rfed link: Android ConversationScreen.kt:603-615, iOS
-     *        ConversationView.swift:596-612);
+     *      - channels: /channel/stream/open for every opened channel, so
+     *        each one's live posts come again, then /channel/pull for the
+     *        one on screen (iOS and Android pull once per fresh rfed link
+     *        while a channel's screen is open: Android
+     *        ConversationScreen.kt:603-616, iOS ConversationView.swift
+     *        :596-612); a channel opened earlier is pulled when it is
+     *        opened again (openChannel);
      *      - the distro: /propagation/stream/open (distro push) and the
      *        registration when it is owed (_registerOwedDistro: one that
      *        failed with an earlier link, or was refused, goes again once
@@ -4676,7 +4686,7 @@ const RnsClient = {
             Promise.allSettled([
                 this._rebindChannelStream(),
             ]).then(() => {
-                if (current()) this._pullOpenedChannels("new rfed.link", generation);
+                if (current()) this._pullChannelOnScreen("new rfed.link", generation);
             }),
         ]);
     },
@@ -4768,18 +4778,25 @@ const RnsClient = {
         return configured;
     },
 
-    /** /channel/pull every opened channel (one pull per channel at a time:
-     *  pullChannel's in-flight guard). With `generation`, a channel already
-     *  pulled on that rfed.link generation (openChannel got there first) is
-     *  not pulled again; a page resume pulls them all, as Android's
-     *  ON_RESUME does. */
-    _pullOpenedChannels(trigger, generation = null) {
-        for (const ch of ChannelStore.getAll()) {
-            if (!ch.isSubscribed || !this._rfedOpenedChannelHashes.has(ch.channelHash)) continue;
-            if (generation !== null && this._rfedPullState.get(ch.channelHash)?.gen === generation) continue;
-            this.pullChannel(ch.channelName).catch(e =>
-                console.warn(`[retichat] 📡 Channel pull for #${ch.channelName} (${trigger}) failed: ${e.message}`));
-        }
+    /**
+     * /channel/pull the channel on screen (channelOnScreen), if one is open
+     * and subscribed, and nothing else: Android pulls on ON_RESUME and on
+     * each new rfed link generation only from the channel's own screen
+     * (ConversationScreen.kt:603-635), iOS from its channel view
+     * (ConversationView.swift:596-612). One pull per channel at a time
+     * (pullChannel's in-flight guard). With `generation`, a channel already
+     * pulled on that rfed.link generation (openChannel got there first) is
+     * not pulled again; a page resume pulls it whatever the generation, as
+     * Android's ON_RESUME does. Until 2026-10-01 these events pulled every
+     * channel opened this session.
+     */
+    _pullChannelOnScreen(trigger, generation = null) {
+        const name = this.channelOnScreen();
+        const ch = name ? ChannelStore.get(name) : null;
+        if (!ch || !ch.isSubscribed || !this._rfedOpenedChannelHashes.has(ch.channelHash)) return;
+        if (generation !== null && this._rfedPullState.get(ch.channelHash)?.gen === generation) return;
+        this.pullChannel(ch.channelName).catch(e =>
+            console.warn(`[retichat] 📡 Channel pull for #${ch.channelName} (${trigger}) failed: ${e.message}`));
     },
 
     /** The key of the link a request on (aspects, path) travels on: rfed.link
@@ -5648,8 +5665,9 @@ const RnsClient = {
         // One page on every explicit open, as Android and iOS pull when the
         // channel screen opens (ConversationScreen.kt:603-615 and
         // ConversationView.swift:596-612: their per-screen generation guard
-        // starts empty on each open); a new rfed.link pulls each opened
-        // channel once more (_onRfedLinkEstablished). The pages after the
+        // starts empty on each open); a new rfed.link, or the page coming
+        // back, pulls it once more while it is on screen
+        // (_pullChannelOnScreen). The pages after the
         // first are the user's: "Load earlier messages" (pullChannel). Until
         // 2026-09-30 a channel was pulled at most once per page load, then
         // at most once per rfed.link generation, opens included.
@@ -5689,7 +5707,7 @@ const RnsClient = {
      * whole deferred queue after an idle gap. /distro/pull, which is message
      * delivery and not history, still follows it (_pullDistroMessages). The
      * rfed.link generation of a completed pull is recorded
-     * (_pullOpenedChannels). Resolves to whether the node holds more.
+     * (_pullChannelOnScreen). Resolves to whether the node holds more.
      */
     async pullChannel(channelName) {
         const channel = ChannelStore.get(channelName);
@@ -9104,6 +9122,10 @@ const App = {
     // ===== REACTIVE WIRING =====
 
     _wire() {
+        // The channel on screen: the one a page event or a new rfed.link
+        // pulls (RnsClient._pullChannelOnScreen).
+        RnsClient.channelOnScreen = () => (this.state.activeHash && ChannelStore.get(this.state.activeHash) ? this.state.activeHash : null);
+
         // The announce interval came round: the date markers' day may have
         // turned with nothing else happening (an idle tab left open across
         // midnight). The page's one interval, not a timer of its own.

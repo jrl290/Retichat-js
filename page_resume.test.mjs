@@ -124,7 +124,7 @@ function makeResume({ rfedLink = null, propLink = null, distro = true, held = tr
         _rfedReopenArmed: new Set(),
         _propReopenArmed: false,
         _propLink: propLink,
-        _pullOpenedChannels: (trigger) => calls.push(`pull channels (${trigger})`),
+        _pullChannelOnScreen: (trigger) => calls.push(`pull channel on screen (${trigger})`),
         _pullDistroMessages: () => calls.push("pull distro"),
         _redriveRfedLink: (key, trigger) => calls.push(`redrive ${key} (${trigger})`),
         _fetchPropagatedMessages: () => calls.push("fetch propagated"),
@@ -135,10 +135,10 @@ function makeResume({ rfedLink = null, propLink = null, distro = true, held = tr
     return { self, calls };
 }
 
-test("a resume with the links up pulls: the opened channels, the distro, and the propagation node", () => {
+test("a resume with the links up pulls: the channel on screen, the distro, and the propagation node", () => {
     const { self, calls } = makeResume({ rfedLink: { status: Link.ACTIVE }, propLink: { status: Link.ACTIVE } });
     self._onPageResume("visible");
-    assert.deepEqual(calls, ["pull channels (visible)", "pull distro", "fetch propagated"]);
+    assert.deepEqual(calls, ["pull channel on screen (visible)", "pull distro", "fetch propagated"]);
     assert.deepEqual([...self._rfedReopenArmed].sort(), [...RFED_PERSISTENT_KEYS].sort(), "every persistent link's re-open is armed");
     assert.equal(self._propReopenArmed, true);
 });
@@ -158,7 +158,7 @@ test("a resume with the links down re-drives them; their \"established\" pulls",
 test("no distro, no distro pull", () => {
     const { self, calls } = makeResume({ rfedLink: { status: Link.ACTIVE }, propLink: { status: Link.ACTIVE }, distro: false });
     self._onPageResume("visible");
-    assert.deepEqual(calls, ["pull channels (visible)", "fetch propagated"]);
+    assert.deepEqual(calls, ["pull channel on screen (visible)", "fetch propagated"]);
 });
 
 test("a resume while the exchange is still down arms the links and does nothing else; the exchange's return does the rest", () => {
@@ -185,6 +185,50 @@ test("a tab without the lock, or a stopped connection, does nothing on resume", 
     const stopped = makeResume({ connected: false });
     stopped.self._onPageResume("online");
     assert.deepEqual(stopped.calls, []);
+});
+
+test("every page event pulls the channel on screen only, not every channel opened this session (Android ON_RESUME, iOS .active)", () => {
+    // Android pulls on ON_RESUME from the channel's own screen
+    // (ConversationScreen.kt:618-635), iOS from its channel view: a channel
+    // opened earlier and left is pulled when it is opened again. Until
+    // 2026-10-01 each event pulled every channel opened this session.
+    const rows = ["alpha", "beta", "gamma", "left"].map((name) => ({
+        channelName: name, channelHash: Buffer.from(name.padEnd(16, "_")).toString("hex"), isSubscribed: name !== "left" }));
+    const ChannelStore = { get: (name) => rows.find((r) => r.channelName === name) ?? null, getAll: () => rows };
+    const pulls = [];
+    const screen = { name: "beta" };
+    const self = {
+        _rns: {},
+        _exchangeIsDown: () => false,
+        _rfedLinks: new Map([["link", { status: Link.ACTIVE }]]),
+        _rfedReopenArmed: new Set(),
+        _propReopenArmed: false,
+        _propLink: null,
+        _rfedOpenedChannelHashes: new Set(rows.filter((r) => r.channelName !== "gamma").map((r) => r.channelHash)),
+        _rfedPullState: new Map(),
+        channelOnScreen: () => screen.name,
+        pullChannel: async (name) => { pulls.push(name); },
+        _pullDistroMessages: () => {},
+        _redrivePropagationLink: () => {},
+    };
+    const env = { ActiveTab: { held: true }, DistroManager: { has: false }, Link, RFED_PERSISTENT_KEYS, ChannelStore, console: quiet };
+    self._pullChannelOnScreen = compile("_pullChannelOnScreen(trigger, generation = null)", env)(self);
+    self._onPageResume = compile("_onPageResume(trigger)", env)(self);
+
+    for (const trigger of ["visible", "online", "pageshow", "exchange back"]) self._onPageResume(trigger);
+    assert.deepEqual(pulls, ["beta", "beta", "beta", "beta"], "beta, on screen, once per event; alpha, opened earlier, never");
+
+    pulls.length = 0;
+    for (const [name, why] of [[null, "no channel on screen (a DM or the chat list)"], ["gamma", "a channel never opened"],
+        ["left", "a channel left (not subscribed)"], ["nosuch", "a name that is no channel"]]) {
+        screen.name = name;
+        self._onPageResume("visible");
+        assert.deepEqual(pulls, [], why);
+    }
+
+    // The UI says which channel is on screen: the open chat, when it is a channel.
+    assert.match(extractMethod("_wire()"),
+        /RnsClient\.channelOnScreen = \(\) => \(this\.state\.activeHash && ChannelStore\.get\(this\.state\.activeHash\) \? this\.state\.activeHash : null\);/);
 });
 
 /** _followExchange over a stand-in exchange that emits as PostInterface does. */

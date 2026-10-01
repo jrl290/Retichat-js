@@ -227,7 +227,7 @@ function compileMethod(signature, env) {
 const PERSISTENT_METHODS = [
     "_ensureRfedLink(aspects)", "_rfedPersistentBound(key)", "async _onRfedLinkEstablished(key, link)",
     "_onRfedLinkClosed(key, link)", "_redriveRfedLink(key, trigger)", "_rebindChannelStream()",
-    "_pullOpenedChannels(trigger, generation = null)", "_rfedLinkKeyFor(aspects, path)", "_closeRefusedRfedLink(key, what)",
+    "_pullChannelOnScreen(trigger, generation = null)", "_rfedLinkKeyFor(aspects, path)", "_closeRefusedRfedLink(key, what)",
     "_rfedDeferUntilAnnounce(key, label, run)", "_rfedRunPending(key)", "_onPageResume(trigger)",
     "async pullChannel(channelName)", "async openChannel(channelName)", "_exchangeIsDown()",
     "_registerOwedDistro(trigger)",
@@ -248,9 +248,11 @@ const settle = async (rounds = 4) => {
 /**
  * A stub RnsClient carrying the real persistent-link bodies. Every link it
  * creates is a real Link whose establish() only records the attempt.
- * `channels` are subscribed channels; `opened` the ones opened this session.
+ * `channels` are subscribed channels; `opened` the ones opened this session;
+ * `screen.name` the one on screen (the first opened, unless a test moves it).
  */
 function makePersistent({ channels = ["general"], opened = channels, distro = false, held = true } = {}) {
+    const screen = { name: opened[0] ?? null };
     const links = [];
     class OfflineLink extends Link {
         constructor() { super(); links.push(this); }
@@ -297,6 +299,7 @@ function makePersistent({ channels = ["general"], opened = channels, distro = fa
         _rfedOpenedChannelHashes: new Set(channelRows.filter((c) => opened.includes(c.channelName)).map((c) => c.channelHash)),
         _rfedPullState: new Map(),
         _rfedStreamPromises: new Map(),
+        channelOnScreen: () => screen.name,
         _channelsInitialized: true,
         _propLink: null,
         _onMsg: [],
@@ -335,7 +338,7 @@ function makePersistent({ channels = ["general"], opened = channels, distro = fa
         await pending;
         return links.at(-1);
     };
-    return { self, links, calls, log, env, exchange, ActiveTab, DistroManager, channelRows, establish, closeUnder, up };
+    return { self, links, calls, log, env, exchange, ActiveTab, DistroManager, channelRows, screen, establish, closeUnder, up };
 }
 
 test("an established rfed.link that closes under us re-opens exactly once", async () => {
@@ -435,22 +438,31 @@ test("an identify refusal on a pull does not loop: the next link waits for an ex
     assert.equal(c.links.length, 2, "and nothing after its refusal");
 });
 
-test("a new rfed.link re-sends the stream open, then pulls the opened channels and the distro", async () => {
+test("a new rfed.link re-binds every opened channel, then pulls the distro and the channel on screen only", async () => {
+    // The phones pull a channel on a fresh rfed link only while its screen
+    // is open (Android LaunchedEffect(rfedLinkGeneration) in
+    // ConversationScreen, iOS .task(id: rfedLinkGeneration) in
+    // ConversationView). Every opened channel is bound again, so each one's
+    // live posts keep coming; one opened earlier is pulled when it is opened
+    // again (openChannel).
     const c = makePersistent({ channels: ["alpha", "beta", "gamma"], opened: ["alpha", "beta"], distro: true });
     const gates = [];
     const held = (name) => async () => { c.calls.push(name); await new Promise((resolve) => gates.push(resolve)); };
     c.self._configureChannelStream = held("stream-open");
     c.self._bindRfedLinkForDistroPush = held("distro-bind");
     c.self.pullChannel = async (name) => { c.calls.push(`pull #${name}`); return false; };
+    c.screen.name = "beta";
 
     const first = await c.up();
     assert.deepEqual(first.identified, [{ name: "me" }], "identified first");
     assert.deepEqual(c.calls, ["distro-bind", "stream-open"],
-        "both bindings, one /channel/stream/open for the whole filter set, and no pull before they are answered");
+        "both bindings, one /channel/stream/open for the whole filter set (alpha and beta), and no pull before they are answered");
+    assert.deepEqual([...c.self._rfedStreamPromises.keys()].sort(), c.channelRows.slice(0, 2).map((r) => r.channelHash).sort(),
+        "every opened channel re-bound");
     gates.splice(0).forEach((open) => open());
     await settle();
-    assert.deepEqual(c.calls.slice(2).sort(), ["distro-pull", "pull #alpha", "pull #beta"],
-        "then every opened channel (not gamma, which was never opened) and the distro");
+    assert.deepEqual(c.calls.slice(2).sort(), ["distro-pull", "pull #beta"],
+        "then the distro and the channel on screen, not alpha (opened, not on screen) nor gamma (never opened)");
     assert.equal(c.self._rfedLinkGeneration, 1);
 
     // The link dies and is re-opened: the node dropped the bindings with it.
@@ -458,13 +470,22 @@ test("a new rfed.link re-sends the stream open, then pulls the opened channels a
     await c.closeUnder(first, Link.TIMEOUT);
     await c.establish(c.links[1]);
     assert.deepEqual(c.calls, ["distro-bind", "stream-open"], "re-bound on the new link (Link.md: the client re-binds on every link)");
-    // openChannel pulled alpha on this new link while the bindings were
+    // openChannel pulled beta on this new link while the bindings were
     // answered: once per generation, so the link does not pull it again.
-    c.self._rfedPullState.set(c.channelRows[0].channelHash, { inFlight: false, morePending: false, gen: 2 });
+    c.self._rfedPullState.set(c.channelRows[1].channelHash, { inFlight: false, morePending: false, gen: 2 });
     gates.splice(0).forEach((open) => open());
     await settle();
-    assert.deepEqual(c.calls.slice(2).sort(), ["distro-pull", "pull #beta"], "and pulled again, each channel once per link");
+    assert.deepEqual(c.calls.slice(2), ["distro-pull"], "the channel on screen was pulled on this link already");
     assert.equal(c.self._rfedLinkGeneration, 2);
+
+    // No channel on screen (a DM, or the chat list): the link pulls none.
+    c.calls.length = 0;
+    c.screen.name = null;
+    await c.closeUnder(c.links[1], Link.TIMEOUT);
+    await c.establish(c.links[2]);
+    gates.splice(0).forEach((open) => open());
+    await settle();
+    assert.deepEqual(c.calls, ["distro-bind", "stream-open", "distro-pull"], "re-bound, the distro pulled, no channel pulled");
 });
 
 test("a new link that closes while its bindings are answered pulls nothing; the next one does", async () => {
@@ -487,7 +508,7 @@ test("a new link that closes while its bindings are answered pulls nothing; the 
         ["distro-pull", "request channel.pull:/rfed/pull"]);
 });
 
-test("every explicit open pulls one page; a new rfed.link pulls each opened channel once more", async () => {
+test("every explicit open pulls one page; a new rfed.link pulls the channel on screen once more", async () => {
     // Android and iOS pull when the channel screen opens (their per-screen
     // generation guard starts empty on each open) and once per new rfed
     // link while it is open (ConversationScreen.kt:603-615,
@@ -506,10 +527,17 @@ test("every explicit open pulls one page; a new rfed.link pulls each opened chan
 
     pulls.length = 0;
     c.self._rfedOpenedChannelHashes.add(hash);
-    c.self._pullOpenedChannels("new rfed.link", 1);
+    c.screen.name = "general";
+    c.self._pullChannelOnScreen("new rfed.link", 1);
     assert.deepEqual(pulls, [], "a link that has pulled it (an open got there first) does not pull it again");
-    c.self._pullOpenedChannels("new rfed.link", 2);
+    c.self._pullChannelOnScreen("new rfed.link", 2);
     assert.deepEqual(pulls, ["general"], "a new link pulls it once");
+    c.self._pullChannelOnScreen("visible");
+    assert.deepEqual(pulls, ["general", "general"], "a page event pulls it whatever the generation (Android ON_RESUME)");
+    c.screen.name = null;
+    c.self._pullChannelOnScreen("new rfed.link", 3);
+    c.self._pullChannelOnScreen("visible");
+    assert.deepEqual(pulls, ["general", "general"], "off screen, neither pulls it");
 });
 
 test("a channel pull is one at a time and one page: more_pending is recorded for \"Load earlier messages\", never followed", async () => {
