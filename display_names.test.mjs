@@ -380,6 +380,66 @@ test("§5.4 one placeholder list: hash forms, \"Retichat\", \"Retichat Web\", \"
     }
 });
 
+/** A hash form (8 to 32 hex, "?" before or "…" after) of `own`: what §5.4
+ *  drops where a name may have been typed. Written here from the spec, not
+ *  taken from display_name.js. */
+function ownHashForm(name, own) {
+    const m = /^\??([0-9a-f]{8,32})…?$/i.exec(name.trim());
+    return !!m && own.toLowerCase().startsWith(m[1].toLowerCase());
+}
+
+test("§5.4 placeholders: every shared vector (LXMF-rust display_name_vectors.json \"placeholder\")", () => {
+    assert.ok(vectors.placeholder.length >= 30);
+    assert.ok(vectors.placeholder.some((v) => v.web_node_default), "the old web node defaults are in the vectors");
+    for (const v of vectors.placeholder) {
+        assert.equal(DN.isPlaceholderName(v.input), v.placeholder, `placeholder: ${v.name}`);
+        assert.equal(DN.isWebNodeDefault(v.input), v.web_node_default, `web_node_default: ${v.name}`);
+    }
+});
+
+test("§5.4 contact migration over the shared vectors: an old web node default is dropped, typed or not", () => {
+    for (const v of vectors.placeholder) {
+        const base = { destHash: v.own_hash, publicKey: null, lastSeen: 1 };
+        const cleaned = DN.clean(v.input);
+        const asReceived = DN.migrateContact({ ...base, displayName: v.input, nameCustomized: false });
+        assert.equal(asReceived.legacyName, v.placeholder ? null : cleaned, `not customized: ${v.name}`);
+        assert.equal(asReceived.localName, null);
+        // Customized: only what the old rename field could save untouched is
+        // dropped — this contact's own hash form, or an old web node default.
+        const asTyped = DN.migrateContact({ ...base, displayName: v.input, nameCustomized: true });
+        const dropped = v.web_node_default || ownHashForm(v.input, v.own_hash);
+        assert.equal(asTyped.localName, dropped ? null : cleaned, `customized: ${v.name}`);
+        assert.equal(asTyped.legacyName, null);
+    }
+});
+
+test("§5.4 the old web node defaults as the web held them: config.json's, announced with the hash, customized", () => {
+    const h = "0123456789abcdef0123456789abcdef";
+    const base = { destHash: h, publicKey: null, lastSeen: 1 };
+    const slots = (localName, legacyName) => ({ ...base, localName, messageName: null, messageNameAt: null, announceName: null, legacyName });
+    for (const old of ["Retichat Web (retichat)", "Retichat Web (selectiv)", "Retichat Web (retichat) (0123456789ab)",
+        "Retichat Web (selectiv) (fedcba987654)", "Retichat Web (0123456789ab)"]) {
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: old, nameCustomized: false }), slots(null, null),
+            `${old}: received from a web user, not a legacyName`);
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: old, nameCustomized: true }), slots(null, null),
+            `${old}: Save on the old rename field, which was pre-filled with it`);
+    }
+    // Everything else a user may have typed is still theirs.
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob (work)", nameCustomized: true }), slots("Bob (work)", null));
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Retichat Web ()", nameCustomized: false }), slots(null, "Retichat Web ()"));
+    // Rows from the first three-slot build hold it in messageName.
+    assert.deepEqual(DN.migrateContact({ ...base, localName: null, messageName: "Retichat Web (selectiv)", announceName: null }),
+        { ...base, localName: null, messageName: null, messageNameAt: null, announceName: null, legacyName: null });
+});
+
+test("§5.4 own name: an old web node default is no Message Display Name, whichever node's it was", () => {
+    assert.equal(DN.migrateOwnDisplayName("Retichat Web (selectiv)", "Retichat Web (retichat)"), null,
+        "a name saved on another node, or before this node's default changed");
+    assert.equal(DN.migrateOwnDisplayName("Retichat Web (retichat)", null), null, "before config.json is read");
+    assert.equal(DN.migrateOwnDisplayName("retichat web (E2E)", null), null);
+    assert.equal(DN.migrateOwnDisplayName("Retichat Web Fan", "Retichat Web (retichat)"), "Retichat Web Fan");
+});
+
 test("§5.4 own name: the old display name becomes the Message Display Name, placeholders empty", () => {
     assert.equal(DN.migrateOwnDisplayName("James", "Retichat Web (E2E)"), "James");
     assert.equal(DN.migrateOwnDisplayName("Retichat Web", null), null);
