@@ -90,6 +90,14 @@ test("the requests checked are the ones PostInterface makes: the base without a 
     // An exact path source allows the one URL it names: no exchange fits it.
     assert.match(exchangeUrlRefusal("https://n.example/reticulum", "connect-src https://n.example/reticulum", "https://p.example/") ?? "", /not among/);
     assert.equal(exchangeUrlRefusal("https://n.example/reticulum", "connect-src https://n.example/reticulum/", "https://p.example/"), null);
+    // Every one of them is checked: a policy naming each request exactly is
+    // enough, and one that leaves any of them out, whichever, is refused.
+    const exact = (paths) => `connect-src ${paths.map((path) => `https://n.example/reticulum${path}`).join(" ")}`;
+    assert.equal(exchangeUrlRefusal("https://n.example/reticulum", exact(EXCHANGE_PATHS), "https://p.example/"), null);
+    for (const missing of EXCHANGE_PATHS) {
+        const policy = exact(EXCHANGE_PATHS.filter((path) => path !== missing));
+        assert.match(exchangeUrlRefusal("https://n.example/reticulum", policy, "https://p.example/") ?? "", /not among/, `without ${missing}`);
+    }
 });
 
 test("CSP Level 3 matching: default-src stands in, every policy must allow, 'none', schemes, wildcards, ports, paths, 'self' upgrades", () => {
