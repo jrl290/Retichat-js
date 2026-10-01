@@ -58,7 +58,9 @@ test("under the nodes' policy: their exchanges and the page's own origin are all
     assert.match(refusal, /^This page's Content-Security-Policy lets it connect only to this page's own origin \(https:\/\/retichat\.com\), /);
     assert.match(refusal, /https:\/\/retichat\.com\/reticulum\/, https:\/\/selectivesubconscious\.com\/reticulum\/, https:\/\/esm\.sh\. /,
         "it names what the policy allows, as the policy says it");
-    assert.match(refusal, /The exchange https:\/\/example\.com\/reticulum is not among them, so the browser would refuse every request to it and the page would stay offline\. Not saved\.$/);
+    assert.match(refusal, /The exchange https:\/\/example\.com\/reticulum is not among them, so the browser would refuse every request to it and the page would stay offline\.$/);
+    assert.doesNotMatch(refusal, /saved/i, "saving is Settings' to speak of (PagePolicy.exchangeRefusal); the page at load uses the same reason");
+    assert.equal(exchangeUrlRefusal("http://[::1", POLICY, "https://retichat.com/"), "\"http://[::1\" is not a URL.");
 
     for (const [url, page] of [
         ["http://127.0.0.1:8080", "https://retichat.com/"],                                       // the local node, from a production page
@@ -220,7 +222,8 @@ test("a policy that cannot be read decides nothing: the change is refused with t
 
 test("the Settings field: the refusal shows under it, and editing it clears it", () => {
     const modal = methodBody("_renderSettingsModal()");
-    assert.match(modal, /h\("div", \{ className: "field-error", id: "cfg-exchange-refusal", role: "alert" \}\)/);
+    assert.match(modal, /h\("div", \{ className: "field-error", id: "cfg-exchange-refusal", role: "alert" \}, RnsClient\.exchangeBlocked\)/,
+        "empty, or, when Settings opens on a saved URL the page found blocked, why (exchange_url_at_load.test.mjs)");
     assert.match(modal, /id: "cfg-exchange", type: "text"[\s\S]{0,200}onInput: \(\) => \{ const el = document\.getElementById\("cfg-exchange-refusal"\); if \(el\) el\.textContent = ""; \}/);
     const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
     assert.match(css, /\.settings-field \.field-error:empty \{ display: none; \}/);

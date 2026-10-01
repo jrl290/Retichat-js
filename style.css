@@ -384,6 +384,19 @@ html, body {
 .conn-banner.direct { background: var(--success-bg); color: var(--success); border-bottom: 1px solid rgba(102,230,138,0.15); }
 .conn-banner.ws     { background: var(--warning-bg); color: var(--warning); border-bottom: 1px solid rgba(255,179,102,0.15); }
 .conn-banner.none   { background: var(--danger-bg); color: var(--danger); border-bottom: 1px solid rgba(255,102,102,0.15); }
+/* The saved exchange is blocked by the page's own policy (App._applyStatusDot):
+   shown under the status dot, and no room taken while empty. */
+#exchange-blocked:empty { display: none; }
+.conn-banner-action {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}
+.status-dot.blocked { background: var(--danger); }
 
 /* =========================================================================
    Sidebar — Contact List

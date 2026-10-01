@@ -309,7 +309,13 @@ async function loadConfig() {
             if (typeof json.announceIntervalMs === "number") cfg.announceIntervalMs = json.announceIntervalMs;
         }
     } catch(e) {}
+    // An exchange URL saved in this browser (Settings, or storage) other than
+    // the node's own: RnsClient.connect checks it against the page's policy
+    // before it connects (PagePolicy.blockedReason). The node's own URL
+    // (config.json, or the default) is served beside that policy, and
+    // deploy.sh's boot gate fails on any violation of it.
     const savedExchangeUrl = sGet("exchangeUrl");
+    cfg.exchangeUrlSaved = !!savedExchangeUrl && savedExchangeUrl !== cfg.exchangeUrl;
     if (savedExchangeUrl) cfg.exchangeUrl = savedExchangeUrl;
     OwnNames.finishMigration(configDisplayName);
     const savedInterfaceName = sGet("interfaceName");
@@ -323,18 +329,21 @@ async function loadConfig() {
 
 /**
  * What this page's Content-Security-Policy lets it connect to, for Settings
- * (App._saveSettings): an exchange URL it does not allow is refused when
- * entered, with the reason, since the page would otherwise sit offline
- * with nothing to say why (the browser refuses each request before it is
- * sent). The policy is the header the page is served with, read by
+ * (App._saveSettings) and for the page as it loads (RnsClient.connect): an
+ * exchange URL it does not allow is refused when entered, with the reason,
+ * and one saved before that check (a71c32a) or edited in storage is found
+ * before the page connects to it, since the page would otherwise sit
+ * offline with nothing to say why (the browser refuses each request before
+ * it is sent). The policy is the header the page is served with, read by
  * fetching the page's own URL again (same origin, which every policy here
  * allows), so it is the nodes' .htaccess line as served and cannot drift
  * from it; the rules are lib/connect_policy.js. A page served with none (a
- * local server) refuses nothing. Read once per page load, when an exchange
- * URL is first changed. A read that fails (no answer, or not a 2xx: Apache
- * sets the header on successful responses only) decides nothing and is not
- * kept: the change is refused with that reason, and the next Save reads
- * again.
+ * local server) refuses nothing. Read once per page load, when it is first
+ * needed. A read that fails (no answer, or not a 2xx: Apache sets the
+ * header on successful responses only) decides nothing and is not kept: in
+ * Settings the change is refused with that reason, and the next Save reads
+ * again; at load the saved URL is connected to unchecked, as before the
+ * check, and the console says so.
  */
 const PagePolicy = {
     _header: undefined,   // the policy header; null when the page is served with none
@@ -353,8 +362,8 @@ const PagePolicy = {
         return this._header;
     },
 
-    /** Why the exchange at `exchangeUrl` cannot be used from this page, or
-     *  null when it can (exchangeUrlRefusal). */
+    /** Settings: why the exchange at `exchangeUrl` cannot be saved, or null
+     *  when it can (exchangeUrlRefusal, or a policy that cannot be read). */
     async exchangeRefusal(exchangeUrl) {
         let header;
         try {
@@ -362,9 +371,30 @@ const PagePolicy = {
         } catch (e) {
             return `Could not check the exchange URL against this page's Content-Security-Policy: the page's own server did not answer (${e?.message || e}). Not saved.`;
         }
+        const refusal = exchangeUrlRefusal(exchangeUrl, header, location.href);
+        return refusal && `${refusal} Not saved.`;
+    },
+
+    /** At load (RnsClient.connect): why this page's policy blocks the saved
+     *  exchange at `exchangeUrl` (exchangeUrlRefusal), or null when it does
+     *  not. A policy that cannot be read decides nothing: null, and the
+     *  console says the URL is used unchecked. */
+    async blockedReason(exchangeUrl) {
+        let header;
+        try {
+            header = await this.header();
+        } catch (e) {
+            console.warn(`[retichat] Could not read this page's Content-Security-Policy (${e?.message || e}): the saved exchange URL ${exchangeUrl} is used unchecked`);
+            return null;
+        }
         return exchangeUrlRefusal(exchangeUrl, header, location.href);
     },
 };
+
+/** What the page says where it shows the connection status while the saved
+ *  exchange URL is blocked by its own policy (RnsClient status "blocked",
+ *  App._applyStatusDot). */
+const EXCHANGE_BLOCKED_NOTICE = "This exchange is blocked by the page's security policy; change it in Settings.";
 
 // =========================================================================
 //  STORE — localStorage helpers
@@ -1736,6 +1766,10 @@ const ChannelMsgStore = {
 const RnsClient = {
     _rns: null, _lxmfRouter: null, _cfg: null,
     _status: "offline", _connType: "none", // "direct" | "websocket" | "none"
+    // Why the page's own Content-Security-Policy blocks the saved exchange
+    // URL (PagePolicy.blockedReason), while connect() holds back for it and
+    // the status is "blocked"; null otherwise.
+    exchangeBlocked: null,
     _annTimer: null,
     _rfedLinks: new Map(),
     _rfedLinkPromises: new Map(),
@@ -2065,6 +2099,26 @@ const RnsClient = {
         // Taken over while the config loaded: disconnect() has already run
         // and the lock is gone, so this connection must not start.
         if (!ActiveTab.held) return;
+
+        // An exchange URL saved in this browser that the page's own
+        // Content-Security-Policy blocks (saved before Settings checked it,
+        // a71c32a, or edited in storage): the browser would refuse every
+        // request to it before it is sent, and the page would sit offline
+        // with nothing to say why. It is checked before anything connects,
+        // with the check Settings makes (PagePolicy), and a blocked one is
+        // not connected to: the status is "blocked", which the page says
+        // where it shows the connection status (App._applyStatusDot), until
+        // the user changes the URL in Settings. The node's own URL is not
+        // checked (loadConfig).
+        const blocked = this._cfg.exchangeUrlSaved ? await PagePolicy.blockedReason(this._cfg.exchangeUrl) : null;
+        if (!ActiveTab.held) return;
+        this.exchangeBlocked = blocked;
+        if (blocked) {
+            console.warn(`[retichat] Not connecting: the saved exchange URL ${this._cfg.exchangeUrl} is blocked by this page's Content-Security-Policy. ${blocked}`);
+            Harness.event("exchange-blocked", { exchangeUrl: this._cfg.exchangeUrl });
+            this._setStatus("blocked");
+            return;
+        }
 
         // Resolve propagation node hash: explicit override, or derive from RFed.
         if (this._cfg.lxmfPropagationOverride) {
@@ -6175,6 +6229,7 @@ const RnsClient = {
         }
         this._rns = null; this._lxmfRouter = null;
         this._connType = "none";
+        this.exchangeBlocked = null;
         this._setStatus("offline");
     },
 
@@ -6416,6 +6471,7 @@ const App = {
         theme: "dark",           // "dark" | "light"
         searchQuery: "",
         showSettings: false,
+        settingsFocus: null,      // the id of the field Settings opens on (the first when null)
         showAddContact: false,
         showIdentity: false,      // consolidated Device + Distro identity screen
         revealDeviceKey: false,   // private-key disclosure, reset on close
@@ -6601,11 +6657,29 @@ const App = {
         requestAnimationFrame(() => this._restoreComposerFocus());
     },
 
-    /** Restore the status dot color after a render destroys the old DOM. */
+    /** The connection status where the page shows it, after a render
+     *  destroys the old DOM and whenever it changes (_wire, RnsClient
+     *  .onStatus): the status dot, and, while the saved exchange URL is
+     *  blocked by the page's own Content-Security-Policy (status "blocked",
+     *  RnsClient.connect), the line under it that says so and opens
+     *  Settings. Until 2026-10-01 such a page sat offline, the dot red, with
+     *  nothing to say why. */
     _applyStatusDot() {
+        const status = RnsClient._status;
         const dot = document.getElementById("status-dot");
-        if (dot && RnsClient._status) {
-            dot.className = `status-dot ${RnsClient._status}`;
+        if (dot && status) {
+            dot.className = `status-dot ${status}`;
+            dot.title = status === "blocked" ? EXCHANGE_BLOCKED_NOTICE : `RNS: ${status}`;
+        }
+        const banner = document.getElementById("exchange-blocked");
+        if (banner) {
+            clear(banner);
+            if (status === "blocked") {
+                banner.appendChild(document.createTextNode(`${EXCHANGE_BLOCKED_NOTICE} `));
+                // Settings opens on the exchange field, whose reason says why.
+                banner.appendChild(h("button", { className: "conn-banner-action",
+                    onClick: () => { this.state.showSettings = true; this.state.settingsFocus = "cfg-exchange"; this.render(); } }, "Open Settings"));
+            }
         }
     },
 
@@ -7012,6 +7086,10 @@ const App = {
                 ),
             ),
         );
+        // Under the status dot: why the page is offline when its own policy
+        // blocks the saved exchange (filled by _applyStatusDot; empty, it
+        // takes no room).
+        frag.appendChild(h("div", { id: "exchange-blocked", className: "conn-banner none", role: "status" }));
 
         // Search bar
         frag.appendChild(
@@ -8109,8 +8187,10 @@ const App = {
                         onInput: () => { const el = document.getElementById("cfg-exchange-refusal"); if (el) el.textContent = ""; } }),
                     h("div", { className: "field-hint" },
                         "HTTP POST polling — no WebSocket or open ports needed."),
-                    // Why Save refused the URL (PagePolicy), until it is edited.
-                    h("div", { className: "field-error", id: "cfg-exchange-refusal", role: "alert" }),
+                    // Why Save refused the URL (PagePolicy), until it is edited;
+                    // when Settings opens, why the saved one is blocked
+                    // (RnsClient.exchangeBlocked, found as the page loaded).
+                    h("div", { className: "field-error", id: "cfg-exchange-refusal", role: "alert" }, RnsClient.exchangeBlocked),
                 ),
             ),
         );
@@ -8156,8 +8236,13 @@ const App = {
 
         this.root.appendChild(overlay);
 
-        // Focus the first input
-        setTimeout(() => sheet.querySelector("input")?.focus(), 150);
+        // Focus the field Settings was opened for (the exchange, from the
+        // line under the status dot: _applyStatusDot), else the first input.
+        // Focusing it here, on the modal's own timer, is what holds: one
+        // focused by the opener was taken back by this timer.
+        const focusId = this.state.settingsFocus;
+        this.state.settingsFocus = null;
+        setTimeout(() => (focusId ? sheet.querySelector(`#${focusId}`) : sheet.querySelector("input"))?.focus(), 150);
     },
 
     // ===== IDENTITY SCREEN =====
@@ -9298,14 +9383,10 @@ const App = {
         // midnight). The page's one interval, not a timer of its own.
         RnsClient.onTick(() => this._checkDayTurn());
 
-        // Status dot updates
-        RnsClient.onStatus(status => {
+        // Status dot (and the blocked-exchange line) updates
+        RnsClient.onStatus(() => {
             this._checkDayTurn();
-            const dot = document.getElementById("status-dot");
-            if (dot) {
-                dot.className = `status-dot ${status}`;
-                dot.title = `RNS: ${status}`;
-            }
+            this._applyStatusDot();
         });
 
         // Incoming messages & proofs. Everything here is a targeted DOM patch:
@@ -9541,6 +9622,7 @@ Harness (headless):
     state() {
         const s = {
             status: RnsClient.status,
+            exchangeBlocked: RnsClient.exchangeBlocked,
             connType: RnsClient.connType,
             ownHash: RnsClient.ownHash,
             lxmfDest: RnsClient._lxmfRouter?.destination?.hash?.toString("hex"),
