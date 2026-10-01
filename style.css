@@ -1306,6 +1306,16 @@ a.msg-file:hover { border-color: var(--primary); }
     font-size: 14px;
 }
 
+/* A channel's "Load more messages" control (App._buildChannelLoadMore):
+   between the message list and the composer, while the node says it holds
+   more for this channel (Channel.md more_pending). */
+.load-more {
+    display: flex;
+    justify-content: center;
+    padding: 6px 12px;
+    flex-shrink: 0;
+}
+
 /* Group member row (checkboxes in group creation) */
 .group-member-row:hover {
     background: var(--primary-bg);

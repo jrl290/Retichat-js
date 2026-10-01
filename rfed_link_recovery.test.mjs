@@ -485,7 +485,11 @@ test("a new link that closes while its bindings are answered pulls nothing; the 
         ["request channel.pull:/rfed/pull", "distro-pull"]);
 });
 
-test("openChannel pulls once per rfed.link generation, not once per session", async () => {
+test("every explicit open pulls one page; a new rfed.link pulls each opened channel once more", async () => {
+    // Android and iOS pull when the channel screen opens (their per-screen
+    // generation guard starts empty on each open) and once per new rfed
+    // link while it is open (ConversationScreen.kt:603-615,
+    // ConversationView.swift:596-612).
     const c = makePersistent({ channels: ["general"], opened: [] });
     const pulls = [];
     c.self._ensureChannelSubscribed = async () => {};
@@ -495,14 +499,24 @@ test("openChannel pulls once per rfed.link generation, not once per session", as
     c.self._rfedLinkGeneration = 1;
     c.self._rfedPullState.set(hash, { inFlight: false, morePending: false, gen: 1 });
     await c.self.openChannel("general");
-    assert.deepEqual(pulls, [], "pulled on this link already");
-    c.self._rfedLinkGeneration = 2; // the link was re-opened
     await c.self.openChannel("general");
-    assert.deepEqual(pulls, ["general"], "a new link: pulled again");
+    assert.deepEqual(pulls, ["general", "general"], "one page on each open, though this link pulled it already");
+
+    pulls.length = 0;
+    c.self._rfedOpenedChannelHashes.add(hash);
+    c.self._pullOpenedChannels("new rfed.link", 1);
+    assert.deepEqual(pulls, [], "a link that has pulled it (an open got there first) does not pull it again");
+    c.self._pullOpenedChannels("new rfed.link", 2);
+    assert.deepEqual(pulls, ["general"], "a new link pulls it once");
 });
 
-test("a channel pull is one at a time, follows more_pending on the response, and records its generation", async () => {
+test("a channel pull is one at a time and one page: more_pending is recorded for \"Load more messages\", never followed", async () => {
+    // Channel.md /rfed/pull: the client shows a "load more" control while
+    // more_pending is true; Android and iOS page channel history by hand.
+    // Until 2026-09-30 the web followed more_pending on its own and drained
+    // the whole deferred queue.
     const c = makePersistent({ channels: ["general"] });
+    c.self.channelPullState = compileMethod("channelPullState(channelName)", c.env)(c.self);
     const [row] = c.channelRows;
     const channelHash = Buffer.from(row.channelHash, "hex");
     const page = (n) => [[channelHash, Buffer.from(`post-${n}`)]];
@@ -515,23 +529,38 @@ test("a channel pull is one at a time, follows more_pending on the response, and
     };
     const handled = [];
     c.self._handleChannelPacket = (data) => { handled.push(Buffer.from(data).subarray(16).toString()); return true; };
+    const events = [];
+    c.self._onMsg.push((ev, name) => events.push(`${ev.kind} ${name}`));
     c.self._rfedLinkGeneration = 3;
+    assert.deepEqual(c.self.channelPullState("general"), { inFlight: false, morePending: false }, "nothing known before a pull");
+
     const first = c.self.pullChannel("general");
     const second = c.self.pullChannel("general");
+    assert.deepEqual(c.self.channelPullState("general"), { inFlight: true, morePending: false });
     await settle();
     assert.equal(c.calls.length, 1, "a pull while one is in flight sends nothing");
     release();
-    await first; await second;
+    assert.equal(await first, true, "the node holds more");
+    await second;
     await settle();
-    assert.equal(c.calls.length, 2, "more_pending: one follow-up, after the page was handled");
-    assert.deepEqual(handled, ["post-1", "post-2"]);
+    assert.equal(c.calls.length, 1, "and nothing pulls it on its own: the next page is the user's");
+    assert.deepEqual(handled, ["post-1"]);
+    assert.deepEqual(c.self.channelPullState("general"), { inFlight: false, morePending: true }, "what the control shows");
     assert.equal(c.self._rfedPullState.get(row.channelHash).gen, 3, "the generation it was pulled on");
+    assert.deepEqual(events, ["channel-pull-start general", "channel-pull-complete general"]);
 
-    // An empty page that claims more is not followed.
-    answers.push([[], true]);
-    await c.self.pullChannel("general");
+    // "Load more messages": the next page, which is the last.
+    assert.equal(await c.self.pullChannel("general"), false);
     await settle();
-    assert.equal(c.calls.length, 3);
+    assert.equal(c.calls.length, 2);
+    assert.deepEqual(handled, ["post-1", "post-2"]);
+    assert.deepEqual(c.self.channelPullState("general"), { inFlight: false, morePending: false });
+
+    // A pull that fails leaves what the last completed one said.
+    c.self._rfedPullState.set(row.channelHash, { inFlight: false, morePending: true, gen: 3 });
+    c.self._rfedRequest = async () => { throw new Error("/channel/pull: the link closed before a response"); };
+    await assert.rejects(c.self.pullChannel("general"));
+    assert.deepEqual(c.self.channelPullState("general"), { inFlight: false, morePending: true });
 });
 
 test("rfed.link refuses a push larger than a message at LXMF's delivery limit, and takes one that size", async () => {

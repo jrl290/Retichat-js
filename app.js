@@ -5464,15 +5464,26 @@ const RnsClient = {
         this._rfedOpenedChannelHashes.add(channel.channelHash);
         await this._ensureChannelSubscribed(channel);
         const stream = this._ensureChannelStreamConfigured(channel);
-        // Once per rfed.link generation, not once per session: a link that
-        // closed and re-opened pulls again (its "established" does, and so
-        // does this). Until 2026-09-30 a channel was pulled at most once per
-        // page load, so what the node deferred after that waited for a reload.
-        const pulled = this._rfedPullState.get(channel.channelHash);
-        const pull = pulled?.gen === this._rfedLinkGeneration && this._rfedLinkGeneration > 0
-            ? Promise.resolve()
-            : this.pullChannel(channelName);
+        // One page on every explicit open, as Android and iOS pull when the
+        // channel screen opens (ConversationScreen.kt:603-615 and
+        // ConversationView.swift:596-612: their per-screen generation guard
+        // starts empty on each open); a new rfed.link pulls each opened
+        // channel once more (_onRfedLinkEstablished). The pages after the
+        // first are the user's: "Load more messages" (pullChannel). Until
+        // 2026-09-30 a channel was pulled at most once per page load, then
+        // at most once per rfed.link generation, opens included.
+        const pull = this.pullChannel(channelName);
         await Promise.all([stream, pull]);
+    },
+
+    /** What the channel's "Load more messages" control shows
+     *  (App._buildChannelLoadMore): whether a pull is running, and whether
+     *  the last one that completed said the node holds more (more_pending
+     *  true). Nothing is known before the first pull completes. */
+    channelPullState(channelName) {
+        const channel = ChannelStore.get(channelName);
+        const state = channel ? this._rfedPullState.get(channel.channelHash) : null;
+        return { inFlight: state?.inFlight === true, morePending: state?.morePending === true };
     },
 
     _ensureChannelStreamConfigured(channel) {
@@ -5486,12 +5497,18 @@ const RnsClient = {
     },
 
     /**
-     * /channel/pull one channel: what the node deferred for this subscriber
-     * on it (Channel.md /rfed/pull). One pull per channel at a time (the
-     * in-flight guard). A page that says more is queued, and brought
-     * something, is followed by one more pull once it has been handled: the
-     * completed response is the event, never a timer. The rfed.link
-     * generation of a completed pull is recorded (openChannel).
+     * /channel/pull one channel: one page of what the node deferred for this
+     * subscriber on it (Channel.md /rfed/pull). One pull per channel at a
+     * time (the in-flight guard). The page's more_pending is recorded, never
+     * followed: Channel.md has the client show a "load more" control while
+     * it is true, and Android and iOS page channel history by hand ("Load
+     * earlier messages"), so the next page is the user's ("Load more
+     * messages", App._buildChannelLoadMore). Until 2026-09-30 the web
+     * followed it, one pull per completed non-empty page, which drained the
+     * whole deferred queue after an idle gap. /distro/pull, which is message
+     * delivery and not history, still follows it (_pullDistroMessages). The
+     * rfed.link generation of a completed pull is recorded
+     * (_pullOpenedChannels). Resolves to whether the node holds more.
      */
     async pullChannel(channelName) {
         const channel = ChannelStore.get(channelName);
@@ -5501,7 +5518,6 @@ const RnsClient = {
         if (current?.inFlight) return current.morePending !== false;
         this._rfedPullState.set(key, {inFlight: true, morePending: current?.morePending, gen: current?.gen});
         this._onMsg.forEach(fn => fn({kind: "channel-pull-start"}, channelName));
-        let again = false;
         try {
             const response = await this._rfedRequest(
                 ["channel", "pull"],
@@ -5529,20 +5545,13 @@ const RnsClient = {
             }
             const morePending = response[1] === true;
             this._rfedPullState.set(key, {inFlight: false, morePending, gen: this._rfedLinkGeneration});
-            // A page that brought nothing is not followed, whatever it says:
-            // pulling again would repeat the same answer.
-            again = morePending && response[0].length > 0;
+            if (morePending) console.log(`[retichat] 📡 More is queued for #${channelName} — "Load more messages" pulls the next page`);
             return morePending;
         } catch(e) {
             this._rfedPullState.set(key, {inFlight: false, morePending: current?.morePending, gen: current?.gen});
             throw e;
         } finally {
             this._onMsg.forEach(fn => fn({kind: "channel-pull-complete"}, channelName));
-            if (again) {
-                console.log(`[retichat] 📡 More is queued for #${channelName} — pulling the next page`);
-                this.pullChannel(channelName).catch(e =>
-                    console.warn(`[retichat] 📡 Channel pull for #${channelName} failed: ${e.message}`));
-            }
         }
     },
 
@@ -7237,6 +7246,9 @@ const App = {
                         : this._buildMsgBubble(m, channelSenderLabel(ch.channelName, m)))),
             ), msgs),
 
+            // The next page of what the node deferred, by hand
+            this._buildChannelLoadMore(ch.channelName),
+
             // Composer
             h("div", { className: "composer" },
                 h("textarea", {
@@ -7257,6 +7269,42 @@ const App = {
                 }, "➤"),
             ),
         );
+    },
+
+    /**
+     * The open channel's "Load more messages" control, under its messages:
+     * Channel.md /rfed/pull ("Client should display a 'load more' control
+     * if more_pending == true"), as Android and iOS page channel history by
+     * hand ("Load earlier messages", ConversationScreen.kt:739-760,
+     * ConversationView.swift:478-507). One click is one /channel/pull, the
+     * next page (RnsClient.pullChannel); while a pull runs it says
+     * "Loading…" and takes no click. The phones also show it before the
+     * first pull has answered; here every open pulls (openChannel), so it
+     * appears only once the node has said it holds more. Pulled posts are
+     * stored in the order they arrive, so they appear at the bottom, here.
+     * The slot is always present (hidden when there is nothing more), so
+     * _syncChannelLoadMore can replace it in place.
+     */
+    _buildChannelLoadMore(channelName) {
+        const { inFlight, morePending } = RnsClient.channelPullState(channelName);
+        if (!morePending) return h("div", { className: "load-more hidden", id: "channel-load-more" });
+        return h("div", { className: "load-more", id: "channel-load-more" },
+            h("button", {
+                className: "btn btn-secondary btn-sm",
+                disabled: inFlight,
+                onClick: () => RnsClient.pullChannel(channelName).catch(e =>
+                    console.warn(`[retichat] 📡 Load more for #${channelName} failed: ${e.message}`)),
+            }, inFlight ? "Loading…" : "Load more messages"),
+        );
+    },
+
+    /** Bring the open channel's "Load more messages" control in line with
+     *  its pull state (a pull started or completed), without touching the
+     *  message list or the draft. */
+    _syncChannelLoadMore() {
+        const id = this.state.activeHash;
+        if (!id || !ChannelStore.get(id)) return;
+        document.getElementById("channel-load-more")?.replaceWith(this._buildChannelLoadMore(id));
     },
 
     // ===== ACTIONS =====
@@ -8865,6 +8913,15 @@ const App = {
                         this._updateMsgStatusDOM(peerHash, m.id, m.status, m);
                     }
                 }
+                return;
+            }
+
+            // A channel pull started or completed: only the open channel's
+            // "Load more messages" control follows. The posts it brings each
+            // come with their own event (channel-receive), below, so this one
+            // leaves the list, the sidebar and the scroll position alone.
+            if (msg.kind === "channel-pull-start" || msg.kind === "channel-pull-complete") {
+                if (inActiveChat) this._syncChannelLoadMore();
                 return;
             }
 
