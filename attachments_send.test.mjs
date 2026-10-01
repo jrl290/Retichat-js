@@ -174,6 +174,33 @@ test("a DM with attachments goes direct as one Resource carrying 0x05 [[name, by
     assert.equal(s.MsgStore.get(c.destHash)[0].attachments[0].stored, "persisted", "kept for the bubble");
 });
 
+test("an attachment's MIME type is ours, from its name: never the browser's guess or a caller's", async () => {
+    // A picked .html is text/html to the browser; as an object URL opened in
+    // a tab it would run as this page (review of adee619).
+    const s = sender();
+    const peer = Identity.create();
+    const c = contactOf(peer);
+    s.contacts.set(c.destHash, c);
+    const rec = s.self.sendMessage(c, "", [
+        { name: "page.html", bytes: Buffer.alloc(10), mime: "text/html" },
+        { name: "pic.svg", bytes: Buffer.alloc(10), mime: "image/svg+xml" },
+        { name: "IMG_1.jpg", bytes: Buffer.alloc(10), mime: "text/html" },
+    ]);
+    assert.deepEqual(rec.attachments.map((a) => a.mime), ["application/octet-stream", "application/octet-stream", "image/jpeg"]);
+
+    const pending = new Map();
+    const app = { state: { activeHash: null }, _pendingAttachments: pending, _renderComposerTray() {}, _composerNotice() {} };
+    install(app, {
+        LXMRouter, MAX_ATTACHMENTS, formatSize, ContactStore: { get: () => null }, RnsClient: { attachmentRefusal: () => null },
+        document: { getElementById: () => null },
+    }, ["async _addAttachments(chatId, files)"]);
+    const picked = { name: "page.html", size: 4, type: "text/html", arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
+    await app._addAttachments("d".repeat(32), [picked]);
+    const [entry] = pending.get("d".repeat(32));
+    assert.deepEqual(Object.keys(entry).sort(), ["bytes", "name"], "the file's own type is not carried");
+    assert.deepEqual([...entry.bytes], [1, 2, 3, 4]);
+});
+
 test("its propagated copy is the same message, attachments and hash, even read back from the store", async () => {
     const s = sender();
     const peer = Identity.create();

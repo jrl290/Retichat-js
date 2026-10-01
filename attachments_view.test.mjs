@@ -23,7 +23,7 @@ import { Buffer } from "node:buffer";
 import { isImageAttachment } from "./lib/rns/lxmf/lxmf.js";
 import { formatSize } from "./lib/attachment_limits.js";
 import { AttachmentStore, memoryBackend } from "./lib/attachment_store.js";
-import { ObjectUrls } from "./lib/object_urls.js";
+import { ObjectUrls, blobType, INLINE_TYPES } from "./lib/object_urls.js";
 import { SendTransfers } from "./lib/send_progress.js";
 import { compile, fn, install } from "./test_app_source.mjs";
 
@@ -136,6 +136,29 @@ test("FIELD_IMAGE is shown as an image whatever its name; a file and FIELD_AUDIO
     ]);
     assert.deepEqual(links.map((a) => a.href), ["blob:2", "blob:3"]);
     assert.ok(row.textContent.includes("three"), "the caption is shown too");
+});
+
+test("an object URL is typed as an image, audio or video only; anything else is a download (no script runs as this page)", async () => {
+    // A blob URL belongs to the page's origin: typed image/svg+xml or
+    // text/html and opened in a tab, its script reads the identity key in
+    // localStorage (review of adee619). Old records may carry such a type.
+    for (const type of ["image/svg+xml", "IMAGE/SVG+XML", "text/html", "application/xhtml+xml", "text/xml", "application/xml",
+        "application/pdf", "text/plain", "image/*", "", null, undefined]) {
+        assert.equal(blobType(type), "application/octet-stream", String(type));
+    }
+    for (const type of INLINE_TYPES) assert.equal(blobType(type), type);
+    assert.equal(blobType(" Image/PNG "), "image/png");
+    assert.ok([...INLINE_TYPES].every((t) => /^(image|audio|video)\//.test(t) && !t.includes("svg")));
+
+    const v = view();
+    for (const k of ["s:0", "s:1", "s:2"]) await v.Attachments.put(k, Buffer.from(k));
+    v.show({ id: "s", dir: "in", content: "", timestamp: 0, attachments: [
+        meta({ key: "s:0", name: "svg+xml", mime: "image/svg+xml", field: 6 }),
+        meta({ key: "s:1", name: "page.html", mime: "text/html" }),
+        meta({ key: "s:2", name: "cat.png", mime: "image/png" }),
+    ] });
+    await settle();
+    assert.deepEqual(v.created.map((b) => b.type), ["application/octet-stream", "application/octet-stream", "image/png"]);
 });
 
 test("an image the browser cannot decode becomes its download link, and its first URL is revoked", async () => {

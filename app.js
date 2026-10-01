@@ -2622,12 +2622,15 @@ const RnsClient = {
      * it. After initialization, one sent while the exchange is down is
      * stored "failed" and never sent. Returns the stored record.
      *
-     * `attachments` ([{name, bytes, mime?}], at most MAX_ATTACHMENTS) go as
+     * `attachments` ([{name, bytes}], at most MAX_ATTACHMENTS) go as
      * FIELD_FILE_ATTACHMENTS [[name, bytes], ...] at their original size,
-     * as iOS and Android send them. A message over its limits
-     * (attachmentRefusal) throws before anything is stored. Their bytes go
-     * to the attachment store with the record, so the bubble shows them and
-     * the propagated copy carries the same field.
+     * as iOS and Android send them. Each one's MIME type is ours, from its
+     * name (mimeForName), never one it came with: a picked file's type is
+     * whatever the browser guessed (text/html for a .html), and an object
+     * URL of that type opened in a tab runs as this page. A message over
+     * its limits (attachmentRefusal) throws before anything is stored. Their
+     * bytes go to the attachment store with the record, so the bubble shows
+     * them and the propagated copy carries the same field.
      */
     sendMessage(contact, content, attachments = []) {
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
@@ -2653,7 +2656,7 @@ const RnsClient = {
         // (queued, failed or sent): the bubble shows what the user sent.
         const withAttachments = (record) => attachments.length
             ? this._keepAttachments(MsgStore, contact.destHash, record, attachments.map(a => ({
-                name: a.name, mime: a.mime || mimeForName(a.name), bytes: a.bytes, field: FIELD_FILE_ATTACHMENTS,
+                name: a.name, mime: mimeForName(a.name), bytes: a.bytes, field: FIELD_FILE_ATTACHMENTS,
             })))
             : record;
         if (!this._initialized) {
@@ -6856,7 +6859,9 @@ const App = {
             }
             try {
                 const bytes = new Uint8Array(await file.arrayBuffer());
-                pending.push({ name: file.name || "attachment.bin", bytes, mime: file.type || mimeForName(file.name) });
+                // No type from the browser (file.type): the record's MIME
+                // type is ours, from the name (RnsClient.sendMessage).
+                pending.push({ name: file.name || "attachment.bin", bytes });
             } catch (e) {
                 notices.push(`${file.name} could not be read: ${e?.message || e}`);
             }

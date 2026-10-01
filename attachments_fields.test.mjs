@@ -69,6 +69,19 @@ test("0x06: [image_type, data], named by its type; 0x07: [audio_mode, data], a f
         "Codec2 (LXMF AM_CODEC2_*) is raw frames: a file to download");
 });
 
+test("0x06's MIME type is never built from the sender's image type: anything but our raster images is a download", () => {
+    // image/svg+xml opened in a tab is a document whose script runs on the
+    // page's origin and reads the identity key (review of adee619).
+    for (const type of ["svg+xml", "image/svg+xml", "SVG+XML", " image/SVG+xml ", "html", "text/html", "xhtml+xml", "bmp", ""]) {
+        const [a] = attachmentsFromFields(new Map([[0x06, [type, bytes(8)]]]));
+        assert.equal(a.mime, "application/octet-stream", JSON.stringify(type));
+        assert.equal(a.field, 6, "still an image to try in an <img>");
+    }
+    for (const [type, mime] of [["png", "image/png"], ["image/png", "image/png"], ["JPEG", "image/jpeg"], ["gif", "image/gif"], ["heic", "image/heic"]]) {
+        assert.equal(attachmentsFromFields(new Map([[0x06, [type, bytes(8)]]]))[0].mime, mime, type);
+    }
+});
+
 test("a malformed entry is skipped and counted; the rest of the message, and its good entries, survive", () => {
     const fields = new Map([
         [0x05, [
