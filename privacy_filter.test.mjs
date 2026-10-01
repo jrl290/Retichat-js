@@ -119,11 +119,19 @@ function appFunction(name, env) {
     assert.ok(m, `function ${name} is missing from app.js`);
     return fn(name, m[1], env);
 }
+/** A top-level `const NAME = <expression>;` of app.js, evaluated. */
+function appConst(name) {
+    const m = app.match(new RegExp(`\\nconst ${name} = ([^;]+);\\n`));
+    assert.ok(m, `const ${name} is missing from app.js`);
+    return new Function(`return (${m[1]});`)();
+}
 /** The group trust rule as app.js defines it: shouldProcessGroupMessage
- *  over groupTrustsSource. */
+ *  over groupTrustsSource and GROUP_ACTIONS_THAT_RELAY. */
 function groupRule() {
     const groupTrustsSource = appFunction("groupTrustsSource", {});
-    return { groupTrustsSource, shouldProcessGroupMessage: appFunction("shouldProcessGroupMessage", { groupTrustsSource }) };
+    const GROUP_ACTIONS_THAT_RELAY = appConst("GROUP_ACTIONS_THAT_RELAY");
+    return { groupTrustsSource, GROUP_ACTIONS_THAT_RELAY,
+        shouldProcessGroupMessage: appFunction("shouldProcessGroupMessage", { groupTrustsSource, GROUP_ACTIONS_THAT_RELAY }) };
 }
 
 // ── fixtures ────────────────────────────────────────────────────────────────
@@ -1317,6 +1325,99 @@ test("group trust rule: an invite allows nobody, its listed co-members and its i
     r.packet(lxm(d, r.me, "a DM from the member it listed"));
     await settle();
     assert.deepEqual([r.proofs.length, c.dms(s), c.dms(d)], [proofs, [], []], "both dropped unproved");
+});
+
+test("group trust rule: this client relays only for a group the user has joined; a relay request for a pending group is dropped unproved from anyone, the allowlisted inviter included and with the filter off", async () => {
+    // James, 2026-10-01. Until then an allowed source (the inviter, or
+    // anyone while the filter was off) could have this client relay its
+    // message to the members of a group the user had not accepted.
+    const c = answeringClient();
+    const { r } = c;
+    const [inviter, b] = [1, 2].map(() => Identity.create());
+    const [I, B] = [inviter, b].map(lxmfHash);
+    r.ContactStore.add(I, false, inviter.getPublicKey().toString("hex"));
+    r.ContactStore.allow(I);
+    const G = "4".repeat(32);
+    r.packet(c.invite(inviter, G, [inviter, b]));
+    await settle();
+    assert.equal(r.GroupStore.get(G)?.groupStatus, "pending");
+    const proved = r.proofs.length;
+
+    // The allowlisted inviter, a listed member, and (filter off) a stranger.
+    const s = Identity.create(), S = lxmfHash(s);
+    r.packet(c.relayRequest(inviter, G));
+    r.packet(c.relayRequest(b, G));
+    await settle();
+    r.PrivacyFilter.set(false);
+    r.packet(c.relayRequest(s, G));
+    r.packet(c.relayRequest(inviter, G));
+    await settle();
+    r.PrivacyFilter.set(true);
+    assert.equal(r.proofs.length, proved, "none is proved");
+    assert.deepEqual(c.relays, [], "nothing relayed");
+    assert.deepEqual(r.drops().slice(-4).map((d) => [d.src, d.at]), [[I, "message"], [B, "message"], [S, "message"], [I, "message"]]
+        .map(([h, at]) => [h.slice(0, 12), at]), "each dropped after the parse, before the proof");
+    assert.deepEqual([...r.GroupStore.get(G).members.entries()].sort(),
+        [[I, "accepted"], [B, "invited"], [c.ME, "invited"]].sort(), "the group as it was");
+
+    // Other actions in the pending group are as before: the inviter's
+    // relay_done is taken (it sends nothing), B's own accept is recorded.
+    r.packet(lxm(inviter, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "relay_done"], [GROUP_FIELDS.GROUP_SENDER, I]])));
+    r.packet(lxm(b, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "accept"], [GROUP_FIELDS.GROUP_SENDER, B]])));
+    await settle();
+    assert.equal(r.proofs.length, proved + 2);
+    assert.equal(r.GroupStore.get(G).members.get(B), "accepted");
+
+    // Once the user accepts, the inviter's relay request is honoured.
+    c.acceptInvite(G);
+    assert.equal(r.GroupStore.get(G).groupStatus, "active");
+    r.packet(c.relayRequest(inviter, G));
+    await settle();
+    assert.equal(r.proofs.length, proved + 3, "proved");
+    assert.equal(c.relays.length, 1, "relayed");
+    assert.deepEqual([c.relays[0][0].groupId, c.relays[0][1], c.relays[0][2], c.relays[0][4]], [G, "relay this", I, I]);
+
+    // The rule as a table: relay_req for a group not active is refused
+    // whoever sends it; every other answer is unchanged.
+    const { shouldProcessGroupMessage } = groupRule();
+    for (const [action, allowedSource, status, member, namesOther, want] of [
+        ["relay_req", true, "pending", true, false, false],
+        ["relay_req", true, "pending", false, false, false],
+        ["relay_req", false, "pending", true, false, false],
+        ["relay_req", true, "active", false, false, true],
+        ["relay_req", false, "active", true, false, true],
+        ["relay_req", false, "active", false, false, false],
+        ["relay_done", true, "pending", false, false, true],
+        ["accept", true, "pending", false, true, true],
+        ["accept", false, "pending", true, false, true],
+        ["leave", false, "pending", true, false, true],
+        [null, false, "pending", false, true, true],
+        ["invite", true, "pending", false, false, true],
+    ]) {
+        assert.equal(shouldProcessGroupMessage(action, allowedSource, status, member, namesOther), want,
+            `${action} sourceAllowed=${allowedSource} ${status} member=${member} namesOther=${namesOther}`);
+    }
+});
+
+test("_performGroupRelay sends nothing for a group the user has not joined, whoever asks; for an active group it relays to the accepted members and answers relay_done", async () => {
+    const sent = [];
+    const self = {
+        ownHash: "0".repeat(32),
+        _fanoutGroupEnvelope: async (targets, content, fields) => { sent.push(["fanout", targets, content, fields.groupSender]); },
+        _sendGroupEnvelope: async (target, content, fields) => { sent.push(["send", target, fields.groupAction]); },
+    };
+    const relay = compile("async _performGroupRelay(group, content, originalSender, alreadySeen, requester)", { console: quiet })(self);
+    const [A, B, R] = ["a", "b", "c"].map((x) => x.repeat(32));
+    const group = (groupStatus) => ({ groupId: "9".repeat(32), groupName: "G", groupStatus,
+        members: new Map([[self.ownHash, groupStatus === "active" ? "accepted" : "invited"], [A, "accepted"], [B, "accepted"], [R, "accepted"]]) });
+
+    await relay(group("pending"), "hello", R, [], R);
+    assert.deepEqual(sent, [], "pending: nothing sent, not even relay_done");
+    await relay({ ...group("active"), groupStatus: undefined }, "hello", R, [], R);
+    assert.deepEqual(sent, [], "a group with no status is no joined group either");
+
+    await relay(group("active"), "hello", R, [], R);
+    assert.deepEqual(sent, [["fanout", [A, B], "hello", R], ["send", R, "relay_done"]]);
 });
 
 test("group trust rule: a plain post names its author (GROUP_SENDER) only from a source the group trusts; a stranger's is its own, whichever member, or this device, it names", async () => {

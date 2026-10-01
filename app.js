@@ -545,6 +545,12 @@ function ownLxmfDestinationHash() {
  *     again once the user accepts. It is allowed nothing by it, and it
  *     cannot speak for anyone else, leave in anyone's name or have this
  *     client relay.
+ *   - Nothing makes this client transmit for someone in a group the user
+ *     has not joined: an action in GROUP_ACTIONS_THAT_RELAY (relay_req) for
+ *     a group that is not active is dropped from any source, an allowlisted
+ *     inviter's included, and with the filter off too (James, 2026-10-01).
+ *     Until then an allowed source's relay request was honoured for a
+ *     pending group, so this client relayed for a group it never joined.
  * @param {string|null} groupAction  GROUP_ACTION; null for a plain message
  * @param {boolean} sourceAllowed  the packet's source passes the privacy
  *   filter (PrivacyFilter.allows)
@@ -562,6 +568,7 @@ function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sour
     if (groupAction === "invite") return sourceAllowed;
     if (!groupStatus) return false;
     if (!groupAction) return true;
+    if (groupStatus !== "active" && GROUP_ACTIONS_THAT_RELAY.has(groupAction)) return false;
     if (groupTrustsSource(sourceAllowed, groupStatus, sourceIsMember)) return true;
     return sourceIsMember && !namesOther && (groupAction === "accept" || groupAction === "leave");
 }
@@ -581,6 +588,17 @@ function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sour
 function groupTrustsSource(sourceAllowed, groupStatus, sourceIsMember) {
     return sourceAllowed || (sourceIsMember && groupStatus === "active");
 }
+
+/**
+ * The group actions that make this client transmit on someone's behalf:
+ * relay_req, whose handler (_performGroupRelay) sends the requester's
+ * message to every accepted member and a relay_done back. No other action
+ * sends anything for anyone (an invite, accept, leave or relay_done only
+ * records, and a plain message is only stored). Refused, from any source,
+ * for a group the user has not joined (shouldProcessGroupMessage), and
+ * _performGroupRelay refuses such a group again itself.
+ */
+const GROUP_ACTIONS_THAT_RELAY = new Set(["relay_req"]);
 
 // =========================================================================
 //  CONTACT STORE — the peers this client holds a row for
@@ -1346,7 +1364,9 @@ GroupStore.init();
 //  relay_req and any other action) for a group held here is kept only when
 //  its source is allowed: passes the filter, or is a current member of that
 //  group once the user has accepted it (groupTrustsSource); a member listed
-//  in a pending group may only accept or leave for itself. A stranger's is
+//  in a pending group may only accept or leave for itself, and a relay
+//  request for a pending group is dropped from anyone (this client relays
+//  only for a group the user joined). A stranger's is
 //  dropped like any other drop below, unproved and unnamed, with no
 //  membership change, no allowlisting and no relay, and its plain message
 //  is shown as its own, never as the member its GROUP_SENDER names. The
@@ -3882,7 +3902,8 @@ const RnsClient = {
         // plain message only for a group this client holds; any other action
         // only for a group held here and from a source allowed for it, the
         // packet's own source, never GROUP_SENDER (a pending group's listed
-        // member may still accept or leave for itself). The router has
+        // member may still accept or leave for itself); a relay request only
+        // for a group the user has joined, whoever asks. The router has
         // already asked the same (PrivacyFilter.acceptsMessage); asked again
         // here so this handler holds the rule on its own. Until 2026-09-30
         // any row but a name-only one could invite, channel posters and
@@ -3891,7 +3912,7 @@ const RnsClient = {
         if (!PrivacyFilter.groupAccepts(groupInfo, srcHash)) {
             const why = !group && groupAction !== "invite" ? "a group not held here"
                 : groupAction === "invite" ? "a source the privacy filter does not allow"
-                : "a source that is not allowed for the group, or speaks for another member";
+                : "a source that is not allowed for the group, a member speaking for another, or a relay request for a group the user has not joined";
             console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: ${why}`);
             return;
         }
@@ -4146,6 +4167,13 @@ const RnsClient = {
     },
 
     async _performGroupRelay(group, content, originalSender, alreadySeen, requester) {
+        // Never for a group the user has not joined, whoever asks
+        // (GROUP_ACTIONS_THAT_RELAY): the group rule already drops such a
+        // request, and this send path holds the rule on its own.
+        if (group?.groupStatus !== "active") {
+            console.warn(`[retichat] 👥 Refused to relay for group ${String(group?.groupId).slice(0,8)} from ${String(requester).slice(0,12)}: the user has not joined it`);
+            return;
+        }
         const ownHash = this.ownHash;
         const seen = new Set([...alreadySeen, requester, ownHash, originalSender]);
         const targets = [...group.members.entries()]

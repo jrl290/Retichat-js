@@ -124,11 +124,14 @@ function contactStore(storage) {
 }
 const msgStore = (storage) => build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });
 /** The group trust rule as app.js defines it: shouldProcessGroupMessage
- *  over groupTrustsSource, each with its own parameter list. */
+ *  over groupTrustsSource and GROUP_ACTIONS_THAT_RELAY, each function with
+ *  its own parameter list. */
 function groupRule() {
     const appFunction = (name, env) => fn(name, app.match(new RegExp(`\\nfunction ${name}\\(([^)]*)\\)`))[1], env);
     const groupTrustsSource = appFunction("groupTrustsSource", {});
-    return { groupTrustsSource, shouldProcessGroupMessage: appFunction("shouldProcessGroupMessage", { groupTrustsSource }) };
+    const GROUP_ACTIONS_THAT_RELAY = new Function(`return (${app.match(/\nconst GROUP_ACTIONS_THAT_RELAY = ([^;]+);\n/)[1]});`)();
+    return { groupTrustsSource, GROUP_ACTIONS_THAT_RELAY,
+        shouldProcessGroupMessage: appFunction("shouldProcessGroupMessage", { groupTrustsSource, GROUP_ACTIONS_THAT_RELAY }) };
 }
 /** The real PrivacyFilter over `storage` (on unless stored off), as a page
  *  load builds it. */
