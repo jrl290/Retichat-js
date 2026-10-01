@@ -69,6 +69,54 @@ RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
   </FilesMatch>
 </IfModule>
 
+# ── Content-Security-Policy ──────────────────────────────────────────────────
+#
+# A second wall behind the code that keeps a stranger's bytes from running as
+# this page (AttachmentUrls types every object URL as an image, audio or video,
+# or a download: 8757c37). A blob document opened in a tab inherits the policy
+# of the page that made it, so a script-typed attachment that got past that
+# would still be refused here. Set on the app's document only (<Files>): the
+# retichat.com docroot is shared with the PHP exchange (/reticulum) and other
+# content, which this policy must not touch.
+#
+#   default-src 'self'      anything not named below: this origin only
+#   script-src              this origin, the importmap's one CDN (esm.sh), and
+#                           index.html's inline importmap by its hash; no
+#                           'unsafe-inline' (the page has no other inline
+#                           script). The hash is of the importmap's exact
+#                           text: change a byte of it and the hash here must
+#                           change too (module_graph.test.mjs checks they
+#                           agree). 'unsafe-eval' because msgpackr evaluates:
+#                           at load it tries `new Function('')` to learn
+#                           whether it may build its record readers that way
+#                           (esm.sh msgpackr@1.11.2 unpack.mjs). It catches
+#                           the refusal and carries on without them, but the
+#                           refusal is a violation in every tab's console on
+#                           every load, and the boot gate fails on any
+#                           violation. No code of ours evaluates a string.
+#   style-src 'self'        style.css; the app sets styles through the DOM
+#                           (el.style), which a policy does not restrict
+#   img-src, media-src      this origin and the object URLs (blob:) attachments
+#                           are shown from; img-src also data:
+#   connect-src             this origin (config.json, its own exchange) and
+#                           the exchange of each production node, which a
+#                           config.json may name (https://<node>/reticulum/…),
+#                           and esm.sh
+#   object-src 'none'       no plugins
+#   base-uri 'self'         no <base> that moves where relative URLs go
+#   form-action 'self'      no form posts anywhere else
+#   frame-ancestors 'none'  never framed (a header-only directive)
+#
+# The deploy's boot gate (deploy.sh boot_gate_js) serves the page with the
+# value of this line, read from this file, and fails on any
+# securitypolicyviolation, so a page that does not boot under it is never
+# deployed. verify-deploy.sh does not yet check that the header is live.
+<IfModule mod_headers.c>
+  <Files "index.html">
+    Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'sha256-IbbZfblD0wDC391LFBjVOBb4HW+qfutKAfnuqxf8XBA=' https://esm.sh; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https://retichat.com/reticulum/ https://selectivesubconscious.com/reticulum/ https://esm.sh; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+  </Files>
+</IfModule>
+
 # ES modules must be served with a JavaScript MIME type or the browser refuses
 # them outright. cPanel's default AddType covers .js; .mjs is not always mapped.
 <IfModule mod_mime.c>

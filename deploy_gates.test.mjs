@@ -34,6 +34,7 @@
 import test, { describe, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
     mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, copyFileSync,
     chmodSync, readdirSync, statSync, symlinkSync,
@@ -154,6 +155,20 @@ const PAGE = (importmap = {}) => `<!DOCTYPE html>
 `;
 const RENDER = `document.getElementById("app").append(Object.assign(document.createElement("p"), { textContent: "booted" }));\n`;
 
+/** The fixture's .htaccess: a Content-Security-Policy for `page` as the real
+ *  one is built (.htaccess, content_security_policy.test.mjs): its inline
+ *  importmap by hash, the importmap's hosts, this origin. connect-src also
+ *  names the host the good page beacons to, so that request reaches the
+ *  gate's own block. The boot gate reads it from here. */
+function fixtureHtaccess(page) {
+    const map = page.match(/<script type="importmap">([\s\S]*?)<\/script>/)?.[1];
+    const hash = map ? ` 'sha256-${createHash("sha256").update(map, "utf8").digest("base64")}'` : "";
+    const hosts = map ? [...new Set(Object.values(JSON.parse(map).imports).filter((u) => /^https?:/.test(u)).map((u) => new URL(u).origin))] : [];
+    const csp = `default-src 'self'; script-src 'self'${hash}${hosts.map((h) => ` ${h}`).join("")}; `
+        + `connect-src 'self' https://blocked-host.invalid; object-src 'none'; base-uri 'self'; frame-ancestors 'none'`;
+    return `# fixture\n<IfModule mod_headers.c>\n  <Files "index.html">\n    Header set Content-Security-Policy "${csp}"\n  </Files>\n</IfModule>\n`;
+}
+
 /** A web client payload that boots: a local module, a mapped bare specifier,
  *  and a boot that reads config.json and posts to the exchange it names. */
 function goodSite(dir, extra = {}) {
@@ -177,9 +192,9 @@ document.getElementById("app").append(Object.assign(document.createElement("p"),
         "lib/rns/link.js": `export const link = 1;\n`,
         "style.css": "body { margin: 0 }\n",
         "retichat-icon.png": "png",
-        ".htaccess": "# fixture\n",
         ...extra,
     };
+    if (!(".htaccess" in files)) files[".htaccess"] = fixtureHtaccess(files["index.html"] ?? "");
     for (const [f, body] of Object.entries(files)) if (body !== null) write(join(dir, f), body);
     return dir;
 }
@@ -467,6 +482,45 @@ describe("deploy gates", { concurrency: 2 }, () => {
             if (!r) return;
             assert.equal(r.code, 1, r.out);
             assert.match(r.out, /FAIL .*module import failed: https:\/\/cdn-host\.invalid\/dep\.js .*blocked/);
+        });
+
+        // ── Content-Security-Policy: the page boots under the policy its .htaccess sets ──
+
+        chromiumTest("boot gate: an inline script the page's policy does not allow is a violation, and fails", async (t) => {
+            const page = PAGE({ shim: "./lib/shim.js" }).replace("</body>", `<script>document.title = "inline";</script></body>`);
+            const r = await booted(t, goodSite(scratch("boot-csp-inline"), { "index.html": page }));
+            if (!r) return;
+            assert.equal(r.code, 1, r.out);
+            assert.match(r.out, /FAIL \d+\.\d s Content-Security-Policy violation: script-src-elem refused inline/);
+        });
+
+        chromiumTest("boot gate: the policy is read from the directory's .htaccess: a stale importmap hash fails", async (t) => {
+            const site = goodSite(scratch("boot-csp-stale"));
+            const fresh = readFileSync(join(site, ".htaccess"), "utf8");
+            write(join(site, ".htaccess"), fresh.replace(/'sha256-[^']+'/, `'sha256-${Buffer.alloc(32, 1).toString("base64")}'`));
+            const r = await booted(t, site);
+            if (!r) return;
+            assert.equal(r.code, 1, r.out);
+            assert.match(r.out, /FAIL \d+\.\d s Content-Security-Policy violation: script-src-elem refused inline/, "the importmap itself is refused");
+        });
+
+        chromiumTest("boot gate: a string evaluated under a policy without 'unsafe-eval' is a violation, even one the page catches", async (t) => {
+            // What msgpackr does at load (unpack.mjs: new Function('') in a
+            // try), which is why the page's policy carries 'unsafe-eval'.
+            const r = await booted(t, goodSite(scratch("boot-csp-eval"), { "app.js": `try { new Function(""); } catch (e) {}\n${RENDER}` }));
+            if (!r) return;
+            assert.equal(r.code, 1, r.out);
+            assert.match(r.out, /FAIL \d+\.\d s Content-Security-Policy violation: script-src refused eval/);
+        });
+
+        chromiumTest("boot gate: a fetch the policy's connect-src does not allow is a violation, never a request", async (t) => {
+            const r = await booted(t, goodSite(scratch("boot-csp-connect"), {
+                "app.js": `${RENDER}fetch("https://not-in-the-policy.invalid/x").catch(() => {});\n`,
+            }));
+            if (!r) return;
+            assert.equal(r.code, 1, r.out);
+            assert.match(r.out, /FAIL \d+\.\d s Content-Security-Policy violation: connect-src refused https:\/\/not-in-the-policy\.invalid\/x/);
+            assert.doesNotMatch(r.out, /blocked, never sent: fetch https:\/\/not-in-the-policy/, "the browser refused it before the gate could see it");
         });
 
         chromiumTest("boot gate: an error thrown after load, inside the window, fails", async (t) => {
@@ -987,6 +1041,18 @@ describe("deploy gates", { concurrency: 2 }, () => {
         test("boot gate: a directory without index.html fails", async () => {
             const r = await bootCheck(scratch("boot-empty"));
             assert.equal(r.code, 1, r.out);
+        });
+
+        test("boot gate: an .htaccess that sets no Content-Security-Policy fails, browser or not: the page would be served without one", async () => {
+            for (const [name, htaccess] of [["boot-no-csp", "# fixture: the cache policy only\n"], ["boot-no-htaccess", null]]) {
+                const site = goodSite(scratch(name), { ".htaccess": htaccess });
+                for (const env of [{ DEPLOY_PLAYWRIGHT_DIR: NO_BROWSER }, {}]) {
+                    const r = await bootCheck(site, env);
+                    assert.equal(r.code, 1, `${name}: ${r.out}`);
+                    assert.match(r.out, /FAIL no Content-Security-Policy in .*\.htaccess: the page would be served without one/);
+                    assert.match(r.out, /the page does not boot/);
+                }
+            }
         });
     });
 });

@@ -397,6 +397,11 @@ cmd_clean_strays() { # <node> [--yes]
 # so the gate answers /config.json itself with an exchange on its own server
 # that refuses everything: a boot never reaches a real exchange.
 #
+# index.html is served with the Content-Security-Policy the nodes send, its
+# value read from the directory's .htaccess (the one deployed with it), so the
+# two cannot drift, and any securitypolicyviolation event in the window fails
+# the gate, as does an .htaccess with no policy to read.
+#
 # Exit status: 0 booted clean; 1 the page failed; 2 the gate could not run (a
 # Playwright that is installed but will not load, a Chromium that will not
 # start), which says nothing about the page; 3 no browser installed (no
@@ -434,6 +439,13 @@ const say = (s) => console.log(`  ${s}`);
 const [rootArg, pwDir] = process.argv.slice(2);
 const ROOT = resolve(rootArg ?? ".");
 if (!existsSync(join(ROOT, "index.html"))) { say(`FAIL no index.html in ${ROOT}`); process.exit(1); }
+
+// The Content-Security-Policy the nodes send with index.html: the value of
+// the .htaccess line that sets it (<Files "index.html">), read here so the
+// page is booted under exactly what it will be served with.
+const CSP_LINE = /^\s*Header\s+(?:always\s+)?set\s+Content-Security-Policy\s+"([^"]+)"\s*$/m;
+const csp = existsSync(join(ROOT, ".htaccess")) ? (await readFile(join(ROOT, ".htaccess"), "utf8")).match(CSP_LINE)?.[1] : null;
+if (!csp) { say(`FAIL no Content-Security-Policy in ${join(ROOT, ".htaccess")}: the page would be served without one`); process.exit(1); }
 
 // Only "not installed" skips: Playwright that cannot be found, or Playwright
 // whose Chromium was never downloaded. An installed Playwright that fails to
@@ -488,6 +500,7 @@ const server = createServer(async (req, res) => {
         res.writeHead(200, {
             "content-type": TYPES[extname(file).toLowerCase()] ?? "application/octet-stream",
             "cache-control": "no-store",
+            ...(file === join(ROOT, "index.html") ? { "content-security-policy": csp } : {}),
         }).end(body);
     } catch {
         res.writeHead(404, { "content-type": "text/plain" }).end("not found");
@@ -534,7 +547,14 @@ try {
         if (m.type() === "error" && /module script|module specifier|import ?map/i.test(m.text())) fail(m.text());
     });
     await page.exposeFunction("__deployBootGateRendered", () => { rendered ??= at(); });
+    await page.exposeFunction("__deployBootGateViolation", (v) => fail(`Content-Security-Policy violation: ${v}`));
     await page.addInitScript(() => {
+        // Every violation of the page's policy, as it happens: the policy
+        // the nodes send is what the page must boot under, untouched.
+        window.addEventListener("securitypolicyviolation", (e) => {
+            window.__deployBootGateViolation(`${e.effectiveDirective || e.violatedDirective} refused ${e.blockedURI || "(inline)"}`
+                + `${e.sourceFile ? ` at ${e.sourceFile}:${e.lineNumber}` : ""}${e.sample ? ` (${e.sample.slice(0, 60)})` : ""}`);
+        }, true);
         const seen = () => {
             const app = document.getElementById("app");
             if (app && app.childElementCount > 0) { observer.disconnect(); window.__deployBootGateRendered(); }
@@ -563,7 +583,7 @@ if (failures.length) {
     for (const f of failures) say(`FAIL ${f}`);
     process.exit(1);
 }
-say(`rendered at ${renderedAt}; no pageerror and no failed module import in the first ${WINDOW_MS / 1000} s`);
+say(`rendered at ${renderedAt}; no pageerror and no failed module import in the first ${WINDOW_MS / 1000} s, and no Content-Security-Policy violation`);
 process.exit(0);
 JS
 }
