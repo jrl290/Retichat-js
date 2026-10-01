@@ -213,19 +213,26 @@ test("§5.4 the old web announce suffix: rows migrated before the rule lose it o
     const row = (destHash, names) => ({ destHash, localName: null, messageName: null, messageNameAt: null, announceName: null,
         legacyName: null, publicKey: null, addedAt: 1, lastSeen: 1, reachable: null, isDistro: false, hidden: false,
         nameOnly: false, allowlisted: true, ...names });
+    const q = "abcdef0123456789abcdef0123456789";
     s.sSet("contacts_v2", [
         row(h, { localName: "Lou (0123456789ab)", announceName: "Ann (0123456789ab)", legacyName: "Retichat (0123456789ab)" }),
+        row(q, { localName: "Quinn (abcdef012345)" }),               // nothing heard since: legacyName
         row(other, { localName: "Lou (0123456789ab)" }),            // not this contact's own hash
     ]);
     const store = contactStore(s);
-    assert.deepEqual([store.get(h).localName, store.get(h).announceName, store.get(h).legacyName], ["Lou", "Ann", null]);
+    assert.deepEqual([store.get(h).localName, store.get(h).announceName, store.get(h).legacyName], [null, "Ann", null],
+        "a localName with the suffix was the old rename pre-fill (James, 2026-10-01): it yields, and the named announce heard since leaves no legacyName");
+    assert.deepEqual([store.get(q).localName, store.get(q).legacyName, store.name(q)], [null, "Quinn", "Quinn"],
+        "with nothing heard since, it is a legacyName, which the contact's first 0xD1 or named announce replaces");
+    store.updateFromAnnounce(q, { appData: MsgPack.pack([Buffer.from("Q"), null, []]) });
+    assert.deepEqual([store.get(q).legacyName, store.name(q)], [null, "Q"], "replaced by the first named announce");
     assert.equal(store.get(other).localName, "Lou (0123456789ab)");
     assert.equal(s.sGet("ownHashSuffixStripped"), true, "recorded");
-    assert.equal(s.sGet("contacts_v2").find((c) => c.destHash === h).localName, "Lou", "persisted");
+    assert.equal(s.sGet("contacts_v2").find((c) => c.destHash === h).localName, null, "persisted");
 
     // Once: what the user types afterwards is theirs, whatever it looks like.
     store.setLocalName(h, "Lou (0123456789ab)");
-    assert.equal(contactStore(s).get(h).localName, "Lou (0123456789ab)", "a later load does not strip it again");
+    assert.equal(contactStore(s).get(h).localName, "Lou (0123456789ab)", "a later load does not touch it again");
     // A user whose rows are new runs it on nothing, and only once.
     const fresh = memory();
     contactStore(fresh);

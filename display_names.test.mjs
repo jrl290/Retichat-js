@@ -494,9 +494,14 @@ test("§5.4 contact migration strips the old web announce suffix, only for the c
     const base = { destHash: h, publicKey: null, lastSeen: 1 };
     const slots = (localName, legacyName) => ({ ...base, localName, messageName: null, messageNameAt: null, announceName: null, legacyName });
     assert.deepEqual(DN.migrateContact({ ...base, displayName: "Alice (0123456789ab)", nameCustomized: false }), slots(null, "Alice"));
-    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Alice (0123456789ab)", nameCustomized: true }), slots("Alice", null),
-        "Save on the old rename field, pre-filled with the announced name");
-    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob (work) (0123456789ab)", nameCustomized: true }), slots("Bob (work)", null));
+    // Save on the old rename field, pre-filled with the announced name: no
+    // name the user typed (James, 2026-10-01), so a legacyName, which her
+    // first 0xD1 or named announce replaces, not a localName that would
+    // outrank them for good.
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Alice (0123456789ab)", nameCustomized: true }), slots(null, "Alice"),
+        "customized with the suffix: legacyName");
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob (work) (0123456789ab)", nameCustomized: true }), slots(null, "Bob (work)"));
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Alice (0123456789AB)", nameCustomized: true }), slots(null, "Alice"), "hex in any case");
     // Only the contact's own hash: parentheses a user typed stay.
     for (const kept of ["Alice (fedcba987654)", "Bob (work)", "Alice (0123456789abcdef)"]) {
         assert.deepEqual(DN.migrateContact({ ...base, displayName: kept, nameCustomized: true }), slots(kept, null), kept);
@@ -512,20 +517,41 @@ test("§5.4 contact migration strips the old web announce suffix, only for the c
     assert.deepEqual(DN.migrateContact({ ...base, displayName: "Retichat", nameCustomized: true }), slots("Retichat", null));
 
     // The first three-slot build: its messageName moves to legacyName, and
-    // all its slots lose the suffix.
+    // all its slots lose the suffix. Its localName with the suffix was the
+    // customized pre-fill: what is left goes to legacyName, unless that
+    // holds a name already or a named announce has been heard since (§5.1
+    // would have dropped it).
     assert.deepEqual(DN.migrateContact({ ...base, localName: "Lou (0123456789ab)", messageName: "Max (0123456789ab)", announceName: "Ann (0123456789ab)" }),
-        { ...base, localName: "Lou", messageName: null, messageNameAt: null, announceName: "Ann", legacyName: "Max" });
+        { ...base, localName: null, messageName: null, messageNameAt: null, announceName: "Ann", legacyName: "Max" });
+    assert.deepEqual(DN.migrateContact({ ...base, localName: "Lou (0123456789ab)", messageName: null, announceName: null }),
+        { ...base, localName: null, messageName: null, messageNameAt: null, announceName: null, legacyName: "Lou" });
+    assert.deepEqual(DN.migrateContact({ ...base, localName: "Lou (0123456789ab)", messageName: null, announceName: "Ann" }),
+        { ...base, localName: null, messageName: null, messageNameAt: null, announceName: "Ann", legacyName: null });
+    assert.deepEqual(DN.migrateContact({ ...base, localName: "Lou", messageName: null, announceName: "Ann" }),
+        { ...base, localName: "Lou", messageName: null, messageNameAt: null, announceName: "Ann", legacyName: null }, "no suffix: the user's");
 
     // Current shape: untouched, but by the one-off pass.
     const current = { ...base, localName: "Lou (0123456789ab)", messageName: "Msg (0123456789ab)", messageNameAt: 5,
         announceName: "Retichat Web (0123456789ab)", legacyName: "Leg (0123456789ab)" };
     assert.deepEqual(DN.migrateContact(current), current, "not without the pass");
     const passed = DN.migrateContact(current, { ownHashSuffixPass: true });
-    assert.deepEqual(passed, { ...current, localName: "Lou", announceName: null, legacyName: "Leg" },
-        "the pass: localName, announceName and legacyName; messageName comes from 0xD1, which never carried it");
+    assert.deepEqual(passed, { ...current, localName: null, announceName: null, legacyName: "Leg" },
+        "the pass: localName, announceName and legacyName; messageName comes from 0xD1, which never carried it; the suffixed localName is no name typed");
     assert.deepEqual(DN.migrateContact(passed), passed);
     const typed = { ...base, localName: "Bob (work)", messageName: null, messageNameAt: null, announceName: null, legacyName: null };
     assert.deepEqual(DN.migrateContact(typed, { ownHashSuffixPass: true }), typed);
+    // The pass on a suffixed localName: legacyName when nothing has been
+    // heard since; dropped when a 0xD1 was accepted (a name, or a clear:
+    // messageNameAt) or a named announce heard; a placeholder goes.
+    const quiet = { ...base, localName: "Lou (0123456789ab)", messageName: null, messageNameAt: null, announceName: null, legacyName: null };
+    assert.deepEqual(DN.migrateContact(quiet, { ownHashSuffixPass: true }), { ...quiet, localName: null, legacyName: "Lou" });
+    for (const since of [{ messageName: "Lu", messageNameAt: 9 }, { messageNameAt: 9 }, { announceName: "Ann" }, { announceName: "Retichat Web (0123456789ab)" }]) {
+        const got = DN.migrateContact({ ...quiet, ...since }, { ownHashSuffixPass: true });
+        assert.deepEqual([got.localName, got.legacyName], [null, null], JSON.stringify(since));
+    }
+    assert.deepEqual(DN.migrateContact({ ...quiet, legacyName: "Old" }, { ownHashSuffixPass: true }), { ...quiet, localName: null, legacyName: "Old" },
+        "a legacyName held is kept");
+    assert.deepEqual(DN.migrateContact({ ...quiet, localName: "Retichat (0123456789ab)" }, { ownHashSuffixPass: true }), { ...quiet, localName: null, legacyName: null });
 });
 
 test("§5.4 own name: an old web node default is no Message Display Name, whichever node's it was", () => {
