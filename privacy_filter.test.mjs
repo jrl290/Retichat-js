@@ -16,8 +16,8 @@
  * proof. A source that is neither allowlisted nor a member here (a
  * stranger) is read only as far as its group id and action: a group
  * message for a group held here is kept, as iOS keeps it, and anything
- * else is dropped. A dropped message gets no proof, no parse, no
- * delivery-ticket reply, no row, no name and no bubble. On every path:
+ * else is dropped. A dropped message gets no proof, no parse, no ticket
+ * remembered, no row, no name and no bubble. On every path:
  * opportunistic packets, link packets, link Resources (transferred first:
  * the source is inside) and messages fetched from the propagation node
  * (still purged).
@@ -236,7 +236,7 @@ test("the filter is on by default, and the Settings toggle is persisted and appl
     assert.match(settings, /"Only accept messages from contacts you have explicitly added"/, "the natives' words");
     assert.match(settings, /checked: PrivacyFilter\.on,/);
     assert.match(settings, /onChange: \(e\) => \{ PrivacyFilter\.set\(e\.target\.checked\); \}/, "applied on change, no Save needed");
-    assert.match(methodBody("async connect()"), /new LXMRouter\(this\._rns, IdMgr\.id, \{ filter: PrivacyFilter \}\)/,
+    assert.match(methodBody("async connect()"), /new LXMRouter\(this\._rns, IdMgr\.id, \{ filter: PrivacyFilter, tickets: OutboundTickets \}\)/,
         "the router is built with the filter, so no message arrives before it");
 });
 
@@ -276,7 +276,7 @@ test("opportunistic: a packet the destination could not decrypt is not proved", 
     assert.equal(r.emitted.length, 0);
 });
 
-test("link packet: a stranger's is never proved, parsed or answered; a contact's is proved and gets its ticket reply", async (t) => {
+test("link packet: a stranger's is never proved, parsed or answered; a contact's is proved", async (t) => {
     const r = recipient();
     const { a, wire } = await deliveryLink(r);
     const stranger = Identity.create(), friend = Identity.create();
@@ -297,7 +297,7 @@ test("link packet: a stranger's is never proved, parsed or answered; a contact's
     a.send(lxm(friend, r.me, "hi friend", ticketed()));
     await settle(6);
     assert.equal(linkProofs(wire).length, 1, "proved once (until 2026-09-30 the link proved it and the router again)");
-    assert.equal(linkReplies(wire).length, 1, "and answered with the ticket reply");
+    assert.equal(linkReplies(wire).length, 0, "and nothing else: LXMF has no ticket reply (lxmf_tickets.test.mjs)");
     assert.deepEqual(r.MsgStore.get(F).map((m) => m.content), ["hi friend"]);
 
     // Only the delivery link waits for the router: any other link still
@@ -377,7 +377,7 @@ test("link Resource: a stranger's is transferred (its source is inside) but drop
     await within(a.sendResource(fromFriend), 5000, "the contact's Resource");
     await settle(6);
     assert.equal(r.emitted.length, 1);
-    assert.equal(linkReplies(wire).length, 1, "the contact's gets its ticket reply");
+    assert.equal(linkReplies(wire).length, 0, "nor a kept one: LXMF has no ticket reply");
     assert.equal(r.MsgStore.get(F)[0].content.length, 3000);
 });
 
@@ -670,16 +670,17 @@ test("a stranger's group message for a group held here is kept and proved, as iO
     await settle();
     assert.equal(r.proofs.length, 2);
 
-    // A link packet and a link Resource: proved, and the ticket answered,
-    // as for any message kept.
+    // A link packet and a link Resource: proved, as any message kept (and
+    // nothing else sent back: LXMF has no ticket reply).
     const { a, wire } = await deliveryLink(r);
     a.send(lxm(stranger, r.me, "link packet", ticketed([[GROUP_FIELDS.GROUP_ID, G]])));
     await settle(6);
     assert.equal(linkProofs(wire).length, 1, "the link packet is proved");
-    assert.equal(linkReplies(wire).length, 1, "and its ticket answered");
+    assert.equal(linkReplies(wire).length, 0, "and no ticket reply");
     await within(a.sendResource(lxm(stranger, r.me, "r".repeat(3000), ticketed([[GROUP_FIELDS.GROUP_ID, G]]))), 5000, "the stranger's Resource");
     await settle(6);
-    assert.equal(linkReplies(wire).length, 2, "the Resource's ticket answered");
+    assert.equal(r.emitted.at(-1)?.content, "r".repeat(3000), "the Resource is kept");
+    assert.equal(linkReplies(wire).length, 0, "with no ticket reply");
 
     // Fetched from the propagation node.
     const purged = await fetchPropagated(r, [lxm(stranger, r.me, "propagated", inG())]);

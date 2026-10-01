@@ -500,6 +500,7 @@ async function runConnect({ held, takenOverWhileLoading = false }) {
         PostInterface: class { constructor() { made.push("PostInterface"); } on() {} },
         LXMRouter: class { constructor() { throw STOP; } },
         PrivacyFilter: {},
+        OutboundTickets: {},
     };
     const self = { _setStatus() {}, _followExchange() {} };
     let outcome;

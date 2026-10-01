@@ -1004,6 +1004,34 @@ const LxmfSeen = {
 LxmfSeen.init();
 
 // =========================================================================
+//  OUTBOUND TICKETS
+//
+//  The tickets senders gave this client (LXMF include_ticket: [expires,
+//  ticket]), one per source, as the router remembers them
+//  (LXMRouter.rememberTicket; LXMF available_tickets["outbound"]).
+//  Persisted, as LXMF saves available_tickets; an expired one is dropped
+//  when the page loads (LXMRouter.py clean_available_tickets).
+// =========================================================================
+const OutboundTickets = {
+    _entries: new Map(), // source hash (hex) → [expires (s), ticket (hex)]
+
+    init() {
+        const stored = sGet("outbound_tickets");
+        const now = Date.now() / 1000;
+        if (stored && typeof stored === "object") {
+            for (const [source, entry] of Object.entries(stored)) {
+                if (Array.isArray(entry) && entry[0] > now && typeof entry[1] === "string") this._entries.set(source, entry);
+            }
+        }
+        this._save();
+    },
+    get(source) { return this._entries.get(source); },
+    set(source, entry) { this._entries.set(source, entry); this._save(); },
+    _save() { sSet("outbound_tickets", Object.fromEntries(this._entries)); },
+};
+OutboundTickets.init();
+
+// =========================================================================
 //  GROUP STORE — group chat state matching iOS GroupChatManager + ChatRepository
 // =========================================================================
 const GroupStore = {
@@ -1853,8 +1881,9 @@ const RnsClient = {
         // carry (DISPLAY_NAMES.md §2.2; nil until the user sets one) and the
         // privacy filter, which it asks before it proves or parses anything
         // (PrivacyFilter). Given to the constructor, so no message can reach
-        // the router before the filter is in place.
-        this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id, { filter: PrivacyFilter });
+        // the router before the filter is in place. The tickets senders give
+        // this client are remembered in OutboundTickets (rememberTicket).
+        this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id, { filter: PrivacyFilter, tickets: OutboundTickets });
         this._lxmfRouter.setAnnounceName(OwnNames.announce);
         this._lxmfRouter.on("message", (lxmfMsg) => {
             const srcHash = lxmfMsg.sourceHash?.toString("hex");
