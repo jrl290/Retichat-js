@@ -7,15 +7,20 @@
  *
  *   lib/day_markers.js for real, the clock, time zone and locale injected:
  *   same day, midnight on both sides, DST change days (a day that starts at
- *   01:00 included), the year boundary, a time-zone change, the first item,
- *   paging prepend, a new message arriving, out-of-order timestamps and
- *   localized labels.
+ *   01:00 included), the year boundary, future days (a sender's clock
+ *   ahead), a time-zone change, the first item, paging prepend, a new
+ *   message arriving, out-of-order timestamps and localized labels; and a
+ *   relabel costing a lookup per row, not a date formatting.
  *
  *   app.js's wiring over a small fake DOM: the marker rides inside its
  *   message's row (no new rows, ids unchanged), the three lists label their
  *   rows, an appended message and a rebuilt row keep the markers right, and
  *   a chat left open across midnight is relabelled in place by the page's
- *   events and the open chat's update paths, with no timer of its own.
+ *   events, the open chat's update paths and the announce interval's tick,
+ *   with no timer of its own.
+ *
+ *   What day a received message is marked by (the time its sender sent it)
+ *   is tested on every receive path in received_time.test.mjs.
  *
  * Run: node --test day_markers.test.mjs
  */
@@ -117,6 +122,18 @@ test("the year boundary: two days; the relative words win over the year; a past 
         "this year's to its last minute");
     assert.equal(label(at(UTC, 2026, 1, 1, 9), at(UTC, 2027, 1, 2, 0, 1), UTC), "Thursday, January 1, 2026",
         "and with its year once the year has turned");
+});
+
+test("a sender's clock running ahead: tomorrow is a date, never Today, and a day in next year carries its year", () => {
+    // Android DayMarkersTest.kt futureDays_areDatesNeverToday. A received
+    // message carries its sender's time (sentTimeMs), ahead or behind.
+    const LONDON = "Europe/London";
+    const midYear = at(LONDON, 2026, 6, 15, 12);
+    assert.equal(label(at(LONDON, 2026, 6, 16, 9), midYear, LONDON), "Tuesday, June 16");
+    assert.deepEqual(markers([msg("a", at(LONDON, 2026, 6, 15, 9)), msg("b", at(LONDON, 2026, 6, 16, 0, 30))], LONDON, midYear),
+        ["Today", "Tuesday, June 16"]);
+    const newYearsEve = at(LONDON, 2026, 12, 31, 12);
+    assert.equal(label(at(LONDON, 2027, 1, 1, 9), newYearsEve, LONDON), "Friday, January 1, 2027");
 });
 
 test("a time-zone change moves the days: the same messages are two days in UTC, one in New York and Tokyo", () => {
