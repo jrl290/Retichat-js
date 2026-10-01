@@ -531,8 +531,13 @@ const ContactStore = {
     init() {
         const data = sGet("contacts_v2");
         let migrated = false;
+        // §5.4, once: rows migrated before the old web announce suffix was
+        // a rule (2026-09-30) lose it too (migrateContact ownHashSuffixPass).
+        // Once only, so a name typed afterwards is never touched.
+        const ownHashSuffixPass = sGet("ownHashSuffixStripped") !== true;
         if (Array.isArray(data)) for (const stored of data) {
-            const c = migrateContact(stored);
+            const c = migrateContact(stored, { ownHashSuffixPass });
+            if (ownHashSuffixPass && ["localName", "announceName", "legacyName"].some((k) => c[k] !== stored[k] && k in stored)) migrated = true;
             if ("displayName" in stored || "nameCustomized" in stored || !("localName" in stored) || !("legacyName" in stored)) migrated = true;
             if (!("allowlisted" in stored)) {
                 c.allowlisted = !c.hidden && !c.nameOnly;
@@ -541,6 +546,7 @@ const ContactStore = {
             this._contacts.set(c.destHash, c);
         }
         if (migrated) this._save();
+        if (ownHashSuffixPass) sSet("ownHashSuffixStripped", true);
     },
 
     onChange(fn) { this._listeners.push(fn); fn(this.getAll()); },
@@ -626,7 +632,9 @@ const ContactStore = {
         const c = this._contacts.get(destHash);
         if (!c) return;
 
-        c.announceName = LXMF.displayNameFromAppData(announce.appData);
+        // §5.4: a web client older than 2026-09-23 still announces its
+        // name with " (" + its own hash's first 12 hex + ")"; that goes.
+        c.announceName = LXMF.displayNameFromAppData(announce.appData, destHash);
         // §5.1: an announce carrying a name replaces a migrated legacyName.
         if (c.announceName !== null) c.legacyName = null;
         // The lxmf.delivery announce is the source of truth for "distro"

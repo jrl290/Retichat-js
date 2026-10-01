@@ -188,6 +188,48 @@ test("§5.1 announce names are replaced on every announce and cleared by a namel
     assert.equal(store.get(h).announceName, null);
 });
 
+test("§5.4 the old web announce suffix: an announce loses it, for the announcing hash only", () => {
+    const store = contactStore(memory());
+    const h = "0123456789abcdef0123456789abcdef";
+    store.add(h);
+    // The pre-09-23 web announce: raw name bytes, the suffix its own hash's.
+    store.updateFromAnnounce(h, { appData: Buffer.from("Alice (0123456789ab)") });
+    assert.equal(store.get(h).announceName, "Alice");
+    store.updateFromAnnounce(h, { appData: MsgPack.pack([Buffer.from("Alice (0123456789AB)"), null, []]) });
+    assert.equal(store.get(h).announceName, "Alice", "the list form too, hex in any case");
+    store.updateFromAnnounce(h, { appData: MsgPack.pack([Buffer.from("Alice (fedcba987654)"), null, []]) });
+    assert.equal(store.get(h).announceName, "Alice (fedcba987654)", "another hash's hex is part of the name");
+    store.updateFromAnnounce(h, { appData: MsgPack.pack([Buffer.from("Bob (work)"), null, []]) });
+    assert.equal(store.get(h).announceName, "Bob (work)");
+    assert.match(methodBody("updateFromAnnounce(destHash, announce)"),
+        /LXMF\.displayNameFromAppData\(announce\.appData, destHash\)/, "the shipped call passes the announcing hash");
+});
+
+test("§5.4 the old web announce suffix: rows migrated before the rule lose it once, and a name typed afterwards keeps it", () => {
+    const s = memory();
+    const h = "0123456789abcdef0123456789abcdef", other = "f".repeat(32);
+    const row = (destHash, names) => ({ destHash, localName: null, messageName: null, messageNameAt: null, announceName: null,
+        legacyName: null, publicKey: null, addedAt: 1, lastSeen: 1, reachable: null, isDistro: false, hidden: false,
+        nameOnly: false, allowlisted: true, ...names });
+    s.sSet("contacts_v2", [
+        row(h, { localName: "Lou (0123456789ab)", announceName: "Ann (0123456789ab)", legacyName: "Retichat (0123456789ab)" }),
+        row(other, { localName: "Lou (0123456789ab)" }),            // not this contact's own hash
+    ]);
+    const store = contactStore(s);
+    assert.deepEqual([store.get(h).localName, store.get(h).announceName, store.get(h).legacyName], ["Lou", "Ann", null]);
+    assert.equal(store.get(other).localName, "Lou (0123456789ab)");
+    assert.equal(s.sGet("ownHashSuffixStripped"), true, "recorded");
+    assert.equal(s.sGet("contacts_v2").find((c) => c.destHash === h).localName, "Lou", "persisted");
+
+    // Once: what the user types afterwards is theirs, whatever it looks like.
+    store.setLocalName(h, "Lou (0123456789ab)");
+    assert.equal(contactStore(s).get(h).localName, "Lou (0123456789ab)", "a later load does not strip it again");
+    // A user whose rows are new runs it on nothing, and only once.
+    const fresh = memory();
+    contactStore(fresh);
+    assert.equal(fresh.sGet("ownHashSuffixStripped"), true);
+});
+
 test("§5.1 rename: the field holds only the local name, Save untouched changes nothing, empty clears (audit M5)", () => {
     const store = contactStore(memory());
     const h = "e".repeat(32);

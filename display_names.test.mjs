@@ -432,6 +432,59 @@ test("§5.4 the old web node defaults as the web held them: config.json's, annou
         { ...base, localName: null, messageName: null, messageNameAt: null, announceName: null, legacyName: null });
 });
 
+test("§5.4 the old web announce suffix: every shared vector (LXMF-rust display_name_vectors.json \"own_hash_suffix\")", () => {
+    assert.ok(vectors.own_hash_suffix.length >= 15);
+    assert.ok(vectors.own_hash_suffix.some((v) => v.expected !== v.input), "some are stripped");
+    assert.ok(vectors.own_hash_suffix.some((v) => v.expected === v.input), "and some are not");
+    for (const v of vectors.own_hash_suffix) {
+        assert.equal(DN.stripOwnHashSuffix(v.input, v.own_hash), v.expected, v.name);
+    }
+    assert.equal(DN.stripOwnHashSuffix(null, "0123456789abcdef0123456789abcdef"), null);
+    assert.equal(DN.stripOwnHashSuffix("Alice (0123456789ab)", null), "Alice (0123456789ab)", "no hash, no rule");
+});
+
+test("§5.4 contact migration strips the old web announce suffix, only for the contact's own hash", () => {
+    // Until 2026-09-23 the web announced "<name> (<first 12 hex of its
+    // lxmf.delivery hash>)", and the old web stored it as the name; its
+    // rename field was pre-filled with it, so Save untouched customized it.
+    const h = "0123456789abcdef0123456789abcdef";
+    const base = { destHash: h, publicKey: null, lastSeen: 1 };
+    const slots = (localName, legacyName) => ({ ...base, localName, messageName: null, messageNameAt: null, announceName: null, legacyName });
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Alice (0123456789ab)", nameCustomized: false }), slots(null, "Alice"));
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Alice (0123456789ab)", nameCustomized: true }), slots("Alice", null),
+        "Save on the old rename field, pre-filled with the announced name");
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Bob (work) (0123456789ab)", nameCustomized: true }), slots("Bob (work)", null));
+    // Only the contact's own hash: parentheses a user typed stay.
+    for (const kept of ["Alice (fedcba987654)", "Bob (work)", "Alice (0123456789abcdef)"]) {
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: kept, nameCustomized: true }), slots(kept, null), kept);
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: kept, nameCustomized: false }), slots(null, kept), kept);
+    }
+    // What is left came from an announce: a placeholder goes, even
+    // customized, and an old web node default with or without it goes too.
+    for (const announced of ["Retichat (0123456789ab)", "Retichat Web (0123456789ab)", "Retichat Web (retichat) (0123456789ab)", "01234567 (0123456789ab)"]) {
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: announced, nameCustomized: true }), slots(null, null), `${announced}, customized`);
+        assert.deepEqual(DN.migrateContact({ ...base, displayName: announced, nameCustomized: false }), slots(null, null), announced);
+    }
+    // A typed "Retichat" with no suffix is still the user's (unchanged rule).
+    assert.deepEqual(DN.migrateContact({ ...base, displayName: "Retichat", nameCustomized: true }), slots("Retichat", null));
+
+    // The first three-slot build: its messageName moves to legacyName, and
+    // all its slots lose the suffix.
+    assert.deepEqual(DN.migrateContact({ ...base, localName: "Lou (0123456789ab)", messageName: "Max (0123456789ab)", announceName: "Ann (0123456789ab)" }),
+        { ...base, localName: "Lou", messageName: null, messageNameAt: null, announceName: "Ann", legacyName: "Max" });
+
+    // Current shape: untouched, but by the one-off pass.
+    const current = { ...base, localName: "Lou (0123456789ab)", messageName: "Msg (0123456789ab)", messageNameAt: 5,
+        announceName: "Retichat Web (0123456789ab)", legacyName: "Leg (0123456789ab)" };
+    assert.deepEqual(DN.migrateContact(current), current, "not without the pass");
+    const passed = DN.migrateContact(current, { ownHashSuffixPass: true });
+    assert.deepEqual(passed, { ...current, localName: "Lou", announceName: null, legacyName: "Leg" },
+        "the pass: localName, announceName and legacyName; messageName comes from 0xD1, which never carried it");
+    assert.deepEqual(DN.migrateContact(passed), passed);
+    const typed = { ...base, localName: "Bob (work)", messageName: null, messageNameAt: null, announceName: null, legacyName: null };
+    assert.deepEqual(DN.migrateContact(typed, { ownHashSuffixPass: true }), typed);
+});
+
 test("§5.4 own name: an old web node default is no Message Display Name, whichever node's it was", () => {
     assert.equal(DN.migrateOwnDisplayName("Retichat Web (selectiv)", "Retichat Web (retichat)"), null,
         "a name saved on another node, or before this node's default changed");
