@@ -573,6 +573,10 @@ function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sour
  * accepted, the other group members are considered allowed", James,
  * 2026-10-01). A member listed in a group still pending is not allowed by
  * that: the user has not accepted it, and declining leaves nothing behind.
+ * Only an allowed source speaks for others: its GROUP_SENDER is the author
+ * of a plain message or the member of an accept or leave, and its relay
+ * request is honoured (PrivacyFilter.groupMember). Anyone else's message is
+ * its own, whatever GROUP_SENDER it carries.
  */
 function groupTrustsSource(sourceAllowed, groupStatus, sourceIsMember) {
     return sourceAllowed || (sourceIsMember && groupStatus === "active");
@@ -1342,8 +1346,9 @@ GroupStore.init();
 //  group once the user has accepted it (groupTrustsSource); a member listed
 //  in a pending group may only accept or leave for itself. A stranger's is
 //  dropped like any other drop below, unproved and unnamed, with no
-//  membership change, no allowlisting and no relay. The phones still
-//  process it from anyone. Messages fanned out to the distro
+//  membership change, no allowlisting and no relay, and its plain message
+//  is shown as its own, never as the member its GROUP_SENDER names. The
+//  phones still process it from anyone. Messages fanned out to the distro
 //  address are never filtered:
 //  mail to the distro is mail to this person (iOS handleDistroMessage,
 //  ChatRepository.swift:2049-2055; Android onDistroMessageReceived,
@@ -1420,7 +1425,8 @@ const PrivacyFilter = {
         const sourceAllowed = this.allows(src);
         const groupStatus = held ? held.groupStatus : null;
         const sourceIsMember = GroupStore.isCurrentMember(groupId, src);
-        return { sourceAllowed, groupStatus, sourceIsMember };
+        return { sourceAllowed, groupStatus, sourceIsMember,
+            trusted: groupTrustsSource(sourceAllowed, groupStatus, sourceIsMember) };
     },
 
     /** The group rule (shouldProcessGroupMessage: iOS groupMessagePolicy
@@ -1434,6 +1440,16 @@ const PrivacyFilter = {
         return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, s.groupStatus, s.sourceIsMember, named !== src);
     },
 
+    /** Whom a group message the rule kept is from, or about (the member of
+     *  an accept or leave, the author a relay request asks to relay): its
+     *  GROUP_SENDER when the group trusts its source (groupTrustsSource:
+     *  an allowed member relaying someone else's), otherwise its source. A
+     *  source the user's trust does not reach speaks only for itself: a
+     *  stranger's post for a held group is shown as the stranger's, never
+     *  as the member it names. */
+    groupMember(group, src) {
+        return group.groupSender && this._groupStanding(group.groupId, src).trusted ? group.groupSender : src;
+    },
 
     /** Step 1, for the router (LXMRouter.acceptsSource): may a message from
      *  `sourceHash` (16 bytes, straight from the decrypted plaintext) be
@@ -3857,7 +3873,6 @@ const RnsClient = {
         console.log(`[retichat] 👥 Group message: groupId=${groupId.slice(0,8)} action=${groupAction || "message"} from=${srcHash.slice(0,12)}`);
 
         const group = GroupStore.get(groupId);
-        const actualSender = groupSender || srcHash;
         // The group rule (shouldProcessGroupMessage: iOS groupMessagePolicy
         // under James's group trust rule, 2026-10-01): an invite only from a
         // source the privacy filter allows (an allowlisted contact while it
@@ -3878,6 +3893,11 @@ const RnsClient = {
             console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: ${why}`);
             return;
         }
+        // GROUP_SENDER only from a source the group trusts; anyone else's
+        // message is its own (PrivacyFilter.groupMember). Until 2026-10-01 a
+        // stranger's post for a held group was shown as written by whichever
+        // member it named, as iOS still shows it.
+        const actualSender = PrivacyFilter.groupMember(groupInfo, srcHash);
         if (!this._groupSeenIds) this._groupSeenIds = new Set();
         const dedupKey = lxmfMsg.hash?.toString("hex") ||
             `${groupId}:${actualSender}:${lxmfMsg.timestamp}:${groupAction || "message"}`;
@@ -3976,9 +3996,10 @@ const RnsClient = {
                     return;
                 }
 
-                // The author (GROUP_SENDER, or the LXMF source) is stored as a
-                // hash and named at render (groupSenderLabel), so the label follows
-                // names learned later.
+                // The author (GROUP_SENDER from a source the group trusts,
+                // else the LXMF source: PrivacyFilter.groupMember) is stored
+                // as a hash and named at render (groupSenderLabel), so the
+                // label follows names learned later.
                 // A group message's attachments are kept like a DM's (iOS
                 // sends a group's attachments to each member,
                 // ChatRepository.swift:1381-1432); a captionless one keeps

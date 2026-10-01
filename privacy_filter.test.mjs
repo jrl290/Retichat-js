@@ -1101,7 +1101,7 @@ test("accepting an invite allows every member of the group, whatever row it has;
  * inviter I listing B, C and D, whose keys are known (hidden rows, not
  * allowlisted), and X, a key known here and in no list. Before the user
  * answers: B tries to speak for others, B, C and D accept or leave for
- * themselves, and I relays X's accept.
+ * themselves, I relays X's accept, and B posts naming C.
  */
 async function pendingGroup() {
     const r = recipient();
@@ -1121,6 +1121,7 @@ async function pendingGroup() {
         ...(sender ? [[GROUP_FIELDS.GROUP_SENDER, sender]] : []), ...extra]);
     const status = (h) => r.GroupStore.get(G)?.members.get(h);
     const allowed = (...hs) => hs.map((h) => r.ContactStore.allowlisted(h));
+    const incoming = () => (r.storage.sGet("gmsg_" + G) ?? []).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]);
 
     // B, listed and not allowed, speaks for others: each is parsed (B is in
     // a member list here, so step 1 lets it through) and dropped unproved.
@@ -1154,7 +1155,13 @@ async function pendingGroup() {
     await settle();
     assert.equal(status(X), "accepted");
     assert.equal(r.ContactStore.allowlisted(X), false, "not allowed before the user accepts");
-    return { r, ids, I, B, C, D, X, ME, G, posts, relays, control, status, allowed };
+
+    // B's post naming C is kept and shown as B's (it speaks only for itself).
+    r.packet(lxm(ids.b, r.me, "from B, naming C", new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_SENDER, C]])));
+    await settle();
+    assert.equal(r.proofs.length, 5);
+    assert.deepEqual(incoming(), [["from B, naming C", B]]);
+    return { r, ids, I, B, C, D, X, ME, G, posts, relays, control, status, allowed, incoming };
 }
 
 test("group trust rule, a group the user has not accepted: a listed member who is not allowed accepts or leaves for itself only, allowed nothing by it; it cannot speak for anyone, leave in another's name or have this client relay", async () => {
@@ -1202,6 +1209,40 @@ test("group trust rule: once the user accepts, every member is allowed, the one 
     await settle();
     assert.deepEqual([p.status(N), p.r.ContactStore.allowlisted(N)], ["accepted", true]);
     assert.equal(p.relays.length, 1, "relayed");
+});
+
+test("group trust rule: a plain post names its author (GROUP_SENDER) only from a source the group trusts; a stranger's is its own, whichever member, or this device, it names", async () => {
+    // A stranger's plain post for a held group is kept and proved (James,
+    // 2026-09-30); shown as written by a member it names, that would be a
+    // false outcome (iOS handleGroupChatMessage still shows it so).
+    const member = Identity.create(), author = Identity.create(), relayer = Identity.create(), stranger = Identity.create();
+    const [M, A, R, S] = [member, author, relayer, stranger].map(lxmfHash);
+    const f = trustFixture([M, A, R]);
+    const { r, G } = f;
+    const ME = lxmfHash(r.me);
+    r.ContactStore.keep(M);
+    r.ContactStore.allow(M);                                 // allowed (the user created the group with it)
+    assert.equal(r.ContactStore.allowlisted(R), false, "R is a current member, not allowlisted");
+    const post = (content, sender) => new Map([[GROUP_FIELDS.GROUP_ID, G], ...(sender ? [f.sender(sender)] : [])]);
+
+    r.packet(lxm(stranger, r.me, "I am M, send me the keys", post(null, M)));
+    r.packet(lxm(stranger, r.me, "I am you", post(null, ME)));
+    r.packet(lxm(stranger, r.me, "I am A", post(null, A.toUpperCase())));
+    r.packet(lxm(member, r.me, "A's words, relayed by M", post(null, A)));
+    r.packet(lxm(relayer, r.me, "A's words, relayed by R", post(null, A)));
+    r.packet(lxm(member, r.me, "M's own", post(null)));
+    await settle();
+    assert.equal(r.proofs.length, 6, "each is kept and proved");
+    assert.deepEqual(f.posts.get(G).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]), [
+        ["I am M, send me the keys", S],
+        ["I am you", S],
+        ["I am A", S],
+        ["A's words, relayed by M", A],
+        ["A's words, relayed by R", A],
+        ["M's own", M],
+    ]);
+    assert.deepEqual(f.memberList().map(([h]) => h).includes(S), false, "the stranger is no member");
+    assert.equal(r.ContactStore.allowlisted(S), false, "nor allowed");
 });
 
 // ── the allowlist ──────────────────────────────────────────────────────────

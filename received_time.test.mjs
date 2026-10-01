@@ -120,8 +120,8 @@ test("a group message is stored at the time its sender sent it", () => {
         GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, isCurrentMember: () => false, _save() {} },
         GroupMsgStore: p.GroupMsgStore, ContactStore: p.ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => lxmfHash(me),
-        // The filter off: every source passes.
-        PrivacyFilter: { allows: () => true, groupAccepts: () => true },
+        // The filter off: every source passes, and speaks for the member it names.
+        PrivacyFilter: { allows: () => true, groupAccepts: () => true, groupMember: (group, src) => group.groupSender || src },
     })(self);
     const sent = twoDaysAgo();
     const packed = lxm(bob, lxmfHash(me), "to the group", new Map([[GROUP_FIELDS.GROUP_ID, G]]), sent);
