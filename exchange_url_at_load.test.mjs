@@ -527,13 +527,21 @@ async function launchChromium(t) {
  * config.json naming an exchange on this server ('self') that answers 503,
  * as deploy.sh's boot gate serves it. With `holdPolicyRead`, every request
  * for index.html that is not the navigation (PagePolicy's read of the
- * policy) is held unanswered.
+ * policy) is held unanswered; `policyReadHeld` resolves when the first one
+ * arrives. connect() starts that read after it has added its interface, so
+ * the read can reach this server after the exchange has answered, or after
+ * the browser has refused the interface's first request: a test waits for
+ * it (readArrives) before it says the read is held. Until 2026-10-01 they
+ * asserted it at once, and under the full suite's load one run in two or
+ * five failed with "while the policy read is still held" (0, not 1).
  */
 async function servePage({ holdPolicyRead = false } = {}) {
     const ROOT = fileURLToPath(new URL(".", import.meta.url));
     const TYPES = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".png": "image/png", ".json": "application/json" };
     const exchangeHits = [];
     const held = [];
+    let readHeld;
+    const policyReadHeld = new Promise((resolve) => { readHeld = resolve; });
     const server = createServer(async (req, res) => {
         const path = new URL(req.url, "http://x").pathname;
         if (path === "/config.json") {
@@ -543,7 +551,7 @@ async function servePage({ holdPolicyRead = false } = {}) {
         }
         if (path.startsWith("/no-exchange")) { exchangeHits.push(path); res.writeHead(503).end(); return; }
         const file = join(ROOT, path.endsWith("/") ? `${path}index.html` : path);
-        if (holdPolicyRead && file.endsWith("index.html") && req.headers["sec-fetch-mode"] !== "navigate") { held.push(res); return; }
+        if (holdPolicyRead && file.endsWith("index.html") && req.headers["sec-fetch-mode"] !== "navigate") { held.push(res); readHeld(); return; }
         try {
             const body = await readFile(file);
             res.writeHead(200, { "content-type": TYPES[extname(file)] ?? "application/octet-stream", "cache-control": "no-store",
@@ -554,7 +562,7 @@ async function servePage({ holdPolicyRead = false } = {}) {
     });
     await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
     return {
-        origin: `http://127.0.0.1:${server.address().port}`, exchangeHits, held,
+        origin: `http://127.0.0.1:${server.address().port}`, exchangeHits, held, policyReadHeld,
         close() { held.forEach((r) => r.destroy()); server.close(); },
     };
 }
@@ -593,6 +601,14 @@ async function openPage(browser, origin, seed) {
         throw new Error(`${what}: not within 10 s (${e.message.split("\n")[0]})\n${consoleLines.slice(-25).join("\n")}`);
     });
     return { context, page, pageErrors, dialogs, elsewhere, until };
+}
+
+/** servePage's `policyReadHeld`: the page's policy read reaching its server,
+ *  within 10 s (a test-failure bound only, never a pass path). */
+function readArrives(policyReadHeld) {
+    let timer;
+    const bound = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("the page's policy read never reached its server within 10 s")), 10_000); });
+    return Promise.race([policyReadHeld, bound]).finally(() => clearTimeout(timer));
 }
 
 const OWN_KEY = "11".repeat(64);
@@ -708,7 +724,7 @@ chromiumTest("the real page: a policy read the page's server never answers holds
     const browser = await launchChromium(t);
     if (!browser) return;
     const served = await servePage({ holdPolicyRead: true });
-    const { origin, exchangeHits, held } = served;
+    const { origin, exchangeHits, held, policyReadHeld } = served;
     try {
         // Saved: the node's own exchange in another spelling (a trailing
         // slash), which the policy allows ('self') and loadConfig counts as
@@ -720,6 +736,7 @@ chromiumTest("the real page: a policy read the page's server never answers holds
         await page.goto(`${origin}/index.html`);
         await until("its exchange asked, and reported down (503)", () => window.RetichatTest.state().exchange === "down" && window.RetichatTest.state().status === "offline");
         assert.ok(exchangeHits.length > 0, "the exchange was asked");
+        await readArrives(policyReadHeld);
         assert.equal(held.length, 1, "while the policy read is still held");
         assert.equal(await page.evaluate(() => window.RetichatTest.state().ownHash), deliveryHash(Identity.fromPrivateKey(Buffer.from(OWN_KEY, "hex"))),
             "and the client is built (its LXMF router: its own hash is known)");
@@ -742,7 +759,7 @@ chromiumTest("the real page: a saved exchange the policy blocks is said from the
     const browser = await launchChromium(t);
     if (!browser) return;
     const served = await servePage({ holdPolicyRead: true });
-    const { origin, exchangeHits, held } = served;
+    const { origin, exchangeHits, held, policyReadHeld } = served;
     try {
         const { context, page, pageErrors, elsewhere, until } = await openPage(browser, origin, {
             identity_private_key: OWN_KEY,
@@ -750,6 +767,7 @@ chromiumTest("the real page: a saved exchange the policy blocks is said from the
         });
         await page.goto(`${origin}/index.html`);
         await until("the line under the status dot", (notice) => document.getElementById("exchange-blocked")?.textContent.startsWith(notice), NOTICE);
+        await readArrives(policyReadHeld);
         assert.equal(held.length, 1, "while the policy read is still held");
         const state = () => page.evaluate(() => {
             const s = window.RetichatTest.state();
