@@ -147,7 +147,7 @@ function stores(me, storage = memory()) {
     GroupStore.init();
     const PrivacyFilter = build("PrivacyFilter", {
         sGet, sSet, ContactStore, GroupStore, Harness, LXMF, LXMessage, Buffer,
-        shouldProcessGroupMessage: fn("shouldProcessGroupMessage", "groupAction, inviterAllowed, groupExists", {}),
+        shouldProcessGroupMessage: fn("shouldProcessGroupMessage", "groupAction, sourceAllowed, groupExists, sourceIsMember", {}),
     });
     PrivacyFilter.init();
     const MsgStore = build("MsgStore", { sGet, sSet, Harness, Date });
@@ -599,7 +599,7 @@ function withGroupHandler(r) {
     r.self._handleGroupMessage = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
         GroupStore: r.GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, Buffer,
         ownLxmfDestinationHash: own, PrivacyFilter: r.PrivacyFilter, sentTimeMs,
-        shouldProcessGroupMessage: fn("shouldProcessGroupMessage", "groupAction, inviterAllowed, groupExists", {}),
+        shouldProcessGroupMessage: fn("shouldProcessGroupMessage", "groupAction, sourceAllowed, groupExists, sourceIsMember", {}),
     })(r.self);
     return GroupMsgStore;
 }
@@ -877,6 +877,211 @@ test("LXMessage.peekGroupFields reads the group id and action as the full parse 
         payload(fieldsHex(new Map([[0xA0, G]]))).subarray(0, 30), Buffer.from([0x94, 0x01, 0xa0, 0xa0, 0xc0])]) {
         assert.equal(LXMessage.peekGroupFields(bad), null, bad.toString("hex"));
     }
+});
+
+// ── James's group trust rule (2026-10-01) ─────────────────────────────────
+//
+// "Groups start by invite. If the invite doesn't come from someone on the
+// allowlist, it is ignored. If the invite is accepted, the other group
+// members are considered allowed." A group control message (accept, leave,
+// relay_req, any action) for a group held here is taken only from a source
+// that is allowlisted or a current member of that group; a plain group
+// message is still kept from anyone (James, 2026-09-30).
+
+/** `r` with the real group handler, a held group G (created here: this
+ *  device accepted, `members` invited) and every relay it is asked for. */
+function trustFixture(members) {
+    const r = recipient();
+    const posts = withGroupHandler(r);
+    const relays = [];
+    r.self._performGroupRelay = (...a) => relays.push(a);
+    const G = r.GroupStore.create("G", members).groupId;
+    const memberList = () => [...r.GroupStore.get(G).members.entries()].sort();
+    const notices = () => posts.get(G).filter((m) => m.dir === "system").map((m) => [m.content, m.actor ?? null]);
+    const control = (action, extra = []) => new Map([[0xD1, new Map([[0, Buffer.from("Named")]])], [GROUP_FIELDS.GROUP_ID, G],
+        [GROUP_FIELDS.GROUP_ACTION, action], ...extra]);
+    const sender = (h) => [GROUP_FIELDS.GROUP_SENDER, h];
+    return { r, posts, relays, G, memberList, notices, control, sender };
+}
+
+test("group trust rule: a stranger's accept, leave or relay_req for a held group is dropped before its proof on every path: no member, no allowlisting, no relay, no row, no name", async (t) => {
+    const member = Identity.create(), stranger = Identity.create(), other = Identity.create();
+    const M = lxmfHash(member), S = lxmfHash(stranger), X = lxmfHash(other);
+    const f = trustFixture([M]);
+    const { r, G } = f;
+    const before = f.memberList();
+    const parses = watchParses(t);
+    const cases = [
+        ["its own accept", f.control("accept", [f.sender(S)])],
+        ["an accept for a hash it claims", f.control("accept", [f.sender(X)])],
+        ["an accept with no GROUP_SENDER", f.control("accept")],
+        ["a leave in a member's name", f.control("leave", [f.sender(M)])],
+        ["its own leave", f.control("leave", [f.sender(S)])],
+        ["a relay request", f.control("relay_req", [f.sender(S), [GROUP_FIELDS.GROUP_RELAY_SEEN, S]])],
+        ["a relay done", f.control("relay_done", [f.sender(S)])],
+        ["an action this client does not know", f.control("promote", [f.sender(S)])],
+    ];
+    for (const [label, fields] of cases) r.packet(lxm(stranger, r.me, label, fields));
+    await settle();
+
+    // A link packet, a link Resource and a /get: dropped the same.
+    const { a, wire } = await deliveryLink(r);
+    a.send(lxm(stranger, r.me, "", ticketed([...f.control("accept", [f.sender(S)])])));
+    await settle(6);
+    await within(a.sendResource(lxm(stranger, r.me, "z".repeat(3000), ticketed([...f.control("relay_req", [f.sender(S)])]))), 5000, "the Resource");
+    await settle(6);
+    const purged = await fetchPropagated(r, [lxm(stranger, r.me, "", f.control("leave", [f.sender(M)]))]);
+
+    assert.equal(r.proofs.length, 0, "none is proved");
+    assert.deepEqual([linkProofs(wire).length, linkReplies(wire).length], [0, 0], "nothing back on the link");
+    assert.deepEqual(purged, [1], "still purged from the node");
+    assert.equal(parses.length, 0, "none is parsed: the look at the group id and action decided");
+    assert.equal(r.emitted.length, 0, "the handler never hears of one");
+    assert.deepEqual(f.memberList(), before, "the members are as they were: nobody added, nobody left");
+    assert.deepEqual(f.relays, [], "nothing relayed");
+    assert.deepEqual([r.ContactStore.get(S), r.ContactStore.get(X)], [null, null], "no row, so no allowlisting and no name");
+    assert.equal(r.ContactStore.allowlisted(M), false, "and the member's standing is untouched");
+    assert.deepEqual(f.notices(), [], "no notice");
+    assert.deepEqual(r.drops().map((d) => [d.path, d.at]),
+        [...cases.map(() => ["opportunistic", "source"]), ["link", "source"], ["resource", "source"], ["propagated", "source"]]);
+    assert.equal(r.events.filter((e) => e.kind === "privacy-group-stranger").length, 0);
+
+    // A plain message from the same stranger, for the same group, is kept
+    // and proved (James, 2026-09-30, as iOS keeps it).
+    r.packet(lxm(stranger, r.me, "just talking", new Map([[GROUP_FIELDS.GROUP_ID, G]])));
+    await settle();
+    assert.equal(r.proofs.length, 1, "proved");
+    assert.deepEqual(f.posts.get(G).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]), [["just talking", S]]);
+    assert.deepEqual(f.memberList(), before, "and it makes nobody a member");
+    assert.equal(r.ContactStore.allowlisted(S), false, "nor allowlisted");
+});
+
+test("group trust rule: a member of another group, or one who left this one, is no source for this group's control messages: parsed, then dropped unproved", async () => {
+    const member = Identity.create(), elsewhere = Identity.create(), gone = Identity.create();
+    const M = lxmfHash(member), E = lxmfHash(elsewhere), L = lxmfHash(gone);
+    const f = trustFixture([M, L]);
+    const { r } = f;
+    r.GroupStore.create("Other", [E]);
+    r.GroupStore.updateMember(f.G, L, "left");
+    const before = f.memberList();
+
+    r.packet(lxm(elsewhere, r.me, "", f.control("accept", [f.sender(E)])));
+    r.packet(lxm(elsewhere, r.me, "", f.control("relay_req", [f.sender(E)])));
+    r.packet(lxm(gone, r.me, "", f.control("accept", [f.sender(L)])));
+    await settle();
+    assert.equal(r.proofs.length, 0, "none is proved");
+    assert.deepEqual(f.memberList(), before);
+    assert.deepEqual(f.relays, []);
+    assert.deepEqual([r.ContactStore.allowlisted(E), r.ContactStore.allowlisted(L)], [false, false]);
+    assert.deepEqual(r.drops().map((d) => [d.src, d.at]), [[E, "message"], [E, "message"], [L, "message"]].map(([h, at]) => [h.slice(0, 12), at]),
+        "each passed step 1 as a member of some group held here, and was dropped after the parse");
+
+    // Their plain messages for the group are kept.
+    r.packet(lxm(elsewhere, r.me, "hi", new Map([[GROUP_FIELDS.GROUP_ID, f.G]])));
+    await settle();
+    assert.equal(r.proofs.length, 1);
+});
+
+test("group trust rule: an allowed source's accept brings in the member it names (GROUP_SENDER) as a member, allowed; a current member's too; a hash that is none is ignored", async () => {
+    const member = Identity.create(), friend = Identity.create(), n1 = Identity.create(), n2 = Identity.create(), stranger = Identity.create();
+    const M = lxmfHash(member), F = lxmfHash(friend), N1 = lxmfHash(n1), N2 = lxmfHash(n2), S = lxmfHash(stranger);
+    const f = trustFixture([M]);
+    const { r, G } = f;
+    r.ContactStore.add(F);
+    r.ContactStore.allow(F);                                // an allowlisted contact, not in G
+
+    // The allowlisted contact relays N1's accept: N1 is a member, allowed.
+    r.packet(lxm(friend, r.me, "", f.control("accept", [f.sender(N1)])));
+    // M, invited here and not allowlisted, a current member: its own accept,
+    // and one it relays for N2.
+    r.packet(lxm(member, r.me, "", f.control("accept", [f.sender(M)])));
+    r.packet(lxm(member, r.me, "", f.control("accept", [f.sender(N2)])));
+    await settle();
+    assert.equal(r.proofs.length, 3, "each is proved");
+    const status = (h) => r.GroupStore.get(G).members.get(h);
+    assert.deepEqual([N1, M, N2].map(status), ["accepted", "accepted", "accepted"], "members, accepted");
+    assert.deepEqual([N1, M, N2].map((h) => r.ContactStore.allowlisted(h)), [true, true, true], "and they pass the filter from now on");
+    assert.deepEqual([N1, N2].map((h) => [r.ContactStore.get(h).hidden, r.ContactStore.isContact(h)]), [[true, false], [true, false]],
+        "a hidden row each, listed nowhere (audit L4)");
+    assert.equal(r.ContactStore.allowlisted(F), true, "the relayer was already");
+    assert.deepEqual(f.notices().filter(([text]) => text === "joined the group").map(([, actor]) => actor), [N1, M, N2]);
+
+    // N1, brought in, is now an allowed source: its DM is kept, and its
+    // relay request is honoured for the member it names.
+    r.packet(lxm(n1, r.me, "a DM from a new member"));
+    r.packet(lxm(n1, r.me, "relay this", f.control("relay_req", [f.sender(N1), [GROUP_FIELDS.GROUP_RELAY_SEEN, M]])));
+    await settle();
+    assert.deepEqual(r.MsgStore.get(N1).map((m) => m.content), ["a DM from a new member"]);
+    assert.equal(f.relays.length, 1, "relayed");
+    const [group, content, originalSender, seen, requester] = f.relays[0];
+    assert.deepEqual([group.groupId, content, originalSender, seen, requester], [G, "relay this", N1, [M], N1]);
+
+    // A member's leave marks it, from an allowed source.
+    r.packet(lxm(member, r.me, "", f.control("leave", [f.sender(M)])));
+    await settle();
+    assert.equal(status(M), "left");
+
+    // An allowed source's accept that names no destination hash adds nothing.
+    const junk = "x".repeat(32);
+    r.packet(lxm(friend, r.me, "", f.control("accept", [f.sender(junk)])));
+    await settle();
+    assert.equal(r.GroupStore.get(G).members.has(junk), false, "no such member");
+    assert.equal(r.ContactStore.get(junk), null, "and no row");
+
+    // With the filter off every source passes it (PrivacyFilter.allows, as
+    // for invites; iOS allowlistDecision filter-disabled): a stranger's
+    // accept is taken then.
+    r.PrivacyFilter.set(false);
+    r.packet(lxm(stranger, r.me, "", f.control("accept", [f.sender(S)])));
+    await settle();
+    assert.equal(status(S), "accepted", "filter off: taken");
+});
+
+test("accepting an invite allows every member of the group, whatever row it has; this device never gets one, and a member with no key holds the accept back (iOS, Android)", () => {
+    // James, 2026-10-01: "If the invite is accepted, the other group
+    // members are considered allowed." iOS acceptGroupInvite and Android
+    // allowlist every member through ensureAllowlistedContact, which also
+    // creates a row; all three hold the accept back until every member's
+    // key has arrived (a key is kept on a row), so no member is row-less
+    // here when it is accepted.
+    const me = Identity.create();
+    const ME = lxmfHash(me);
+    const { ContactStore, GroupStore } = stores(me);
+    const [inviter, keyed, named, listed, keyless] = [1, 2, 3, 4, 5].map(() => Identity.create());
+    const [I, K, N, Ls, KL] = [inviter, keyed, named, listed, keyless].map(lxmfHash);
+    const key = (id) => id.getPublicKey().toString("hex");
+    ContactStore.add(I, false, key(inviter));
+    ContactStore.allow(I);                                         // the allowlisted inviter
+    ContactStore.keep(K, key(keyed));                              // a co-member's key, hidden
+    ContactStore.keep(N, null, true);                              // a name-only row...
+    ContactStore.get(N).publicKey = key(named);                    // ...whose key an announce brought
+    ContactStore.add(Ls, false, key(listed));                      // listed, not allowlisted (kept while the filter was off)
+    const G = "d".repeat(32);
+    GroupStore.addPending(G, "G", I, [K, N, Ls, ME]);
+    const alerts = [];
+    const sent = [];
+    const accept = compile("_acceptGroupInvite(groupId)", {
+        GroupStore, ContactStore, GroupMsgStore: { addSystem() {} }, console: quiet,
+        RnsClient: { ownHash: ME, _requestGroupPeer() {}, sendGroupAccept: async (id) => { sent.push(id); } },
+        alert: (m) => alerts.push(m),
+    })({ render() {} });
+
+    accept(G);
+    assert.deepEqual([alerts.length, sent], [0, [G]], "accepted and announced");
+    assert.equal(GroupStore.get(G).groupStatus, "active");
+    assert.deepEqual([I, K, N, Ls].map((h) => ContactStore.allowlisted(h)), [true, true, true, true], "every member passes the filter");
+    assert.equal(ContactStore.get(N).nameOnly, false, "a name-only row is one no longer");
+    assert.deepEqual([K, N].map((h) => ContactStore.get(h).hidden), [true, true], "hidden rows stay hidden (audit L4)");
+    assert.equal(ContactStore.isContact(Ls), true, "and a listed one listed");
+    assert.equal(ContactStore.get(ME), null, "never this device");
+
+    // A member whose key has not arrived (no row) holds the accept back.
+    const H = "e".repeat(32);
+    GroupStore.addPending(H, "H", I, [KL, ME]);
+    accept(H);
+    assert.equal(alerts.length, 1, "Still receiving member keys");
+    assert.equal(GroupStore.get(H).groupStatus, "pending");
+    assert.equal(ContactStore.get(KL), null, "nothing allowed before the user's accept");
 });
 
 // ── the allowlist ──────────────────────────────────────────────────────────

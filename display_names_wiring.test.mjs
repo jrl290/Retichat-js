@@ -123,7 +123,7 @@ function contactStore(storage) {
     return store;
 }
 const msgStore = (storage) => build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });
-const groupPolicy = () => fn("shouldProcessGroupMessage", "groupAction, inviterAllowed, groupExists", {});
+const groupPolicy = () => fn("shouldProcessGroupMessage", "groupAction, sourceAllowed, groupExists, sourceIsMember", {});
 /** The real PrivacyFilter over `storage` (on unless stored off), as a page
  *  load builds it. */
 function privacyFilter(storage, ContactStore, GroupStore) {
@@ -480,7 +480,7 @@ test("§5.3 no surface builds a name from displayName or a \"?hash\" placeholder
 test("the group invite notice and the distro import prompt name the sender through the resolver (audit M14)", () => {
     const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
     assert.match(handler, /GroupMsgStore\.addSystem\(groupId, `invited you to "\$\{groupName \|\| "Group"\}"`, srcHash\)/);
-    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "joined the group", actualSender\)/);
+    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "joined the group", member\)/);
     assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "left the group", actualSender\)/);
     const transfer = methodBody("_handleDistroIdentityTransfer(lxmfMsg, srcHash, privateKeyHex)");
     assert.match(transfer, /const senderName = ContactStore\.name\(srcHash\);/);
@@ -1142,6 +1142,7 @@ function makeGroupReceiver(me, memberHashes) {
         addPending: (id, groupName, inviter, members) => groups.set(id, {
             groupId: id, groupName, groupStatus: "pending", members: new Map(members.map((h) => [h, "invited"])) }),
         updateMember: (id, h, status) => groups.get(id).members.set(h, status),
+        isCurrentMember: (id, h) => !["left", undefined].includes(groups.get(id)?.members.get(h)),
         _save() {},
     };
     const GroupMsgStore = {
@@ -1267,10 +1268,13 @@ test("§5.2 a row created only for a group sender's name never lets that sender 
         [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${Z},${lxmfHash(me)}`]]), zed, t);
 
     // Zed is no member and has no row, but knows the id of a group the user
-    // holds. A leave (or plain message, or relay_done) is processed and
+    // holds. His leave (any control message) is dropped and leaves no row
+    // (the group trust rule, 2026-10-01); a plain message is processed and
     // names him on a hidden row...
     const t = tick() + 1000;
-    r.deliver(lxm(zed, me, "", groupFields("Zed", "leave", [[GROUP_FIELDS.GROUP_SENDER, Z]]), zed, t));
+    r.deliver(lxm(zed, me, "", groupFields("Zed", "leave", [[GROUP_FIELDS.GROUP_SENDER, Z]]), zed, t - 1));
+    assert.deepEqual([r.ContactStore.get(Z), r.notices.length], [null, 0], "a stranger's leave changes nothing");
+    r.deliver(lxm(zed, me, "hello", groupFields("Zed", null, [[GROUP_FIELDS.GROUP_SENDER, Z]]), zed, t));
     assert.deepEqual([r.ContactStore.get(Z)?.messageName, r.ContactStore.get(Z)?.hidden, r.ContactStore.get(Z)?.nameOnly], ["Zed", true, true]);
     assert.equal(r.ContactStore.allowlisted(Z), false, "a name-only row is not allowlisted");
     // ...but his invites are still dropped.

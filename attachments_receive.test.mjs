@@ -85,7 +85,7 @@ function page(me) {
     const backend = memoryBackend({ persistent: true });
     const Attachments = new AttachmentStore(backend, { warn() {} });
     const groups = new Map();
-    const GroupStore = { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, _save() {} };
+    const GroupStore = { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, isCurrentMember: () => false, _save() {} };
     const self = {
         _onMsg: [], _pendingTickets: new Map(), _onAttachmentState: [], ownHash: lxmfHash(me),
         _handleDistroIdentityTransfer() {},

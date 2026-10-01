@@ -117,7 +117,7 @@ test("a group message is stored at the time its sender sent it", () => {
     const groups = new Map([[G, { groupId: G, groupName: "G", members: new Map(), lastActivity: 0 }]]);
     const self = { _onMsg: [] };
     const handleGroup = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
-        GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, _save() {} },
+        GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, isCurrentMember: () => false, _save() {} },
         GroupMsgStore: p.GroupMsgStore, ContactStore: p.ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => lxmfHash(me), shouldProcessGroupMessage: () => true,
         PrivacyFilter: { allows: () => true },
