@@ -1135,28 +1135,29 @@ GroupStore.init();
 //  before it spends anything on a message (lib/rns/lxmf/lxmf_router.js
 //  acceptsSource / acceptsMessage):
 //    1. acceptsSource, on the decrypted bytes, before the proof and the
-//       parse. It knows only the source, so it drops what no rule could
-//       keep: a source that is neither allowlisted nor a member of a group
-//       this client holds. That is the stranger, who then costs no proof,
-//       no msgpack, no signature check, no ticket reply and no write.
+//       parse. A source that is allowlisted or a member of a group this
+//       client holds is let through on its hash alone, nothing read. Any
+//       other source is a stranger: its message is read just far enough to
+//       see whether it is a group message for a group held here (the
+//       router's peekGroup, LXMessage.peekGroupFields: the group id and
+//       action, nothing else decoded), the one thing iOS keeps from a
+//       source it has not allowlisted (groupMessagePolicy asks only whether
+//       the group exists; James, 2026-09-30: keep it, like iOS). Anything
+//       else from a stranger is dropped there, and costs no proof, no full
+//       parse, no signature check, no ticket reply and no write.
 //    2. acceptsMessage, after the parse and before the proof: the whole
-//       rule above, for the sources step 1 let through.
+//       rule above, for the messages step 1 let through.
 //  A dropped message is never proved and never reaches the router's
 //  listeners, so it records nothing, its 0xD1 name included (iOS applies
 //  the name only once its policy accepts the message). A link Resource is
 //  the exception to "no proof": the Resource protocol proves it on
 //  assembly, before the source can be read.
 //
-//  Departures from iOS, forced by step 1 (the source is all it knows):
-//  - a group message for a group this client holds, from a source that is
-//    neither allowlisted nor in any group's member list here, is dropped
-//    (iOS keeps it: groupMessagePolicy asks only whether the group exists).
-//    Legitimate group traffic comes from members, whose hashes the invite
-//    lists, so this is a member the local list does not have;
-//  - a distro identity transfer from a device that is neither allowlisted
-//    nor a co-member is dropped (iOS and Android offer it whoever sent
-//    it). Add the sending device first, turn the filter off for the
-//    transfer, or paste the key (Identity, Import).
+//  Departure from iOS and Android, decided by James (2026-09-30, "Add
+//  another device" is strict): a distro identity transfer from a device
+//  that is neither allowlisted nor a co-member is dropped (the phones
+//  offer it whoever sent it). The user adds the sending device first, or
+//  turns the filter off, or the key is pasted (Identity, Import).
 // =========================================================================
 const PrivacyFilter = {
     _on: true,
@@ -1182,13 +1183,28 @@ const PrivacyFilter = {
         return !this._on || ContactStore.allowlisted(srcHash);
     },
 
+    /** A source step 1 lets through on its hash alone: allowlisted (or the
+     *  filter is off), or in the member list of a group held here. */
+    knows(src) {
+        return this.allows(src) || GroupStore.hasMember(src);
+    },
+
     /** Step 1, for the router (LXMRouter.acceptsSource): may a message from
      *  `sourceHash` (16 bytes, straight from the decrypted plaintext) be
-     *  kept by any rule? */
-    acceptsSource(sourceHash, path) {
+     *  kept by any rule? A stranger's only as a group message for a group
+     *  held here: `peekGroup()` is the router's look at its group id and
+     *  action (LXMessage.peekGroupFields), asked for nobody else. Then the
+     *  rule is iOS groupMessagePolicy, as in step 2: an invite needs an
+     *  allowlisted source, which a stranger is not; anything else needs the
+     *  group to exist here, pending or active (iOS: a group ChatEntity,
+     *  which a pending invite creates). */
+    acceptsSource(sourceHash, path, peekGroup = null) {
         const src = Buffer.from(sourceHash).toString("hex");
-        const accepted = this.allows(src) || GroupStore.hasMember(src);
-        if (!accepted) Harness.event("privacy-drop", { src: src.slice(0, 12), path, at: "source" });
+        if (this.knows(src)) return true;
+        const group = peekGroup ? peekGroup() : null;
+        const accepted = !!group?.groupId
+            && shouldProcessGroupMessage(group.groupAction, this.allows(src), GroupStore.get(group.groupId) !== null);
+        Harness.event(accepted ? "privacy-group-stranger" : "privacy-drop", { src: src.slice(0, 12), path, at: "source" });
         return accepted;
     },
 
@@ -1200,8 +1216,12 @@ const PrivacyFilter = {
         if (LXMF.distroTransferKeyFromFields(lxmfMsg.fields) !== null) {
             // An offer the user answers, checked before the allowlist on iOS
             // (handleIncomingMessage, ChatRepository.swift:1926-1933) and
-            // Android (onMessageReceived, ChatRepository.kt:1365-1373).
-            accepted = true;
+            // Android (onMessageReceived, ChatRepository.kt:1365-1373) —
+            // but only from a source step 1 knows: a stranger reaches this
+            // step only as a group message, and a transfer that also carries
+            // a group id is still a transfer, which "Add another device"
+            // takes only from a device the user added (James, 2026-09-30).
+            accepted = this.knows(src);
         } else {
             const group = LXMessage.extractGroupFields(lxmfMsg.fields);
             accepted = group?.groupId
@@ -2581,12 +2601,14 @@ const RnsClient = {
                 try {
                     const decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
                     if (!decrypted || decrypted.length < 80) { console.log(`[retichat] 📬 [3/4] ${tidHex} decrypt failed`); continue; }
-                    // The privacy filter on the decrypted bytes, before any
-                    // parse, as the router applies it on every direct path
-                    // (LXMRouter.acceptsSource): a stranger's message was
-                    // downloaded (its source is inside the ciphertext) but
-                    // costs nothing more.
-                    if (!this._lxmfRouter.acceptsSource(decrypted.subarray(0, 16), "propagated")) { had(); continue; }
+                    // The privacy filter on the decrypted bytes (source |
+                    // signature | payload), before any parse, as the router
+                    // applies it on every direct path (LXMRouter
+                    // .acceptsSource): a stranger's message was downloaded
+                    // (its source is inside the ciphertext) but costs nothing
+                    // more, unless it is a group message for a group held
+                    // here, which goes on as any other.
+                    if (!this._lxmfRouter.acceptsSource(decrypted, "propagated")) { had(); continue; }
 
                     // Parsed as the router parses the direct paths: the same
                     // hash, so a copy of one already received is recognised,

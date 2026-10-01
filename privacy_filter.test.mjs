@@ -13,10 +13,14 @@
  * "Drop costs nothing" (James, 2026-09-30): the LXMF router asks the filter
  * on the decrypted bytes (the source, bytes 0..16 of the plaintext) before
  * it proves or parses anything, then again after the parse and before the
- * proof. A dropped message gets no proof, no parse, no delivery-ticket
- * reply, no row, no name and no bubble. On every path: opportunistic
- * packets, link packets, link Resources (transferred first: the source is
- * inside) and messages fetched from the propagation node (still purged).
+ * proof. A source that is neither allowlisted nor a member here (a
+ * stranger) is read only as far as its group id and action: a group
+ * message for a group held here is kept, as iOS keeps it, and anything
+ * else is dropped. A dropped message gets no proof, no parse, no
+ * delivery-ticket reply, no row, no name and no bubble. On every path:
+ * opportunistic packets, link packets, link Resources (transferred first:
+ * the source is inside) and messages fetched from the propagation node
+ * (still purged).
  *
  * These run the real shipped code: lib/rns/lxmf/lxmf_router.js, and
  * ContactStore, GroupStore, PrivacyFilter, MsgStore, the router's message
@@ -143,7 +147,7 @@ function stores(me, storage = memory()) {
     PrivacyFilter.init();
     const MsgStore = build("MsgStore", { sGet, sSet, Harness, Date });
     const drops = () => events.filter((e) => e.kind === "privacy-drop").map((e) => e.detail);
-    return { storage, Harness, drops, ContactStore, GroupStore, PrivacyFilter, MsgStore };
+    return { storage, Harness, events, drops, ContactStore, GroupStore, PrivacyFilter, MsgStore };
 }
 
 /**
@@ -573,6 +577,232 @@ test("a group invite from a co-member who is not allowlisted passes step 1 and i
     await settle();
     assert.equal(r.proofs.length, 1, "once allowlisted, its invite is proved");
     assert.equal(r.self.groups.length, 1, "and processed");
+});
+
+// ── a stranger: only a group message for a group held here (iOS) ──────────
+
+/** The real _handleGroupMessage behind `r`'s handler, over its real
+ *  GroupStore and ContactStore and a real GroupMsgStore. */
+function withGroupHandler(r) {
+    const GroupMsgStore = build("GroupMsgStore", { sGet: r.storage.sGet, sSet: r.storage.sSet, Date, ContactStore: r.ContactStore });
+    const own = () => lxmfHash(r.me);
+    r.self.ownHash = own();
+    r.self._onMsg = [];
+    r.self._performGroupRelay = () => {};
+    r.self._rememberGroupMemberKeys = () => [];
+    r.self._keepAttachments = () => {};
+    r.self._handleGroupMessage = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
+        GroupStore: r.GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, Buffer,
+        ownLxmfDestinationHash: own, PrivacyFilter: r.PrivacyFilter, sentTimeMs,
+        shouldProcessGroupMessage: fn("shouldProcessGroupMessage", "groupAction, inviterAllowed, groupExists", {}),
+    })(r.self);
+    return GroupMsgStore;
+}
+
+/** Count the router's look at a stranger's group entries. */
+function watchPeeks(t) {
+    const real = LXMessage.peekGroupFields;
+    const calls = [];
+    LXMessage.peekGroupFields = (...a) => { const got = real.apply(LXMessage, a); calls.push(got); return got; };
+    t.after(() => { LXMessage.peekGroupFields = real; });
+    return calls;
+}
+
+/** Every value msgpackr decodes (MsgPack.unpack), as it was decoded. */
+function watchUnpacks(t) {
+    const real = MsgPack.unpack;
+    const decoded = [];
+    MsgPack.unpack = (...a) => { const got = real.apply(MsgPack, a); decoded.push(got); return got; };
+    t.after(() => { MsgPack.unpack = real; });
+    return decoded;
+}
+
+/** One /get fetch of `packed` messages through the shipped
+ *  _fetchPropagatedMessages; returns the transient ids it purged. */
+async function fetchPropagated(r, packed) {
+    const blobs = packed.map((p) => Buffer.concat([r.destination.hash, r.me.encrypt(p.subarray(16))]));
+    const purged = [];
+    const self = {
+        _lxmfRouter: r.router,
+        _propLink: { status: Link.ACTIVE, sendRequest: (path, data) => data },
+        async _waitForResponse(link, [wants, haves]) {
+            if (haves) { purged.push(...haves.map((h) => h[0])); return true; }
+            if (wants) return [blobs[wants[0][0] - 1]];
+            return blobs.map((_, i) => Buffer.from([i + 1]));
+        },
+    };
+    await compile("async _fetchPropagatedMessages()", {
+        Link, Buffer, MsgPack, LXMessage, IdMgr: { id: r.me }, console: quiet,
+    })(self)();
+    await settle();
+    return purged;
+}
+
+test("a stranger's group message for a group held here is kept and proved, as iOS keeps it, on every path; named only once kept", async (t) => {
+    // iOS groupMessagePolicy asks only whether the group exists here
+    // (ChatRepository.swift shouldProcessGroupMessage); James, 2026-09-30:
+    // the web keeps it too. Typically a member someone else's re-invite
+    // added, whom this client's member list does not have.
+    const r = recipient();
+    const posts = withGroupHandler(r);
+    const member = Identity.create(), stranger = Identity.create();
+    const S = lxmfHash(stranger);
+    const G = r.GroupStore.create("G", [lxmfHash(member)]).groupId;
+    assert.equal(r.PrivacyFilter.knows(S), false, "neither allowlisted nor in any member list here");
+    const inG = (extra = []) => new Map([[0xD1, new Map([[0, Buffer.from("Stan")]])], [GROUP_FIELDS.GROUP_ID, G], ...extra]);
+    const received = () => posts.get(G).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]);
+    const parses = watchParses(t);
+
+    r.packet(lxm(stranger, r.me, "opportunistic", inG()));
+    await settle();
+    assert.equal(r.proofs.length, 1, "proved");
+    assert.equal(parses.length, 1, "parsed once it was seen to be one");
+    assert.deepEqual(received(), [["opportunistic", S]], "stored in the group");
+    const row = r.ContactStore.get(S);
+    assert.deepEqual([row.hidden, row.messageName, r.ContactStore.allowlisted(S), r.ContactStore.isContact(S)],
+        [true, "Stan", false, false], "named under §5.2 after the policy kept it (source unknown: fills the empty slot); not a contact");
+
+    // The Retichat-field form of the group id (§10, senders after the switch).
+    r.packet(lxm(stranger, r.me, "new form", new Map([[0xD1, new Map([[1, G]])]])));
+    await settle();
+    assert.equal(r.proofs.length, 2);
+
+    // A link packet and a link Resource: proved, and the ticket answered,
+    // as for any message kept.
+    const { a, wire } = await deliveryLink(r);
+    a.send(lxm(stranger, r.me, "link packet", ticketed([[GROUP_FIELDS.GROUP_ID, G]])));
+    await settle(6);
+    assert.equal(linkProofs(wire).length, 1, "the link packet is proved");
+    assert.equal(linkReplies(wire).length, 1, "and its ticket answered");
+    await within(a.sendResource(lxm(stranger, r.me, "r".repeat(3000), ticketed([[GROUP_FIELDS.GROUP_ID, G]]))), 5000, "the stranger's Resource");
+    await settle(6);
+    assert.equal(linkReplies(wire).length, 2, "the Resource's ticket answered");
+
+    // Fetched from the propagation node.
+    const purged = await fetchPropagated(r, [lxm(stranger, r.me, "propagated", inG())]);
+    assert.deepEqual(purged, [1]);
+
+    assert.deepEqual(received().map(([c]) => c.slice(0, 16)), ["opportunistic", "new form", "link packet", "r".repeat(16), "propagated"]);
+    assert.deepEqual(r.drops(), [], "nothing dropped");
+    assert.equal(r.events.filter((e) => e.kind === "privacy-group-stranger").length, 5, "each let in by the look at its group");
+});
+
+test("a stranger's other messages are dropped after a look at their group id and action only: no proof, no parse, no ticket reply, no name, no row", async (t) => {
+    const r = recipient();
+    withGroupHandler(r);
+    const member = Identity.create(), stranger = Identity.create();
+    const S = lxmfHash(stranger);
+    const held = r.GroupStore.create("G", [lxmfHash(member)]).groupId;
+    const OTHER = "8".repeat(32);
+    const parses = watchParses(t);
+    const peeks = watchPeeks(t);
+    const decoded = watchUnpacks(t);
+    const transfer = [[LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_TRANSFER_TYPE], [LXMF.FIELD_CUSTOM_DATA, "a".repeat(128)]];
+    const cases = [
+        ["a DM", named("Stranger")],
+        ["a DM with an attachment", named("Stranger", [[0x05, [[Buffer.from("a.bin"), Buffer.alloc(150, 1)]]]])],
+        ["a group message for a group not held here", named("Stranger", [[GROUP_FIELDS.GROUP_ID, OTHER]])],
+        ["an invite to a group held here (an invite needs an allowlisted source)", named("Stranger", [[GROUP_FIELDS.GROUP_ID, held],
+            [GROUP_FIELDS.GROUP_ACTION, "invite"], [GROUP_FIELDS.GROUP_MEMBERS, `${S},${lxmfHash(r.me)}`]])],
+        ["a distro identity transfer (Add another device is strict)", new Map(transfer)],
+    ];
+    for (const [label, fields] of cases) r.packet(lxm(stranger, r.me, label, fields));
+    await settle();
+    assert.equal(r.proofs.length, 0, "none is proved");
+    assert.equal(parses.length, 0, "none is parsed: no full msgpack decode, no hash, no signature check");
+    assert.equal(peeks.length, cases.length, "each was looked at once");
+    assert.deepEqual(decoded, [OTHER, held, "invite"], "and only group ids and actions were decoded: no name, attachment or member list");
+    assert.equal(r.emitted.length, 0);
+    assert.equal(r.ContactStore.get(S), null, "no row, so no name");
+    assert.deepEqual(r.MsgStore.get(S), []);
+    assert.equal(r.self.transfers.length, 0, "no transfer offered");
+    assert.deepEqual(r.drops().map((d) => d.at), cases.map(() => "source"));
+
+    // A transfer that also names a held group is let in by the look, then
+    // dropped after the parse: still a transfer, still a stranger's.
+    r.packet(lxm(stranger, r.me, "", new Map([...transfer, [GROUP_FIELDS.GROUP_ID, held]])));
+    await settle();
+    assert.deepEqual([r.proofs.length, r.self.transfers.length, r.emitted.length], [0, 0, 0]);
+    assert.deepEqual(r.drops().at(-1), { src: S.slice(0, 12), path: "opportunistic", at: "message" });
+
+    // A link packet with a ticket, a link Resource, a /get: dropped the same.
+    const { a, wire } = await deliveryLink(r);
+    a.send(lxm(stranger, r.me, "a DM on a link", ticketed(named("Stranger"))));
+    await settle(6);
+    await within(a.sendResource(lxm(stranger, r.me, "q".repeat(3000), ticketed([[GROUP_FIELDS.GROUP_ID, OTHER]]))), 5000, "the Resource");
+    await settle(6);
+    assert.equal(linkProofs(wire).length, 0, "no proof on the link");
+    assert.equal(linkReplies(wire).length, 0, "no ticket reply");
+    const purged = await fetchPropagated(r, [lxm(stranger, r.me, "left on the node", named("Stranger"))]);
+    assert.deepEqual(purged, [1], "still purged from the node");
+    assert.equal(parses.length, 1, "only the transfer naming a held group was ever parsed");
+    assert.deepEqual(r.drops().slice(-3).map((d) => [d.path, d.at]), [["link", "source"], ["resource", "source"], ["propagated", "source"]]);
+    assert.equal(r.ContactStore.get(S), null);
+
+    // The cheap path is unchanged: a contact's or a member's message is let
+    // through on its source alone, with no look at its group entries.
+    const friend = Identity.create();
+    r.ContactStore.add(lxmfHash(friend));
+    r.ContactStore.allow(lxmfHash(friend));
+    const looked = peeks.length;
+    r.packet(lxm(friend, r.me, "a DM", named("Friend", [[GROUP_FIELDS.GROUP_ID, OTHER]])));
+    r.packet(lxm(member, r.me, "in the group", new Map([[GROUP_FIELDS.GROUP_ID, held]])));
+    await settle();
+    assert.equal(peeks.length, looked, "no look for a source the filter knows");
+    assert.equal(r.proofs.length, 1, "the member's group message is proved (the friend's names a group not held here)");
+});
+
+test("a stranger's packet let in as a group message but not parseable is not proved; a known source's still is", async (t) => {
+    const r = recipient();
+    const member = Identity.create(), stranger = Identity.create(), friend = Identity.create();
+    const G = r.GroupStore.create("G", [lxmfHash(member)]).groupId;
+    r.ContactStore.allow(lxmfHash(friend));
+    const real = LXMessage.fromBytes;
+    LXMessage.fromBytes = () => null;
+    t.after(() => { LXMessage.fromBytes = real; });
+
+    r.packet(lxm(stranger, r.me, "x", new Map([[GROUP_FIELDS.GROUP_ID, G]])));
+    r.packet(lxm(friend, r.me, "x"));
+    await settle();
+    assert.equal(r.proofs.length, 1, "only the friend's (LXMF delivery_packet proves before it parses)");
+    const { a, wire } = await deliveryLink(r);
+    a.send(lxm(stranger, r.me, "y", new Map([[GROUP_FIELDS.GROUP_ID, G]])));
+    await settle(6);
+    a.send(lxm(friend, r.me, "y"));
+    await settle(6);
+    assert.equal(linkProofs(wire).length, 1, "the same on a link");
+    assert.equal(r.router.admission(lxm(stranger, r.me, "z", new Map([[GROUP_FIELDS.GROUP_ID, G]])).subarray(16), "t"), "group");
+    assert.equal(r.router.admission(lxm(friend, r.me, "z").subarray(16), "t"), "source");
+    assert.equal(r.router.admission(lxm(stranger, r.me, "z").subarray(16), "t"), null);
+});
+
+test("LXMessage.peekGroupFields reads the group id and action as the full parse does: every Retichat-field vector", async () => {
+    const fieldVectors = JSON.parse(await readFile(new URL("../LXMF-rust/tests/retichat_field_vectors.json", import.meta.url), "utf8"));
+    // [timestamp, title, content, fields], the fields as the vector's bytes.
+    const payload = (fieldsHex, content = Buffer.from("hello")) => Buffer.concat([Buffer.from([0x94]),
+        MsgPack.pack(1700000000.5), MsgPack.pack(Buffer.from("t")), MsgPack.pack(content), Buffer.from(fieldsHex, "hex")]);
+    assert.ok(fieldVectors.decode.length >= 30);
+    for (const v of fieldVectors.decode) {
+        const want = v.group.group_id === null ? null : { groupId: v.group.group_id, groupAction: v.group.group_action };
+        assert.deepEqual(LXMessage.peekGroupFields(payload(v.fields_msgpack_hex)), want, v.name);
+        const full = LXMessage.extractGroupFields(LXMessage.decodePayload(payload(v.fields_msgpack_hex)).fields);
+        assert.deepEqual(full ? { groupId: full.groupId, groupAction: full.groupAction } : null, want, `the full parse agrees: ${v.name}`);
+    }
+    const G = "0123456789abcdef0123456789abcdef";
+    const fieldsHex = (m) => MsgPack.pack(m).toString("hex");
+    // A float field number reads as that integer in msgpackr, so here too.
+    assert.deepEqual(LXMessage.peekGroupFields(payload("81cb406a200000000000" + MsgPack.pack(new Map([[1, G]])).toString("hex"))),
+        { groupId: G, groupAction: null }, "0xD1 as a float64 key");
+    assert.equal(LXMessage.extractGroupFields(LXMessage.decodePayload(
+        payload("81cb406a200000000000" + MsgPack.pack(new Map([[1, G]])).toString("hex"))).fields)?.groupId, G);
+    // A big content and attachment are skipped, not read.
+    assert.deepEqual(LXMessage.peekGroupFields(payload(fieldsHex(new Map([[0x05, [[Buffer.from("a"), Buffer.alloc(100000)]]], [0xA0, G]])),
+        Buffer.alloc(200000))), { groupId: G, groupAction: null });
+    // Not a payload, or cut short: no group.
+    for (const bad of [Buffer.alloc(0), Buffer.from([0x93, 0x01, 0xa0, 0xa0]), Buffer.from([0xc1]),
+        payload(fieldsHex(new Map([[0xA0, G]]))).subarray(0, 30), Buffer.from([0x94, 0x01, 0xa0, 0xa0, 0xc0])]) {
+        assert.equal(LXMessage.peekGroupFields(bad), null, bad.toString("hex"));
+    }
 });
 
 // ── the allowlist ──────────────────────────────────────────────────────────
