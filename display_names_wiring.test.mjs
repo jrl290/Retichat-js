@@ -42,7 +42,7 @@ import * as DN from "./lib/display_name.js";
 import * as RF from "./lib/retichat_field.js";
 const { applyGroupFields } = RF;
 import { SendTransfers } from "./lib/send_progress.js";
-import { ChannelPublishes } from "./lib/channel_publish.js";
+import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
@@ -878,24 +878,29 @@ test("§4.2 own posts carry the Channel Display Name by the channel rule, record
     const sent = [];
     const records = [];
     const env = {
-        IdMgr: { has: true, id: me }, Destination, Link, Buffer, console: quiet, channelLxmPack, channelComputeStamp,
+        IdMgr: { has: true, id: me }, Destination, Link, Buffer, MsgPack, console: quiet, channelLxmPack, channelComputeStamp,
         ChannelMsgStore: { add: (c, m) => { records.push(m); return { id: String(records.length), ...m }; }, updateStatus: () => ({}) },
         ChannelStore: { get: () => ({ channelName: CHANNEL, stampCost: null }), touch() {} },
         ChannelPostNamesStore: posts, OwnNames: { channel: "Pseud", message: "Not this one" },
-        rfedRequestTimeoutMs: () => 10_000,
+        rfedRequestTimeoutMs: () => 10_000, CHANNEL_PUBLISH_PATH,
     };
     const self = {
         _onMsg: [], _rfedSendChain: Promise.resolve(), _chanSeenIds: new Set(), _pendingPacketHashes: new Map(),
         _channelPublishes: new ChannelPublishes(),
         _exchangeIsDown: () => false,
         _ensureChannelSubscribed: async () => {}, _ensureChannelStreamConfigured: async () => {},
-        // RFed has the post once its echo comes back (lib/channel_publish.js).
-        _ensureRfedLink: async () => ({ send: (payload) => {
-            sent.push(payload);
-            const { sourceHash, tsMs } = channelLxmUnpack(CHANNEL, payload);
-            queueMicrotask(() => self._channelPublishes.echoed(`${sourceHash.toString("hex")}:${tsMs}`));
-            return { packetHash: Buffer.alloc(32) };
-        } }),
+        _rfedLinkAvailable: () => true,
+        // RFed has the post once it answers the /channel/publish request
+        // (lib/channel_publish.js).
+        _ensureRfedLink: async () => ({
+            sendRequestPacked: (path, packed, { onDelivered }) => {
+                assert.equal(path, "/channel/publish");
+                sent.push(Buffer.from(MsgPack.unpack(packed)));
+                onDelivered?.();
+                return Buffer.alloc(16, sent.length);
+            },
+            responseFor: () => Promise.resolve([true, null]),
+        }),
     };
     self._setChannelPostStatus = compile("_setChannelPostStatus(channelName, msgId, status)", env)(self);
     const post = compile("async sendChannelMessage(channelName, content)", env)(self);

@@ -7,22 +7,25 @@
  * through the composer was proved by rfed at +1596 ms and echoed at
  * +1597 ms, its record went "sent" at +1604 ms, and its bubble still showed
  * the "sending" dot 25 s later (the same for a second post: record "sent"
- * at +551 ms). The status reached the store, never the screen.
+ * at +551 ms). The status reached the store, never the screen. The post is
+ * now the /channel/publish request on rfed.link, decided by rfed's answer
+ * or its echo of the post (lib/channel_publish.js).
  *
  * This loads the real page (index.html, app.js, the nodes' policy) in
  * Chromium on a stand-in exchange, opens a channel and posts through the
- * composer, as a user does. rfed is played at the page's own seams: the
- * rfed.channel link is a stand-in that keeps what is published, rfed's
- * proof goes through the page's own proof handler (Reticulum "proof"), and
- * rfed's echo through _handleChannelPacket, the handler every route of
+ * composer, as a user does. rfed is played at the page's own seams: rfed.link
+ * is a stand-in that keeps each request and lets the test answer it, and
+ * rfed's echo goes through _handleChannelPacket, the handler every route of
  * rfed's fan-out ends in. The bubble is read from the DOM:
- *   - proof then echo, as on staging: the bubble says "sent" as the echo is
- *     handled (on f56346c it stays "sending");
- *   - an exchange that lost the publish: "failed" at once, and rfed's echo
+ *   - rfed's answer: the bubble says "sent" as it is handled (on f56346c
+ *     it stays "sending");
+ *   - rfed's echo before its answer, as rfed sends them: "sent" at the echo;
+ *   - rfed's refusal: "failed" at once;
+ *   - an exchange that lost the publish: "failed" at once, and rfed's answer
  *     after that makes it "sent" (no other event follows it);
  *   - a record whose status changed with no event of its own: the next
  *     message event brings its bubble in line.
- * channel_send_status.test.mjs runs the same code under Node.
+ * channel_send_status.test.mjs runs the same code under Node over a real link.
  *
  * It runs only with RETICHAT_BOOT_TESTS=1 (`npm run test:full`; deploy.sh
  * always sets it), as the other Chromium tests do.
@@ -109,7 +112,7 @@ function within(promise, what) {
 
 const CH = "public.indicator";
 
-chromiumTest("the real page: a channel post's bubble says sent when rfed's echo comes, failed when the exchange lost it, and follows its record on every message event", async (t) => {
+chromiumTest("the real page: a channel post's bubble says sent at rfed's answer or echo, failed at its refusal or a lost exchange, and follows its record on every message event", async (t) => {
     const browser = await launchChromium(t);
     if (!browser) return;
     const served = await servePageAndExchange();
@@ -142,21 +145,31 @@ chromiumTest("the real page: a channel post's bubble says sent when rfed's echo 
         await within(page.waitForFunction(() => window.RetichatTest?.state().status === "online", null, { timeout: 0 }), "the page online on its exchange");
 
         // rfed, at the page's seams: subscribed, the stream bound, and an
-        // rfed.channel link that keeps each publish (its packet hash too).
+        // rfed.link that keeps each request and lets the test answer it.
         await page.evaluate((ch) => {
             const c = window.RetichatTest.client;
             window.__published = [];
+            window.__linksAsked = [];
             c._ensureChannelSubscribed = async () => null;
             c._ensureChannelStreamConfigured = async () => {};
             c.openChannel = async () => {};
-            c._ensureRfedLink = async () => ({
-                rtt: 100,
-                send(payload) {
-                    const packetHash = Buffer.alloc(32, window.__published.length + 1);
-                    window.__published.push({ payload: Buffer.from(payload), packetHash });
-                    return { packetHash };
-                },
-            });
+            c._rfedLinkAvailable = () => true;
+            c._ensureRfedLink = async (aspects) => {
+                window.__linksAsked.push(aspects.join("."));
+                return {
+                    rtt: 100,
+                    sendRequestPacked(path, packed, options) {
+                        const requestId = Buffer.alloc(16, window.__published.length + 1);
+                        const entry = { path, packed: Buffer.from(packed), requestId, delivered: false };
+                        entry.answer = new Promise((resolve, reject) => { entry.resolve = resolve; entry.reject = reject; });
+                        window.__published.push(entry);
+                        options?.onDelivered?.();
+                        entry.delivered = true;
+                        return requestId;
+                    },
+                    responseFor(id) { return window.__published.find((p) => p.requestId.equals(id)).answer; },
+                };
+            };
             window.RetichatTest.app.openChat(ch);
         }, CH);
         const statusOf = (text) => page.evaluate((txt) => {
@@ -170,34 +183,48 @@ chromiumTest("the real page: a channel post's bubble says sent when rfed's echo 
             await within(page.waitForFunction((k) => window.__published.length > k, n, { timeout: 0 }), `"${text}" published`);
             return n;
         };
-        /** rfed proves publish `i` (the page's own proof handler) and the page has taken it. */
-        const prove = (i) => within(page.evaluate((k) => new Promise((resolve) => {
-            const c = window.RetichatTest.client;
-            const key = window.__published[k].packetHash.subarray(0, 16).toString("hex");
-            c._rns.emit("proof", { provedPacketHash: window.__published[k].packetHash.subarray(0, 16) });
-            const check = () => (c._pendingPacketHashes.has(key) ? setTimeout(check, 10) : resolve());
-            check();
-        }), i), `the proof of publish ${i} handled`);
+        /** rfed answers publish `i` with `value`, and the page has handled it. */
+        const answer = (i, value) => within(page.evaluate(([k, v]) => {
+            window.__published[k].resolve(v);
+            return new Promise((resolve) => setTimeout(resolve, 0));
+        }, [i, value]), `rfed's answer to publish ${i} handled`);
         /** rfed's echo of publish `i`: its fan-out to this subscriber, the post as published (no stamp here). */
-        const echo = (i) => page.evaluate((k) => window.RetichatTest.client._handleChannelPacket(window.__published[k].payload), i);
+        const echo = (i) => page.evaluate((k) => {
+            const packed = window.__published[k].packed;
+            const header = { 0xc4: 2, 0xc5: 3, 0xc6: 5 }[packed[0]];
+            return window.RetichatTest.client._handleChannelPacket(packed.subarray(header));
+        }, i);
 
-        // 1. Proof, then echo, as on staging.
+        // 1. rfed answers: the bubble says sent as the answer is handled.
         const first = await post("first post");
+        assert.deepEqual(await page.evaluate((k) => [window.__published[k].path, window.__published[k].delivered], first),
+            ["/channel/publish", true], "the publish request on rfed.link");
+        assert.deepEqual(await page.evaluate(() => window.__linksAsked), ["link"]);
         assert.equal(await statusOf("first post"), "sending");
-        await prove(first);
-        assert.equal(await statusOf("first post"), "sending", "rfed's proof alone is not sent");
-        assert.equal(await echo(first), true);
-        assert.equal(await statusOf("first post"), "sent", "the bubble says sent as rfed's echo is handled");
+        await answer(first, [true, null]);
+        assert.equal(await statusOf("first post"), "sent", "the bubble says sent as rfed's answer is handled");
 
-        // 2. The exchange lost the publish: failed now; rfed's echo after it: sent.
+        // 2. rfed's echo before its answer, as rfed sends them: sent at the echo.
         const second = await post("second post");
-        await page.evaluate((k) => window.RetichatTest.client._onPacketsLost({
-            packetHashes: [window.__published[k].packetHash.toString("hex")], reason: "HTTP 502" }), second);
-        assert.equal(await statusOf("second post"), "failed", "a lost publish fails the post at once");
         assert.equal(await echo(second), true);
-        assert.equal(await statusOf("second post"), "sent", "rfed had it after all: the bubble follows");
+        assert.equal(await statusOf("second post"), "sent", "the bubble says sent as rfed's echo is handled");
+        await answer(second, [true, null]);
+        assert.equal(await statusOf("second post"), "sent");
 
-        // 3. A record whose status changed without an event of its own: the
+        // 3. rfed refuses: failed at once, saying why.
+        const third = await post("third post");
+        await answer(third, [false, "stamp_invalid"]);
+        assert.equal(await statusOf("third post"), "failed", "rfed's refusal fails the post at once");
+
+        // 4. The exchange lost the publish: failed now; rfed's answer after it: sent.
+        const fourth = await post("fourth post");
+        await page.evaluate((k) => window.RetichatTest.client._onPacketsLost({
+            packetHashes: [window.__published[k].requestId.toString("hex") + "00".repeat(16)], reason: "HTTP 502" }), fourth);
+        assert.equal(await statusOf("fourth post"), "failed", "a lost publish fails the post at once");
+        await answer(fourth, [true, null]);
+        assert.equal(await statusOf("fourth post"), "sent", "rfed had it after all: the bubble follows");
+
+        // 5. A record whose status changed without an event of its own: the
         // next message event (here a post received) brings its bubble in line.
         assert.equal(await statusOf("posted earlier"), "sending");
         await page.evaluate((ch) => {

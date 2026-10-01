@@ -246,6 +246,74 @@ test("a request sent as a Resource starts its timeout only once the peer has pro
     assert.ok(clock.now() - started > 80, "the upload took longer than the request's timeout");
 });
 
+test("onDelivered: once, when the peer holds the request: at the send for a packet, at the proof for a request Resource", async () => {
+    // lib/channel_publish.js starts its §1 clock here for the
+    // /channel/publish request, so a request Resource's upload is never
+    // counted against 5 s (DESIGN_PRINCIPLES §1, bulk transfers).
+    const { a, b } = linkPair({ delay: (p, from) => (from === "a" && p.context === Packet.RESOURCE ? 10 : 0) });
+    // The answer comes 20 ms after the request: an answer handled before
+    // the request Resource's promise settles (a macrotask after its proof)
+    // leaves the request READY, and a request answered first is never
+    // DELIVERED (_requestResourceConcluded), which the next test covers.
+    b.on("request", (request) => setTimeout(() => b.sendResponse(request.requestId, "got it"), 20));
+    const small = [];
+    const id1 = a.sendRequest("/p", bytes(10), { timeoutMs: 1000, onDelivered: () => small.push(a.pendingRequests.at(-1)?.status) });
+    assert.deepEqual(small, [Link.REQUEST_DELIVERED], "a packet request is held as it is sent");
+    assert.equal(await within(a.responseFor(id1), 3000, "the small response"), "got it");
+    assert.equal(small.length, 1, "once");
+
+    const big = [];
+    const started = clock.now();
+    const id2 = a.sendRequest("/p", bytes(40_000), { timeoutMs: 40, onDelivered: () => big.push({ at: clock.now(), status: a.pendingRequests.at(-1)?.status }) });
+    assert.deepEqual(big, [], "not while it uploads");
+    assert.equal(await within(a.responseFor(id2), 20_000, "the big response"), "got it");
+    assert.equal(big.length, 1, "once");
+    assert.equal(big[0].status, Link.REQUEST_DELIVERED, "at the peer's proof, as its response clock starts");
+    assert.ok(big[0].at - started > 80, "after the upload");
+});
+
+test("onDelivered is not called again between a split response's segments, nor for a request that failed or was answered first", async () => {
+    const saved = Resource.MAX_EFFICIENT_SIZE;
+    Resource.MAX_EFFICIENT_SIZE = 5000;
+    try {
+        const { a, b } = linkPair();
+        b.on("request", (request) => {
+            sendSplit(b, MsgPack.pack([request.requestId, bytes(9000)]), { requestId: request.requestId, isResponse: true });
+        });
+        let delivered = 0;
+        const id = a.sendRequest("/pull", null, { timeoutMs: 2000, onDelivered: () => delivered++ });
+        const response = await within(a.responseFor(id), 30_000, "the split response");
+        assert.equal(Buffer.from(response).length, 9000);
+        assert.equal(delivered, 1, "the clock restarted between the segments; the request was held once");
+    } finally {
+        Resource.MAX_EFFICIENT_SIZE = saved;
+    }
+
+    const { a } = linkPair({ drop: (p, from) => from === "a" && p.context === Packet.RESOURCE_ADV });
+    let delivered = 0;
+    const id = a.sendRequest("/p", bytes(2000), { timeoutMs: 100, onDelivered: () => delivered++ });
+    await assert.rejects(within(a.responseFor(id), 60_000, "the failure"), /sending the request as a Resource failed/);
+    assert.equal(delivered, 0, "never held");
+
+    // The answer handled before the request Resource's promise settles: the
+    // request is READY, and is never put back to DELIVERED.
+    const pair = linkPair();
+    pair.b.on("request", (request) => pair.b.sendResponse(request.requestId, "early"));
+    let held = 0;
+    const early = pair.a.sendRequest("/p", bytes(2000), { timeoutMs: 1000, onDelivered: () => held++ });
+    // Hold the Resource's own settlement back until the answer is in.
+    const receipt = pair.a._pendingRequest(early);
+    const answered = within(pair.a.responseFor(early), 30_000, "the early answer");
+    const realConcluded = pair.a._requestResourceConcluded.bind(pair.a);
+    let concluded;
+    const concludedLate = new Promise((resolve) => { concluded = resolve; });
+    pair.a._requestResourceConcluded = (r, ok, why) => { answered.then(() => { realConcluded(r, ok, why); concluded(); }); };
+    assert.equal(await answered, "early");
+    await within(concludedLate, 30_000, "the request Resource settles (after its proof)");
+    assert.equal(receipt.status, Link.REQUEST_READY);
+    assert.equal(held, 0, "answered first: never DELIVERED, so never held by this event");
+});
+
 test("a request whose response is already arriving is not put back to waiting when its own Resource settles", async () => {
     // PostInterface hands a poll's packets over in one synchronous loop, so
     // the proof of a request Resource and the response's advertisement can

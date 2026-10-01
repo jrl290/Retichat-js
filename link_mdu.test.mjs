@@ -156,16 +156,25 @@ test("PostInterface refuses to queue a packet larger than the node advertised", 
     }
 });
 
-test("the channel sender checks the payload before mining the stamp", async () => {
+test("the channel sender sends nothing a link packet cannot carry, and mines no stamp for a send it cannot make", async () => {
+    // Until 2026-10-01 sendChannelMessage sized the post against Link.MDU
+    // itself, before mining the stamp: one DATA packet up to the MDU, a bare
+    // Resource over it. It now publishes the /channel/publish request on
+    // rfed.link (lib/channel_publish.js), which the link sizes as RNS/Link.py
+    // request() does: one REQUEST packet up to the MDU, a request Resource
+    // over it. Every size can be sent, so no stamp is mined for nothing, and
+    // no over-MTU frame can reach the exchange.
     const appSource = await readFile(new URL("./app.js", import.meta.url), "utf8");
-    const send = appSource.indexOf("sendChannelMessage");
-    assert.notEqual(send, -1);
-
-    const guard = appSource.indexOf("Link.MDU", send);
-    const mine = appSource.indexOf("channelComputeStamp(", send);
-    assert.notEqual(guard, -1, "sendChannelMessage must size-check against Link.MDU");
-    assert.ok(
-        guard < mine,
-        "the size check must run before the proof-of-work, otherwise the stamp is mined for a packet that cannot be sent",
-    );
+    const at = appSource.indexOf("\n    async sendChannelMessage(channelName, content) {");
+    assert.notEqual(at, -1);
+    const send = appSource.slice(at, appSource.indexOf("\n    },\n", at));
+    assert.match(send, /link\.sendRequestPacked\(CHANNEL_PUBLISH_PATH, MsgPack\.pack\(finalPayload\)/,
+        "the post goes as the link's request, which the link sizes");
+    assert.doesNotMatch(send, /link\.send\(|sendResource\(/, "never a raw packet or a bare Resource the sender sizes itself");
+    // Its signature holds a brace (options = {}), so it is cut by its neighbours.
+    const from = linkSource.indexOf("\n    _sendRequestPayload(requestPayload, options = {}) {");
+    assert.notEqual(from, -1, "Link._sendRequestPayload is missing");
+    const request = linkSource.slice(from, linkSource.indexOf("\n    // ---- Request receipts", from));
+    assert.match(request, /if\(requestPayload\.length <= Link\.MDU\)\{/, "the link sizes every request against Link.MDU");
+    assert.match(request, /Resource\.send\(this, requestPayload, \{ requestId, isRequest: true/, "and sends a larger one as a request Resource");
 });

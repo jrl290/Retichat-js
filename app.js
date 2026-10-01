@@ -59,7 +59,7 @@ import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_led
 import { applyGroupFields } from "./lib/retichat_field.js";
 import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.js";
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
-import { ChannelPublishes } from "./lib/channel_publish.js";
+import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
@@ -1895,8 +1895,8 @@ const RnsClient = {
     _rfedStampRefreshed: new Set(),
     _rfedSubscriptionPromises: new Map(),
     _rfedStreamPromises: new Map(),
-    // This device's channel posts until rfed's echo of each decides it
-    // (lib/channel_publish.js).
+    // This device's channel posts until rfed's answer to each publish, or
+    // its echo of the post, decides it (lib/channel_publish.js).
     _channelPublishes: new ChannelPublishes(),
     _rfedSendChain: Promise.resolve(),
     _groupLinks: new Map(),
@@ -3815,17 +3815,20 @@ const RnsClient = {
      * settled for the propagated copy (_propagateMessage). The proof entry
      * stays: the node may have taken the batch before the exchange failed,
      * and a proof that still arrives is the truth and outranks the failure.
-     * A channel post whose publish packet was lost fails now the same way,
-     * and rfed's echo of it outranks that failure (lib/channel_publish.js).
-     * Link keepalives, proofs and requests are left to the link protocol.
+     * A channel post whose publish request went as one packet and was lost
+     * fails now the same way, and rfed's answer or echo, should rfed have
+     * taken the batch after all, outranks that failure
+     * (lib/channel_publish.js). Link keepalives, proofs and other requests
+     * are left to the link protocol.
      */
     _onPacketsLost({ packetHashes, reason }) {
         for (const packetHash of packetHashes) {
             const pending = this._pendingPacketHashes.get(packetHash.slice(0, 32));
             if (pending?.channelPost) {
-                // A channel post's publish went down with the exchange: it
-                // fails now, and rfed's echo, should rfed have taken the
-                // batch after all, still makes it "sent" (lib/channel_publish.js).
+                // A channel post's publish request went down with the
+                // exchange: it fails now, and rfed's answer or echo, should
+                // rfed have taken the batch after all, still makes it "sent"
+                // (lib/channel_publish.js).
                 this._channelPublishes.failed(pending.channelPost, `its packet was lost (${reason})`);
                 continue;
             }
@@ -6326,8 +6329,9 @@ const RnsClient = {
         this._onMsg.forEach(fn => fn({kind: "channel-left"}, channelName));
     },
 
-    /** Send a message to a channel. Resolves once rfed has it (its echo of
-     *  the post, lib/channel_publish.js) and rejects when it failed; the
+    /** Send a message to a channel: the `/channel/publish` request on
+     *  rfed.link. Resolves once rfed has the post (its answer, or its echo
+     *  of the post, lib/channel_publish.js) and rejects when it failed; the
      *  bubble follows each status (_setChannelPostStatus). */
     async sendChannelMessage(channelName, content) {
         if (!IdMgr.has) throw new Error("No identity");
@@ -6372,82 +6376,83 @@ const RnsClient = {
             const postName = ChannelPostNamesStore.decide(channelName, OwnNames.channel, nameDecidedAt);
             const { wire, tsMs } = channelLxmPack(channelName, IdMgr.id, content, postName);
 
-            // Compute PoW stamp (only if server requires one)
+            // Compute PoW stamp (only if server requires one). The publish
+            // is a request, which goes whatever its size (a packet, or a
+            // request Resource over the link MDU), so no stamp is mined for
+            // a send that cannot be made.
             const stampCost = ChannelStore.get(channelName)?.stampCost;
-
-            // Anything at or under the link MDU goes as a single data packet;
-            // larger payloads go as an RNS Resource. Decide before mining the
-            // stamp so the PoW is never burned on a send we cannot make.
-            const stampBytes = (stampCost != null && stampCost > 0) ? 32 : 0;
-            const oversized = wire.length + stampBytes > Link.MDU;
-
             let stamp = null;
             if (stampCost != null && stampCost > 0) {
                 stamp = await channelComputeStamp(wire, stampCost);
                 if (!stamp) throw new Error(`Could not compute required channel stamp at cost ${stampCost}`);
             }
 
-            // Append stamp if available
+            // Append stamp if available. Only its size is kept below: a
+            // post that fails stays tracked, and must not hold its bytes.
             const finalPayload = stamp ? Buffer.concat([wire, stamp]) : wire;
+            const payloadBytes = finalPayload.length;
 
             if (!this._chanSeenIds) this._chanSeenIds = new Set();
             const ownSourceHash = Destination.hash(IdMgr.id, "lxmf", "delivery").toString("hex");
             const echoKey = `${ownSourceHash}:${tsMs}`;
             this._chanSeenIds.add(echoKey);
 
-            const link = await this._ensureRfedLink(["channel"]);
-            // rfed's echo of the post makes it "sent"; a definite failure,
-            // or last the ceiling, "failed" (lib/channel_publish.js). Tracked
-            // before the publish can go, so no echo outruns it.
-            let proofKey = null;
+            // On rfed.link, as every other request to rfed (_rfedRequest):
+            // the subscription above already waited for it.
+            if (!this._rfedLinkAvailable()) await this._waitForRfedService(["link"]);
+            const link = await this._ensureRfedLink(["link"]);
+            // rfed's answer, or its echo of the post, makes it "sent"; a
+            // definite failure, rfed's refusal, or last the request's own
+            // budget, "failed" (lib/channel_publish.js). Tracked before the
+            // publish can go, so no echo outruns it.
+            let lostKey = null;
             post = this._channelPublishes.track(echoKey, {
-                sent: ({ waitedMs, late, proved }) => {
-                    if (proofKey) this._pendingPacketHashes.delete(proofKey);
+                sent: ({ via, late }) => {
+                    if (lostKey) this._pendingPacketHashes.delete(lostKey);
                     // RFed has the post, so what it carried is recorded for
                     // the channel rule (§4.2).
                     ChannelPostNamesStore.recordIncluded(channelName, postName, nameDecidedAt);
                     this._setChannelPostStatus(channelName, outMsg.id, "sent");
-                    console.log(`[retichat] 📡 Channel message accepted by RFed on #${channelName}, ${waitedMs} ms after it left `
-                        + `(${finalPayload.length}B, stamp=${!!stamp}, resource=${oversized}, proof ${proved ? "came" : "not seen"})`
+                    console.log(`[retichat] 📡 Channel message accepted by RFed on #${channelName} (${via}`
+                        + `${post.leftAt === null ? "" : `, ${Date.now() - post.leftAt} ms after rfed held it`}; ${payloadBytes}B, stamp=${!!stamp})`
                         + (late ? "; it had been shown failed" : ""));
                 },
-                failed: (why, { proved }) => {
-                    if (proofKey) this._pendingPacketHashes.delete(proofKey);
+                failed: (why) => {
+                    if (lostKey) this._pendingPacketHashes.delete(lostKey);
                     this._setChannelPostStatus(channelName, outMsg.id, "failed");
-                    console.warn(`[retichat] 📡 Channel post to #${channelName} failed: ${why}`
-                        + (proved ? " (rfed received it, its proof came, and has not accepted it)" : ""));
+                    console.warn(`[retichat] 📡 Channel post to #${channelName} failed: ${why}`);
                 },
             });
-            if (oversized) {
-                // A Resource has no single packet hash to prove against. Its
-                // own proof says rfed holds every part, and only then can
-                // rfed take the post in; its failure is the post's.
-                await link.sendResource(finalPayload);
-                this._channelPublishes.proved(post);
-            } else {
-                const packet = link.send(finalPayload);
-                // Its proof says rfed received the post, not that it took it
-                // in: noted. The entry also lets an exchange that lost the
-                // packet fail the post (_onPacketsLost). Nothing can arrive
-                // between the send and this line.
-                const tracked = post;
-                proofKey = packet.packetHash.slice(0, 16).toString("hex");
-                this._pendingPacketHashes.set(proofKey, {
+            const tracked = post;
+            const requestId = link.sendRequestPacked(CHANNEL_PUBLISH_PATH, MsgPack.pack(finalPayload), {
+                timeoutMs: rfedRequestTimeoutMs(link),
+                // rfed holds it: the packet went, or the request Resource
+                // was proved. The §1 clock starts.
+                onDelivered: () => this._channelPublishes.left(tracked),
+            });
+            // A request that fits one packet is that packet, and its id is
+            // the packet's hash: an exchange that loses it fails the post now
+            // (_onPacketsLost). A request is answered, never proved (RNS/Link.py).
+            // A request Resource's packets are never reported here; its own
+            // events decide it.
+            lostKey = requestId.toString("hex");
+            if (post.status === "sending") {
+                this._pendingPacketHashes.set(lostKey, {
                     contactHash: channelName,
                     messageId: outMsg.id,
                     channelPost: tracked,
-                    onProof: () => this._channelPublishes.proved(tracked),
+                    onProof: () => {},
                 });
             }
-            // The publish has left: the §1 clock and the ceiling start now.
-            await this._channelPublishes.left(post, rfedRequestTimeoutMs(link));
+            link.responseFor(requestId).then(
+                (response) => this._channelPublishes.answered(tracked, response),
+                (e) => this._channelPublishes.unanswered(tracked, e.message),
+            );
+            await post.outcome;
         } catch(e) {
             if (post) {
                 // The post's own failure (a no-op once it has an outcome).
-                // rfed's echo may have come before its Resource reported a
-                // failure: rfed has the post, and it stays "sent".
                 this._channelPublishes.failed(post, e.message);
-                if (post.status === "sent") return outMsg;
             } else {
                 this._setChannelPostStatus(channelName, outMsg.id, "failed");
                 console.warn(`[retichat] 📡 Channel send failed for #${channelName}:`, e.message);
@@ -6512,7 +6517,10 @@ const RnsClient = {
         this._rfedStampRefreshed.clear();
         this._rfedSubscriptionPromises.clear();
         this._rfedStreamPromises.clear();
-        this._channelPublishes.clear("the connection stopped before rfed accepted the post");
+        // A channel post still waiting for rfed's answer fails as its
+        // rfed.link closes above (the request's own failure), and stays
+        // tracked: its echo on the next connection makes it "sent"
+        // (lib/channel_publish.js).
         this._rfedSendChain = Promise.resolve();
         for (const entry of this._groupLinks.values()) {
             try { entry.link.close(); } catch(e) {}
