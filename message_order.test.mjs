@@ -54,18 +54,43 @@ test("addInOrder: by timestamp, equal timestamps in the order they came, a late 
         "z stops at y: a record with no time is never passed over");
 });
 
-test("addInOrder: a limit drops the oldest, never the record being added", () => {
-    const r = [{ id: "a", timestamp: 10 }, { id: "b", timestamp: 20 }, { id: "c", timestamp: 30 }];
+test("addInOrder: a limit drops the records that arrived first, wherever they are listed, never the record being added", () => {
+    const r = [];
+    for (const [id, timestamp] of [["a", 10], ["b", 20], ["c", 30]]) addInOrder(r, { id, timestamp });
+    assert.deepEqual(r.map((m) => m.arrival), [0, 1, 2], "each record is stamped with the order it was stored in");
     assert.deepEqual(ids(addInOrder(r, { id: "d", timestamp: 40 }, 3)), ["a"]);
     assert.deepEqual(ids(r), ["b", "c", "d"]);
-    assert.deepEqual(ids(addInOrder(r, { id: "bb", timestamp: 25 }, 3)), ["b"]);
-    assert.deepEqual(ids(r), ["bb", "c", "d"]);
-    // Older than every record held: it is kept, at the top, and the next-oldest go.
-    assert.deepEqual(ids(addInOrder(r, { id: "old", timestamp: 1 }, 3)), ["bb"]);
-    assert.deepEqual(ids(r), ["old", "c", "d"]);
+
+    // Older than every record held (a sender whose clock is behind, a batch
+    // of old propagated or distro messages): kept, listed at the top, and
+    // the next one like it does not push it out. It has been proved to its
+    // sender and purged from the node; dropping it would lose it unseen.
+    assert.deepEqual(ids(addInOrder(r, { id: "late1", timestamp: 1 }, 3)), ["b"]);
+    assert.deepEqual(ids(r), ["late1", "c", "d"]);
+    assert.deepEqual(ids(addInOrder(r, { id: "late2", timestamp: 2 }, 3)), ["c"], "c arrived before late1");
+    assert.deepEqual(ids(r), ["late1", "late2", "d"], "both late ones held, in time order");
+    assert.deepEqual(ids(addInOrder(r, { id: "e", timestamp: 50 }, 3)), ["d"]);
+    assert.deepEqual(ids(addInOrder(r, { id: "f", timestamp: 60 }, 3)), ["late1"], "late1 goes when it is the first to have arrived");
+    assert.deepEqual(ids(r), ["late2", "e", "f"]);
+
+    // Several at once: the first arrived, first.
     const many = [1, 2, 3, 4].map((t) => ({ id: `m${t}`, timestamp: t * 10 }));
-    assert.deepEqual(ids(addInOrder(many, { id: "first", timestamp: 0 }, 2)), ["m1", "m2", "m3"]);
-    assert.deepEqual(ids(many), ["first", "m4"]);
+    for (const m of [...many.splice(0).reverse()]) addInOrder(many, m);
+    assert.deepEqual(ids(many), ["m1", "m2", "m3", "m4"], "stored m4 first, m1 last");
+    assert.deepEqual(ids(addInOrder(many, { id: "first", timestamp: 0 }, 2)), ["m4", "m3", "m2"]);
+    assert.deepEqual(ids(many), ["first", "m1"]);
+});
+
+test("addInOrder: records stored before arrival stamps went first, in the order they are listed", () => {
+    // A conversation the released web stored: no stamps, kept in arrival
+    // order (it appended). They count as arriving before any stamped record.
+    const r = [{ id: "old1", timestamp: 30 }, { id: "old2", timestamp: 10 }, { id: "old3", timestamp: 20 }];
+    addInOrder(r, { id: "new", timestamp: 5 });
+    assert.equal(r.find((m) => m.id === "new").arrival, 0, "the first stamp is 0");
+    assert.deepEqual(ids(r), ["new", "old1", "old2", "old3"], "goes before old1, the first later one from the end");
+    assert.deepEqual(ids(addInOrder(r, { id: "next", timestamp: 40 }, 3)), ["old1", "old2"], "old1 then old2, as listed, before new");
+    assert.deepEqual(ids(r), ["new", "old3", "next"]);
+    assert.equal(r.at(-1).arrival, 1);
 });
 
 // ── the stores ──────────────────────────────────────────────────────────────
@@ -94,18 +119,25 @@ test("MsgStore, GroupMsgStore and ChannelMsgStore keep conversation order; add r
     }
 });
 
-test("the 500 cap drops the oldest by time, and their attachments with them (onDiscard)", () => {
+test("the 500 cap drops what arrived first, and its attachments (onDiscard); a late message older than all held is kept", () => {
     const s = stores();
-    const discarded = [];
-    s.MsgStore.onDiscard = (records) => discarded.push(...records.map((m) => m.content));
-    for (let i = 0; i < 500; i++) s.MsgStore.add("p", { dir: "in", content: `m${i}`, timestamp: NOON + i * 1000 });
-    s.MsgStore.add("p", { dir: "in", content: "late", timestamp: NOON - HOUR });
-    assert.deepEqual(discarded, ["m0"], "the oldest other than the one added");
-    const kept = s.MsgStore.get("p");
-    assert.equal(kept.length, 500);
-    assert.deepEqual(kept.slice(0, 2).map((m) => m.content), ["late", "m1"]);
-    s.MsgStore.add("p", { dir: "in", content: "new", timestamp: NOON + 600_000 });
-    assert.deepEqual(discarded, ["m0", "late"], "then the late one is the oldest");
+    for (const [store, key] of [[s.MsgStore, "p"], [s.GroupMsgStore, "g"], [s.ChannelMsgStore, "c"]]) {
+        const discarded = [];
+        store.onDiscard = (records) => discarded.push(...records.map((m) => m.content));
+        for (let i = 0; i < 500; i++) store.add(key, { dir: "in", content: `m${i}`, timestamp: NOON + i * 1000 });
+        store.add(key, { dir: "in", content: "late1", timestamp: NOON - HOUR });
+        store.add(key, { dir: "in", content: "late2", timestamp: NOON - 2 * HOUR });
+        const kept = store.get(key);
+        assert.equal(kept.length, 500, key);
+        assert.deepEqual(kept.slice(0, 3).map((m) => m.content), ["late2", "late1", "m2"], `${key}: both late ones, at the top, in time order`);
+        store.add(key, { dir: "in", content: "new", timestamp: NOON + 600_000 });
+        assert.deepEqual(store.get(key).slice(0, 3).map((m) => m.content), ["late2", "late1", "m3"], `${key}: the late ones stay`);
+        assert.equal(store.get(key).at(-1).content, "new");
+        // The stamps are stored with the records, so the rule holds across a reload.
+        assert.deepEqual(store.get(key).slice(0, 2).map((m) => m.arrival), [501, 500], key);
+        if (store === s.ChannelMsgStore) continue;   // a channel post's attachments are not stored apart
+        assert.deepEqual(discarded, ["m0", "m1", "m2"], `${key}: what arrived first, and its attachments with it`);
+    }
 });
 
 test("a DM pulled late (router handler) is stored at its sent time, among the messages of its time", () => {

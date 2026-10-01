@@ -861,8 +861,10 @@ const MsgStore = {
     get(hash) { return sGet("msg_"+hash) ?? []; },
     /** Store `msg` in conversation order (lib/message_order.js: by
      *  timestamp, then arrival, as iOS and Android list a conversation), so
-     *  a message pulled late sits among the messages of its time. Returns
-     *  the stored record. */
+     *  a message pulled late sits among the messages of its time. Past 500
+     *  the records that arrived first go, wherever they are listed, never
+     *  one that just arrived older than everything held. Returns the stored
+     *  record. */
     add(hash, msg) {
         const msgs = this.get(hash);
         const stored = { id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg };
