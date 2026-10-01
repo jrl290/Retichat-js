@@ -5,24 +5,35 @@
  * block (a71c32a, exchange_url_policy.test.mjs). One saved before that, or
  * edited in storage, still left the page offline with nothing to say why:
  * the browser refuses each request to it before it is sent, and the status
- * dot only turned red. Now, as the page loads, a saved exchange URL other
+ * dot only turned red. Now, as the page connects, a saved exchange URL other
  * than the node's own is checked with the same check Settings makes
- * (PagePolicy, lib/connect_policy.js) before anything connects (§5). A
- * blocked one is not connected to: the status is "blocked", and the page
- * says so where it shows the connection status, under the status dot ("This
- * exchange is blocked by the page's security policy; change it in
- * Settings.", with a button to Settings, whose exchange field then says
- * why). Changing it in Settings reconnects, and the line goes.
+ * (PagePolicy, lib/connect_policy.js), alongside the connection
+ * (RnsClient._checkSavedExchange): nothing waits on it. A blocked one has
+ * its interface stopped (PostInterface.block: never asked again), the
+ * status is "blocked", and the page says so where it shows the connection
+ * status, under the status dot ("This exchange is blocked by the page's
+ * security policy; change it in Settings.", with a button to Settings,
+ * whose exchange field then says why). The client behind it is built as
+ * for any URL, so the page works as it does while the exchange is down (an
+ * invite can be accepted). Changing the URL in Settings reconnects, and the
+ * line goes.
+ *
+ * Until 2026-10-01 (review of e48ede8) connect() awaited the check first:
+ * a blocked URL returned before the router was built, so an accept said
+ * keys were missing or threw halfway, and a policy read the page's server
+ * never answered kept even an allowed exchange from ever being asked.
  *
  * The node's own URL (config.json, or the default) is never checked: it is
  * served beside the policy, and deploy.sh's boot gate fails on any
- * violation. A policy that cannot be read decides nothing: the saved URL is
- * connected to as before, and the console says it is unchecked.
+ * violation. A policy that cannot be read decides nothing: the saved URL
+ * stays connected, unchecked, and the console says so. A read that has not
+ * answered in 5 s is a §1 failure, said then.
  *
  * These run the real shipped code from app.js (loadConfig, PagePolicy,
- * RnsClient.connect up to its interface, App._applyStatusDot, h) over
- * stubs. One test (RETICHAT_BOOT_TESTS=1, as deploy.sh runs the suite)
- * loads the real page in Chromium under the .htaccess policy.
+ * RnsClient.connect up to its router, _checkSavedExchange,
+ * App._applyStatusDot, h) over stubs. Two tests (RETICHAT_BOOT_TESTS=1, as
+ * deploy.sh runs the suite) load the real page in Chromium under the
+ * .htaccess policy. PostInterface.block is in exchange_truth.test.mjs.
  *
  * Run: node --test exchange_url_at_load.test.mjs
  */
@@ -35,6 +46,7 @@ import { createRequire } from "node:module";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { exchangeUrlRefusal } from "./lib/connect_policy.js";
+import { Identity, Destination } from "./lib/rns/reticulum.js";
 import { app, build, compile, constValue, fn, methodBody } from "./test_app_source.mjs";
 
 const htaccess = readFileSync(new URL("./.htaccess", import.meta.url), "utf8");
@@ -54,15 +66,19 @@ const response = (status, headers = {}) => ({
 const servedWithPolicy = () => response(200, { "Content-Security-Policy": POLICY });
 
 /** The real PagePolicy over a page at `href` served by `serve`; what it
- *  warns goes to `warnings`. */
-function pagePolicy(serve, href = PAGE, warnings = []) {
+ *  warns goes to `warnings`, what it says as an error to `errors`. Its
+ *  timers are captured (`timers`) and fired by hand. */
+function pagePolicy(serve, href = PAGE, warnings = [], errors = []) {
     const fetched = [];
+    const timers = [];
     const PagePolicy = build("PagePolicy", {
         fetch: async (url, init) => { fetched.push([url, init?.cache]); return serve(url, init); },
         location: { href }, exchangeUrlRefusal, Date,
-        console: { log() {}, error() {}, warn: (m) => warnings.push(m) },
+        setTimeout: (fn, ms) => { const timer = { fn, ms, cleared: false }; timers.push(timer); return timer; },
+        clearTimeout: (timer) => { if (timer) timer.cleared = true; },
+        console: { log() {}, error: (m) => errors.push(m), warn: (m) => warnings.push(m) },
     });
-    return { PagePolicy, fetched, warnings };
+    return { PagePolicy, fetched, warnings, errors, timers };
 }
 
 // ── PagePolicy.blockedReason ───────────────────────────────────────────────
@@ -86,6 +102,26 @@ test("PagePolicy.blockedReason: the reason the served policy blocks a saved exch
 
     const local = pagePolicy(() => response(200, {}), "http://127.0.0.1:8000/");
     assert.equal(await local.PagePolicy.blockedReason("http://127.0.0.1:8080"), null, "a page served with no policy blocks nothing");
+});
+
+test("PagePolicy.header: a read its server has not answered in 5 s is a §1 failure, said then; one answered in time says nothing", async () => {
+    // DESIGN_PRINCIPLES.md §1: a fetch has no deadline, so a read never
+    // answered would otherwise never be heard of. It decides nothing.
+    const hung = pagePolicy(() => new Promise(() => {}));
+    hung.PagePolicy.header();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(hung.timers.map((x) => [x.ms, x.cleared]), [[5000, false]], "armed as the read starts");
+    assert.deepEqual(hung.errors, []);
+    hung.timers[0].fn();
+    assert.equal(hung.errors.length, 1);
+    assert.match(hung.errors[0], /§1: this page's own server has not answered the read of its Content-Security-Policy in 5 s/);
+
+    for (const serve of [servedWithPolicy, () => { throw new TypeError("Failed to fetch"); }]) {
+        const answered = pagePolicy(serve);
+        await answered.PagePolicy.header().catch(() => {});
+        assert.deepEqual(answered.timers.map((x) => [x.ms, x.cleared]), [[5000, true]], "cleared by the answer, or the failure");
+        assert.deepEqual(answered.errors, []);
+    }
 });
 
 // ── loadConfig: which URL is the saved one ─────────────────────────────────
@@ -127,86 +163,114 @@ test("loadConfig marks the exchange URL as saved only when one saved in this bro
     }
 });
 
-// ── RnsClient.connect ──────────────────────────────────────────────────────
+// ── RnsClient.connect and _checkSavedExchange ───────────────────────────────
 
 /**
- * The real RnsClient.connect() up to its exchange interface (as
- * tab_lock.test.mjs runs it), with the real PagePolicy over `serve` and a
- * config whose exchange URL is `exchangeUrl`, saved or the node's.
+ * The real RnsClient.connect() up to its LXMF router (as tab_lock.test.mjs
+ * runs it), with the real _checkSavedExchange and PagePolicy over `serve`,
+ * and a config whose exchange URL is `exchangeUrl`, saved or the node's.
+ * `duringRead(self)` runs as the policy is read (a disconnect meanwhile).
+ * The check is awaited unless `awaitCheck` is false.
  */
-async function runConnect({ exchangeUrl, saved, serve = servedWithPolicy, takenOverWhileChecking = false }) {
+async function runConnect({ exchangeUrl, saved, serve = servedWithPolicy, duringRead = null, awaitCheck = true }) {
     const made = [];
     const statuses = [];
     const events = [];
     const warnings = [];
-    const STOP = new Error("the interface exists (the test stops here)");
-    const activeTab = { held: true };
+    const blocks = [];
+    const STOP = new Error("the LXMF router is being built (the test stops here)");
+    let self;
     const p = pagePolicy(async (...a) => {
-        if (takenOverWhileChecking) activeTab.held = false;   // _takenOver() ran meanwhile
+        duringRead?.(self);
         return serve(...a);
     }, PAGE, warnings);
+    const Harness = { event: (kind, detail) => events.push([kind, detail]) };
+    const console = { log() {}, error() {}, warn: (m) => warnings.push(m) };
     const env = {
         IdMgr: { has: true, hash: "ab".repeat(16) },
-        ActiveTab: activeTab,
+        ActiveTab: { held: true },
         loadConfig: async () => ({ lxmfPropagationOverride: "b".repeat(32), exchangeUrl, exchangeUrlSaved: saved, interfaceName: "Retichat Web" }),
-        PagePolicy: p.PagePolicy,
-        Harness: { event: (kind, detail) => events.push([kind, detail]) },
-        console: { log() {}, error() {}, warn: (m) => warnings.push(m) },
+        Harness, console,
         ContactStore: { resetPropagationTimers() {} },
         Reticulum: class { constructor() { this.interfaces = []; made.push("Reticulum"); } addInterface(i) { this.interfaces.push(i); made.push("addInterface"); } },
-        PostInterface: class { constructor(name, url) { made.push(`PostInterface ${url}`); } on() {} },
-        LXMRouter: class { constructor() { throw STOP; } },
+        PostInterface: class { constructor(name, url) { made.push(`PostInterface ${url}`); } on() {} block(reason) { blocks.push(reason); } },
+        LXMRouter: class { constructor() { made.push("LXMRouter"); throw STOP; } },
         PrivacyFilter: {},
         OutboundTickets: {},
     };
-    const self = { exchangeBlocked: "stale", _setStatus(s) { statuses.push(s); }, _followExchange() {} };
-    let outcome;
-    try {
-        outcome = await compile("async connect()", env)(self)();
-    } catch (e) {
-        outcome = e;
-    }
-    return { made, statuses, events, warnings, outcome, STOP, self, fetched: p.fetched };
+    self = { exchangeBlocked: "stale", _setStatus(s) { statuses.push(s); }, _followExchange() {} };
+    self._checkSavedExchange = compile("async _checkSavedExchange(iface, exchangeUrl)", { PagePolicy: p.PagePolicy, Harness, console })(self);
+    // Everything connect() does up to the router is synchronous once the
+    // config is loaded (a settled promise here), so by the next macrotask it
+    // has returned or thrown, unless it waits on something outside it (the
+    // policy read): then the outcome is PENDING, and the test fails at once
+    // instead of hanging.
+    const outcome = await Promise.race([
+        compile("async connect()", env)(self)().catch((e) => e),
+        new Promise((resolve) => setImmediate(() => resolve(PENDING))),
+    ]);
+    const atReturn = { made: [...made], statuses: [...statuses], blocks: [...blocks] };
+    if (awaitCheck) await self._exchangeCheck;
+    return { made, statuses, events, warnings, blocks, outcome, STOP, self, atReturn, fetched: p.fetched };
 }
+const PENDING = Symbol("connect() still waiting");
 
-test("connect(): a saved exchange URL the page's policy blocks is not connected to; the status is \"blocked\" and the reason kept", async () => {
+test("connect(): with a saved exchange URL the page's policy blocks, the client is built as for any URL, and the check alongside stops the interface; the status is \"blocked\" and the reason kept", async () => {
     const run = await runConnect({ exchangeUrl: BLOCKED, saved: true });
-    assert.equal(run.outcome, undefined, "it stops there, quietly");
-    assert.deepEqual(run.made, [], "no Reticulum, no interface: nothing is sent to an exchange the browser would refuse");
-    assert.deepEqual(run.statuses, ["blocked"]);
+    assert.equal(run.outcome, run.STOP, "connect() went on to the router");
+    assert.deepEqual(run.made, ["Reticulum", `PostInterface ${BLOCKED}`, "addInterface", "LXMRouter"],
+        "the client is built whatever the check finds: the page stays usable as while the exchange is down (an accept needs RnsClient.ownHash)");
+    assert.deepEqual(run.atReturn.blocks, [], "nothing waited on the check");
+    assert.deepEqual(run.blocks, ["the exchange URL is blocked by this page's Content-Security-Policy"], "then its interface is stopped, saying why");
+    assert.deepEqual(run.statuses, ["connecting", "blocked"]);
     assert.equal(run.self.exchangeBlocked, exchangeUrlRefusal(BLOCKED, POLICY, PAGE), "the reason, for Settings");
     assert.deepEqual(run.events, [["exchange-blocked", { exchangeUrl: BLOCKED }]], "the harness hears of it");
-    assert.match(run.warnings[0], /^\[retichat\] Not connecting: the saved exchange URL https:\/\/other-node\.example\/reticulum is blocked by this page's Content-Security-Policy\. This page's/);
-    assert.deepEqual(run.fetched, [[PAGE, "no-store"]], "the policy read before anything connects");
+    assert.match(run.warnings[0], /^\[retichat\] The saved exchange URL https:\/\/other-node\.example\/reticulum is blocked by this page's Content-Security-Policy: its interface is stopped\. This page's/);
+    assert.deepEqual(run.fetched, [[PAGE, "no-store"]], "the policy read once");
 });
 
-test("connect(): an allowed saved URL connects; the node's own URL is never checked; an unreadable policy decides nothing; a tab taken over while it checks stops", async () => {
+test("connect(): nothing waits on the policy read: one the page's server never answers holds back neither the exchange nor the router, and decides nothing", async () => {
+    const never = await runConnect({ exchangeUrl: ALLOWED, saved: true, serve: () => new Promise(() => {}), awaitCheck: false });
+    assert.equal(never.outcome, never.STOP, "connect() went on to the router while the read hangs");
+    assert.deepEqual(never.made, ["Reticulum", `PostInterface ${ALLOWED}`, "addInterface", "LXMRouter"], "the exchange's interface added: it is asked at once");
+    assert.deepEqual(never.fetched, [[PAGE, "no-store"]], "the read was started");
+    const pending = Symbol("pending");
+    assert.equal(await Promise.race([never.self._exchangeCheck, new Promise((resolve) => setImmediate(() => resolve(pending)))]), pending, "and is still out");
+    assert.deepEqual([never.statuses, never.blocks, never.self.exchangeBlocked], [["connecting"], [], null], "nothing stopped, nothing said");
+});
+
+test("connect(): an allowed saved URL is left connected; the node's own URL is never checked; an unreadable policy decides nothing; a check that lands after a disconnect stops nothing", async () => {
     const allowed = await runConnect({ exchangeUrl: ALLOWED, saved: true });
     assert.equal(allowed.outcome, allowed.STOP);
-    assert.deepEqual(allowed.made, ["Reticulum", `PostInterface ${ALLOWED}`, "addInterface"]);
-    assert.deepEqual([allowed.statuses, allowed.self.exchangeBlocked], [["connecting"], null], "nothing blocked, and a stale reason cleared");
-    assert.equal(allowed.fetched.length, 1, "checked first");
+    assert.deepEqual(allowed.made, ["Reticulum", `PostInterface ${ALLOWED}`, "addInterface", "LXMRouter"]);
+    assert.deepEqual([allowed.statuses, allowed.blocks, allowed.self.exchangeBlocked], [["connecting"], [], null], "nothing blocked, and a stale reason cleared");
+    assert.equal(allowed.fetched.length, 1, "checked");
 
     // The node's own URL, even one the policy would block, is not checked:
-    // no read of the page, and it connects.
+    // no read of the page, no check at all.
     const own = await runConnect({ exchangeUrl: BLOCKED, saved: false });
     assert.equal(own.outcome, own.STOP);
-    assert.deepEqual([own.fetched, own.statuses], [[], ["connecting"]], "no policy read at all");
+    assert.deepEqual([own.fetched, own.statuses, own.blocks, own.self._exchangeCheck], [[], ["connecting"], [], null], "no policy read at all");
 
     const unread = await runConnect({ exchangeUrl: BLOCKED, saved: true, serve: () => { throw new TypeError("Failed to fetch"); } });
     assert.equal(unread.outcome, unread.STOP, "connected to, as before the check");
-    assert.deepEqual([unread.statuses, unread.self.exchangeBlocked], [["connecting"], null]);
+    assert.deepEqual([unread.statuses, unread.blocks, unread.self.exchangeBlocked], [["connecting"], [], null]);
     assert.match(unread.warnings[0], /used unchecked$/);
 
-    const takenOver = await runConnect({ exchangeUrl: BLOCKED, saved: true, takenOverWhileChecking: true });
-    assert.equal(takenOver.outcome, undefined);
-    assert.deepEqual([takenOver.made, takenOver.statuses, takenOver.events], [[], [], []], "the other tab has the identity: nothing here");
+    // Disconnected while the policy was read (Settings saved another URL,
+    // another tab took over): the connection the check was for is gone.
+    const replaced = await runConnect({ exchangeUrl: BLOCKED, saved: true, duringRead: (self) => { self._rns = null; } });
+    assert.deepEqual([replaced.blocks, replaced.statuses, replaced.events, replaced.self.exchangeBlocked], [[], ["connecting"], [], null],
+        "not this check's to stop: nothing blocked, nothing said");
 
-    // The check comes before the connection's first step, and a disconnect
-    // (a reconnect from Settings, a takeover) forgets the reason.
+    // Where it starts: once the interface is added, before the router, and
+    // not awaited; a disconnect (a reconnect from Settings, a takeover)
+    // forgets the reason and the check.
     const connect = methodBody("async connect()");
-    assert.ok(connect.indexOf("PagePolicy.blockedReason(this._cfg.exchangeUrl)") < connect.indexOf("ContactStore.resetPropagationTimers()"));
-    assert.match(methodBody("disconnect()"), /this\.exchangeBlocked = null;\n\s+this\._setStatus\("offline"\);/);
+    const check = connect.indexOf("this._checkSavedExchange(iface, this._cfg.exchangeUrl)");
+    assert.ok(connect.indexOf("this._rns.addInterface(iface);") < check && check < connect.indexOf("new LXMRouter("));
+    assert.doesNotMatch(connect, /\bawait\s+[^;]*(_checkSavedExchange|PagePolicy|_exchangeCheck)/);
+    assert.match(methodBody("disconnect()"), /this\.exchangeBlocked = null;\n\s+this\._exchangeCheck = null;\n\s+this\._setStatus\("offline"\);/);
 });
 
 // ── where the page shows it ────────────────────────────────────────────────
@@ -302,27 +366,35 @@ const BOOT_TESTS = process.env.RETICHAT_BOOT_TESTS === "1";
 const chromiumTest = BOOT_TESTS ? test
     : (name, fn) => test(name, { skip: "RETICHAT_BOOT_TESTS is not 1: run `npm run test:full` (deploy.sh always does)" }, fn);
 
-chromiumTest("the real page under the .htaccess policy: a saved exchange it blocks is said under the status dot, never asked for, and changing it in Settings clears it", async (t) => {
+/** Playwright's Chromium, or null when the test was skipped for want of it. */
+async function launchChromium(t) {
     let chromium;
     try {
         ({ chromium } = createRequire(new URL("../test-harnesses/distro-pipeline/package.json", import.meta.url))("playwright"));
     } catch {
-        return t.skip("no Playwright in ../test-harnesses/distro-pipeline");
+        t.skip("no Playwright in ../test-harnesses/distro-pipeline");
+        return null;
     }
-    let browser;
     try {
-        browser = await chromium.launch({ headless: true, args: ["--disable-dev-shm-usage"] });
+        return await chromium.launch({ headless: true, args: ["--disable-dev-shm-usage"] });
     } catch (e) {
-        if (/Executable doesn't exist/i.test(e?.message ?? "")) return t.skip("Playwright has no Chromium installed");
+        if (/Executable doesn't exist/i.test(e?.message ?? "")) { t.skip("Playwright has no Chromium installed"); return null; }
         throw e;
     }
-    // The page from this directory, index.html with the nodes' policy, and
-    // a config.json naming an exchange on this server ('self') that answers
-    // 503, as deploy.sh's boot gate serves it. Only this server and esm.sh
-    // (the importmap) are reachable; anything else is blocked in the browser.
+}
+
+/**
+ * The page from this directory, index.html with the nodes' policy, and a
+ * config.json naming an exchange on this server ('self') that answers 503,
+ * as deploy.sh's boot gate serves it. With `holdPolicyRead`, every request
+ * for index.html that is not the navigation (PagePolicy's read of the
+ * policy) is held unanswered.
+ */
+async function servePage({ holdPolicyRead = false } = {}) {
     const ROOT = fileURLToPath(new URL(".", import.meta.url));
     const TYPES = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".png": "image/png", ".json": "application/json" };
     const exchangeHits = [];
+    const held = [];
     const server = createServer(async (req, res) => {
         const path = new URL(req.url, "http://x").pathname;
         if (path === "/config.json") {
@@ -331,8 +403,9 @@ chromiumTest("the real page under the .htaccess policy: a saved exchange it bloc
             return;
         }
         if (path.startsWith("/no-exchange")) { exchangeHits.push(path); res.writeHead(503).end(); return; }
+        const file = join(ROOT, path.endsWith("/") ? `${path}index.html` : path);
+        if (holdPolicyRead && file.endsWith("index.html") && req.headers["sec-fetch-mode"] !== "navigate") { held.push(res); return; }
         try {
-            const file = join(ROOT, path.endsWith("/") ? `${path}index.html` : path);
             const body = await readFile(file);
             res.writeHead(200, { "content-type": TYPES[extname(file)] ?? "application/octet-stream", "cache-control": "no-store",
                 ...(file.endsWith("index.html") ? { "content-security-policy": POLICY } : {}) }).end(body);
@@ -341,36 +414,73 @@ chromiumTest("the real page under the .htaccess policy: a saved exchange it bloc
         }
     });
     await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
-    const origin = `http://127.0.0.1:${server.address().port}`;
+    return {
+        origin: `http://127.0.0.1:${server.address().port}`, exchangeHits, held,
+        close() { held.forEach((r) => r.destroy()); server.close(); },
+    };
+}
+
+/**
+ * A new page at `origin` with `seed` in its storage (retichat_<key>: JSON)
+ * at its first load. Only `origin` and esm.sh (the importmap) are
+ * reachable; anything else is blocked in the browser (`elsewhere`). Every
+ * securitypolicyviolation is recorded in window.__violations.
+ */
+async function openPage(browser, origin, seed) {
+    const context = await browser.newContext({ serviceWorkers: "block" });
+    const elsewhere = [];
+    await context.route("**/*", (route) => {
+        const u = new URL(route.request().url());
+        if (u.origin === origin || (u.protocol === "https:" && u.hostname === "esm.sh")) return route.continue();
+        elsewhere.push(route.request().url());
+        return route.abort("blockedbyclient");
+    });
+    await context.addInitScript((seed) => {
+        if (!sessionStorage.getItem("seeded")) {
+            for (const [k, v] of Object.entries(seed)) localStorage.setItem(`retichat_${k}`, JSON.stringify(v));
+            sessionStorage.setItem("seeded", "1");
+        }
+        window.__violations = [];
+        window.addEventListener("securitypolicyviolation", (e) => window.__violations.push(`${e.effectiveDirective} ${e.blockedURI}`), true);
+    }, seed);
+    const page = await context.newPage();
+    const pageErrors = [], dialogs = [], consoleLines = [];
+    page.on("pageerror", (e) => pageErrors.push(e.message));
+    page.on("dialog", (d) => { dialogs.push(d.message()); d.accept().catch(() => {}); });
+    page.on("console", (m) => consoleLines.push(`${m.type()}: ${m.text()}`.slice(0, 240)));
+    /** A page condition, failing the test with `what` (and the page's last
+     *  console lines) if it does not hold within 10 s. */
+    const until = (what, condition, arg = null) => page.waitForFunction(condition, arg, { timeout: 10_000 }).catch((e) => {
+        throw new Error(`${what}: not within 10 s (${e.message.split("\n")[0]})\n${consoleLines.slice(-25).join("\n")}`);
+    });
+    return { context, page, pageErrors, dialogs, elsewhere, until };
+}
+
+const OWN_KEY = "11".repeat(64);
+const deliveryHash = (id) => Destination.hash(id, "lxmf", "delivery").toString("hex");
+
+chromiumTest("the real page under the .htaccess policy: a saved exchange it blocks is said under the status dot and never asked again; the page still works (an invite is accepted); changing it in Settings clears it", async (t) => {
+    const browser = await launchChromium(t);
+    if (!browser) return;
+    const served = await servePage();
+    const { origin, exchangeHits } = served;
     try {
-        const context = await browser.newContext({ serviceWorkers: "block" });
-        const elsewhere = [];
-        await context.route("**/*", (route) => {
-            const u = new URL(route.request().url());
-            if (u.origin === origin || (u.protocol === "https:" && u.hostname === "esm.sh")) return route.continue();
-            elsewhere.push(route.request().url());
-            return route.abort("blockedbyclient");
-        });
-        await context.addInitScript(({ blocked }) => {
-            // An identity, so the page opens on its main view, and the
-            // exchange URL a build before a71c32a let the user save.
-            if (!sessionStorage.getItem("seeded")) {
-                localStorage.setItem("retichat_identity_private_key", JSON.stringify("11".repeat(64)));
-                localStorage.setItem("retichat_exchangeUrl", JSON.stringify(blocked));
-                sessionStorage.setItem("seeded", "1");
-            }
-            window.__violations = [];
-            window.addEventListener("securitypolicyviolation", (e) => window.__violations.push(`${e.effectiveDirective} ${e.blockedURI}`), true);
-        }, { blocked: BLOCKED });
-        const page = await context.newPage();
-        const pageErrors = [];
-        page.on("pageerror", (e) => pageErrors.push(e.message));
-        const consoleLines = [];
-        page.on("console", (m) => consoleLines.push(`${m.type()}: ${m.text()}`.slice(0, 240)));
-        /** A page condition, failing the test with `what` (and the page's last
-         *  console lines) if it does not hold within 10 s. */
-        const until = (what, condition, arg = null) => page.waitForFunction(condition, arg, { timeout: 10_000 }).catch((e) => {
-            throw new Error(`${what}: not within 10 s (${e.message.split("\n")[0]})\n${consoleLines.slice(-25).join("\n")}`);
+        // An identity, so the page opens on its main view; the exchange URL a
+        // build before a71c32a let the user save; and an invite waiting from
+        // an allowlisted contact, every member's key held.
+        const id = (byte) => Identity.fromPrivateKey(Buffer.from(byte.repeat(64), "hex"));
+        const [own, inviter, other] = [id("11"), id("22"), id("33")];
+        const row = (who, allowlisted) => ({ destHash: deliveryHash(who), publicKey: who.getPublicKey().toString("hex"), hidden: true, allowlisted,
+            localName: null, messageName: null, messageNameAt: null, announceName: null, legacyName: null, isDistro: false });
+        const GID = "ab".repeat(16);
+        const { context, page, pageErrors, dialogs, elsewhere, until } = await openPage(browser, origin, {
+            identity_private_key: OWN_KEY,
+            exchangeUrl: BLOCKED,
+            groupMembersAllowlisted: 2,
+            contacts_v2: [row(inviter, true), row(other, false)],
+            groups_v1: [{ groupId: GID, groupName: "Pending G", groupStatus: "pending", lastActivity: Date.now(),
+                members: [{ hash: deliveryHash(inviter), status: "accepted" }, { hash: deliveryHash(other), status: "invited" },
+                    { hash: deliveryHash(own), status: "invited" }] }],
         });
         await page.goto(`${origin}/index.html`);
 
@@ -384,10 +494,37 @@ chromiumTest("the real page under the .htaccess policy: a saved exchange it bloc
         });
         assert.deepEqual(await shown(), ["block", true], "on screen");
         assert.equal(await page.locator("#status-dot").getAttribute("class"), "status-dot blocked");
-        assert.deepEqual(await page.evaluate(() => [window.RetichatTest.state().status, !!window.RetichatTest.state().exchangeBlocked]), ["blocked", true],
-            "the debug surface says it too");
-        assert.deepEqual(await page.evaluate(() => window.__violations), [], "the blocked exchange was never asked for");
-        assert.deepEqual(exchangeHits, [], "nor any exchange");
+        const state = () => page.evaluate(() => {
+            const s = window.RetichatTest.state();
+            return { status: s.status, blocked: !!s.exchangeBlocked, exchange: s.exchange, ownHash: s.ownHash };
+        });
+        assert.deepEqual(await state(), { status: "blocked", blocked: true, exchange: "down", ownHash: deliveryHash(own) },
+            "the debug surface says it too; the client is built (its own hash is known)");
+        // The interface's first request was refused by the browser before it
+        // was sent (the one violation a blocked saved URL costs a page load);
+        // the check then stopped it, so it is never asked again.
+        await until("the browser's refusal of the interface's first request", () => window.__violations.length > 0);
+        const violations = await page.evaluate(() => window.__violations);
+        assert.ok(violations.length >= 1 && violations.every((v) => /^connect-src https:\/\/other-node\.example\b/.test(v)),
+            `only the blocked exchange, refused by the browser: ${JSON.stringify(violations)}`);
+        assert.deepEqual(exchangeHits, [], "no exchange was reached");
+        // The network "comes back": a running interface would ask again at
+        // once (PostInterface.check), and be refused again. A stopped one
+        // does not (checked below, after the steps that follow).
+        await page.evaluate(() => window.dispatchEvent(new Event("online")));
+
+        // The page works as it does while the exchange is down: the invite is
+        // accepted. Until 2026-10-01 the client had no router here, and the
+        // accept said "Still receiving member keys (2/3)" and did nothing.
+        await page.locator(".contact-item", { hasText: "Pending G" }).first().click();
+        await page.getByRole("button", { name: "Accept", exact: true }).first().click();
+        await until("the group joined", (gid) => JSON.parse(localStorage.getItem("retichat_groups_v1")).find((g) => g.groupId === gid)?.groupStatus === "active", GID);
+        const joined = await page.evaluate(([gid, other]) => ({
+            allowlisted: JSON.parse(localStorage.getItem("retichat_contacts_v2")).find((c) => c.destHash === other)?.allowlisted,
+            system: JSON.parse(localStorage.getItem(`retichat_gmsg_${gid}`) ?? "[]").map((m) => m.content),
+        }), [GID, deliveryHash(other)]);
+        assert.deepEqual(joined, { allowlisted: true, system: ['You joined "Pending G"'] }, "joined, every member allowed");
+        assert.deepEqual([dialogs, pageErrors], [[], []], "no complaint, no error");
 
         // Its button opens Settings, where the field says why.
         // Settings focuses its field on its own timer, and only then: until
@@ -406,20 +543,53 @@ chromiumTest("the real page under the .htaccess policy: a saved exchange it bloc
         assert.deepEqual(await shown(), ["none", false], "and, empty, takes no room");
         // The new connection's interface reports its exchange down (the 503),
         // so the exchange it was given was asked.
-        await until("the new exchange reported down", () => window.RetichatTest.state().exchange === "down");
+        await until("the new exchange reported down", () => window.RetichatTest.state().exchange === "down" && window.RetichatTest.state().status === "offline");
         assert.ok(exchangeHits.length > 0, "the exchange it was given was asked");
         assert.equal(await page.locator("#status-dot").getAttribute("class"), "status-dot offline");
-        assert.deepEqual(await page.evaluate(() => window.__violations), [], "no violation");
+        assert.deepEqual(await page.evaluate(() => window.__violations), violations, "no violation since: the blocked interface never asked again");
 
         // Reloaded with the node's own URL saved, nothing is said.
         await page.reload();
         await until("the reloaded page's status", () => /status-dot (connecting|offline|online)/.test(document.getElementById("status-dot")?.className));
         assert.equal(await banner.textContent(), "", "no line for an exchange the policy allows");
+        assert.deepEqual(await page.evaluate(() => window.__violations), [], "and no violation");
         assert.deepEqual(pageErrors, []);
         assert.deepEqual(elsewhere, [], "nothing left this machine but esm.sh");
         await context.close();
     } finally {
         await browser.close();
-        server.close();
+        served.close();
+    }
+});
+
+chromiumTest("the real page: a policy read the page's server never answers holds nothing back; a saved exchange the policy allows is asked at once, and nothing is said", async (t) => {
+    // Until 2026-10-01 connect() awaited the read: a server that answered
+    // the page but held this read kept the page offline, its exchange never
+    // asked, with no line.
+    const browser = await launchChromium(t);
+    if (!browser) return;
+    const served = await servePage({ holdPolicyRead: true });
+    const { origin, exchangeHits, held } = served;
+    try {
+        // Saved: the node's own exchange in another spelling (a trailing
+        // slash), which the policy allows ('self') and loadConfig counts as
+        // saved, so the page reads the policy for it.
+        const { context, page, pageErrors, elsewhere, until } = await openPage(browser, origin, {
+            identity_private_key: OWN_KEY,
+            exchangeUrl: `${origin}/no-exchange/`,
+        });
+        await page.goto(`${origin}/index.html`);
+        await until("its exchange asked, and reported down (503)", () => window.RetichatTest.state().exchange === "down" && window.RetichatTest.state().status === "offline");
+        assert.ok(exchangeHits.length > 0, "the exchange was asked");
+        assert.equal(held.length, 1, "while the policy read is still held");
+        assert.equal(await page.evaluate(() => window.RetichatTest.state().ownHash), deliveryHash(Identity.fromPrivateKey(Buffer.from(OWN_KEY, "hex"))),
+            "and the client is built (its LXMF router: its own hash is known)");
+        assert.equal(await page.locator("#exchange-blocked").textContent(), "", "nothing said: nothing is known to be blocked");
+        assert.deepEqual(await page.evaluate(() => [window.__violations, !!window.RetichatTest.state().exchangeBlocked]), [[], false]);
+        assert.deepEqual([pageErrors, elsewhere], [[], []]);
+        await context.close();
+    } finally {
+        await browser.close();
+        served.close();
     }
 });

@@ -310,10 +310,10 @@ async function loadConfig() {
         }
     } catch(e) {}
     // An exchange URL saved in this browser (Settings, or storage) other than
-    // the node's own: RnsClient.connect checks it against the page's policy
-    // before it connects (PagePolicy.blockedReason). The node's own URL
-    // (config.json, or the default) is served beside that policy, and
-    // deploy.sh's boot gate fails on any violation of it.
+    // the node's own: RnsClient checks it against the page's policy while it
+    // connects (_checkSavedExchange). The node's own URL (config.json, or
+    // the default) is served beside that policy, and deploy.sh's boot gate
+    // fails on any violation of it.
     const savedExchangeUrl = sGet("exchangeUrl");
     cfg.exchangeUrlSaved = !!savedExchangeUrl && savedExchangeUrl !== cfg.exchangeUrl;
     if (savedExchangeUrl) cfg.exchangeUrl = savedExchangeUrl;
@@ -329,12 +329,13 @@ async function loadConfig() {
 
 /**
  * What this page's Content-Security-Policy lets it connect to, for Settings
- * (App._saveSettings) and for the page as it loads (RnsClient.connect): an
- * exchange URL it does not allow is refused when entered, with the reason,
- * and one saved before that check (a71c32a) or edited in storage is found
- * before the page connects to it, since the page would otherwise sit
- * offline with nothing to say why (the browser refuses each request before
- * it is sent). The policy is the header the page is served with, read by
+ * (App._saveSettings) and for the page as it loads
+ * (RnsClient._checkSavedExchange): an exchange URL it does not allow is
+ * refused when entered, with the reason, and one saved before that check
+ * (a71c32a) or edited in storage is found as the page connects to it, and
+ * its interface stopped, since the page would otherwise sit offline with
+ * nothing to say why (the browser refuses each request before it is
+ * sent). The policy is the header the page is served with, read by
  * fetching the page's own URL again (same origin, which every policy here
  * allows), so it is the nodes' .htaccess line as served and cannot drift
  * from it; the rules are lib/connect_policy.js. A page served with none (a
@@ -342,8 +343,10 @@ async function loadConfig() {
  * needed. A read that fails (no answer, or not a 2xx: Apache sets the
  * header on successful responses only) decides nothing and is not kept: in
  * Settings the change is refused with that reason, and the next Save reads
- * again; at load the saved URL is connected to unchecked, as before the
- * check, and the console says so.
+ * again; at load the saved URL stays connected, unchecked, as before the
+ * check, and the console says so. Nothing waits on the read at load (the
+ * page connects at once), so a read its server never answers holds nothing
+ * back; it decides nothing either, and is a §1 failure said at 5 s.
  */
 const PagePolicy = {
     _header: undefined,   // the policy header; null when the page is served with none
@@ -353,7 +356,17 @@ const PagePolicy = {
     async header() {
         if (this._header !== undefined) return this._header;
         const started = Date.now();
-        const resp = await fetch(location.href, { cache: "no-store" });
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // No answer within 5 s is a §1 failure, said when the 5 s are up: a
+        // fetch has no deadline, so a read its server never answers would
+        // otherwise never be heard of. It decides nothing.
+        const silence = setTimeout(() => console.error("[retichat] §1: this page's own server has not answered the read of its Content-Security-Policy in 5 s; nothing it decides is known until it does"), 5000);
+        let resp;
+        try {
+            resp = await fetch(location.href, { cache: "no-store" });
+        } finally {
+            clearTimeout(silence);
+        }
         resp.body?.cancel().catch(() => {});
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
         if (Date.now() - started > 5000) console.error(`[settings] §1: reading this page's Content-Security-Policy took ${Date.now() - started} ms (a late success is a failure)`);
@@ -375,10 +388,10 @@ const PagePolicy = {
         return refusal && `${refusal} Not saved.`;
     },
 
-    /** At load (RnsClient.connect): why this page's policy blocks the saved
-     *  exchange at `exchangeUrl` (exchangeUrlRefusal), or null when it does
-     *  not. A policy that cannot be read decides nothing: null, and the
-     *  console says the URL is used unchecked. */
+    /** At load (RnsClient._checkSavedExchange): why this page's policy
+     *  blocks the saved exchange at `exchangeUrl` (exchangeUrlRefusal), or
+     *  null when it does not. A policy that cannot be read decides nothing:
+     *  null, and the console says the URL is used unchecked. */
     async blockedReason(exchangeUrl) {
         let header;
         try {
@@ -1783,9 +1796,10 @@ const RnsClient = {
     _rns: null, _lxmfRouter: null, _cfg: null,
     _status: "offline", _connType: "none", // "direct" | "websocket" | "none"
     // Why the page's own Content-Security-Policy blocks the saved exchange
-    // URL (PagePolicy.blockedReason), while connect() holds back for it and
-    // the status is "blocked"; null otherwise.
+    // URL this connection was given (_checkSavedExchange), which stopped its
+    // interface; the status is then "blocked". null otherwise.
     exchangeBlocked: null,
+    _exchangeCheck: null,     // that check, for this connection's saved URL (a promise that never rejects); null for the node's own
     _annTimer: null,
     _rfedLinks: new Map(),
     _rfedLinkPromises: new Map(),
@@ -2105,6 +2119,38 @@ const RnsClient = {
         });
     },
 
+    /**
+     * The saved exchange URL `exchangeUrl` that connection `iface` was given
+     * (loadConfig: saved in this browser and not the node's own), checked
+     * against the page's own Content-Security-Policy with the check
+     * Settings makes (PagePolicy.blockedReason, lib/connect_policy.js). One
+     * saved before Settings checked it (a71c32a), or edited in storage, can
+     * be one the policy blocks: the browser then refuses every request to
+     * it before it is sent, and the page would sit offline with nothing to
+     * say why. Found blocked, the interface is stopped (PostInterface.block:
+     * nothing is asked of that URL again, and what is sent through it fails
+     * at once) and the status is "blocked", which the page says where it
+     * shows the connection status (App._applyStatusDot) until the user
+     * changes the URL in Settings. The client behind it stays as built, as
+     * it is while the exchange is down. Run alongside the connection
+     * (connect), so the interface's first request, refused by the browser,
+     * is made before this answer: a page load with a blocked saved URL
+     * costs a securitypolicyviolation (one, unless the read takes longer
+     * than the interface's reconnect wait). A policy that cannot be read decides
+     * nothing (blockedReason). Only for this connection: one a disconnect
+     * has ended (Settings saved another URL, another tab took over) is not
+     * this check's to stop.
+     */
+    async _checkSavedExchange(iface, exchangeUrl) {
+        const blocked = await PagePolicy.blockedReason(exchangeUrl);
+        if (!blocked || !this._rns?.interfaces?.includes(iface)) return;
+        this.exchangeBlocked = blocked;
+        console.warn(`[retichat] The saved exchange URL ${exchangeUrl} is blocked by this page's Content-Security-Policy: its interface is stopped. ${blocked}`);
+        Harness.event("exchange-blocked", { exchangeUrl });
+        iface.block("the exchange URL is blocked by this page's Content-Security-Policy");
+        this._setStatus("blocked");
+    },
+
     async connect() {
         if (!IdMgr.has) throw new Error("No identity");
         // D11: only the tab holding this identity's lock registers with the
@@ -2115,26 +2161,7 @@ const RnsClient = {
         // Taken over while the config loaded: disconnect() has already run
         // and the lock is gone, so this connection must not start.
         if (!ActiveTab.held) return;
-
-        // An exchange URL saved in this browser that the page's own
-        // Content-Security-Policy blocks (saved before Settings checked it,
-        // a71c32a, or edited in storage): the browser would refuse every
-        // request to it before it is sent, and the page would sit offline
-        // with nothing to say why. It is checked before anything connects,
-        // with the check Settings makes (PagePolicy), and a blocked one is
-        // not connected to: the status is "blocked", which the page says
-        // where it shows the connection status (App._applyStatusDot), until
-        // the user changes the URL in Settings. The node's own URL is not
-        // checked (loadConfig).
-        const blocked = this._cfg.exchangeUrlSaved ? await PagePolicy.blockedReason(this._cfg.exchangeUrl) : null;
-        if (!ActiveTab.held) return;
-        this.exchangeBlocked = blocked;
-        if (blocked) {
-            console.warn(`[retichat] Not connecting: the saved exchange URL ${this._cfg.exchangeUrl} is blocked by this page's Content-Security-Policy. ${blocked}`);
-            Harness.event("exchange-blocked", { exchangeUrl: this._cfg.exchangeUrl });
-            this._setStatus("blocked");
-            return;
-        }
+        this.exchangeBlocked = null;
 
         // Resolve propagation node hash: explicit override, or derive from RFed.
         if (this._cfg.lxmfPropagationOverride) {
@@ -2167,6 +2194,22 @@ const RnsClient = {
         this._followExchange(iface);
         this._rns.addInterface(iface);
         this._connType = "exchange";
+
+        // An exchange URL saved in this browser (loadConfig; never the
+        // node's own) is checked against the page's Content-Security-Policy
+        // while the interface connects, with the check Settings makes
+        // (_checkSavedExchange). Nothing waits on it: everything else here
+        // is built as for any URL, so a check the page's server is slow to
+        // answer, or never answers, holds back neither the exchange nor the
+        // client (§5: the two are independent; only what the status says
+        // depends on both). Until 2026-10-01 connect() awaited it first and
+        // returned for a blocked URL before it built the router, so the
+        // page stayed usable with no router behind it (an accept said keys
+        // were missing, or threw halfway), and a read that never came back
+        // kept even an allowed exchange from ever being asked.
+        this._exchangeCheck = this._cfg.exchangeUrlSaved
+            ? this._checkSavedExchange(iface, this._cfg.exchangeUrl).catch((e) => console.error("[retichat] Checking the saved exchange URL against this page's Content-Security-Policy failed:", e?.message || e))
+            : null;
 
         // Set up LXMF router, with the Announce Display Name its announces
         // carry (DISPLAY_NAMES.md §2.2; nil until the user sets one) and the
@@ -6246,6 +6289,7 @@ const RnsClient = {
         this._rns = null; this._lxmfRouter = null;
         this._connType = "none";
         this.exchangeBlocked = null;
+        this._exchangeCheck = null;
         this._setStatus("offline");
     },
 
@@ -6677,7 +6721,7 @@ const App = {
      *  destroys the old DOM and whenever it changes (_wire, RnsClient
      *  .onStatus): the status dot, and, while the saved exchange URL is
      *  blocked by the page's own Content-Security-Policy (status "blocked",
-     *  RnsClient.connect), the line under it that says so and opens
+     *  RnsClient._checkSavedExchange), the line under it that says so and opens
      *  Settings. Until 2026-10-01 such a page sat offline, the dot red, with
      *  nothing to say why. */
     _applyStatusDot() {

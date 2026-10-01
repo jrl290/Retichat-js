@@ -486,6 +486,47 @@ test("disconnect() aborts a registration in flight, and one answered anyway is n
     }
 });
 
+test("block(): an exchange the page's policy blocks is never asked again, and what is sent through it is lost at once, saying why, whichever lands first", async (t) => {
+    // RnsClient._checkSavedExchange, 2026-10-01: the browser refuses every
+    // request to such a URL before it is sent. Until then the interface kept
+    // asking on the reconnect wait, each request refused again.
+    quiet(t);
+    const clock = fakeTimers(t);
+    const REASON = "the exchange URL is blocked by this page's Content-Security-Policy";
+    for (const refusedFirst of [true, false]) {
+        const node = fakeNode(t);
+        const iface = new PostInterface("Retichat Web", "https://other-node.example/reticulum", "ab".repeat(16));
+        const seen = record(iface);
+        iface.connect();
+        const registering = await node.pending("register");
+        if (refusedFirst) {
+            // The browser's refusal lands before the check's answer.
+            registering.fail();
+            await eventually(() => seen.kinds().includes("down"), "down");
+            assert.equal(clock.armed().ms, PostInterface.RECONNECT_WAIT_MS, "the next attempt was armed");
+            iface.block(REASON);
+        } else {
+            iface.block(REASON);
+            assert.equal(registering.signal.aborted, true, "the request in flight is ended");
+            await tick(); await tick();
+        }
+        const label = refusedFirst ? "refused, then blocked" : "blocked first";
+        assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0, `${label}: no attempt armed`);
+        assert.deepEqual(seen.kinds(), refusedFirst ? ["down"] : [], `${label}: block() emits no down of its own`);
+        assert.equal(iface.isDown, true, `${label}: down`);
+
+        const a = rawPacket(0xa1);
+        iface.sendData(a.raw);
+        await eventually(() => seen.lost().length === 1, "lost at once");
+        assert.deepEqual(seen.lost()[0], { packetHashes: [a.hash], reason: REASON, abandoned: false }, `${label}: lost at once, saying why`);
+        iface.check("online");
+        iface.check("visible");
+        await tick(); await tick();
+        assert.equal(node.requests.length, 1, `${label}: nothing is asked of it again, a check included`);
+        assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0);
+    }
+});
+
 // ── A DM whose packet is lost (app.js) ─────────────────────────────────────
 
 function braceMatch(from, label) {
