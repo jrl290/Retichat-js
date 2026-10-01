@@ -443,6 +443,49 @@ test("§5.4 the old web announce suffix: every shared vector (LXMF-rust display_
     assert.equal(DN.stripOwnHashSuffix("Alice (0123456789ab)", null), "Alice (0123456789ab)", "no hash, no rule");
 });
 
+test("§5.4 white space is §3's, Unicode White_Space: the shared vectors tell it from every platform's own trim", () => {
+    // Review of 8319411: the contract said "trim surrounding white space"
+    // while its SQLite form trimmed U+0020 alone and the web trimmed with
+    // String.prototype.trim, so the clients disagreed on a stored name such
+    // as "Alice (0123456789ab)\n". The rule, with the trim as a parameter:
+    const trimOf = (set) => (s) => {
+        let a = 0, b = s.length;
+        while (a < b && set.has(s.charCodeAt(a))) a++;
+        while (b > a && set.has(s.charCodeAt(b - 1))) b--;
+        return s.slice(a, b);
+    };
+    const range = (lo, hi) => Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+    const WS = [...range(0x09, 0x0D), 0x20, 0x85, 0xA0, 0x1680, ...range(0x2000, 0x200A), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000];
+    const rule = (trim) => ({
+        strip: (name, own) => {
+            const m = /^(.+) \(([0-9a-f]{12})\)$/is.exec(trim(name));
+            return m && m[2].toLowerCase() === own.slice(0, 12).toLowerCase() ? trim(m[1]) : name;
+        },
+        nodeDefault: (name) => /^retichat web \(.+\)$/is.test(trim(name)),
+    });
+    const misses = ({ strip, nodeDefault }) => [
+        ...vectors.own_hash_suffix.filter((v) => strip(v.input, v.own_hash) !== v.expected),
+        ...vectors.placeholder.filter((v) => nodeDefault(v.input) !== v.web_node_default),
+    ].map((v) => v.name);
+
+    assert.deepEqual(misses(rule(trimOf(new Set(WS)))), [], "the contract's set meets every vector");
+    const platforms = {
+        "String.prototype.trim (adds U+FEFF, keeps U+0085)": (s) => s.trim(),
+        "Swift .whitespacesAndNewlines (adds U+200B)": trimOf(new Set([...WS, 0x200B])),
+        "Kotlin trim() (adds U+001C-U+001F, keeps U+0085)": trimOf(new Set([...WS.filter((c) => c !== 0x85), ...range(0x1C, 0x1F)])),
+        "SQLite trim(x) (U+0020 alone)": trimOf(new Set([0x20])),
+    };
+    for (const [platform, trim] of Object.entries(platforms)) {
+        assert.ok(misses(rule(trim)).length > 0, `a vector tells it from ${platform}`);
+    }
+    // And the web's §5.4 rules use the contract's set, not the platform's.
+    assert.equal(DN.stripOwnHashSuffix("Alice (0123456789ab)\u0085", "0123456789abcdef0123456789abcdef"), "Alice");
+    assert.equal(DN.stripOwnHashSuffix("﻿Alice (0123456789ab)", "0123456789abcdef0123456789abcdef"), "﻿Alice");
+    assert.equal(DN.isWebNodeDefault("\u0085Retichat Web (selectiv)"), true);
+    assert.equal(DN.isPlaceholderName("Retichat\u0085"), true);
+    assert.equal(DN.isPlaceholderName("﻿Retichat"), false, "U+FEFF is §3's to remove, not white space to trim");
+});
+
 test("§5.4 contact migration strips the old web announce suffix, only for the contact's own hash", () => {
     // Until 2026-09-23 the web announced "<name> (<first 12 hex of its
     // lxmf.delivery hash>)", and the old web stored it as the name; its
