@@ -15,7 +15,9 @@
  * (Link.requestLost), which closes at once — a named event, not a clock
  * (DESIGN_PRINCIPLES §1), as app-links fails an attempt with no usable
  * interface at once (SendErr::NoUsableInterface). RNS waits
- * establishment_timeout; link.js says why this departs.
+ * establishment_timeout; link.js says why this departs. Not for an
+ * exchange a check abandoned: its batch may have reached the node, so that
+ * attempt waits for its LRPROOF or its timeout, as in RNS.
  *
  * The real PostInterface runs against a scripted node (a fake fetch) inside
  * a real Reticulum, with real Links. The app test runs the real shipped
@@ -182,6 +184,72 @@ test("an attempt started while the exchange is down fails at once, and nothing l
     assert.match(link.requestLostReason, /down/);
     assert.equal(clock.armed(ESTABLISHMENT_MS).length, 0);
     assert.equal(node.requests.length, sent, "the LINKREQUEST never left");
+});
+
+/**
+ * The node's answer to a LINKREQUEST it took: a real responder (the
+ * rfed.link destination in a second Reticulum) accepts it and proves it.
+ * Returns the LRPROOF as the exchange delivers it (base64).
+ */
+async function lrproofFor(requestBase64) {
+    class Capture extends Interface {
+        constructor() { super("rfed side"); this.sent = []; }
+        connect() {}
+        sendData(data) { this.sent.push(Buffer.from(data)); }
+    }
+    const rfed = new Reticulum();
+    const wire = new Capture();
+    rfed.addInterface(wire);
+    const destination = rfed.registerDestination(rfedNode, Destination.IN, Destination.SINGLE, "rfed", "link");
+    destination.on("link_request", (link) => link.accept());
+    rfed.onPacketReceived(Packet.fromBytes(Buffer.from(requestBase64, "base64")), wire);
+    const [proof] = await eventually(() => wire.sent.length && wire.sent, "the node's LRPROOF");
+    assert.equal(Packet.fromBytes(proof).context, Packet.LRPROOF);
+    return proof.toString("base64");
+}
+
+test("an exchange a check abandoned does not fail the attempt: the node may have taken its LINKREQUEST, and the LRPROOF the next exchange brings establishes the link", async (t) => {
+    // Review of 2026-09-30: requestLost closed the attempt for every report,
+    // also for the batch of an exchange check() abandoned (the page became
+    // visible, came online, or back from the cache), whose fate cannot be
+    // known. When the node had taken it, its LRPROOF came in the exchange
+    // check() started and was dropped; and as an abandoned exchange marks no
+    // "down", no return followed to re-drive the link.
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { rns, iface } = await upExchange(t, node);
+
+    const { link, closes } = attempt(rns);
+    const [watchdog] = clock.armed(ESTABLISHMENT_MS);
+    const carrying = await node.pending("exchange");
+    const [request] = carrying.body.packets;
+    assert.deepEqual(node.linkRequests(), [link.requestPacketHash]);
+
+    iface.check("visible"); // the fetch may hang on a dead connection: abandoned
+    const next = await node.pending("exchange"); // check() exchanges again at once
+    assert.notEqual(next, carrying);
+    await tick(); await tick();
+    assert.equal(link.status, Link.PENDING, "an abandoned exchange is no proof that the request never left");
+    assert.deepEqual(closes, []);
+    assert.equal(link.requestLostReason, undefined);
+    assert.equal(watchdog.cleared || watchdog.fired, false, "it waits for its LRPROOF or its establishment timeout, as RNS waits");
+    assert.equal(iface.isDown, false, "and an abandoned exchange marks no down, so no return would re-drive a closed attempt");
+
+    // The node had taken the batch: rfed's LRPROOF comes in the next exchange.
+    next.respond(200, { delivery_packets: [await lrproofFor(request)] });
+    await eventually(() => link.status === Link.ACTIVE, "the link established on the LRPROOF");
+    assert.deepEqual(closes, []);
+    assert.equal(watchdog.fired, false);
+    assert.equal(node.linkRequests().length, 1, "nothing was sent again");
+
+    // An abandoned report never fails an attempt, on any interface.
+    const other = attempt(rns);
+    rns.onPacketsLost(iface, { packetHashes: [other.link.requestPacketHash], reason: "exchange abandoned by a check", abandoned: true });
+    await tick(); await tick();
+    assert.equal(other.link.status, Link.PENDING);
+    rns.onPacketsLost(iface, { packetHashes: [other.link.requestPacketHash], reason: "Failed to fetch" });
+    await eventually(() => other.closes.length === 1, "a failed exchange's report fails it");
 });
 
 test("only a report of this attempt's own LINKREQUEST, from every interface it went to, while it waits for its proof, fails it", async (t) => {

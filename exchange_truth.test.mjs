@@ -313,6 +313,8 @@ test("check() aborts a hung exchange, loses its batch and exchanges at once", as
     assert.notEqual(fresh, hung, "a new exchange, at once, without a timer");
     await eventually(() => seen.lost().length === 1, "the abandoned batch reported");
     assert.deepEqual(seen.lost()[0].packetHashes, [a.hash]);
+    assert.equal(seen.lost()[0].abandoned, true,
+        "as abandoned: the node may have taken it, so a link attempt keeps waiting for its LRPROOF (Link.requestLost)");
     assert.deepEqual(fresh.body.packets, [], "the abandoned packet is not re-sent");
 
     fresh.respond(200, {});
@@ -351,13 +353,14 @@ test("a failed exchange loses its batch and the queue behind it, and a down inte
     exchange.fail();
     await eventually(() => seen.lost().length === 1, "lost");
     assert.deepEqual(seen.lost()[0].packetHashes, [a.hash, b.hash]);
+    assert.equal(seen.lost()[0].abandoned, false, "a failed exchange's report is not an abandoned one");
     assert.equal(seen.kinds().indexOf("down") < seen.kinds().indexOf("lost"), true, "down, then what it lost");
 
     const requestsBefore = node.requests.length;
     const c = rawPacket(0xc3);
     iface.sendData(c.raw);
     await eventually(() => seen.lost().length === 2, "lost at once");
-    assert.deepEqual(seen.lost()[1], { packetHashes: [c.hash], reason: "the exchange is down" });
+    assert.deepEqual(seen.lost()[1], { packetHashes: [c.hash], reason: "the exchange is down", abandoned: false });
     assert.equal(node.requests.length, requestsBefore, "nothing is sent for it");
 
     // The next attempt re-sends none of them (a re-send is a retry, §3).

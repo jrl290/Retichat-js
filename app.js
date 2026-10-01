@@ -260,7 +260,9 @@ const RFED_LINK_FAILED = "link_failed";
 // (Link.requestLost) instead of waiting out its establishment timeout, so it
 // cannot swallow the exchange's return, the one event that can bring the
 // link back. This is app-links' "no usable interface" failure, which
-// interface_online re-attempts.
+// interface_online re-attempts. An exchange that check() abandoned is not
+// such a failure: its batch may have reached the node and no return
+// follows, so that attempt waits for its LRPROOF or its timeout, as in RNS.
 //
 // Only a close we did not ask for re-opens: TIMEOUT (the keepalive watchdog,
 // or no answer at all) or DESTINATION_CLOSED (the node's LINKCLOSE). Every
