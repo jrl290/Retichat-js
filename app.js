@@ -4991,14 +4991,27 @@ const RnsClient = {
         // that wedges the server (DESIGN_PRINCIPLES.md Rule #1).
         //
         // Until it is answered yes, the registration is owed: every new
-        // rfed.link sends it again, once (_registerOwedDistro). A call for a
-        // different distro while one is in flight (imported or generated
-        // meanwhile) is owed too, and goes as soon as the one in flight is
-        // done (iOS RfedDistroClient registerAgain).
+        // rfed.link sends it again, once (_registerOwedDistro).
+        //
+        // A registration belongs to the connection that sent it (`rns`):
+        // disconnect() lets go of the one in flight, and one that ends
+        // after it touches nothing of the next connection, which registers
+        // for itself (_onExchangeRegistered). That is still never two on
+        // one link, the case above: the next connection's registration
+        // goes on its own rfed.link, which disconnect() leaves it to open.
         const distroHash = DistroManager.hash;
-        if (this._registerDistroInFlight) {
-            if (this._registerDistroInFlight.distroHash !== distroHash) this._distroRegistrationOwed = distroHash;
-            return this._registerDistroInFlight;
+        const rns = this._rns;
+        const prior = this._registerDistroInFlight;
+        if (prior) {
+            if (prior.distroHash === distroHash) return prior;
+            // A different distro (imported or generated while one is in
+            // flight) is owed, and goes as soon as the one in flight is
+            // done: never two at once on one link (iOS RfedDistroClient
+            // registerAgain). Its caller is answered by its own
+            // registration. Until 2026-10-01 it was handed the one in
+            // flight, and told the other distro's result.
+            this._distroRegistrationOwed = distroHash;
+            return prior.then(() => this._rns === rns ? this._registerDistro() : false);
         }
         this._distroRegistrationOwed = distroHash;
         // Declared first: the body below reads it in its finally.
@@ -5010,7 +5023,11 @@ const RnsClient = {
                 const sig = DistroManager.identity.sign(devicePubKey);
                 const payload = MsgPack.pack([devicePubKey, distroPubKey, sig]);
                 const response = await this._rfedRequest(["distro", "register"], "/rfed/distro/register", payload);
-                if (response === true || (Array.isArray(response) && response[0] === true)) {
+                const accepted = response === true || (Array.isArray(response) && response[0] === true);
+                // Answered after disconnect(): the stopped connection's answer
+                // decides nothing for the next one.
+                if (this._rns !== rns) return accepted;
+                if (accepted) {
                     if (this._distroRegistrationOwed === distroHash) this._distroRegistrationOwed = null;
                     this._bindRfedLinkForDistroPush();
                     console.log(`[distro] ✅ Registered device with RFed (distro=${distroHash.slice(0,12)}...)`);
@@ -5030,6 +5047,9 @@ const RnsClient = {
                 }
             } catch(e) {
                 console.error(`[distro] Registration failed:`, e);
+                // Failed after disconnect(): nothing of the next connection's
+                // is parked (its rfed.link state is its own).
+                if (this._rns !== rns) return false;
                 // A link that never established is transient on this transport
                 // (one lost LINKREQUEST/LRPROOF ends the attempt). The request
                 // travels on rfed.link (RFED_LINK_PATHS), so it is that link's
@@ -5056,12 +5076,6 @@ const RnsClient = {
         })();
         inFlight.distroHash = distroHash;
         this._registerDistroInFlight = inFlight;
-        // A different distro was asked for while this one was in flight:
-        // register it now, after this one (never two at once on one link).
-        inFlight.then(() => {
-            const owed = this._distroRegistrationOwed;
-            if (owed && owed !== distroHash && DistroManager.has && DistroManager.hash === owed) this._registerDistro();
-        });
         return inFlight;
     },
 
@@ -5755,9 +5769,14 @@ const RnsClient = {
         this._rfedReopenArmed.clear();
         this._propReopenArmed = false;
         this._distroPullInFlight = null;
-        // A stopped tab owes nothing; the next connection's registration
-        // (_onExchangeRegistered) is owed afresh.
+        // A stopped tab owes nothing, and its registration in flight is not
+        // the next connection's: left in place, the next connection's own
+        // (_onExchangeRegistered) joined it and was never sent, while it
+        // waited on an rfed.link attempt of the stopped interface and failed
+        // on that attempt's own timeout (review of 2026-09-30). One that
+        // ends late touches nothing of the next connection (_registerDistro).
         this._distroRegistrationOwed = null;
+        this._registerDistroInFlight = null;
         this._pendingTickets.clear();
         this._pendingPacketHashes.clear();
         for (const tid of this._pendingTimeouts.values()) clearTimeout(tid);

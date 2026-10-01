@@ -811,19 +811,20 @@ test("a registration for another distro, asked for while one is in flight, goes 
     await settle();
     c.DistroManager.hash = DISTRO_B; // imported while A's registration is in flight
     const b = c.self._registerDistro();
+    const b2 = c.self._registerDistro(); // a second caller for B
     await settle();
     assert.deepEqual(r.registers(), ["register a1 on 0"], "never two registrations at once on one link");
+    r.answers.length = 0;
+    r.answers.push(true, false); // A is answered yes, B is refused
     release();
     assert.equal(await a, true);
     await settle();
-    assert.equal(await b, true, "the caller for B has the registration in flight");
-    assert.deepEqual(r.registers(), ["register a1 on 0", "register b2 on 0"], "B goes once A is answered");
-    assert.equal(c.self._distroRegistrationOwed, null);
+    assert.equal(await b, false, "B's caller is answered by B's own registration, not told A's yes");
+    assert.equal(await b2, false);
+    assert.deepEqual(r.registers(), ["register a1 on 0", "register b2 on 0"], "B goes once A is answered, once for both callers");
+    assert.equal(c.self._distroRegistrationOwed, DISTRO_B, "refused: B is still owed");
 
     // Owed for a distro that is then forgotten: the next link sends nothing.
-    r.answers.push(false);
-    await c.self._registerDistro();
-    assert.equal(c.self._distroRegistrationOwed, DISTRO_B);
     c.DistroManager.has = false;
     c.calls.length = 0;
     await c.closeUnder(c.links[0], Link.TIMEOUT);
@@ -835,6 +836,128 @@ test("a registration for another distro, asked for while one is in flight, goes 
     await c.establish(c.links[1]);
     assert.deepEqual(r.registers(), [], "nothing of the forgotten distro is owed");
     assert.equal(c.self._distroRegistrationOwed, null);
+});
+
+// ── A reconnect: each connection registers for itself ─────────────────────
+//
+// reconnect() is disconnect() + connect() (Settings > Save; a tab that took
+// over and gave the identity back). Review of 2026-09-30: disconnect() left
+// the stopped connection's registration in flight, so the next connection's
+// own (_onExchangeRegistered) joined it and was never sent. The stopped one
+// waited on an rfed.link attempt of the stopped interface (disconnect()
+// closes only established links, and a stopped PostInterface reports
+// nothing lost), failed on that attempt's own timeout, and nothing was owed
+// any more: no later rfed.link of the new connection registered.
+
+/** The real disconnect() over a makePersistent client. */
+function disconnectFor(c) {
+    Object.assign(c.self, {
+        _annTimer: null, _unhookPageLifecycle() {}, _pendingTickets: new Map(), _pendingPacketHashes: new Map(),
+        _pendingTimeouts: new Map(), _rfedServiceWaiters: new Map(), _rfedStampRefreshed: new Set(),
+        _rfedSubscriptionPromises: new Map(), _rfedPendingEchoes: new Map(), _groupLinks: new Map(),
+        _groupLinkPromises: new Map(), _groupPeerReady: new Set(), _groupPeerWaiters: new Map(),
+        _groupPathsRequested: new Set(), _groupFallbacks: new Map(), _propLinkUpWaiters: [], _setStatus() {},
+    });
+    return compileMethod("disconnect()", { ...c.env, clearInterval() {}, clearTimeout() {} })(c.self);
+}
+
+/** connect() as far as these paths read it: a new exchange, the rfed.link announce heard. */
+function connectAgain(c) {
+    c.self._rns = { interfaces: [{ isDown: false }] };
+    c.self._rfedServiceReady.add("link");
+}
+
+test("a reconnect while the registration waits for its rfed.link: the new connection sends its own, once", async () => {
+    const c = makePersistent({ opened: [], distro: true });
+    const r = withRegistration(c);
+    // Startup: the registration opens rfed.link, which is still coming up.
+    const old = c.self._registerDistro();
+    await settle();
+    assert.equal(c.links.length, 1);
+    assert.equal(c.links[0].status, Link.PENDING);
+
+    disconnectFor(c)();
+    connectAgain(c);
+    r.answers.push(true);
+    const fresh = c.self._registerDistro(); // _onExchangeRegistered
+    assert.notEqual(fresh, old, "not joined to the stopped connection's registration");
+    assert.equal(c.self._distroRegistrationOwed, DISTRO_A, "owed by the new connection until it is answered yes");
+    await settle();
+    assert.equal(c.links.length, 2, "on the new connection's own rfed.link");
+    await c.establish(c.links[1]);
+    assert.equal(await fresh, true);
+    assert.deepEqual(r.registers(), ["register a1 on 1"]);
+    assert.equal(c.self._distroRegistrationOwed, null);
+
+    // The stopped connection's attempt fails on its own timeout.
+    await c.closeUnder(c.links[0], Link.TIMEOUT);
+    assert.equal(await old, false);
+    assert.equal(c.self._rfedLinks.get("link"), c.links[1], "the new connection's link is untouched");
+    assert.equal(c.self._rfedPending.has("link"), false, "and nothing is parked for it");
+    assert.deepEqual(r.registers(), ["register a1 on 1"], "registered once");
+});
+
+test("a stopped connection's registration that ends after the reconnect touches nothing of the new one", async () => {
+    // Answered yes after disconnect(): no push binding and no distro
+    // announce on the new connection, which has not registered yet.
+    const c = makePersistent({ opened: [], distro: true });
+    const r = withRegistration(c);
+    await c.up();
+    c.calls.length = 0;
+    let release;
+    r.gates.push(new Promise((resolve) => { release = resolve; }));
+    r.answers.push(true);
+    const old = c.self._registerDistro();
+    await settle();
+    assert.deepEqual(r.registers(), ["register a1 on 0"]);
+    disconnectFor(c)();
+    connectAgain(c);
+    await settle();
+    c.calls.length = 0;
+    release();
+    assert.equal(await old, true, "its caller is told what the node answered");
+    await settle();
+    assert.deepEqual(c.calls, [], "and the new connection is left to register, bind and announce for itself");
+    assert.equal(c.self._registerDistroInFlight, null);
+
+    // A caller for another distro, joined to a registration of the stopped
+    // connection: answered false, and nothing is sent for it on the new one.
+    const d = makePersistent({ opened: [], distro: true });
+    const s = withRegistration(d);
+    await d.up();
+    let releaseA;
+    s.gates.push(new Promise((resolve) => { releaseA = resolve; }));
+    s.answers.push(true);
+    const a = d.self._registerDistro();
+    await settle();
+    d.DistroManager.hash = DISTRO_B;
+    let b = "unanswered";
+    d.self._registerDistro().then((answer) => { b = answer; });
+    disconnectFor(d)();
+    connectAgain(d);
+    releaseA();
+    assert.equal(await a, true);
+    await settle();
+    assert.equal(b, false, "the connection it was asked on is gone");
+    assert.equal(d.links.length, 1, "no rfed.link is opened for it on the new connection");
+    assert.deepEqual(s.registers(), ["register a1 on 0"], "B is the new connection's to register (_onExchangeRegistered)");
+    assert.equal(d.self._registerDistroInFlight, null);
+
+    // Failed after the reconnect: what it parks is decided by the stopped
+    // connection's link, not by the new connection's rfed.link state.
+    const e = makePersistent({ opened: [], distro: true });
+    withRegistration(e);
+    const stale = e.self._registerDistro();
+    await settle();
+    disconnectFor(e)();
+    connectAgain(e);
+    e.self._ensureRfedLink(["link"]).catch(() => {}); // the new connection's first attempt (a channel send's)
+    await e.closeUnder(e.links[1], Link.TIMEOUT);       // fails, and its caller fails in front of the user
+    assert.equal(e.self._rfedLinkState.get("link"), APP_CONSTS.RFED_LINK_FAILED);
+    await e.closeUnder(e.links[0], Link.TIMEOUT);       // the stopped connection's attempt times out
+    assert.equal(await stale, false);
+    assert.equal(e.self._rfedPending.has("link"), false, "the stopped connection's registration parks nothing on the new one");
+    assert.equal(e.self._distroRegistrationOwed, null, "and owes nothing on it");
 });
 
 test("the persistent-link paths schedule nothing", () => {
