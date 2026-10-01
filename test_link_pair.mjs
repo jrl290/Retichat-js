@@ -13,7 +13,8 @@
  * Delivery is asynchronous (one macrotask per packet), so a transfer runs as
  * a sequence of events rather than as recursion, `drop(packet, fromName)`
  * can lose any packet on the way, and `delay(packet, fromName)` can hold one
- * back for that many milliseconds.
+ * back for that many milliseconds. Under test_virtual_time.mjs those are
+ * virtual milliseconds, as is within()'s bound.
  */
 import crypto from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -109,7 +110,11 @@ export async function sendSplit(link, data, { requestId = null, isResponse = fal
     }
 }
 
-/** Fail the test if `promise` has not settled within `ms` (a test-failure bound only). */
+/**
+ * Fail the test if `promise` has not settled within `ms` (a test-failure
+ * bound only). Under test_virtual_time.mjs the bound is virtual time: it is
+ * reached when nothing else can happen, however slow the machine is.
+ */
 export function within(promise, ms, label = "promise") {
     let timer;
     const bound = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms); });
