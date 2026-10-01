@@ -69,9 +69,11 @@ const run = (n) => new Promise((resolve) => {
     setImmediate(hop);
 });
 
-// Should a broken clock still hang one of these tests, the per-test timeout
-// (wall clock, a failure bound only) turns that into red.
-const HANG_BOUND = { timeout: 60_000 };
+// Should a broken clock still hang one of these tests, this per-test
+// timeout turns that into red. It is wall clock, so it is a failure bound
+// only and far beyond any load: the slowest of them, 100,000 hops, takes
+// about 1.5 s on an idle machine and 12 s under the suite at load 40.
+const HANG_BOUND = { timeout: 600_000 };
 
 /** Burn `ms` of wall-clock time on the CPU, as a loaded machine would. */
 function busy(ms) {
@@ -251,7 +253,7 @@ test("a livelocked test with no bound fails, and its file exits, instead of hang
     // NODE_TEST_CONTEXT tells a child to report to this runner; this one reports to us.
     const { NODE_TEST_CONTEXT, ...env } = process.env;
     const { code, out } = await new Promise((resolve) => {
-        execFile(process.execPath, ["--test", file], { env, timeout: 50_000 }, (err, stdout, stderr) =>
+        execFile(process.execPath, ["--test", file], { env, timeout: HANG_BOUND.timeout }, (err, stdout, stderr) =>
             resolve({ code: err ? (err.killed ? "killed: it hung" : err.code) : 0, out: stdout + stderr }));
     });
     assert.equal(code, 1, out);
