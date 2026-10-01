@@ -24,6 +24,12 @@
 // to resolve instead of reaching production. The boot gate runs the
 // Playwright + Chromium of test-harnesses/distro-pipeline against pages
 // served from this disk; those tests skip if no browser is installed.
+//
+// The tests that start Chromium run only with RETICHAT_BOOT_TESTS=1
+// (`npm run test:full`), and deploy.sh sets it when it runs the suite, so
+// they still run on every deploy. A plain `npm test` skips them, each one
+// marked SKIP with the reason, and says so on stderr: they add headless
+// browsers and about 25 s to a run, which a quick check does not need.
 
 import test, { describe, after } from "node:test";
 import assert from "node:assert/strict";
@@ -38,6 +44,16 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PLAYWRIGHT_DIR = resolve(ROOT, "../test-harnesses/distro-pipeline");
+
+// Chromium runs only when asked for; deploy.sh always asks (see the header).
+const BOOT_TESTS = process.env.RETICHAT_BOOT_TESTS === "1";
+const BOOT_SKIP = "RETICHAT_BOOT_TESTS is not 1: run `npm run test:full` (deploy.sh always does)";
+/** A test that starts Chromium: it runs only with RETICHAT_BOOT_TESTS=1. */
+const chromiumTest = BOOT_TESTS ? test : (name, fn) => test(name, { skip: BOOT_SKIP }, fn);
+if (!BOOT_TESTS) {
+    process.stderr.write("\n⚠ deploy_gates.test.mjs: the boot-gate tests that start Chromium are SKIPPED.\n"
+        + `  ${BOOT_SKIP}.\n\n`);
+}
 const TMP = mkdtempSync(join(tmpdir(), "deploy-gates-"));
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
@@ -347,20 +363,19 @@ function runRemote(home, script) {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-// Two suites run side by side. The Chromium one runs at most two browsers at a
-// time: `npm test` is the deploy gate, and this file's peak (five boot gates,
-// 16 Chromium processes) ran beside timing-sensitive tests in other files
-// (link_request_resource.test.mjs has 100 ms and 150 ms budgets). Two slots
-// halve the peak (8 processes); its first three tests each watch the whole
-// 10 s window, so two slots cost the file only about 4 s. This is not shown to be
-// what turns those tests red: on 2026-09-30, under load from other work, they
-// went red in whole-suite runs with the old peak and with this one, and never
-// in 12 runs beside this file alone.
+// Two suites run side by side. The Chromium one (RETICHAT_BOOT_TESTS=1 only)
+// runs at most two browsers at a time: its peak with five boot gates was 16
+// Chromium processes beside the rest of the suite; two slots halve it (8
+// processes). Its first three tests each watch the whole 10 s window, so two
+// slots cost the file only about 4 s. The 100 ms and 150 ms budgets of
+// link_request_resource.test.mjs that went red under load on 2026-09-30 run
+// on virtual time since (test_virtual_time.mjs), so load no longer decides
+// them, whichever peak this file has.
 describe("deploy gates", { concurrency: 2 }, () => {
 
     describe("in Chromium, at most two browsers at a time", { concurrency: 2 }, () => {
 
-        test("a clean deploy: boots, lists both nodes before uploading, retichat first, never ships the debug pages, and verifies", async (t) => {
+        chromiumTest("a clean deploy: boots, lists both nodes before uploading, retichat first, never ships the debug pages, and verifies", async (t) => {
             const repo = fixtureRepo("deploy-e2e");
             const nodes = fakeNodes("deploy-e2e");
             const { env, logs } = scriptEnv(nodes);
@@ -393,7 +408,7 @@ describe("deploy gates", { concurrency: 2 }, () => {
             assert.ok(curlUrls(logs).some((u) => u.endsWith("/debug.html")), "verify-deploy.sh probed the debug page");
         });
 
-        test("boot gate: a page that renders, with its exchange refused locally and other hosts blocked, passes after the full 10 s", async (t) => {
+        chromiumTest("boot gate: a page that renders, with its exchange refused locally and other hosts blocked, passes after the full 10 s", async (t) => {
             const t0 = Date.now();
             const r = await booted(t, goodSite(scratch("boot-good")));
             if (!r) return;
@@ -403,14 +418,14 @@ describe("deploy gates", { concurrency: 2 }, () => {
             assert.ok(Date.now() - t0 >= 10_000, "the whole window was watched");
         });
 
-        test("boot gate: a page that loads cleanly and renders nothing (a blank screen) fails", async (t) => {
+        chromiumTest("boot gate: a page that loads cleanly and renders nothing (a blank screen) fails", async (t) => {
             const r = await booted(t, goodSite(scratch("boot-blank"), { "app.js": `export {};\n` }));
             if (!r) return;
             assert.equal(r.code, 1, r.out);
             assert.match(r.out, /nothing rendered into #app within 10 s/);
         });
 
-        test("a page that dies at load refuses the deploy before any node is contacted", async (t) => {
+        chromiumTest("a page that dies at load refuses the deploy before any node is contacted", async (t) => {
             const repo = fixtureRepo("deploy-buffer", { "app.js": `Buffer.from("x");\n${RENDER}` });
             const nodes = fakeNodes("deploy-buffer");
             const { env, logs } = scriptEnv(nodes);
@@ -422,28 +437,28 @@ describe("deploy gates", { concurrency: 2 }, () => {
             assert.equal(sshCalls(logs).length, 0);
         });
 
-        test("boot gate: \"Buffer is not defined\" at module load (0760960) fails", async (t) => {
+        chromiumTest("boot gate: \"Buffer is not defined\" at module load (0760960) fails", async (t) => {
             const r = await booted(t, goodSite(scratch("boot-buffer"), { "app.js": `import "./lib/a.js";\nBuffer.from("x");\n${RENDER}` }));
             if (!r) return;
             assert.equal(r.code, 1, r.out);
             assert.match(r.out, /FAIL .*pageerror: Buffer is not defined/);
         });
 
-        test("boot gate: a relative import with no file fails", async (t) => {
+        chromiumTest("boot gate: a relative import with no file fails", async (t) => {
             const r = await booted(t, goodSite(scratch("boot-missing"), { "app.js": `import "./lib/gone.js";\n${RENDER}` }));
             if (!r) return;
             assert.equal(r.code, 1, r.out);
             assert.match(r.out, /FAIL .*module import failed: http:\/\/127\.0\.0\.1:\d+\/lib\/gone\.js/);
         });
 
-        test("boot gate: a bare specifier the importmap does not map fails", async (t) => {
+        chromiumTest("boot gate: a bare specifier the importmap does not map fails", async (t) => {
             const r = await booted(t, goodSite(scratch("boot-bare"), { "app.js": `import "buffer";\n${RENDER}` }));
             if (!r) return;
             assert.equal(r.code, 1, r.out);
             assert.match(r.out, /FAIL .*buffer/);
         });
 
-        test("boot gate: a module from a host other than esm.sh is blocked, never fetched, and fails", async (t) => {
+        chromiumTest("boot gate: a module from a host other than esm.sh is blocked, never fetched, and fails", async (t) => {
             const site = goodSite(scratch("boot-cdn"), {
                 "index.html": PAGE({ dep: "https://cdn-host.invalid/dep.js" }),
                 "app.js": `import "dep";\n${RENDER}`,
@@ -454,7 +469,7 @@ describe("deploy gates", { concurrency: 2 }, () => {
             assert.match(r.out, /FAIL .*module import failed: https:\/\/cdn-host\.invalid\/dep\.js .*blocked/);
         });
 
-        test("boot gate: an error thrown after load, inside the window, fails", async (t) => {
+        chromiumTest("boot gate: an error thrown after load, inside the window, fails", async (t) => {
             const r = await booted(t, goodSite(scratch("boot-late"), { "app.js": `${RENDER}setTimeout(() => { throw new Error("late failure"); }, 1500);\n` }));
             if (!r) return;
             assert.equal(r.code, 1, r.out);
@@ -751,6 +766,46 @@ describe("deploy gates", { concurrency: 2 }, () => {
             }
             assert.equal(sshCalls(logs).length, 0);
             assert.deepEqual(snapshot(nodes.root), before);
+        });
+
+        // ── the suite step: the boot gate's Chromium tests run on every deploy ──
+
+        test("the deploy runs the suite with RETICHAT_BOOT_TESTS=1, so the Chromium tests run on every deploy", async () => {
+            // The fixture's suite passes only when the flag reaches it.
+            const suite = `node -e "if (process.env.RETICHAT_BOOT_TESTS !== '1') { console.log('RETICHAT_BOOT_TESTS=' + process.env.RETICHAT_BOOT_TESTS); process.exit(1); } console.log('ℹ pass 1')"`;
+            const repo = fixtureRepo("deploy-boot-flag", {
+                "package.json": JSON.stringify({ name: "fixture", version: "0.0.0", private: true, scripts: { test: suite } }),
+            });
+            const nodes = fakeNodes("deploy-boot-flag");
+            // Unset where the deploy is run from: deploy.sh sets it itself.
+            const { env } = scriptEnv(nodes, { DEPLOY_PLAYWRIGHT_DIR: NO_BROWSER, RETICHAT_BOOT_TESTS: "" });
+            const r = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env });
+            assert.equal(r.code, 0, r.out);
+            assert.match(r.out, /suite green — ℹ pass 1/);
+        });
+
+        test("npm test leaves the Chromium tests out and says so; npm run test:full runs them", async () => {
+            const scripts = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts;
+            assert.equal(scripts["test:full"], `RETICHAT_BOOT_TESTS=1 ${scripts.test}`, "test:full is npm test with the flag");
+            assert.doesNotMatch(scripts.test, /RETICHAT_BOOT_TESTS/);
+            // This file without the flag, one Chromium test selected: skipped, with the reason, and a warning.
+            // NODE_TEST_CONTEXT is how this runner tells its own children to report to it; the child here reports to us.
+            const { NODE_TEST_CONTEXT, ...outside } = process.env;
+            const r = await new Promise((ok) => {
+                const p = spawn(process.execPath, ["--test", "--test-reporter=spec",
+                    "--test-name-pattern=boot gate: a relative import with no file fails", "deploy_gates.test.mjs"], {
+                    cwd: ROOT, env: { ...outside, RETICHAT_BOOT_TESTS: "", DEPLOY_PLAYWRIGHT_DIR: NO_BROWSER },
+                });
+                let out = "";
+                p.stdout.on("data", (d) => { out += d; });
+                p.stderr.on("data", (d) => { out += d; });
+                p.on("close", (code) => ok({ code, out }));
+            });
+            assert.equal(r.code, 0, r.out);
+            assert.match(r.out, /﹣ boot gate: a relative import with no file fails .*# RETICHAT_BOOT_TESTS is not 1: run `npm run test:full` \(deploy\.sh always does\)/);
+            assert.match(r.out, /ℹ skipped 1\n/);
+            assert.match(r.out, /⚠ deploy_gates\.test\.mjs: the boot-gate tests that start Chromium are SKIPPED/);
+            assert.doesNotMatch(r.out, /✔ boot gate: a relative import/, "it did not run");
         });
 
         // ── the whole deploy, offline ───────────────────────────────────────

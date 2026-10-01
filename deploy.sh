@@ -49,7 +49,9 @@
 # The checks, in order:
 #
 #   1. refuse a dirty working tree      — you cannot ship what isn't committed
-#   2. run the test suite               — and refuse on any failure
+#   2. run the test suite               — and refuse on any failure; with
+#      RETICHAT_BOOT_TESTS=1, so the boot gate's own Chromium tests run too
+#      (a plain `npm test` skips them)
 #   3. deploy from `git archive <ref>`  — never from the working directory
 #   4. boot the staged export in headless Chromium — refuse on a pageerror or a
 #      failed module import in the first 10 s (0760960 passed 1–3 and died at
@@ -657,7 +659,9 @@ else
   if [[ ! -d "$REPO_DIR/node_modules" ]]; then
     die "node_modules missing — run 'npm install' first (the browser uses the importmap; this is test-only)"
   fi
-  if output="$(cd "$REPO_DIR" && npm test 2>&1)"; then
+  # RETICHAT_BOOT_TESTS=1: deploy_gates.test.mjs runs its Chromium tests,
+  # the ones that prove this script's boot gate works (`npm run test:full`).
+  if output="$(cd "$REPO_DIR" && RETICHAT_BOOT_TESTS=1 npm test 2>&1)"; then
     echo "  ${GREEN}✓${NC} suite green — $(grep -E '^ℹ pass' <<< "$output" | tr -d '\n')"
   else
     sed 's/^/    /' <<< "$output" | tail -30
