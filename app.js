@@ -57,6 +57,11 @@ import {
 } from "./lib/display_name.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
+import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.js";
+import { SendTransfers } from "./lib/send_progress.js";
+import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
+import { ObjectUrls } from "./lib/object_urls.js";
+import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
     regenerateRoot, typeChannelName, validateChannelName, visibilityHint,
@@ -315,6 +320,31 @@ async function loadConfig() {
 const PFX = "retichat_";
 function sGet(k) { try { const r = localStorage.getItem(PFX+k); return r ? JSON.parse(r) : null; } catch(e) { return null; } }
 function sSet(k, v) { try { localStorage.setItem(PFX+k, JSON.stringify(v)); } catch(e) {} }
+
+// Attachment bytes: IndexedDB, or this tab's memory when IndexedDB cannot be
+// opened (lib/attachment_store.js). Never localStorage, which sSet above
+// would fail silently on. A message record keeps only each attachment's
+// {key, name, mime, size, sha256, field, stored}.
+const Attachments = AttachmentStore.open();
+// The object URLs the chat shows attachments through, revoked once their
+// element has left the page (lib/object_urls.js; swept after each render).
+const AttachmentUrls = new ObjectUrls();
+/** Groups carry text only: every client's group relay (_performGroupRelay
+ *  here, iOS GroupChatManager relay) forwards a message's content alone, so
+ *  an attachment would never reach a member served through a relay. */
+const GROUP_ATTACHMENT_REFUSAL = "Attachments can't be sent to a group: group messages that are relayed carry "
+    + "text only, in every Retichat client, so some members would never get them. Send it in a direct chat.";
+
+/** Delete the attachment bytes of message records that are going away (a
+ *  conversation deleted, the oldest messages trimmed). A failed delete is
+ *  reported, never swallowed. */
+function discardAttachments(records) {
+    const keys = keysOf(records);
+    if (!keys.length) return;
+    Attachments.remove(keys).then((failed) => {
+        if (failed.length) console.error(`[attachments] ${failed.length} of ${keys.length} attachment(s) could not be deleted`);
+    }, (e) => console.error("[attachments] deleting attachments failed:", e?.message || e));
+}
 
 // =========================================================================
 //  OWN NAMES — LXMF-rust/DISPLAY_NAMES.md §1 and §6
@@ -742,6 +772,9 @@ const Harness = {
             via: msg.via ?? "direct",
             timestamp: msg.timestamp,
             id: msg.id,
+            // The LXMF message hash (lowercase hex), so a stage finds a
+            // captionless message by what its sender printed.
+            lxmfHash: msg.lxmfHash ?? null,
         });
         if (this.inbox.length > 500) this.inbox.splice(0, this.inbox.length - 500);
         this.event("rx", { via: msg.via ?? "direct", src: (msg.srcHash ?? peerHash).slice(0, 12), content: (msg.content ?? "").slice(0, 80) });
@@ -772,11 +805,14 @@ window.Harness = Harness;
 //  MESSAGE STORE
 // =========================================================================
 const MsgStore = {
+    // Called with the records a trim or a remove drops, so their attachment
+    // bytes go with them (discardAttachments, wired after the stores).
+    onDiscard: null,
     get(hash) { return sGet("msg_"+hash) ?? []; },
     add(hash, msg) {
         const msgs = this.get(hash);
         msgs.push({ id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg });
-        if (msgs.length > 500) msgs.splice(0, msgs.length-500);
+        if (msgs.length > 500) this.onDiscard?.(msgs.splice(0, msgs.length-500));
         sSet("msg_"+hash, msgs);
         const stored = msgs[msgs.length-1];
         // In-memory mirror so headless harnesses can assert without reparsing localStorage.
@@ -797,15 +833,30 @@ const MsgStore = {
         return m;
     },
     remove(hash) {
+        this.onDiscard?.(this.get(hash));
         sSet("msg_"+hash, []);
     },
     preview(hash) {
         const msgs = this.get(hash);
         if (!msgs.length) return null;
         const last = msgs[msgs.length-1];
-        return (last.dir === "out" ? "You: " : "") + (last.content?.slice(0,60) ?? "");
+        return (last.dir === "out" ? "You: " : "") + (last.content?.slice(0,60) || attachmentPreview(last));
     },
 };
+
+/** What a distro message shows with neither text nor an attachment to show:
+ *  a §17.11 sent-copy of a message that carried only attachments (copies are
+ *  text only), or one whose attachments this client cannot read. iOS's words
+ *  (RfedDistroClient.swift DistroMessageStore.unavailablePlaceholder). */
+const DISTRO_ATTACHMENT_PLACEHOLDER = "[Attachment not available via the distro address]";
+
+/** A captionless attachment's line in the chat list: "📎 name". */
+function attachmentPreview(m) {
+    const first = m?.attachments?.[0];
+    if (!first) return "";
+    const more = m.attachments.length > 1 ? ` +${m.attachments.length - 1}` : "";
+    return `📎 ${first.name}${more}`;
+}
 
 // =========================================================================
 //  DISTRO DEDUPE
@@ -846,6 +897,14 @@ const DistroSeen = {
         }
         sSet("distro_seen", this._order);
         return false;
+    },
+
+    /** Un-record `key`: the blob was dropped, not kept, so a later copy of it
+     *  is judged again rather than answered "already held". */
+    forget(key) {
+        if (!this._keys.delete(key)) return;
+        this._order = this._order.filter(k => k !== key);
+        sSet("distro_seen", this._order);
     },
 
     clear() { this._keys.clear(); this._order = []; sSet("distro_seen", []); },
@@ -1150,11 +1209,13 @@ PrivacyFilter.init();
 //  GROUP MESSAGE STORE — per-group messages
 // =========================================================================
 const GroupMsgStore = {
+    // As MsgStore.onDiscard: the attachment bytes of dropped records go too.
+    onDiscard: null,
     get(groupId) { return sGet("gmsg_"+groupId) ?? []; },
     add(groupId, msg) {
         const msgs = this.get(groupId);
         msgs.push({ id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg });
-        if (msgs.length > 500) msgs.splice(0, msgs.length-500);
+        if (msgs.length > 500) this.onDiscard?.(msgs.splice(0, msgs.length-500));
         sSet("gmsg_"+groupId, msgs);
         return msgs[msgs.length-1];
     },
@@ -1181,6 +1242,7 @@ const GroupMsgStore = {
             : { dir: "system", content: text, status: "delivered" });
     },
     remove(groupId) {
+        this.onDiscard?.(this.get(groupId));
         sSet("gmsg_"+groupId, []);
     },
     preview(groupId, systemText = (m) => m.content) {
@@ -1188,7 +1250,7 @@ const GroupMsgStore = {
         if (!msgs.length) return null;
         const last = msgs[msgs.length-1];
         if (last.dir === "system") return systemText(last)?.slice(0,60) ?? "";
-        return (last.dir === "out" ? "You: " : "") + (last.content?.slice(0,60) ?? "");
+        return (last.dir === "out" ? "You: " : "") + (last.content?.slice(0,60) || attachmentPreview(last));
     },
     /** Notices stored before 2026-09-27 had the member's name frozen into the
      *  text ("?1a2b3c4d joined the group"). Give each one whose member can be
@@ -1213,6 +1275,8 @@ const GroupMsgStore = {
     },
 };
 GroupMsgStore.migrateLegacyNotices(GroupStore.getAll(), (hash) => ContactStore.name(hash));
+MsgStore.onDiscard = discardAttachments;
+GroupMsgStore.onDiscard = discardAttachments;
 
 // =========================================================================
 //  CHANNEL STORE — RFed channel subscriptions matching iOS ChannelEntity
@@ -1388,6 +1452,12 @@ const RnsClient = {
     // (waitFor "init") and dispatched by _dispatchQueued() when it flips.
     _initialized: false,
     _onStatus: [], _onMsg: [],
+    // The Resources an outgoing message waits on: its progress (0.10 + 0.90
+    // x fraction), the send ceiling's deferral while one moves, and the §1
+    // watch for bulk transfers (lib/send_progress.js).
+    _sendTransfers: new SendTransfers(),
+    _onSendProgress: [],      // (convHash, msgId, progress)
+    _onAttachmentState: [],   // (convHash, msgId): an attachment's `stored` changed
 
     get status() { return this._status; },
     get connType() { return this._connType; },
@@ -1428,6 +1498,159 @@ const RnsClient = {
 
     onStatus(fn) { this._onStatus.push(fn); },
     onMessage(fn) { this._onMsg.push(fn); },
+    onSendProgress(fn) { this._onSendProgress.push(fn); },
+    onAttachmentState(fn) { this._onAttachmentState.push(fn); },
+
+    /**
+     * Keep the attachments a received (or sent) message carries: each one's
+     * bytes go to the attachment store under "<msgId>:<index>", and the record
+     * gets {key, name, mime, size, sha256, field, stored}. `found` is
+     * LXMF.attachmentsFromFields's list (its `skipped` count of entries that
+     * could not be read is kept too, and so is `fieldsUnreadable`, a fields
+     * map that could not be decoded at all: the bubble says so). Called right
+     * after the record is added and before anyone is told of it. `stored`
+     * starts "saving" and becomes "persisted", "session" or "failed" when the
+     * write lands; anything but "persisted" is shown on the bubble.
+     * Returns the record as updated.
+     */
+    _keepAttachments(store, convHash, record, found, fieldsUnreadable = null) {
+        const list = found ?? [];
+        const metas = list.map((a, i) => ({
+            key: attachmentKey(record.id, i),
+            name: a.name,
+            mime: a.mime,
+            size: a.bytes.length,
+            sha256: Cryptography.fullHash(a.bytes).toString("hex"),
+            field: a.field,
+            stored: "saving",
+        }));
+        const changes = {};
+        if (metas.length) changes.attachments = metas;
+        if (list.skipped) changes.attachmentsSkipped = list.skipped;
+        if (fieldsUnreadable) changes.fieldsUnreadable = true;
+        if (!Object.keys(changes).length) return record;
+        const updated = store.update(convHash, record.id, changes) ?? Object.assign(record, changes);
+        if (list.skipped || fieldsUnreadable) {
+            console.warn(`[attachments] message ${record.id} kept without ${fieldsUnreadable ? "its fields (unreadable: " + fieldsUnreadable + ")" : list.skipped + " malformed attachment(s)"}`);
+        }
+        if (!metas.length) return updated;
+        Promise.all(list.map((a, i) => Attachments.put(metas[i].key, a.bytes))).then((results) => {
+            const current = store.get(convHash).find(m => m.id === record.id);
+            if (!current?.attachments) return;   // deleted meanwhile
+            const byKey = new Map(metas.map((m, i) => [m.key, results[i]]));
+            let unsaved = false;
+            const attachments = current.attachments.map((m) => {
+                const r = byKey.get(m.key);
+                if (!r) return m;
+                if (r.stored !== "persisted") unsaved = true;
+                return { ...m, stored: r.stored, ...(r.error ? { storeError: r.error } : {}) };
+            });
+            store.update(convHash, record.id, { attachments });
+            if (unsaved) {
+                console.warn(`[attachments] message ${record.id}: not saved to IndexedDB — kept for this session only`);
+                this._onAttachmentState.forEach(fn => fn(convHash, record.id));
+            }
+        });
+        return updated;
+    },
+
+    /** The stored record with id `msgId`, in a DM or a group: {store, convHash, record}. */
+    _findRecord(msgId) {
+        for (const c of ContactStore.getAll()) {
+            const record = MsgStore.get(c.destHash).find(m => m.id === msgId);
+            if (record) return { store: MsgStore, convHash: c.destHash, record };
+        }
+        for (const g of GroupStore.getAll()) {
+            const record = GroupMsgStore.get(g.groupId).find(m => m.id === msgId);
+            if (record) return { store: GroupMsgStore, convHash: g.groupId, record };
+        }
+        return null;
+    },
+
+    /**
+     * The attachments of stored message `msgId`, each read back from where
+     * the page keeps it (IndexedDB, or this tab's memory when it is
+     * session-only): [{name, size, sha256, mime, field, stored}], [] for a
+     * message with none. size and sha256 are of the bytes read back (null
+     * when nothing holds them any more). The staging harness's hook
+     * (test-harnesses/staging/lib/attach.mjs HOOK_CONTRACT).
+     */
+    async attachmentsFor(msgId) {
+        const found = this._findRecord(msgId);
+        const out = [];
+        for (const meta of found?.record?.attachments ?? []) {
+            const bytes = await Attachments.readBack(meta.key);
+            out.push({
+                name: meta.name,
+                size: bytes ? bytes.length : null,
+                sha256: bytes ? Cryptography.fullHash(bytes).toString("hex") : null,
+                mime: meta.mime,
+                field: meta.field,
+                stored: meta.stored,
+            });
+        }
+        return out;
+    },
+
+    /**
+     * A Resource carrying message `msgId` (to `convHash`): sent on `link`,
+     * its progress reported as the message's (_onSendProgress) and counted
+     * as transfer activity (_sendTransfers), its end recorded. Resolves or
+     * rejects as the Resource does.
+     */
+    _sendWithProgress(link, data, convHash, msgId, label) {
+        const transfer = this._sendTransfers.begin(msgId, `${label} transfer of ${msgId.slice(0, 8)} to ${convHash.slice(0, 8)}`);
+        return link.sendResource(data, {
+            onProgress: (fraction) => {
+                const value = this._sendTransfers.progress(transfer, fraction);
+                if (value !== null) this._onSendProgress.forEach(fn => fn(convHash, msgId, value));
+            },
+        }).then(
+            (resource) => { this._sendTransfers.end(transfer, true); return resource; },
+            (error) => { this._sendTransfers.end(transfer, false); throw error; });
+    },
+
+    /**
+     * Why a DM with these attachments ([{name, bytes}]) cannot be sent, or
+     * null (lib/attachment_limits.js): at most MAX_ATTACHMENTS, within LXMF's
+     * delivery limit, and within what the propagation node announced it
+     * holds in one upload. Checked before anything is stored.
+     */
+    attachmentRefusal(contact, content, attachments) {
+        if (!attachments?.length) return null;
+        return attachmentRefusal({
+            count: attachments.length,
+            packedSize: estimatePackedSize(content, attachments),
+            deliveryLimit: LXMRouter.DELIVERY_LIMIT * 1000,
+            perSyncKb: this._propagationLimits()?.perSyncKb ?? null,
+        });
+    },
+
+    /** The FIELD_FILE_ATTACHMENTS value of an outgoing record, from the bytes
+     *  this tab holds now (sync: _sendPacket packs in the same tick it is
+     *  called). null for a record with none; throws when one is not held. */
+    _attachmentFieldNow(record) {
+        if (!record?.attachments?.length) return null;
+        return record.attachments.map((meta) => {
+            const bytes = Attachments.peek(meta.key);
+            if (!bytes) throw new Error(`the attachment ${meta.name} is not in memory to send`);
+            return [meta.name, bytes];
+        });
+    },
+
+    /** As _attachmentFieldNow, reading the bytes from the store if need be.
+     *  Rejects when the store no longer holds one (a session-only
+     *  attachment after a reload). */
+    async _attachmentField(record) {
+        if (!record?.attachments?.length) return null;
+        const field = [];
+        for (const meta of record.attachments) {
+            const bytes = await Attachments.get(meta.key);
+            if (!bytes) throw new Error(`the attachment ${meta.name} is no longer held (it was kept for an earlier session only)`);
+            field.push([meta.name, bytes]);
+        }
+        return field;
+    },
 
     /** Update the delivery status of an outgoing message (e.g. "proved", "failed"). */
     updateMessageStatus(contactHash, msgId, newStatus) {
@@ -1611,12 +1834,17 @@ const RnsClient = {
             }
 
             // ---- Delivery notification (proof) ----
-            // If the incoming message has FIELD_TICKET and empty content, it's a
-            // delivery notification from a recipient proving they got our message.
-            const FIELD_TICKET = 0x0C;
-            const ticket = lxmfMsg.fields?.get(FIELD_TICKET);
-            if (ticket && (!content || content.length === 0)) {
-                const pending = this._pendingTickets.get(ticket);
+            // A ticket (0x0C), no content and no attachment: a recipient's
+            // reply to the ticket one of our messages carried, proving it got
+            // it (LXMF.isDeliveryNotification). A message that carries 0x05,
+            // 0x06 or 0x07 is always a message, ticket or not (LXMF-rust
+            // 06c40e1): until 2026-09-30 a captionless photo from a sender
+            // that includes its ticket was taken for a notification and lost.
+            // Only a ticket of ours (LXMF.webTicket) is looked up: the
+            // reference's [expires, ticket] is never one.
+            if (LXMF.isDeliveryNotification(lxmfMsg.fields, content)) {
+                const ticket = LXMF.webTicket(lxmfMsg.fields);
+                const pending = ticket ? this._pendingTickets.get(ticket) : null;
                 if (pending) {
                     this._pendingTickets.delete(ticket);
                     console.log(`[retichat] ✅ PROOF (LXMF) ticket=${ticket.slice(0,8)}... from ${srcHash.slice(0,12)}`);
@@ -1625,6 +1853,8 @@ const RnsClient = {
                         MsgStore.updateStatus(pending.contactHash, pending.messageId, "proved");
                         this._onMsg.forEach(fn => fn(lxmfMsg, srcHash));
                     }
+                } else {
+                    console.log(`[retichat] delivery notification from ${srcHash.slice(0,12)} for a ticket that is not one we are waiting on — not stored`);
                 }
                 return;
             }
@@ -1648,7 +1878,14 @@ const RnsClient = {
                 ContactStore.acceptMessageName(srcHash, nameField, signatureState, lxmfMsg.timestamp);
             }
 
-            MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash, via: "direct" });
+            // Its attachments (0x05, 0x06, 0x07; LXMessage.fromBytes read them
+            // on every path: direct packet, link packet, link Resource and
+            // the propagated /get) go to the attachment store; a captionless
+            // one keeps content "" and the bubble shows the attachment.
+            const stored = MsgStore.add(srcHash, { dir: "in", content, status: "delivered", srcHash, via: "direct", lxmfHash: lxmfHashHex });
+            if (lxmfMsg.attachments?.length || lxmfMsg.attachments?.skipped || lxmfMsg.fieldsUnreadable) {
+                this._keepAttachments(MsgStore, srcHash, stored, lxmfMsg.attachments, lxmfMsg.fieldsUnreadable);
+            }
             ContactStore.touch(srcHash);
             // Successfully received a message — reset propagation timer to 5s
             ContactStore.setReachable(srcHash, true);
@@ -1676,6 +1913,14 @@ const RnsClient = {
                         sSet("propagationStampCost", String(costs.stampCost));
                         sSet("propagationStampFlexibility", String(costs.flexibility));
                         console.log(`[retichat] 📡 Propagation node stamp cost ${costs.stampCost} (flexibility ${costs.flexibility}) from announce`);
+                    }
+                    // Its transfer limits, which bound an outgoing message
+                    // with attachments (lib/attachment_limits.js).
+                    const limits = this._parsePropagationNodeLimits(event.announce.appData);
+                    if (limits) {
+                        this._cfg.propagationLimits = limits;
+                        sSet("propagationLimits", limits);
+                        console.log(`[retichat] 📡 Propagation node limits: ${limits.perTransferKb} KB per transfer, ${limits.perSyncKb} KB per sync`);
                     }
                     // Defer link establishment — follow same pattern as channel init
                     this._initPropagation();
@@ -1888,6 +2133,39 @@ const RnsClient = {
         const flexibility = Number(costs[1]);
         if (!Number.isInteger(stampCost) || !Number.isInteger(flexibility) || stampCost < 0 || flexibility < 0) return null;
         return { stampCost, flexibility };
+    },
+
+    /**
+     * The transfer limits in the propagation node's announce, in KB of
+     * 1000 B: [3] per-transfer and [4] per-sync (LXMF/LXMRouter.py
+     * get_propagation_node_app_data; LXMF.pn_announce_data_is_valid takes
+     * int() of each). Returns {perTransferKb, perSyncKb} or null when the
+     * data is not a valid propagation-node announce. What they bind is in
+     * lib/attachment_limits.js: the node refuses an upload over per-sync.
+     */
+    _parsePropagationNodeLimits(appData) {
+        if (!appData || appData.length === 0) return null;
+        let data;
+        try { data = MsgPack.unpack(Buffer.from(appData)); } catch (e) { return null; }
+        if (!Array.isArray(data) || data.length < 7) return null;
+        const kb = (v) => {
+            const n = typeof v === "bigint" ? Number(v) : v;
+            return typeof n === "number" && Number.isFinite(n) && n >= 0 ? Math.trunc(n) : null;
+        };
+        const perTransferKb = kb(data[3]);
+        const perSyncKb = kb(data[4]);
+        if (perTransferKb === null || perSyncKb === null) return null;
+        return { perTransferKb, perSyncKb };
+    },
+
+    /** The propagation node's announced limits (_parsePropagationNodeLimits),
+     *  from this session's announce or the last one stored; null while none
+     *  has been heard. */
+    _propagationLimits() {
+        const known = this._cfg?.propagationLimits ?? sGet("propagationLimits");
+        if (!known || typeof known !== "object") return null;
+        const ok = (v) => Number.isFinite(v) && v >= 0;
+        return ok(known.perTransferKb) && ok(known.perSyncKb) ? known : null;
     },
 
     /** The stamp target for a propagated message: the node's announced
@@ -2343,11 +2621,20 @@ const RnsClient = {
      * localStorage, so a reload keeps it and the next initialization sends
      * it. After initialization, one sent while the exchange is down is
      * stored "failed" and never sent. Returns the stored record.
+     *
+     * `attachments` ([{name, bytes, mime?}], at most MAX_ATTACHMENTS) go as
+     * FIELD_FILE_ATTACHMENTS [[name, bytes], ...] at their original size,
+     * as iOS and Android send them. A message over its limits
+     * (attachmentRefusal) throws before anything is stored. Their bytes go
+     * to the attachment store with the record, so the bubble shows them and
+     * the propagated copy carries the same field.
      */
-    sendMessage(contact, content) {
+    sendMessage(contact, content, attachments = []) {
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
+        const refusal = attachments.length ? this.attachmentRefusal(contact, content, attachments) : null;
+        if (refusal) throw new Error(refusal);
 
-        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"`);
+        console.log(`[retichat] ✉️ SEND to ${contact.destHash.slice(0,12)}... content="${content.slice(0,60)}"${attachments.length ? ` attachments=${attachments.length}` : ""}`);
 
         // The user wrote to them, so their answer passes the privacy filter.
         // A departure from iOS and Android, asked for with the web's filter
@@ -2362,6 +2649,13 @@ const RnsClient = {
 
         // Create the outgoing message record
         ContactStore.touch(contact.destHash);
+        // Attachments are kept with the record whatever happens to it next
+        // (queued, failed or sent): the bubble shows what the user sent.
+        const withAttachments = (record) => attachments.length
+            ? this._keepAttachments(MsgStore, contact.destHash, record, attachments.map(a => ({
+                name: a.name, mime: a.mime || mimeForName(a.name), bytes: a.bytes, field: FIELD_FILE_ATTACHMENTS,
+            })))
+            : record;
         if (!this._initialized) {
             const queued = MsgStore.add(contact.destHash, {
                 dir: "out", content, status: "queued", waitFor: "init",
@@ -2373,7 +2667,7 @@ const RnsClient = {
                 throw new Error("Could not store the message to send when connected (storage full?)");
             }
             console.log(`[retichat] ⏳ Queued for ${contact.destHash.slice(0,8)} until initialization finishes`);
-            return queued;
+            return withAttachments(queued);
         }
         // D3 (James, 2026-09-25): a send is an immediate act; "it should fail
         // in front of the user and be considered dead". Outside the
@@ -2385,12 +2679,12 @@ const RnsClient = {
                 srcHash: this.sendingIdentity().hash, destHash: contact.destHash,
             });
             console.warn(`[retichat] ✗ Not sent to ${contact.destHash.slice(0,8)}: the exchange is down`);
-            return failed;
+            return withAttachments(failed);
         }
-        const outMsg = MsgStore.add(contact.destHash, {
+        const outMsg = withAttachments(MsgStore.add(contact.destHash, {
             dir: "out", content, status: "sending",
             srcHash: this.sendingIdentity().hash, destHash: contact.destHash,
-        });
+        }));
         this._dispatchMessage(contact, outMsg);
         return outMsg;
     },
@@ -2438,6 +2732,7 @@ const RnsClient = {
                     // Direct proof callback: the message is DELIVERED, so the
                     // name it carried is now known to the recipient (§4.1).
                     MsgStore.updateStatus(contact.destHash, msgId, "proved");
+                    this._sendTransfers.settle(msgId);
                     this._recordNameDelivered(contact.destHash, msgId);
                     ContactStore.setReachable(contact.destHash, true);
                     console.log(`[retichat] ✅ Direct proof for ${contact.destHash.slice(0,8)}`);
@@ -2474,11 +2769,27 @@ const RnsClient = {
             });
         }
 
-        // After propagation delay, if no direct proof, also send to propagation node
-        const delaySec = ContactStore.propagationDelay(contact.destHash);
-        setTimeout(propagate, delaySec * 1000);
+        // After the propagation delay with no direct proof, the copy goes to
+        // the propagation node too — counting only time without transfer
+        // activity: a direct Resource that keeps moving gets no copy, as
+        // AppLinks Timer P (app-links 07bea51; Android 4b5bd9b, iOS 4744376).
+        // Until 2026-09-30 a photo still moving direct got a second upload
+        // of the whole attachment 5 s in. The delay is unchanged; what it
+        // measures changed.
+        const delayMs = ContactStore.propagationDelay(contact.destHash) * 1000;
+        const fallback = () => {
+            if (propagationStarted) return;
+            const quiet = this._sendTransfers.quietFor(outMsg.id);
+            if (quiet !== null && quiet < delayMs) {
+                setTimeout(fallback, delayMs - quiet);
+                return;
+            }
+            propagate();
+        };
+        setTimeout(fallback, delayMs);
 
-        // 30-second total timeout — mark as failed if no proof at all
+        // The 30 s ceiling: failed if nothing proved or propagated it, unless
+        // a transfer of it is still in flight (_armSendCeiling).
         this._armSendCeiling(contact.destHash, outMsg.id);
     },
 
@@ -2559,6 +2870,24 @@ const RnsClient = {
         applyDisplayName(msg.fields, sameMessage
             ? record.lxmfName
             : this._decideMessageName(sender.hash, contact.destHash));
+        // Its attachments, after the name as in _sendPacket, so the copy's
+        // bytes and hash are the direct message's. Read from the attachment
+        // store: a copy can go long after the send, or after a reload. One
+        // whose bytes are gone (kept for an earlier session only) cannot be
+        // the message the user sent, so it fails, saying why.
+        if (record.attachments?.length) {
+            let field;
+            try {
+                field = await this._attachmentField(record);
+            } catch (e) {
+                console.warn(`[retichat] ✗ Propagated copy of ${outMsg.id.slice(0,8)} to ${contact.destHash.slice(0,8)}: ${e.message}`);
+                MsgStore.update(contact.destHash, outMsg.id, { sendError: e.message });
+                this._failSending(contact.destHash, outMsg.id);
+                return;
+            }
+            if (settled(stored())) return;
+            msg.fields.set(FIELD_FILE_ATTACHMENTS, field);
+        }
         // Pack non-opportunistic so destinationHash is at offset 0.
         // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
         // to identify the final recipient.
@@ -2574,10 +2903,22 @@ const RnsClient = {
             park("the link closed while the stamp was mined");
             return;
         }
+        // The node refuses an upload over the per-sync limit it announces
+        // (lib/attachment_limits.js). The composer checked an estimate; this
+        // is the copy as built. Not uploaded: the direct attempt, if any,
+        // still decides, and the send ceiling otherwise fails it, with why.
+        const perSyncKb = record.attachments?.length ? this._propagationLimits()?.perSyncKb : undefined;
+        if (perSyncKb !== undefined && propagationPacked.length > perSyncKb * 1000) {
+            const why = `the propagated copy is ${formatSize(propagationPacked.length)}, over the ${formatSize(perSyncKb * 1000)} the propagation node takes`;
+            console.warn(`[retichat] ✗ ${outMsg.id.slice(0,8)} to ${contact.destHash.slice(0,8)}: ${why} — not uploaded`);
+            MsgStore.update(contact.destHash, outMsg.id, { sendError: why });
+            return;
+        }
         const markPropagated = () => {
             // Delivery outranks everything: a direct proof keeps its ✓✓.
             if (stored()?.status === "proved") return;
             MsgStore.updateStatus(contact.destHash, outMsg.id, "propagated");
+            this._sendTransfers.settle(outMsg.id);
             console.log(`[retichat] ✓ Propagation proof for ${contact.destHash.slice(0,8)}`);
             this._onMsg.forEach(fn => fn(null, contact.destHash));
         };
@@ -2589,7 +2930,9 @@ const RnsClient = {
         // long message to a distro address never left the browser.
         if (propagationPacked.length > Link.MDU) {
             console.log(`[retichat] 📡 Propagation upload of ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
-            link.sendResource(propagationPacked)
+            // Its progress is the message's (0.10 + 0.90 x fraction), and
+            // while it moves the send ceiling waits for its end.
+            this._sendWithProgress(link, propagationPacked, contact.destHash, outMsg.id, "propagated")
                 .then(markPropagated)
                 .catch(error => console.warn(`[retichat] ⚠️ Propagation resource failed for ${contact.destHash.slice(0,8)}:`, error.message));
             if (contact.reachable !== false) {
@@ -2666,11 +3009,26 @@ const RnsClient = {
 
     /** The 30 s ceiling on a DM send: a record still "sending" when it
      *  expires has failed. Re-arming (a parked copy being flushed) replaces
-     *  the earlier ceiling. */
+     *  the earlier ceiling.
+     *
+     *  A Resource of the message still in flight when it expires decides
+     *  instead (DESIGN_PRINCIPLES §1, bulk transfers): its proof delivers
+     *  the message, its failure (its own watchdog, a refusal, the link
+     *  closing) ends it. The ceiling waits for that end, then runs again
+     *  from it: the failed direct Resource has started the propagated copy,
+     *  which gets the same 30 s to go. A moving transfer is never failed
+     *  for its length, and a silence in it is logged as a §1 violation by
+     *  _sendTransfers. Until 2026-09-30 a photo whose Resource was still
+     *  moving was failed at 30 s, then shown delivered at its late proof. */
     _armSendCeiling(contactHash, msgId) {
         clearTimeout(this._pendingTimeouts.get(msgId));
         const timeoutId = setTimeout(() => {
             this._pendingTimeouts.delete(msgId);
+            if (this._sendTransfers.inFlight(msgId)) {
+                console.log(`[retichat] ⏳ ${msgId.slice(0,8)} to ${contactHash.slice(0,8)} is still transferring at the send ceiling — its transfer decides`);
+                this._sendTransfers.deferCeiling(msgId, () => this._armSendCeiling(contactHash, msgId));
+                return;
+            }
             this._failSending(contactHash, msgId);
         }, 30000);
         this._pendingTimeouts.set(msgId, timeoutId);
@@ -2683,6 +3041,7 @@ const RnsClient = {
         const msg = MsgStore.get(contactHash).find(m => m.id === msgId);
         if (msg?.status !== "sending") return;
         MsgStore.updateStatus(contactHash, msgId, "failed");
+        this._sendTransfers.settle(msgId);
         this._onMsg.forEach(fn => fn(null, contactHash));
     },
 
@@ -2740,7 +3099,8 @@ const RnsClient = {
                         return;
                     }
                     MsgStore.update(contact.destHash, msg.id, { waitFor: null });
-                    this._dispatchMessage(contact, msg);
+                    if (msg.attachments?.length) this._dispatchWarmed(contact, msg);
+                    else this._dispatchMessage(contact, msg);
                 }});
             }
         }
@@ -2762,6 +3122,34 @@ const RnsClient = {
                 console.warn(`[retichat] ⚠️ Queued message ${msg.id.slice(0,8)} failed to dispatch:`, error.message);
                 Harness.error("queued-dispatch", error);
             }
+        }
+    },
+
+    /**
+     * Dispatch a queued DM whose attachments are in the attachment store and
+     * maybe not in memory (it waited for initialization, maybe across a
+     * reload): their bytes are held in memory while _sendPacket packs them,
+     * which it does synchronously, and let go after. One whose bytes are gone
+     * (kept for an earlier session only) is not sent without them: it fails,
+     * saying why.
+     */
+    async _dispatchWarmed(contact, msg) {
+        const keys = msg.attachments.map(a => a.key);
+        const missing = await Attachments.warm(keys);
+        try {
+            if (missing.length) {
+                const why = `${missing.length === 1 ? "an attachment was" : "attachments were"} kept for an earlier session only and ${missing.length === 1 ? "is" : "are"} gone`;
+                console.warn(`[retichat] ✗ Queued message ${msg.id.slice(0,8)} to ${contact.destHash.slice(0,8)} not sent: ${why}`);
+                MsgStore.update(contact.destHash, msg.id, { status: "failed", sendError: why });
+                this._onMsg.forEach(fn => fn(null, contact.destHash));
+                return;
+            }
+            this._dispatchMessage(contact, msg);
+        } catch (error) {
+            console.warn(`[retichat] ⚠️ Queued message ${msg.id.slice(0,8)} failed to dispatch:`, error.message);
+            Harness.error("queued-dispatch", error);
+        } finally {
+            Attachments.cool(keys);
         }
     },
 
@@ -2849,12 +3237,33 @@ const RnsClient = {
         // DISPLAY_NAMES.md §4.1: the 0xD1 decided once for this message and
         // kept on its record (_dispatchMessage). None on a record without a
         // decision.
-        applyDisplayName(msg.fields, MsgStore.get(contactHash).find(m => m.id === messageId)?.lxmfName);
+        const record = MsgStore.get(contactHash).find(m => m.id === messageId);
+        applyDisplayName(msg.fields, record?.lxmfName);
+        // Its attachments as FIELD_FILE_ATTACHMENTS [[name, bytes], ...], at
+        // their original size, from the bytes this tab holds now (the send
+        // put them there; _dispatchQueued warms a queued one's).
+        if (record?.attachments?.length) {
+            try {
+                msg.fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));
+            } catch (e) {
+                MsgStore.update(contactHash, messageId, { sendError: e.message });
+                if (onError) onError(messageId);
+                throw e;
+            }
+        }
         // The full packing: destination hash, source hash, signature, payload.
         // A packet to the destination sends it without the destination hash
         // (the packet header carries it); a link packet or Resource sends it
         // whole. Reference: LXMessage.py __as_packet / __as_resource.
         const packed = msg.pack(sender.identity, false);
+        // LXMF's delivery limit, on the message as built (the composer
+        // checked an estimate): no recipient takes more, on any path.
+        if (record?.attachments?.length && packed.length > LXMRouter.DELIVERY_LIMIT * 1000) {
+            const why = `This message is ${formatSize(packed.length)}; an LXMF message can be at most ${formatSize(LXMRouter.DELIVERY_LIMIT * 1000)}.`;
+            MsgStore.update(contactHash, messageId, { sendError: why });
+            if (onError) onError(messageId);
+            throw new Error(why);
+        }
         const plan = LXMessage.deliveryPlan(packed);
         // Kept on the record, so the propagated copy (_propagateMessage) —
         // one parked across a reload too — is rebuilt as this same message
@@ -2902,7 +3311,9 @@ const RnsClient = {
         this._ensureGroupLink(contactHash, publicKeyHex).then(({ link }) => {
             if (representation === LXMessage.RESOURCE) {
                 console.log(`[retichat] ✉️ Direct message of ${packed.length} B to ${contactHash.slice(0,8)} exceeds the link MDU — sending as a resource`);
-                link.sendResource(packed)
+                // Its progress is the message's, and while it moves the
+                // propagation fallback and the send ceiling wait for it.
+                this._sendWithProgress(link, packed, contactHash, messageId, "direct")
                     .then(() => { if (onProof) onProof(messageId); })
                     .catch(error => fail("resource", error));
                 return;
@@ -3155,8 +3566,17 @@ const RnsClient = {
                 // The author (GROUP_SENDER, or the LXMF source) is stored as a
                 // hash and named at render (groupSenderLabel), so the label follows
                 // names learned later.
-                const displayContent = content || "(empty)";
-                GroupMsgStore.add(groupId, { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender });
+                // A group message's attachments are kept like a DM's (iOS
+                // sends a group's attachments to each member,
+                // ChatRepository.swift:1381-1432); a captionless one keeps
+                // content "" and shows its attachment. Only a message with
+                // neither is "(empty)".
+                const found = lxmfMsg.attachments ?? [];
+                const unreadable = found.skipped || lxmfMsg.fieldsUnreadable;
+                const displayContent = content || (found.length || unreadable ? "" : "(empty)");
+                const stored = GroupMsgStore.add(groupId, { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender,
+                    lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null });
+                if (found.length || unreadable) this._keepAttachments(GroupMsgStore, groupId, stored, found, lxmfMsg.fieldsUnreadable);
                 // Update group last activity
                 group.lastActivity = Date.now();
                 GroupStore._save();
@@ -4602,21 +5022,15 @@ const RnsClient = {
         }
     },
 
-    /** Read FIELD_TICKET (0x0C) out of a raw msgpack-decoded fields map.
-     *  Decoded as a Map (msgpack.js sets mapsAsObjects:false), but tolerate a
-     *  plain object, and normalise a binary value to hex the way the sender
-     *  wrote it. */
-    _ticketFromFields(fields) {
-        const FIELD_TICKET = 0x0C;
-        let v = null;
-        if (fields instanceof Map) v = fields.get(FIELD_TICKET);
-        else if (fields && typeof fields === "object") v = fields[FIELD_TICKET];
-        if (v == null) return null;
-        return typeof v === "string" ? v : Buffer.from(v).toString("hex");
-    },
-
-    /** Handle a distro blob from PULL. */
-    /** Returns true when the blob was kept (or already held), false when dropped. */
+    /**
+     * Handle a distro blob (a push on rfed.link, the channel stream's distro
+     * prefix, or /distro/pull). Returns true when this device keeps the
+     * message the blob carries, or already holds it; false when the blob was
+     * dropped: the push answers rfed with it (Link.md "The response is the
+     * delivery proof"), so rfed is never told the web holds a blob it threw
+     * away. A dropped blob is not recorded as seen, so a later copy of it is
+     * judged again.
+     */
     _handleDistroBlob(distroHash, blob) {
         try {
             const data = Buffer.from(blob);
@@ -4633,11 +5047,16 @@ const RnsClient = {
             if (!decrypted || decrypted.length < 80) return false;
             const srcHash = decrypted.slice(0, 16);
             const payloadBytes = decrypted.slice(80);
-            const payload = MsgPack.unpack(payloadBytes);
-            if (!Array.isArray(payload) || payload.length < 3) return false;
-            const [ts, titleBin, contentBin, fieldsMap] = payload;
+            // LXMessage.decodePayload: a fields map that cannot be decoded
+            // costs the fields (and so the attachments), never the message
+            // (Android 702e5fb: such a map from a stranger lost the text for
+            // good, and every later copy was deduped as seen).
+            const payload = LXMessage.decodePayload(payloadBytes);
+            const { timestamp: ts, content: contentBin, fields: fieldsMap } = payload;
             const content = Buffer.from(contentBin || []).toString();
             const srcHashHex = srcHash.toString("hex");
+            const found = payload.attachments;
+            const unreadable = found.skipped || payload.fieldsUnreadable;
 
             // Idempotency: the same blob is delivered more than once (see
             // DistroSeen). Drop repeats before they reach the store, or the
@@ -4648,6 +5067,9 @@ const RnsClient = {
                 console.log(`[distro] ↩︎ duplicate, ignoring (${srcHashHex.slice(0,12)} ts=${ts})`);
                 return true; // already held
             }
+            // Nothing kept: un-record it, so a later copy is not answered
+            // "already held" (see above), and tell the caller.
+            const dropped = () => { DistroSeen.forget(dedupKey); return false; };
 
             // RFed SPEC §17.11 sent-message sync: another device of this
             // distro sent a message as the distro and propagated a copy here.
@@ -4664,7 +5086,7 @@ const RnsClient = {
                 // Rule 1, source.
                 if (srcHashHex !== myLxmfHash) {
                     console.warn(`[distro] ⚠️ Sent-copy marker from ${srcHashHex.slice(0,12)}, not our distro — ignored (§17.11 rule 1)`);
-                    return true; // consumed: not ours to store
+                    return dropped();
                 }
                 // Rule 2, signature. Stored as "me", so the source must really
                 // be the distro's key, not just its address: anyone can
@@ -4678,10 +5100,12 @@ const RnsClient = {
                 const signature = decrypted.slice(16, 80);
                 if (!DistroManager.identity.validate(signature, Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)]))) {
                     console.warn(`[distro] ⚠️ Sent-copy for ${sentCopy.toHex?.slice(0,12) ?? "?"} fails the distro signature — dropped (§17.11 rule 2)`);
-                    return true;
+                    return dropped();
                 }
                 // Rule 3, own echo.
                 if (sentCopy.byHex === (this.ownHash ?? ownLxmfDestinationHash())) {
+                    // Held: the copy is this device's own message, stored
+                    // here when it was sent. It stays recorded as seen.
                     console.log(`[distro] ↩︎ own sent-copy echo for ${sentCopy.toHex?.slice(0,12) ?? "?"} — dropped (§17.11 rule 3)`);
                     return true;
                 }
@@ -4690,7 +5114,7 @@ const RnsClient = {
                 // the distro address).
                 if (!sentCopy.toHex || sentCopy.toHex === myLxmfHash) {
                     console.warn(`[distro] ⚠️ Sent-copy with a malformed 0xFC recipient from device ${sentCopy.byHex.slice(0,12) || "?"} — dropped (§17.11 rule 4)`);
-                    return true;
+                    return dropped();
                 }
                 const recipientHex = sentCopy.toHex;
                 // No contact request and no stranger filter: this device's own
@@ -4700,12 +5124,21 @@ const RnsClient = {
                     ContactStore.add(recipientHex);
                 }
                 // "sent", never "proved"/"delivered": this device holds no
-                // evidence of delivery, only that the distro said it.
-                const stored = MsgStore.add(recipientHex, {
-                    dir: "out", content, status: "sent",
+                // evidence of delivery, only that the distro said it. §17.11
+                // copies are text only (SPEC: "attachments are not copied"),
+                // so a message that carried only attachments arrives empty:
+                // it shows iOS's placeholder (ChatRepository.swift
+                // handleDistroSentCopy), not an empty bubble. Attachments a
+                // copy does carry are kept like any other.
+                const placeholder = !content.trim() && !found.length && !unreadable;
+                const record = MsgStore.add(recipientHex, {
+                    dir: "out", content: placeholder ? DISTRO_ATTACHMENT_PLACEHOLDER : content, status: "sent",
                     srcHash: myLxmfHash, destHash: recipientHex, via: "distro",
                     timestamp: Number.isFinite(Number(ts)) ? Math.round(Number(ts) * 1000) : Date.now(),
                 });
+                const stored = found.length || unreadable
+                    ? this._keepAttachments(MsgStore, recipientHex, record, found, payload.fieldsUnreadable)
+                    : record;
                 ContactStore.touch(recipientHex);
                 console.log(`[distro] 📤 Synced sent message to ${recipientHex.slice(0,12)} from device ${sentCopy.byHex.slice(0,12)}: "${content.slice(0,60)}"`);
                 Harness.event("distro-sent-sync", { to: recipientHex.slice(0, 12), by: sentCopy.byHex.slice(0, 12) });
@@ -4716,20 +5149,23 @@ const RnsClient = {
             // Delivery notifications now arrive here too. Since we send as the
             // distro, the recipient's ticket reply is addressed to the distro
             // and reaches us fanned out rather than direct. It carries a ticket
-            // and no content; storing it would post an empty bubble.
-            const ticket = this._ticketFromFields(fieldsMap);
-            if (ticket && !content) {
-                const pending = this._pendingTickets.get(ticket);
+            // and no content; storing it would post an empty bubble. One that
+            // carries an attachment is a message (LXMF.isDeliveryNotification,
+            // LXMF-rust 06c40e1), and only a ticket of ours is looked up
+            // (LXMF.webTicket: the reference's [expires, ticket] never is).
+            if (LXMF.isDeliveryNotification(fieldsMap, content)) {
+                const ticket = LXMF.webTicket(fieldsMap);
+                const pending = ticket ? this._pendingTickets.get(ticket) : null;
                 if (pending) {
                     this._pendingTickets.delete(ticket);
                     console.log(`[distro] ✅ PROOF (LXMF via distro) ticket=${ticket.slice(0,8)}… from ${srcHashHex.slice(0,12)}`);
                     if (pending.onProof) pending.onProof(pending.messageId);
                     else MsgStore.updateStatus(pending.contactHash, pending.messageId, "proved");
                     this._onMsg.forEach(fn => fn(null, pending.contactHash));
-                } else {
-                    console.log(`[distro] delivery notification for an unknown ticket ${ticket.slice(0,8)}…`);
+                    return true; // its proof was taken
                 }
-                return true; // consumed
+                console.log(`[distro] delivery notification from ${srcHashHex.slice(0,12)} for a ticket that is not one we are waiting on — dropped`);
+                return dropped();
             }
 
             console.log(`[distro] 📥 Message from ${srcHashHex.slice(0,12)}: "${content.slice(0,60)}"`);
@@ -4750,7 +5186,16 @@ const RnsClient = {
                 : signature.unverifiedReason === LXMessage.SOURCE_UNKNOWN ? "unknown" : "invalid";
             if (!signature.validated) console.log(`[distro] Message from ${srcHashHex.slice(0,12)}: signature ${signatureState}`);
             ContactStore.acceptMessageName(srcHashHex, decodeDisplayName(payloadBytes), signatureState, ts);
-            const stored = MsgStore.add(srcHashHex, { dir: "in", content, status: "delivered", srcHash: srcHashHex, via: "distro" });
+            // Its attachments, as on the direct path. With neither text nor
+            // an attachment to show, iOS's placeholder stands in
+            // (RfedDistroClient.swift DistroMessageStore.stored), not an
+            // empty bubble.
+            const placeholder = !content.trim() && !found.length && !unreadable;
+            const record = MsgStore.add(srcHashHex, { dir: "in", content: placeholder ? DISTRO_ATTACHMENT_PLACEHOLDER : content,
+                status: "delivered", srcHash: srcHashHex, via: "distro", lxmfHash: signature.hash.toString("hex") });
+            const stored = found.length || unreadable
+                ? this._keepAttachments(MsgStore, srcHashHex, record, found, payload.fieldsUnreadable)
+                : record;
             ContactStore.touch(srcHashHex);
             // Pass the stored message, not null: listeners read a null `msg` as
             // a proof-only event and only repaint status ticks, so a distro
@@ -5395,6 +5840,9 @@ const App = {
     },
     _pathRequestedThisSession: new Set(),
     _savedFocus: null,  // { activeHash, cursorPos, value } for focus restoration
+    // chat id -> attachments picked for the next message there: [{name, bytes, mime}]
+    _pendingAttachments: new Map(),
+    _fileInput: null,
 
     // ===== LIFECYCLE =====
 
@@ -5528,6 +5976,9 @@ const App = {
         // Re-apply status dot after DOM rebuild (RNS status hasn't changed so listener won't fire)
         this._applyStatusDot();
 
+        // The bubbles just replaced let go of their attachments' object URLs.
+        AttachmentUrls.sweep();
+
         // Restore composer focus if it was active before render
         requestAnimationFrame(() => this._restoreComposerFocus());
     },
@@ -5650,6 +6101,8 @@ const App = {
         }
         const send = view.querySelector(".btn-send");
         if (send) send.disabled = !c.publicKey;
+        const attach = view.querySelector(".btn-attach");
+        if (attach) attach.disabled = !c.publicKey;
     },
 
     /** Re-resolve the sender labels and system notices of the open group or
@@ -5702,6 +6155,7 @@ const App = {
         if (next && scrollTop !== null) {
             next.scrollTop = wasAtBottom ? next.scrollHeight : scrollTop;
         }
+        AttachmentUrls.sweep();
         requestAnimationFrame(() => this._restoreComposerFocus());
     },
 
@@ -6036,8 +6490,17 @@ const App = {
                     : msgs.map(m => this._buildMsgBubble(m))),
             ),
 
+            // Attachments waiting to go, and the composer's notices
+            this._buildComposerExtras(c.destHash),
+
             // Composer
             h("div", { className: "composer" },
+                h("button", {
+                    className: "btn-attach",
+                    title: "Attach files (sent at their original size)",
+                    disabled: !c.publicKey,
+                    onClick: () => this._pickAttachments(),
+                }, "📎"),
                 h("textarea", {
                     id: "composer-input",
                     placeholder: c.publicKey ? "Message…" : "Waiting for public key…",
@@ -6115,7 +6578,15 @@ const App = {
 
             // Composer (hidden for pending groups)
             ...(isPending ? [] : [
+                this._buildComposerExtras(g.groupId),
                 h("div", { className: "composer" },
+                    // Shown, and it says why a group takes no attachment
+                    // (GROUP_ATTACHMENT_REFUSAL).
+                    h("button", {
+                        className: "btn-attach",
+                        title: "Groups carry text only",
+                        onClick: () => this._pickAttachments(),
+                    }, "📎"),
                     h("textarea", {
                         id: "composer-input",
                         placeholder: "Message…",
@@ -6167,16 +6638,237 @@ const App = {
     _buildMsgBubble(m, sender = null) {
         const isOwn = m.dir === "out";
         const statusIcon = isOwn ? this._statusIcon(m.status) : "";
+        // A send in progress shows its transfer (0.10 + 0.90 x the Resource's
+        // fraction), as iOS's bar does (4744376).
+        const progress = isOwn && m.status === "sending" ? RnsClient._sendTransfers.progressOf(m.id) : null;
         return h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": m.id },
             h("div", { className: "msg-bubble" },
                 (!isOwn && sender) ? this._buildSenderLabel(sender) : null,
+                this._buildAttachments(m),
                 m.content,
+                progress !== null ? this._buildProgressBar(progress) : null,
+                isOwn && m.status === "failed" && m.sendError ? h("div", { className: "msg-attach-note" }, `Not sent: ${m.sendError}`) : null,
                 h("div", { className: "msg-meta" },
                     h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
                     statusIcon ? h("span", { className: `msg-status ${m.status}`, "data-msg-status": m.status }, statusIcon) : null,
                 ),
             ),
         );
+    },
+
+    // ===== ATTACHMENTS =====
+
+    /**
+     * What a message carries besides its text: an inline image for a
+     * FIELD_IMAGE and for a file with one of iOS's image extensions
+     * (isImageAttachment), a download link with its name and size for
+     * anything else (FIELD_AUDIO included). The bytes come from the
+     * attachment store through an object URL, revoked once the bubble has
+     * left the page (AttachmentUrls.sweep). Under them, what the user must
+     * know: an attachment kept for this session only, one that could not be
+     * saved, one that is gone, or attachments that could not be read.
+     * null for a message with none of these.
+     */
+    _buildAttachments(m) {
+        const list = m.attachments ?? [];
+        const notes = [];
+        if (list.some(a => a.stored === "session")) {
+            notes.push("Kept for this session only: this browser is not keeping attachments.");
+        }
+        const failed = list.find(a => a.stored === "failed");
+        if (failed) notes.push(`Not saved (${failed.storeError || "storage refused it"}): kept until this tab closes.`);
+        if (m.attachmentsSkipped) {
+            notes.push(`${m.attachmentsSkipped === 1 ? "An attachment" : `${m.attachmentsSkipped} attachments`} in this message could not be read.`);
+        }
+        if (m.fieldsUnreadable) notes.push("Part of this message could not be read.");
+        if (!list.length && !notes.length) return null;
+        return h("div", { className: "msg-attachments" },
+            ...list.map(a => {
+                const el = isImageAttachment(a)
+                    ? h("img", { className: "msg-image", alt: a.name, title: `${a.name} · ${formatSize(a.size)}`, "data-attachment-key": a.key })
+                    : this._attachmentLink(a);
+                this._loadAttachment(el, a);
+                return el;
+            }),
+            ...notes.map(text => h("div", { className: "msg-attach-note" }, text)),
+        );
+    },
+
+    _attachmentLink(a) {
+        return h("a", { className: "msg-file", download: a.name, title: a.name, "data-attachment-key": a.key },
+            "📄 ", h("span", { className: "msg-file-name" }, a.name), ` · ${formatSize(a.size)}`);
+    },
+
+    /** Fill an attachment's element from the store once its bubble is on
+     *  the page. An image the browser cannot decode (HEIC outside Safari)
+     *  is offered as a file instead. Bytes that are gone say so. */
+    _loadAttachment(el, a) {
+        Attachments.get(a.key).then((bytes) => {
+            if (!el.isConnected) return;
+            if (!bytes) {
+                el.replaceWith(h("div", { className: "msg-file gone", title: a.name },
+                    `📄 ${a.name} · ${formatSize(a.size)} — no longer available (it was kept for that session only)`));
+                return;
+            }
+            const url = AttachmentUrls.attach(el, bytes, a.mime);
+            if (el.tagName === "IMG") {
+                el.addEventListener("error", () => {
+                    AttachmentUrls.release(url);
+                    const link = this._attachmentLink(a);
+                    el.replaceWith(link);
+                    this._loadAttachment(link, a);
+                }, { once: true });
+                el.addEventListener("load", () => {
+                    // Keep the newest message in view when an image above it
+                    // grows the list.
+                    const list = document.getElementById("msg-list");
+                    if (list && list.scrollHeight - list.scrollTop - list.clientHeight < el.clientHeight + 80) {
+                        list.scrollTop = list.scrollHeight;
+                    }
+                }, { once: true });
+                el.src = url;
+            } else {
+                el.href = url;
+            }
+        }, (e) => console.warn(`[attachments] ${a.key} could not be shown:`, e?.message || e));
+    },
+
+    _buildProgressBar(progress) {
+        return h("div", { className: "msg-progress", title: `${Math.round(progress * 100)}%` },
+            h("span", { style: { width: `${Math.round(progress * 100)}%` } }));
+    },
+
+    /** A transfer of an outgoing message moved (RnsClient.onSendProgress):
+     *  its bar follows, in place, while it is "sending". */
+    _updateMsgProgressDOM(msgId, progress) {
+        const row = document.querySelector(`.msg-row[data-msg-id="${msgId}"]`);
+        if (!row) return;
+        const status = row.querySelector(".msg-status")?.getAttribute("data-msg-status");
+        if (status && status !== "sending") return;
+        const bar = row.querySelector(".msg-progress");
+        if (bar) {
+            bar.title = `${Math.round(progress * 100)}%`;
+            bar.firstChild.style.width = `${Math.round(progress * 100)}%`;
+            return;
+        }
+        row.querySelector(".msg-meta")?.before(this._buildProgressBar(progress));
+    },
+
+    /** Rebuild one bubble of the open chat from the store (an attachment's
+     *  storage changed), leaving the rest of the list alone. */
+    _repaintMsgRow(convHash, msgId) {
+        if (this.state.activeHash !== convHash) return;
+        const row = document.querySelector(`.msg-row[data-msg-id="${msgId}"]`);
+        if (!row) return;
+        let m, sender = null;
+        if (GroupStore.isGroupChat(convHash)) {
+            m = GroupMsgStore.get(convHash).find(x => x.id === msgId);
+            if (m) sender = groupSenderLabel(m);
+        } else {
+            m = MsgStore.get(convHash).find(x => x.id === msgId);
+        }
+        if (!m || m.dir === "system") return;
+        row.replaceWith(this._buildMsgBubble(m, sender));
+        AttachmentUrls.sweep();
+    },
+
+    /** The pending attachments and the notice line above a composer. */
+    _buildComposerExtras(chatId) {
+        const extras = h("div", { className: "composer-extras", id: "composer-extras" },
+            h("div", { className: "composer-tray", id: "composer-tray" }),
+            h("div", { className: "composer-notice", id: "composer-notice", role: "status" }),
+        );
+        this._fillComposerTray(extras.firstChild, chatId);
+        return extras;
+    },
+
+    _fillComposerTray(tray, chatId) {
+        clear(tray);
+        for (const [i, a] of (this._pendingAttachments.get(chatId) ?? []).entries()) {
+            tray.appendChild(h("span", { className: "attach-chip", title: a.name },
+                h("span", { className: "attach-chip-name" }, `📎 ${a.name}`),
+                ` · ${formatSize(a.bytes.length)}`,
+                h("button", {
+                    className: "attach-chip-remove", title: `Remove ${a.name}`,
+                    onClick: () => {
+                        const list = this._pendingAttachments.get(chatId) ?? [];
+                        list.splice(i, 1);
+                        if (!list.length) this._pendingAttachments.delete(chatId);
+                        this._composerNotice("");
+                        this._renderComposerTray(chatId);
+                    },
+                }, "×"),
+            ));
+        }
+    },
+
+    _renderComposerTray(chatId) {
+        if (this.state.activeHash !== chatId) return;
+        const tray = document.getElementById("composer-tray");
+        if (tray) this._fillComposerTray(tray, chatId);
+    },
+
+    /** One line above the composer for why something cannot go; "" clears it. */
+    _composerNotice(text) {
+        const el = document.getElementById("composer-notice");
+        if (el) el.textContent = text || "";
+    },
+
+    /** The paperclip: pick files for the open DM. A group takes none
+     *  (GROUP_ATTACHMENT_REFUSAL). Several files at once, as iOS allows
+     *  (up to MAX_ATTACHMENTS). */
+    _pickAttachments() {
+        const chatId = this.state.activeHash;
+        if (!chatId) return;
+        if (GroupStore.isGroupChat(chatId) || ChannelStore.get(chatId)) {
+            this._composerNotice(GROUP_ATTACHMENT_REFUSAL);
+            return;
+        }
+        if (!this._fileInput) {
+            this._fileInput = h("input", { type: "file", multiple: "multiple", style: { display: "none" } });
+            document.body.appendChild(this._fileInput);
+        }
+        const input = this._fileInput;
+        input.value = "";
+        input.onchange = () => {
+            const files = [...(input.files ?? [])];
+            input.value = "";
+            this._addAttachments(chatId, files);
+        };
+        input.click();
+    },
+
+    /** Read picked files (async: the page never waits on them) into the
+     *  chat's pending list, refusing what cannot go, with why. */
+    async _addAttachments(chatId, files) {
+        const pending = this._pendingAttachments.get(chatId) ?? [];
+        const limit = LXMRouter.DELIVERY_LIMIT * 1000;
+        const notices = [];
+        for (const file of files) {
+            if (pending.length >= MAX_ATTACHMENTS) {
+                notices.push(`At most ${MAX_ATTACHMENTS} attachments go in one message.`);
+                break;
+            }
+            if (file.size > limit) {
+                notices.push(`${file.name} is ${formatSize(file.size)}: a message can be at most ${formatSize(limit)}, `
+                    + `the most any recipient accepts, and files are sent at their original size.`);
+                continue;
+            }
+            try {
+                const bytes = new Uint8Array(await file.arrayBuffer());
+                pending.push({ name: file.name || "attachment.bin", bytes, mime: file.type || mimeForName(file.name) });
+            } catch (e) {
+                notices.push(`${file.name} could not be read: ${e?.message || e}`);
+            }
+        }
+        if (pending.length) this._pendingAttachments.set(chatId, pending);
+        // The whole message, as it would go now.
+        const contact = ContactStore.get(chatId);
+        const draft = this.state.activeHash === chatId ? (document.getElementById("composer-input")?.value ?? "") : "";
+        const refusal = contact && pending.length ? RnsClient.attachmentRefusal(contact, draft.trim(), pending) : null;
+        if (refusal) notices.push(refusal);
+        this._renderComposerTray(chatId);
+        if (this.state.activeHash === chatId) this._composerNotice(notices.join(" "));
     },
 
     /** Channel conversation view */
@@ -6303,7 +6995,9 @@ const App = {
         const ta = document.getElementById("composer-input");
         if (!ta) return;
         const content = ta.value.trim();
-        if (!content) return;
+        const chatId = this.state.activeHash;
+        const attachments = this._pendingAttachments.get(chatId) ?? [];
+        if (!content && !attachments.length) return;
 
         const clearAndFocus = () => {
             ta.value = "";
@@ -6320,6 +7014,11 @@ const App = {
         };
 
         try {
+            // Groups and channels carry text only.
+            if (attachments.length && (GroupStore.isGroupChat(chatId) || ChannelStore.get(chatId))) {
+                this._composerNotice(GROUP_ATTACHMENT_REFUSAL);
+                return;
+            }
             // Check if this is a group chat
             if (GroupStore.isGroupChat(this.state.activeHash)) {
                 RnsClient.sendGroupMessage(this.state.activeHash, content).catch(e => {
@@ -6341,10 +7040,18 @@ const App = {
                 });
                 return;
             }
-            // DM
+            // DM. One over its limits is refused here, with why, and the
+            // draft and attachments stay (attachmentRefusal).
             const c = ContactStore.get(this.state.activeHash);
             if (!c) return;
-            RnsClient.sendMessage(c, content);
+            const refusal = RnsClient.attachmentRefusal(c, content, attachments);
+            if (refusal) { this._composerNotice(refusal); return; }
+            RnsClient.sendMessage(c, content, attachments);
+            if (attachments.length) {
+                this._pendingAttachments.delete(chatId);
+                this._renderComposerTray(chatId);
+            }
+            this._composerNotice("");
             clearAndFocus();
         } catch(e) { alert("Send failed: " + e.message); }
     },
@@ -6838,7 +7545,12 @@ const App = {
 
     _resetAll() {
         if (confirm("Delete your identity and ALL messages? This cannot be undone.")) {
-            IdMgr.forget(); localStorage.clear(); location.reload();
+            // The attachment bytes (IndexedDB) go with the messages.
+            const done = () => { IdMgr.forget(); localStorage.clear(); location.reload(); };
+            Attachments.clear().then(done, (e) => {
+                console.error("[attachments] could not delete the stored attachments:", e?.message || e);
+                done();
+            });
         }
     },
 
@@ -7717,9 +8429,15 @@ const App = {
 
     /** Update a message status icon in-place without re-rendering.
      *  Finds the msg-row by data-msg-id and updates its status span. */
-    _updateMsgStatusDOM(contactHash, msgId, newStatus) {
+    _updateMsgStatusDOM(contactHash, msgId, newStatus, record = null) {
         const row = document.querySelector(`.msg-row[data-msg-id="${msgId}"]`);
         if (!row) return;
+        // A send's bar goes once it is no longer sending, and a failed one
+        // says why when it knows.
+        if (newStatus !== "sending") row.querySelector(".msg-progress")?.remove();
+        if (newStatus === "failed" && record?.sendError && !row.querySelector(".msg-send-error")) {
+            row.querySelector(".msg-meta")?.before(h("div", { className: "msg-attach-note msg-send-error" }, `Not sent: ${record.sendError}`));
+        }
         // Remove old status span if present
         const oldStatus = row.querySelector(".msg-status");
         if (oldStatus) oldStatus.remove();
@@ -7777,7 +8495,7 @@ const App = {
                     const msgs = MsgStore.get(peerHash);
                     for (const m of msgs) {
                         if (m.dir !== "out") continue;
-                        this._updateMsgStatusDOM(peerHash, m.id, m.status);
+                        this._updateMsgStatusDOM(peerHash, m.id, m.status, m);
                     }
                 }
                 return;
@@ -7795,6 +8513,18 @@ const App = {
             if (inActiveChat && appended) {
                 requestAnimationFrame(() => this._scrollChatBottom());
             }
+        });
+
+        // A send's transfer moved: its bar follows, in the open chat only.
+        RnsClient.onSendProgress((convHash, msgId, progress) => {
+            if (this.state.view !== "main" || this.state.activeHash !== convHash) return;
+            this._updateMsgProgressDOM(msgId, progress);
+        });
+
+        // An attachment could not be saved to IndexedDB: its bubble says so.
+        RnsClient.onAttachmentState((convHash, msgId) => {
+            if (this.state.view !== "main") return;
+            this._repaintMsgRow(convHash, msgId);
         });
 
         // Contact list changes — announces and path responses land here. The
@@ -7913,6 +8643,12 @@ window.RetichatTest = {
     registerDistro() { return RnsClient._registerDistro(); },
     pullDistro() { return RnsClient._pullDistroMessages(); },
 
+    // ---- Attachments (test-harnesses/staging/lib/attach.mjs HOOK_CONTRACT) ----
+    // client.attachmentsFor(msgId) reads each attachment of a stored message
+    // back from the attachment store: [{name, size, sha256, mime, field}].
+    /** One /get fetch from the propagation node, as a user's pull. */
+    fetchPropagated() { return RnsClient._fetchPropagatedMessages(); },
+
     // ---- One active tab (D11) ----
     /** "active" when this tab holds the identity's lock, else "inactive". */
     tab() { return ActiveTab.held ? "active" : "inactive"; },
@@ -7932,7 +8668,9 @@ RetichatTest commands:
 Harness (headless):
   .ready          — promise resolving when the interface is online
   .identity()     — own identity + destination hashes
-  .inbox          — received messages [{srcHash, content, via}]
+  .inbox          — received messages [{srcHash, content, via, id, lxmfHash}]
+  .client.attachmentsFor(msgId) — a message's attachments, read back from storage
+  .fetchPropagated() — one /get fetch from the propagation node
   .got(marker)    — true if a message containing marker arrived
   .addPeer(h,pk)  — add a peer (allowlisted), optionally with its public key
   .privacyFilter([on]) — read, or turn on/off, the privacy filter

@@ -28,6 +28,7 @@
  *
  * Run: node --test send_queue.test.mjs
  */
+import { SendTransfers } from "./lib/send_progress.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -135,6 +136,9 @@ function makeClient({ storage = makeStorage(), contacts = [], groups = [], metho
         _onMsg: [],
         _pendingTimeouts: new Map(),
         _pendingPacketHashes: new Map(),
+        // The transfers a send waits on (lib/send_progress.js), on no clock.
+        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }),
+        _onSendProgress: [],
         // Display names (DISPLAY_NAMES.md §4.1) are pinned in display_names_wiring.test.mjs.
         _decideMessageName: () => ABSENT,
         _recordNameDelivered() {},
@@ -149,7 +153,7 @@ const contactFor = (identity) => ({ destHash: lxmfHash(identity), publicKey: ide
 
 // ── A/B: queued until initialization finishes ──────────────────────────────
 
-const QUEUE_METHODS = ["sendMessage(contact, content)", "_dispatchQueued()", "_onExchangeRegistered()", "_exchangeIsDown()"];
+const QUEUE_METHODS = ["sendMessage(contact, content, attachments = [])", "_dispatchQueued()", "_onExchangeRegistered()", "_exchangeIsDown()"];
 
 function makeQueueClient(options) {
     const c = makeClient({ methods: QUEUE_METHODS, ...options });
@@ -288,6 +292,7 @@ test("a registration from an interface disconnect() stopped does not initialize 
 const PROPAGATION_METHODS = [
     "async _propagateMessage(contact, outMsg)", "async _flushPropagation()", "_signerFor(srcHash)",
     "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
+    "_sendWithProgress(link, data, convHash, msgId, label)",
 ];
 
 /** The real propagation-link lifecycle, with only the wire handshake skipped. */

@@ -28,6 +28,7 @@
  *
  * Run: node --test exchange_truth.test.mjs
  */
+import { SendTransfers } from "./lib/send_progress.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -527,7 +528,7 @@ const methodName = (signature) => signature.replace(/^async /, "").split("(")[0]
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
 
 const DM_METHODS = [
-    "sendMessage(contact, content)", "_dispatchMessage(contact, outMsg)",
+    "sendMessage(contact, content, attachments = [])", "_dispatchMessage(contact, outMsg)",
     "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
     "async _propagateMessage(contact, outMsg)", "_signerFor(srcHash)",
     "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
@@ -558,6 +559,7 @@ function makeDmClient(iface) {
         _rns: rns, _initialized: true, _onMsg: [],
         _decideMessageName: () => ABSENT, _recordNameDelivered() {},
         _pendingTimeouts: new Map(), _pendingPacketHashes: new Map(), _pendingTickets: new Map(),
+        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }),
         _cfg: { propagationNodeHash: "b".repeat(32) },
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
         _ensurePropagationLink: async () => { propagationLinks.push(1); throw new Error("no propagation link in this test"); },

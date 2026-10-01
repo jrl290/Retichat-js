@@ -720,6 +720,127 @@ html, body {
 .btn-send:hover  { background: var(--primary-hover); }
 .btn-send:disabled { background: var(--border); color: var(--text-muted); cursor: default; }
 
+/* Attachments: the paperclip, the files waiting to go, and why one cannot */
+.btn-attach {
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--surface-alt);
+    color: var(--text-secondary);
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+.btn-attach:hover { color: var(--text); border-color: var(--border-strong); }
+.btn-attach:disabled { opacity: 0.5; cursor: default; }
+
+.composer-extras {
+    background: var(--surface);
+    flex-shrink: 0;
+}
+.composer-tray {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 12px;
+}
+.composer-tray:not(:empty) { padding-top: 8px; }
+.attach-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    padding: 4px 4px 4px 10px;
+    border-radius: 14px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.attach-chip-name {
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+}
+.attach-chip-remove {
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+}
+.attach-chip-remove:hover { color: var(--danger); }
+.composer-notice {
+    padding: 0 16px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--warning);
+}
+.composer-notice:not(:empty) { padding-top: 6px; }
+
+/* Attachments in a bubble */
+.msg-attachments {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 2px 0 4px;
+    max-width: 100%;
+}
+.msg-row.own .msg-attachments { align-items: flex-end; }
+.msg-image {
+    display: block;
+    max-width: 100%;
+    max-height: 320px;
+    border-radius: 12px;
+    object-fit: contain;
+    background: var(--glass-bg);
+}
+.msg-file {
+    display: inline-block;
+    max-width: 100%;
+    padding: 6px 10px;
+    border-radius: 10px;
+    background: var(--glass-bg);
+    border: 0.5px solid var(--glass-border);
+    color: inherit;
+    text-decoration: none;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+a.msg-file:hover { border-color: var(--primary); }
+.msg-file.gone { opacity: 0.7; white-space: normal; }
+.msg-file-name { font-weight: 600; }
+.msg-attach-note {
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--warning);
+    margin-top: 2px;
+}
+.msg-progress {
+    width: 120px;
+    max-width: 100%;
+    height: 3px;
+    margin-top: 4px;
+    border-radius: 2px;
+    background: var(--border-strong);
+    overflow: hidden;
+}
+.msg-progress > span {
+    display: block;
+    height: 100%;
+    background: var(--primary);
+    transition: width 0.3s ease;
+}
+
 /* =========================================================================
    Modal / Overlay
    ========================================================================= */

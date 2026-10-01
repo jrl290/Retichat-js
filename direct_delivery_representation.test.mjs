@@ -57,7 +57,9 @@ test("the link path sends a link packet or a Resource and reports failure", () =
     assert.notEqual(start, -1);
     const body = app.slice(start, app.indexOf("\n    },", start));
     assert.match(body, /_ensureGroupLink\(contactHash, publicKeyHex\)/, "reuses the per-peer delivery link");
-    assert.match(body, /link\.sendResource\(packed\)/, "Resource carries the whole packing");
+    // Through _sendWithProgress, which hands link.sendResource the packing
+    // and reports its progress (attachments.test.mjs).
+    assert.match(body, /this\._sendWithProgress\(link, packed, contactHash, messageId, "direct"\)/, "Resource carries the whole packing");
     assert.match(body, /link\.send\(packed\)/, "link packet carries the whole packing");
     assert.match(body, /_pendingPacketHashes\.set\(truncatedHex/, "link packet proof is matched");
     assert.match(body, /onError\(messageId\)/, "a failed link or transfer marks the message failed");

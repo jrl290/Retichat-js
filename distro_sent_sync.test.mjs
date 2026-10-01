@@ -103,11 +103,11 @@ test("a DM's dispatch sends the copy once, only when sending as the distro to so
     // message that never left.
     assert.ok(copyAt > body.indexOf("this._sendPacket("), "sent only after the direct dispatch returned");
     // One dispatch per user message, from either entry point.
-    for (const sig of ["sendMessage(contact, content)", "_dispatchQueued()"]) {
+    for (const sig of ["sendMessage(contact, content, attachments = [])", "_dispatchQueued()"]) {
         assert.equal((extractMethod(app, sig).match(/this\._dispatchMessage\(/g) || []).length, 1, `${sig} dispatches once`);
     }
     // No other path that can re-send the same message may copy it again.
-    for (const sig of ["sendMessage(contact, content)", "_dispatchQueued()", "async _propagateMessage(contact, outMsg)",
+    for (const sig of ["sendMessage(contact, content, attachments = [])", "_dispatchQueued()", "async _propagateMessage(contact, outMsg)",
         "async _flushPropagation()", "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
         "_sendOverPeerLink(contactHash, publicKeyHex, packed, representation, messageId, onProof, onError)", "_sendDistroViaLxmf()"]) {
         assert.doesNotMatch(extractMethod(app, sig), /_sendDistroSentCopy|DISTRO_SENT_TYPE/, `${sig} must not copy`);
@@ -284,7 +284,7 @@ function makeReceiver(distro, deviceHash) {
     const seen = new Set();
     const MsgStore = { add: (hash, m) => { const s = { id: String(stored.length), timestamp: -1, ...m }; stored.push({ hash, msg: s }); return s; } };
     const ContactStore = { isContact: (h) => contacts.has(h), add: (h) => contacts.add(h), touch() {}, acceptMessageName() { return false; } };
-    const DistroSeen = { check: (k) => { if (seen.has(k)) return true; seen.add(k); return false; } };
+    const DistroSeen = { check: (k) => { if (seen.has(k)) return true; seen.add(k); return false; }, forget: (k) => seen.delete(k) };
     const harness = [];
     const Harness = { event: (name, data) => harness.push({ name, data }), error() {} };
     const DistroManager = { identity: distro, lxmfDeliveryHash: lxmfHash(distro) };
@@ -389,22 +389,25 @@ test("a forged copy is dropped at the signature rule even when it claims to be t
     const realLog = console.log;
     console.warn = (...a) => warnings.push(a.join(" "));
     console.log = () => {};
-    try { assert.equal(rx.run(forged), true); } finally { console.warn = realWarn; console.log = realLog; }
+    // false since 2026-09-30: nothing was kept, so rfed is not told the web
+    // holds it (a push answers with this), and a later copy is judged again.
+    try { assert.equal(rx.run(forged), false); } finally { console.warn = realWarn; console.log = realLog; }
     assert.equal(rx.stored.length, 0);
+    assert.deepEqual([...rx.seen], [], "not recorded as seen");
     assert.ok(warnings.some((w) => w.includes("fails the distro signature")), `rule 2 speaks before rule 3: ${warnings}`);
 });
 
 test("a copy whose 0xFC is the distro itself is dropped (rule 4)", () => {
     const distro = Identity.create();
     const rx = makeReceiver(distro, ME);
-    assert.equal(rx.run(blobFor(distro, { fields: marker(lxmfHash(distro), OTHER_DEVICE) })), true);
+    assert.equal(rx.run(blobFor(distro, { fields: marker(lxmfHash(distro), OTHER_DEVICE) })), false, "nothing kept");
     assert.equal(rx.stored.length, 0, "never opens a chat with the distro address");
 });
 
 test("a copy with a malformed 0xFC is dropped", () => {
     const distro = Identity.create();
     const rx = makeReceiver(distro, ME);
-    assert.equal(rx.run(blobFor(distro, { fields: marker("not-a-hash", OTHER_DEVICE) })), true);
+    assert.equal(rx.run(blobFor(distro, { fields: marker("not-a-hash", OTHER_DEVICE) })), false, "nothing kept");
     assert.equal(rx.stored.length, 0);
 });
 
@@ -412,7 +415,7 @@ test("the marker from a source other than our distro is ignored", () => {
     const distro = Identity.create();
     const stranger = Identity.create();
     const rx = makeReceiver(distro, ME);
-    assert.equal(rx.run(blobFor(distro, { signer: stranger, fields: marker(R, OTHER_DEVICE) })), true);
+    assert.equal(rx.run(blobFor(distro, { signer: stranger, fields: marker(R, OTHER_DEVICE) })), false, "nothing kept");
     assert.equal(rx.stored.length, 0);
 });
 
@@ -425,7 +428,7 @@ test("a copy claiming source D without D's signature is dropped", () => {
     msg.fields = marker(R, OTHER_DEVICE);
     const packed = msg.pack(forger, false);
     const rx = makeReceiver(distro, ME);
-    assert.equal(rx.run(Buffer.concat([D, distro.encrypt(packed.subarray(16))])), true);
+    assert.equal(rx.run(Buffer.concat([D, distro.encrypt(packed.subarray(16))])), false, "nothing kept");
     assert.equal(rx.stored.length, 0);
 });
 

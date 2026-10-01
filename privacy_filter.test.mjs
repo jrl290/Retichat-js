@@ -603,7 +603,7 @@ test("the user allowlists a peer by adding it, writing to it, or creating a grou
     const P = lxmfHash(peer);
     ContactStore.add(P, false, peer.getPublicKey().toString("hex"));   // a stranger kept while the filter was off
     assert.equal(ContactStore.allowlisted(P), false);
-    const send = compile("sendMessage(contact, content)", { ContactStore, MsgStore, console: quiet })({
+    const send = compile("sendMessage(contact, content, attachments = [])", { ContactStore, MsgStore, console: quiet })({
         _initialized: false, sendingIdentity: () => ({ hash: lxmfHash(me) }),
     });
     send(ContactStore.get(P), "hello back");

@@ -41,6 +41,7 @@ import {
 import * as DN from "./lib/display_name.js";
 import * as RF from "./lib/retichat_field.js";
 const { applyGroupFields } = RF;
+import { SendTransfers } from "./lib/send_progress.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -519,6 +520,7 @@ function makeSender({ me, messageName = "Alice", storage = memory() }) {
     };
     const self = {
         _onMsg: [], _pendingTickets: new Map(), _pendingPacketHashes: new Map(), _pendingTimeouts: new Map(),
+        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }), _onSendProgress: [],
         _cfg: { propagationNodeHash: "b".repeat(32) },
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
         _rns: {
@@ -538,6 +540,7 @@ function makeSender({ me, messageName = "Alice", storage = memory() }) {
         "async _propagateMessage(contact, outMsg)", "_signerFor(srcHash)",
         "_decideMessageName(sourceHex, recipientHex)", "_recordNameDelivered(contactHash, msgId)",
         "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId)",
+        "_sendWithProgress(link, data, convHash, msgId, label)",
     ]) self[methodName(signature)] = compile(signature, env)(self);
     const send = (contact, content) => {
         const record = MsgStore.add(contact.destHash, { dir: "out", content, status: "sending", srcHash: lxmfHash(me), destHash: contact.destHash });

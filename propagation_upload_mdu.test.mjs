@@ -49,7 +49,10 @@ test("each propagation upload sends over the MDU as a Resource, before any packe
         assert.ok(candidates.length > 0, `site at ${site}: no packet path found after it`);
         const window = source.slice(site, Math.min(...candidates));
         assert.match(window, /propagationPacked\.length > Link\.MDU/, `site at ${site}: no MDU branch before the packet`);
-        assert.match(window, /link\.sendResource\(propagationPacked\)/, `site at ${site}: the over-MDU branch must use link.sendResource`);
+        // The DM copy goes through _sendWithProgress, which hands
+        // link.sendResource the upload and reports its progress.
+        assert.match(window, /link\.sendResource\(propagationPacked\)|this\._sendWithProgress\(link, propagationPacked,/,
+            `site at ${site}: the over-MDU branch must use link.sendResource`);
         // The branch must leave the packet path: return in the DM copy, the
         // group fallback and the §17.11 sent-copy.
         assert.match(window, /\n\s+return( null)?;\n/, `site at ${site}: the Resource branch must not fall through to the packet`);

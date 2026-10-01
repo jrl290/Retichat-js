@@ -21,6 +21,7 @@
  *
  * Run: node --test lxmf_dedupe.test.mjs
  */
+import { SendTransfers } from "./lib/send_progress.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -197,6 +198,8 @@ function makeSender({ storage, me }) {
         _onMsg: [],
         _pendingTickets: new Map(),
         _pendingPacketHashes: new Map(),
+        _sendTransfers: new SendTransfers({ setTimer: () => null, clearTimer() {} }),
+        _onSendProgress: [],
         _cfg: { propagationNodeHash: "b".repeat(32) },
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
     };
@@ -216,6 +219,7 @@ function makeSender({ storage, me }) {
     for (const signature of [
         "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
         "async _propagateMessage(contact, outMsg)", "_signerFor(srcHash)",
+        "_sendWithProgress(link, data, convHash, msgId, label)",
     ]) self[methodName(signature)] = compile(signature, env)(self);
     return { self, MsgStore, direct, copies };
 }
