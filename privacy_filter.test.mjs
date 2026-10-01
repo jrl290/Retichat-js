@@ -404,7 +404,7 @@ test("propagated: a stranger's message is dropped after decryption and before an
     await settle();
     assert.deepEqual(r.emitted.map((m) => m.content), ["stored by a friend"]);
     assert.equal(parses.length, 1, "only the contact's message was parsed");
-    assert.equal(unpacks, 1, "the stranger's payload was never unpacked");
+    assert.equal(unpacks, 0, "no msgpack pre-parse of its own: fromBytes, counted above, is the only parse, and never of the stranger's");
     assert.deepEqual(purged.sort(), [1, 2], "both are reported as had, so the node purges both (LXMRouter.py message_get_response)");
     assert.equal(r.ContactStore.get(S), null);
     assert.deepEqual(r.drops(), [{ src: S.slice(0, 12), path: "propagated", at: "source" }]);
