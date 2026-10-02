@@ -118,11 +118,14 @@ test("a group message is stored at the time its sender sent it", () => {
     const groups = new Map([[G, { groupId: G, groupName: "G", members: new Map(), lastActivity: 0 }]]);
     const self = { _onMsg: [] };
     const handleGroup = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
-        GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, isCurrentMember: () => false, _save() {} },
+        GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
+            isClosed: () => false, heldChanges: () => [], _save() {} },
         GroupMsgStore: p.GroupMsgStore, ContactStore: p.ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => lxmfHash(me),
-        // The filter off: every source passes, and speaks for the member it names.
-        PrivacyFilter: { allows: () => true, groupAccepts: () => true, groupMember: (group, src) => group.groupSender || src },
+        // The group rule is not what this tests: it lets the plain post
+        // through, and the post is its source's own (privacy_filter.test.mjs
+        // pins the rule and GROUP_SENDER).
+        PrivacyFilter: { groupAccepts: () => true, groupMember: (group, src) => src },
     })(self);
     const sent = twoDaysAgo();
     const packed = lxm(bob, lxmfHash(me), "to the group", new Map([[GROUP_FIELDS.GROUP_ID, G]]), sent);

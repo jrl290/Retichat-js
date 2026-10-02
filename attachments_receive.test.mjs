@@ -85,7 +85,8 @@ function page(me) {
     const backend = memoryBackend({ persistent: true });
     const Attachments = new AttachmentStore(backend, { warn() {} });
     const groups = new Map();
-    const GroupStore = { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, isCurrentMember: () => false, _save() {} };
+    const GroupStore = { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
+        isClosed: () => false, heldChanges: () => [], _save() {} };
     const self = {
         _onMsg: [], _pendingTickets: new Map(), _onAttachmentState: [], ownHash: lxmfHash(me),
         _handleDistroIdentityTransfer() {},
@@ -98,8 +99,10 @@ function page(me) {
     install(self, {
         GroupStore, GroupMsgStore, ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => lxmfHash(me),
-        // The filter off: every source passes, and speaks for the member it names.
-        PrivacyFilter: { allows: () => true, groupAccepts: () => true, groupMember: (group, src) => group.groupSender || src },
+        // The group rule is not what this tests: it lets the plain post
+        // through, and the post is its source's own (privacy_filter.test.mjs
+        // pins the rule and GROUP_SENDER).
+        PrivacyFilter: { groupAccepts: () => true, groupMember: (group, src) => src },
     }, ["_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)"]);
     return { me, storage, ContactStore, MsgStore, GroupMsgStore, DistroSeen, Attachments, backend, groups, self };
 }

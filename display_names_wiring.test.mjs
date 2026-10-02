@@ -332,7 +332,7 @@ function makeReceiver(me) {
     const recall = recallFor({ contacts: ContactStore, device: me });
     /** Deliver `packed` (full packing) as the router would. */
     const deliver = (packed) => handle(LXMessage.fromBytes(packed.subarray(16), packed.subarray(0, 16), recall));
-    return { ContactStore, MsgStore, self, deliver };
+    return { ContactStore, MsgStore, self, deliver, recall };
 }
 
 /** LXMF timestamps (seconds) that always move forward: §5.2 takes a name
@@ -501,9 +501,12 @@ test("the group invite notice and the distro import prompt name the sender throu
     const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
     assert.match(handler, /GroupMsgStore\.addSystem\(groupId, `invited you to "\$\{groupName \|\| "Group"\}"`, srcHash\)/);
     // An accept or a leave is about its own source (James's group model,
-    // 2026-10-01), so the notice names the source, by hash.
-    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "joined the group", srcHash\)/);
-    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "left the group", srcHash\)/);
+    // 2026-10-01), so the notice names the source, by hash: counted as it
+    // arrives, or once its key is here (a held one).
+    assert.match(handler, /this\._applyGroupStatusChange\(groupId, srcHash, groupAction, lxmfMsg\)/);
+    assert.match(methodBody("_decideHeldGroupChanges()"), /this\._applyGroupStatusChange\(entry\.groupId, entry\.src, entry\.action\)/);
+    assert.match(methodBody("_applyGroupStatusChange(groupId, src, action, event = null)"),
+        /GroupMsgStore\.addSystem\(groupId, action === "leave" \? "left the group" : "joined the group", src\)/);
     const transfer = methodBody("_handleDistroIdentityTransfer(lxmfMsg, srcHash, privateKeyHex)");
     assert.match(transfer, /const senderName = ContactStore\.name\(srcHash\);/);
 });
@@ -1186,6 +1189,11 @@ function makeGroupReceiver(me, memberHashes) {
         memberStatus: (id, h) => groups.get(id)?.members.get(h),
         isClosed: () => false,
         _save() {},
+        // The accepts and leaves held for their source's key (unbounded here).
+        _held: [],
+        hold(entry) { this._held.push(entry); return null; },
+        heldChanges() { return this._held.slice(); },
+        release(entry) { this._held = this._held.filter((e) => e !== entry); },
     };
     const GroupMsgStore = {
         addSystem: (id, content, actor) => notices.push({ dir: "system", content, actor }),
@@ -1198,16 +1206,26 @@ function makeGroupReceiver(me, memberHashes) {
     r.self._rememberGroupMemberKeys = compile("_rememberGroupMemberKeys(memberKeys)", {
         Buffer, Identity, Destination, ContactStore: r.ContactStore, console: quiet, ownLxmfDestinationHash: own,
     })(r.self);
-    r.self._handleGroupMessage = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
+    // LXMessage as the held accepts and leaves see it: checked against this
+    // receiver's identity store, as app.js installs it (LXMessage.recall).
+    const LXM = { SOURCE_UNKNOWN: LXMessage.SOURCE_UNKNOWN, signedPayload: (p) => LXMessage.signedPayload(p),
+        verify: (d, src, sig, p) => LXMessage.verify(d, src, sig, p, r.recall) };
+    const env = {
         GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, ownLxmfDestinationHash: own,
-        PrivacyFilter, sentTimeMs,
-    })(r.self);
+        PrivacyFilter, sentTimeMs, Buffer, LXMessage: LXM, Harness,
+    };
+    for (const signature of [
+        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
+        "_applyGroupStatusChange(groupId, src, action, event = null)",
+        "_holdGroupStatusChange(lxmfMsg, groupId, src, action)",
+        "_decideHeldGroupChanges()",
+    ]) r.self[signature.slice(0, signature.indexOf("("))] = compile(signature, env)(r.self);
     const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
     const groupLabel = fn("groupSenderLabel", "m", { ContactStore: r.ContactStore });
     /** The user pressing Accept on a pending invite (the real _acceptGroupInvite). */
     const acceptInvite = compile("_acceptGroupInvite(groupId)", {
         GroupStore, ContactStore: r.ContactStore, GroupMsgStore, console: quiet,
-        RnsClient: { ownHash: own(), _requestGroupPeer() {}, sendGroupAccept: async () => {} },
+        RnsClient: { ownHash: own(), _requestGroupPeer() {}, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {} },
         alert: (m) => assert.fail(`the accept was held back: ${m}`),
     })({ render() {} });
     return { ...r, groups, notices, posts, systemText, groupLabel, PrivacyFilter, acceptInvite };
@@ -1231,16 +1249,22 @@ test("§5.2 a group member with no row still gets its name: a hidden row, named 
     assert.ok(row, "the name has somewhere to live");
     assert.deepEqual([row.messageName, row.messageNameAt, row.hidden], ["Carol", null, true],
         "source unknown (no key yet): the name fills the empty slot without recording its time");
-    assert.equal(r.systemText(r.notices.at(-1)), "Carol joined the group", "the system notice");
     assert.equal(r.ContactStore.name(C), "Carol", "the member list's resolver");
     assert.equal(r.ContactStore.isContact(C), false, "not a contact");
     assert.equal(r.ContactStore.listed().some((c) => c.destHash === C), false, "not in the contact list (audit L4)");
-    assert.equal(r.ContactStore.allowlisted(C), true,
-        "a member's accept allowlists it (iOS handleGroupAccept, Android ACCEPT); the row stays hidden");
+    // Her accept waits for her key: with none here, its signature cannot
+    // show she sent it (James's group model: an accept is the member's own).
+    assert.deepEqual([r.notices.length, r.groups.get(GROUP).members.get(C), r.ContactStore.allowlisted(C)], [0, "invited", false],
+        "her accept is held until her key is here: no notice, no status, not allowed");
 
-    // The key arrives: later messages are validated and rename her, in order.
+    // The key arrives: her next message is validated, so her held accept is
+    // checked and counted first, then the message renames her, in order.
     r.ContactStore.get(C).publicKey = carol.getPublicKey().toString("hex");
     r.deliver(lxm(carol, me, "hi all", groupFields("Caz", null, [[GROUP_FIELDS.GROUP_SENDER, C]]), carol, t + 10));
+    assert.equal(r.groups.get(GROUP).members.get(C), "accepted", "her held accept verifies and counts");
+    assert.equal(r.systemText(r.notices.at(-1)), "Caz joined the group", "the system notice, named by the resolver");
+    assert.equal(r.ContactStore.allowlisted(C), true,
+        "a member's accept allowlists it (iOS handleGroupAccept, Android ACCEPT); the row stays hidden");
     assert.deepEqual(r.groupLabel(r.posts.at(-1)), { label: "Caz", secondary: null }, "the group sender label");
     r.deliver(lxm(carol, me, "old, relayed late", groupFields("Carol", null, [[GROUP_FIELDS.GROUP_SENDER, C]]), carol, t + 5));
     assert.equal(r.ContactStore.name(C), "Caz", "an older group message does not undo it");
@@ -1382,7 +1406,7 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore: { get: () => ({ groupName: "G", members: new Map([[B, "accepted"], [A, "invited"], [lxmfHash(me), "invited"]]) }), accept() {} },
         ContactStore: store, GroupMsgStore: { addSystem() {} }, console: quiet,
-        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, sendGroupAccept: async () => {} },
+        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, _decideHeldGroupChanges() {}, sendGroupAccept: async () => {} },
         alert: () => assert.fail("keys are all there"),
     });
     store.keep(A, alice.getPublicKey().toString("hex"));

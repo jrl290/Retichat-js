@@ -608,10 +608,38 @@ function ownLxmfDestinationHash() {
  *   - Any other action (relay_done, an action this client does not know):
  *     only from a source the group trusts (groupTrustsSource: a current
  *     member of a group the user has joined).
+ * Every rule above that turns on who the source is needs the source to be
+ * the one that signed the message (`signature`, the LXMF signature check,
+ * LXMessage.signatureState). The source field is not authenticated by
+ * itself: anyone who knows a group id and a member's hash can put that hash
+ * there, and the router keeps a message whose signature fails, as the
+ * reference and the phones keep it. So:
+ *   - "invalid" (the source's key is held here and does not verify the
+ *     message): it is not the source's, and no group action is taken from
+ *     it, an invite included. A plain message is still kept, as a DM with
+ *     an invalid signature is, and speaks only for its source
+ *     (PrivacyFilter.groupMember).
+ *   - "unknown" (no key for the source here yet): an invite is taken (the
+ *     inviter's key travels in one of the invite's own messages, and the
+ *     filter decides by source, as on the phones). An accept or a leave
+ *     passes this rule, but does not count yet: the handler holds it until
+ *     the source's key is held, checks the signature then, and counts it
+ *     only if it verifies (_holdGroupStatusChange). A pending group's
+ *     members' keys arrive one per invite message (each client sends one
+ *     per member, sendGroupInvites, iOS GroupChatManager.sendInvites), and
+ *     a member's accept can come first, both fetched from the propagation
+ *     node in one batch. A relay request, and any other action, is not
+ *     taken: it comes only from a member of a joined group, and the user's
+ *     accept (or the creation) waited for every member's key.
+ *   - null: not checked yet. The router's first look (acceptsSource) reads
+ *     only the source and the group id and action; its second look and the
+ *     handler pass the signature.
  * Until 2026-10-01 a source the privacy filter passed (with the filter off,
  * anyone) could accept or leave in any member's name and have this client
  * relay, and its accept naming a hash not on the list made that hash a
  * member, allowlisted; a later invite for a held group merged its list in.
+ * Until later that day a forged source (an invalid signature) could still
+ * accept, leave for good, or have this client relay in a member's name.
  * @param {string|null} groupAction  GROUP_ACTION; null for a plain message
  * @param {boolean} sourceAllowed  the packet's source passes the privacy
  *   filter (PrivacyFilter.allows); asked of an invite only
@@ -624,17 +652,21 @@ function ownLxmfDestinationHash() {
  *   source (GROUP_SENDER)
  * @param {boolean} groupClosed  the user declined or left this group
  *   (GroupStore.isClosed)
+ * @param {"validated"|"unknown"|"invalid"|null} signature  the message's
+ *   signature check (LXMessage.signatureState); null when not checked yet
  * The source is the LXMF source of the packet, never GROUP_SENDER.
  */
-function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sourceStatus, namesOther, groupClosed) {
-    if (groupAction === "invite") return sourceAllowed && !groupClosed;
+function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sourceStatus, namesOther, groupClosed, signature = null) {
+    const forged = signature === "invalid";
+    const proven = signature === "validated" || signature === null;
+    if (groupAction === "invite") return sourceAllowed && !groupClosed && !forged;
     if (!groupStatus) return false;
     if (!groupAction) return true;
-    if (GROUP_ACTIONS_THAT_RELAY.has(groupAction)) return groupStatus === "active" && sourceStatus === "accepted";
+    if (GROUP_ACTIONS_THAT_RELAY.has(groupAction)) return groupStatus === "active" && sourceStatus === "accepted" && proven;
     if (groupAction === "accept" || groupAction === "leave") {
-        return (sourceStatus === "invited" || sourceStatus === "accepted") && !namesOther;
+        return (sourceStatus === "invited" || sourceStatus === "accepted") && !namesOther && !forged;
     }
-    return groupTrustsSource(groupStatus, sourceStatus);
+    return groupTrustsSource(groupStatus, sourceStatus) && proven;
 }
 
 /**
@@ -644,9 +676,11 @@ function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sour
  * (_performGroupRelay, and the phones' performRelay), so its GROUP_SENDER
  * names the author of a plain message, or of the message a relay request
  * asks this client to relay, when that author is on the member list
- * (PrivacyFilter.groupMember). Anyone else's message is its own, whatever
+ * (PrivacyFilter.groupMember), and only when the message's signature shows
+ * the member sent it (validated). Anyone else's message is its own, whatever
  * GROUP_SENDER it carries: a stranger's, a member's of a group the user
- * has not accepted, and an allowlisted contact's that is no member. It
+ * has not accepted, an allowlisted contact's that is no member, and one
+ * whose signature does not show its source sent it. It
  * also takes the group actions this client has no rule of its own for
  * (shouldProcessGroupMessage). The privacy filter is not asked: until
  * 2026-10-01 any source it passed was trusted, so with the filter off a
@@ -1329,6 +1363,23 @@ const GroupStore = {
     // an invite to that one would be shown again.
     _closed: new Map(),
     CLOSED_LIMIT: 500,
+    // The accepts and leaves held until their source's key is here
+    // (RnsClient._holdGroupStatusChange): each {groupId, src, action,
+    // lxmfHash, dest, signature, payload}, the last three what the
+    // signature covers (hex, hex, base64), oldest first. Persisted, so a
+    // reload between a member's accept and its key loses neither. Bounded,
+    // as anyone can send one for a member whose key is not here yet: a
+    // genuine accept or leave carries no content, so its signed payload is
+    // a few hundred bytes (group id, action and sender, a name of at most 64
+    // characters, a ticket) and one past HELD_PAYLOAD_LIMIT is not held; a
+    // member sends one accept and at most one leave per group (a copy
+    // received twice is dropped by its LXMF hash before this), so past
+    // HELD_PER_MEMBER for one member, or HELD_LIMIT in all, a new one is
+    // refused and those already held stay.
+    _held: [],
+    HELD_LIMIT: 128,
+    HELD_PER_MEMBER: 4,
+    HELD_PAYLOAD_LIMIT: 2048,
 
     init() {
         const data = sGet("groups_v1");
@@ -1353,6 +1404,38 @@ const GroupStore = {
                 if (Array.isArray(entry) && typeof entry[0] === "string") this._closed.set(entry[0], entry[1] === "left" ? "left" : "rejected");
             }
         }
+        const held = sGet("groups_held_v1");
+        if (Array.isArray(held)) {
+            const text = (v) => typeof v === "string" && v.length > 0;
+            this._held = held.filter(e => e && this._groups.has(e.groupId) && text(e.src)
+                && (e.action === "accept" || e.action === "leave")
+                && text(e.dest) && text(e.signature) && text(e.payload)).slice(0, this.HELD_LIMIT);
+        }
+    },
+
+    /** Hold `entry` (an accept or leave whose source's key is not here
+     *  yet) until RnsClient._decideHeldGroupChanges can check it. Returns
+     *  null when held, else why not: the group is not held, it is held
+     *  already (its LXMF hash), or a bound (above) is reached. */
+    hold(entry) {
+        if (!this._groups.has(entry.groupId)) return "the group is not held here";
+        if (entry.lxmfHash && this._held.some(e => e.lxmfHash === entry.lxmfHash)) return "it is held already";
+        if (Buffer.from(entry.payload, "base64").length > this.HELD_PAYLOAD_LIMIT) return `its payload is over ${this.HELD_PAYLOAD_LIMIT} bytes, which no accept or leave is`;
+        if (this._held.filter(e => e.groupId === entry.groupId && e.src === entry.src).length >= this.HELD_PER_MEMBER) {
+            return `${this.HELD_PER_MEMBER} are held for this member already`;
+        }
+        if (this._held.length >= this.HELD_LIMIT) return `${this.HELD_LIMIT} are held already`;
+        this._held.push(entry);
+        sSet("groups_held_v1", this._held);
+        return null;
+    },
+    /** The held accepts and leaves, oldest first (a copy). */
+    heldChanges() { return this._held.slice(); },
+    /** Stop holding `entry` (decided, or its group gone). */
+    release(entry) {
+        const before = this._held.length;
+        this._held = this._held.filter(e => e !== entry);
+        if (this._held.length !== before) sSet("groups_held_v1", this._held);
     },
 
     onChange(fn) { this._listeners.push(fn); fn(this.getAll()); },
@@ -1420,9 +1503,12 @@ const GroupStore = {
         return true;
     },
 
-    /** Remove a group entirely. */
+    /** Remove a group entirely, with the accepts and leaves held for it. */
     remove(groupId) {
         this._groups.delete(groupId);
+        const held = this._held.length;
+        this._held = this._held.filter(e => e.groupId !== groupId);
+        if (this._held.length !== held) sSet("groups_held_v1", this._held);
         this._save();
         this._notify();
     },
@@ -1523,13 +1609,17 @@ GroupStore.init();
 //  only from a member on the group's list, about itself, and never after it
 //  left; a relay request only from a member that accepted a group the user
 //  has joined; any other action only from a current member of a group the
-//  user has joined. A dropped one is dropped like any other drop below,
-//  unproved and unnamed, with no membership change, no allowlisting and no
-//  relay, and a plain message is shown as its source's own unless that
-//  source is a current member of a joined group relaying a listed member's
-//  post (groupTrustsSource). The phones still process every non-invite
-//  action from anyone. Messages fanned out to the distro address are never
-//  filtered:
+//  user has joined; and each only when the message's signature does not
+//  show it forged (a relay request, and those other actions, only when it
+//  shows the source sent it; an accept or leave from a source whose key is
+//  not here yet counts once the key is, and its signature verifies). A
+//  dropped one is dropped like any other drop below, unproved and unnamed,
+//  with no membership change, no allowlisting and no relay, and a plain
+//  message is shown as its source's own unless that source is a current
+//  member of a joined group relaying a listed member's post, signed by it
+//  (groupTrustsSource). The phones still process every non-invite action
+//  from anyone, signature or not. Messages fanned out to the distro address
+//  are never filtered:
 //  mail to the distro is mail to this person (iOS handleDistroMessage,
 //  ChatRepository.swift:2049-2055; Android onDistroMessageReceived,
 //  ChatRepository.kt:1436-1437), and _handleDistroBlob does not ask.
@@ -1631,25 +1721,30 @@ const PrivacyFilter = {
      *  under James's group model) for a message from `src` (hex) naming
      *  `group` ({groupId, groupAction, groupSender?}: step 1's look carries
      *  no GROUP_SENDER): held here means pending or active (iOS: a group
-     *  ChatEntity, which a pending invite creates). */
-    groupAccepts(group, src) {
+     *  ChatEntity, which a pending invite creates). `signature` is the
+     *  message's LXMessage.signatureState, null at step 1's look (not
+     *  checked yet). */
+    groupAccepts(group, src, signature = null) {
         const s = this._groupStanding(group.groupId, src);
         const named = group.groupSender ? String(group.groupSender).toLowerCase() : src;
-        return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, s.groupStatus, s.sourceStatus, named !== src, s.closed);
+        return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, s.groupStatus, s.sourceStatus, named !== src, s.closed, signature);
     },
 
     /** Whom a group message the rule kept is from: its GROUP_SENDER
      *  (lowercased) when the group trusts its source (groupTrustsSource: a
-     *  current member of a group the user has joined, relaying) and names a
-     *  member on the group's list; otherwise its source. Everyone else
-     *  speaks only for itself: a stranger's post for a held group, or an
-     *  allowlisted contact's that is no member, is shown as its own, never
+     *  current member of a group the user has joined, relaying), the
+     *  message's signature shows that source sent it (`signature`
+     *  "validated"), and it names a member on the group's list; otherwise
+     *  its source. Everyone else speaks only for itself: a stranger's post
+     *  for a held group, an allowlisted contact's that is no member, or one
+     *  whose signature does not show its source, is shown as its own, never
      *  as the member it names, filter on or off. An accept or a leave the
      *  rule kept is always about its source (it names nobody else). */
-    groupMember(group, src) {
+    groupMember(group, src, signature) {
         if (!group.groupSender) return src;
         const named = String(group.groupSender).toLowerCase();
-        return this._groupStanding(group.groupId, src).trusted && GroupStore.memberStatus(group.groupId, named) !== undefined ? named : src;
+        return signature === "validated" && this._groupStanding(group.groupId, src).trusted
+            && GroupStore.memberStatus(group.groupId, named) !== undefined ? named : src;
     },
 
     /** Step 1, for the router (LXMRouter.acceptsSource): may a message from
@@ -1707,7 +1802,7 @@ const PrivacyFilter = {
             accepted = this.knows(src);
         } else {
             const group = LXMessage.extractGroupFields(lxmfMsg.fields);
-            accepted = group?.groupId ? this.groupAccepts(group, src) : this.allows(src);
+            accepted = group?.groupId ? this.groupAccepts(group, src, lxmfMsg.signatureState ?? "invalid") : this.allows(src);
         }
         if (!accepted) Harness.event("privacy-drop", { src: src.slice(0, 12), path, at: "message" });
         return accepted;
@@ -2580,6 +2675,9 @@ const RnsClient = {
         this._rns.registerAnnounceHandler("lxmf.delivery", (event) => {
             const hash = event.announce.destinationHash.toString("hex");
             ContactStore.updateFromAnnounce(hash, event.announce);
+            // The key an announce brings may be one a held accept or leave
+            // waits for (_holdGroupStatusChange).
+            if (GroupStore.heldChanges().some(e => e.src === hash)) this._decideHeldGroupChanges();
             this._markGroupPeerReady(hash);
         });
 
@@ -4313,19 +4411,25 @@ const RnsClient = {
         // but a name-only one could invite, channel posters and every
         // auto-added stranger included; until 2026-10-01 anyone could
         // accept, leave or ask for a relay in a group held here, and then
-        // any source the filter passed could, in any member's name.
-        if (!PrivacyFilter.groupAccepts(groupInfo, srcHash)) {
+        // any source the filter passed could, in any member's name. Each
+        // rule needs the source to be the one that signed the message
+        // (shouldProcessGroupMessage's `signature`): a group action whose
+        // signature fails is not its source's.
+        const signature = lxmfMsg.signatureState ?? "invalid";
+        if (!PrivacyFilter.groupAccepts(groupInfo, srcHash, signature)) {
             const why = !group && groupAction !== "invite" ? "a group not held here"
+                : groupAction && signature === "invalid" ? "its signature does not verify: it is not the source's"
                 : groupAction === "invite" ? (GroupStore.isClosed(groupId) ? "a group the user declined or left" : "a source the privacy filter does not allow")
-                : "a source that is not a member of the group (or left it), a member speaking for another, or a relay request from a member that has not accepted, or for a group the user has not joined";
+                : "a source that is not a member of the group (or left it), a member speaking for another, or a relay request from a member that has not accepted, or for a group the user has not joined, or not signed by a key held here";
             console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: ${why}`);
             return;
         }
-        // GROUP_SENDER only from a source the group trusts, naming a member;
-        // anyone else's message is its own (PrivacyFilter.groupMember).
-        // Until 2026-10-01 a stranger's post for a held group was shown as
-        // written by whichever member it named, as iOS still shows it.
-        const actualSender = PrivacyFilter.groupMember(groupInfo, srcHash);
+        // GROUP_SENDER only from a source the group trusts, signed by it,
+        // naming a member; anyone else's message is its own
+        // (PrivacyFilter.groupMember). Until 2026-10-01 a stranger's post for
+        // a held group was shown as written by whichever member it named, as
+        // iOS still shows it.
+        const actualSender = PrivacyFilter.groupMember(groupInfo, srcHash, signature);
         if (!this._groupSeenIds) this._groupSeenIds = new Set();
         const dedupKey = lxmfMsg.hash?.toString("hex") ||
             `${groupId}:${actualSender}:${lxmfMsg.timestamp}:${groupAction || "message"}`;
@@ -4337,6 +4441,12 @@ const RnsClient = {
         if (this._groupSeenIds.size > 2000) {
             this._groupSeenIds = new Set([...this._groupSeenIds].slice(-1000));
         }
+        // A message its source signed (validated) shows that source's key is
+        // here, however it came (a channel post's prelude, a contact added
+        // with its key): an accept or leave of that source's held for the
+        // key (_holdGroupStatusChange) is decided now, before this message,
+        // so they count in the order they came.
+        if (signature === "validated" && GroupStore.heldChanges().some(e => e.src === srcHash)) this._decideHeldGroupChanges();
 
         // DISPLAY_NAMES.md §5.2 for a sender this client holds no row for (a
         // member who joined after the invite, an accept from someone never
@@ -4365,6 +4475,9 @@ const RnsClient = {
                 // 2220-2221) and Android handleGroupMessage
                 // (ChatRepository.kt:1545-1552, 1596-1599) still do.
                 this._rememberGroupMemberKeys(memberKeys);
+                // A key it brought may be one an accept or leave is held for
+                // (_holdGroupStatusChange): each such one is decided now.
+                this._decideHeldGroupChanges();
                 // A group held here (pending, or created or accepted) keeps
                 // the member list its first invite, or its creation, gave
                 // it (James's group model, 2026-10-01: "There are no
@@ -4384,35 +4497,20 @@ const RnsClient = {
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));  // trigger UI refresh with groupId
                 break;
             }
-            case "accept": {
-                if (!group) return;
-                // The source's own accept (the rule took it only from a
-                // member on the list that has not left, naming nobody else).
-                // In a group the user has accepted the member also passes
-                // the privacy filter (iOS handleGroupAccept,
-                // ChatRepository.swift:2260-2264, Android
-                // ChatRepository.kt:1643-1646), as _acceptGroupInvite made
-                // every member. In one still pending, nobody is allowed by
-                // membership: the user's accept allows every member then,
-                // and a decline leaves no one allowed. A member already
-                // accepted changes nothing, and is not said to join again.
-                // Until 2026-10-01 an accept naming another hash
-                // (GROUP_SENDER) from an allowed source made that hash a
-                // member, allowlisted.
-                if (!GroupStore.updateMember(groupId, srcHash, "accepted")) return;
-                if (group.groupStatus === "active" && srcHash !== (this.ownHash ?? ownLxmfDestinationHash())) ContactStore.allow(srcHash);
-                GroupMsgStore.addSystem(groupId, "joined the group", srcHash);
-                this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
-                break;
-            }
+            case "accept":
             case "leave": {
                 if (!group) return;
-                // The source's own leave, for good: its later accept is
-                // dropped (shouldProcessGroupMessage), and updateMember
-                // never moves a member back from left.
-                if (!GroupStore.updateMember(groupId, srcHash, "left")) return;
-                GroupMsgStore.addSystem(groupId, "left the group", srcHash);
-                this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
+                // The source's own accept or leave (the rule took it only
+                // from a member on the list that has not left, naming nobody
+                // else, and not forged). It counts only once its signature
+                // shows the member sent it: from a source whose key is not
+                // here yet it is held until the key is, then checked
+                // (_holdGroupStatusChange).
+                if (signature !== "validated") {
+                    this._holdGroupStatusChange(lxmfMsg, groupId, srcHash, groupAction);
+                    return;
+                }
+                this._applyGroupStatusChange(groupId, srcHash, groupAction, lxmfMsg);
                 break;
             }
             case "relay_req": {
@@ -4459,6 +4557,84 @@ const RnsClient = {
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
                 break;
             }
+        }
+    },
+
+    /** Member `src`'s own accept or leave (`action`) of group `groupId`,
+     *  whose signature shows `src` sent it. In a group the user has
+     *  accepted, the member's accept also passes the privacy filter (iOS
+     *  handleGroupAccept, ChatRepository.swift:2260-2264, Android
+     *  ChatRepository.kt:1643-1646), as _acceptGroupInvite made every
+     *  member; in one still pending nobody is allowed by membership (the
+     *  user's accept allows every member then, and a decline no one). A
+     *  leave is for good: the member's later accept is dropped
+     *  (shouldProcessGroupMessage), and updateMember never moves a member
+     *  back from left. A member already accepted, or one not on the list,
+     *  changes nothing and gets no notice. Until 2026-10-01 an accept naming
+     *  another hash (GROUP_SENDER) from an allowed source made that hash a
+     *  member, allowlisted. The open chat is told with `event`: the message
+     *  itself when it is counted as it arrives, as before, or a "group-status"
+     *  event when a held one is. Returns whether anything changed. */
+    _applyGroupStatusChange(groupId, src, action, event = null) {
+        const group = GroupStore.get(groupId);
+        if (!group) return false;
+        if (!GroupStore.updateMember(groupId, src, action === "leave" ? "left" : "accepted")) return false;
+        if (action === "accept" && group.groupStatus === "active" && src !== (this.ownHash ?? ownLxmfDestinationHash())) ContactStore.allow(src);
+        GroupMsgStore.addSystem(groupId, action === "leave" ? "left the group" : "joined the group", src);
+        this._onMsg.forEach(fn => fn(event ?? { kind: "group-status", groupId }, groupId));
+        return true;
+    },
+
+    /** An accept or leave from member `src` whose signature could not be
+     *  checked: no key for `src` is here yet (LXMessage "source unknown").
+     *  The LXMF source field alone is anyone's to write, so it does not
+     *  count yet: it is held (GroupStore.hold, persisted and bounded) with
+     *  what its signature covers, and decided once the key is here
+     *  (_decideHeldGroupChanges): when an invite message brings it, when
+     *  the user accepts the group (which waits for every member's key),
+     *  when the member announces, or when a message of the member's that
+     *  verifies arrives. A pending group's members' keys come one per
+     *  invite message, so a member's accept arriving before its key (both
+     *  fetched in one batch from the propagation node) is the usual case,
+     *  not an attack. Until 2026-10-01 (the review of 1fdfca8) the source
+     *  field was believed as it came, signature or not. */
+    _holdGroupStatusChange(lxmfMsg, groupId, src, action) {
+        const hex = (b) => Buffer.from(b).toString("hex");
+        const signed = lxmfMsg.destinationHash && lxmfMsg.signature && lxmfMsg.packedPayload;
+        const refused = !signed ? "what its signature covers was not kept"
+            : GroupStore.hold({ groupId, src, action,
+                lxmfHash: lxmfMsg.hash ? hex(lxmfMsg.hash) : null,
+                dest: hex(lxmfMsg.destinationHash),
+                signature: hex(lxmfMsg.signature),
+                payload: LXMessage.signedPayload(lxmfMsg.packedPayload).toString("base64") });
+        if (refused) {
+            console.log(`[retichat] 👥 Dropped ${action} for group ${groupId.slice(0,8)} from ${src.slice(0,12)}: no key for it here to check its signature, and it cannot be held (${refused})`);
+            Harness.event("group-change-dropped", { group: groupId.slice(0, 8), src: src.slice(0, 12), action, why: refused });
+            return;
+        }
+        console.log(`[retichat] 👥 Holding ${action} for group ${groupId.slice(0,8)} from ${src.slice(0,12)} until its key is here to check its signature`);
+        Harness.event("group-change-held", { group: groupId.slice(0, 8), src: src.slice(0, 12), action });
+    },
+
+    /** Decide every held accept or leave (_holdGroupStatusChange) whose
+     *  source's key is now here: counted when its signature verifies
+     *  (_applyGroupStatusChange), dropped when it does not (it was not that
+     *  member's). One whose key is still missing stays held; one whose group
+     *  is gone was released with it (GroupStore.remove). In the order they
+     *  came. */
+    _decideHeldGroupChanges() {
+        for (const entry of GroupStore.heldChanges()) {
+            const check = LXMessage.verify(Buffer.from(entry.dest, "hex"), Buffer.from(entry.src, "hex"),
+                Buffer.from(entry.signature, "hex"), Buffer.from(entry.payload, "base64"));
+            if (check.unverifiedReason === LXMessage.SOURCE_UNKNOWN) continue;
+            GroupStore.release(entry);
+            if (!check.validated) {
+                console.log(`[retichat] 👥 Dropped held ${entry.action} for group ${entry.groupId.slice(0,8)} from ${entry.src.slice(0,12)}: its signature does not verify with that member's key, so it is not the member's`);
+                Harness.event("group-change-dropped", { group: entry.groupId.slice(0, 8), src: entry.src.slice(0, 12), action: entry.action, why: "invalid signature" });
+                continue;
+            }
+            console.log(`[retichat] 👥 Held ${entry.action} for group ${entry.groupId.slice(0,8)} from ${entry.src.slice(0,12)} verifies: counted`);
+            this._applyGroupStatusChange(entry.groupId, entry.src, entry.action);
         }
     },
 
@@ -8344,6 +8520,10 @@ const App = {
             alert(`Still receiving member keys (${group.members.size - missingKeys.length}/${group.members.size}).`);
             return;
         }
+        // Every member's key is here now, so an accept or leave held for
+        // its key (RnsClient._holdGroupStatusChange) is decided before the
+        // group fans out to its accepted members.
+        RnsClient._decideHeldGroupChanges();
         GroupStore.accept(groupId);
         for (const memberHash of group.members.keys()) {
             if (memberHash === RnsClient.ownHash) continue;
