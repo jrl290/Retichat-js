@@ -500,8 +500,10 @@ test("§5.3 no surface builds a name from displayName or a \"?hash\" placeholder
 test("the group invite notice and the distro import prompt name the sender through the resolver (audit M14)", () => {
     const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
     assert.match(handler, /GroupMsgStore\.addSystem\(groupId, `invited you to "\$\{groupName \|\| "Group"\}"`, srcHash\)/);
-    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "joined the group", member\)/);
-    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "left the group", actualSender\)/);
+    // An accept or a leave is about its own source (James's group model,
+    // 2026-10-01), so the notice names the source, by hash.
+    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "joined the group", srcHash\)/);
+    assert.match(handler, /GroupMsgStore\.addSystem\(groupId, "left the group", srcHash\)/);
     const transfer = methodBody("_handleDistroIdentityTransfer(lxmfMsg, srcHash, privateKeyHex)");
     assert.match(transfer, /const senderName = ContactStore\.name\(srcHash\);/);
 });
@@ -1175,8 +1177,14 @@ function makeGroupReceiver(me, memberHashes) {
         addPending: (id, groupName, inviter, members) => groups.set(id, {
             groupId: id, groupName, groupStatus: "pending", members: new Map(members.map((h) => [h, "invited"])) }),
         accept: (id) => { groups.get(id).groupStatus = "active"; groups.get(id).members.set(lxmfHash(me), "accepted"); },
-        updateMember: (id, h, status) => groups.get(id).members.set(h, status),
-        isCurrentMember: (id, h) => !["left", undefined].includes(groups.get(id)?.members.get(h)),
+        updateMember: (id, h, status) => {
+            const was = groups.get(id)?.members.get(h);
+            if (was === undefined || was === "left" || was === status) return false;
+            groups.get(id).members.set(h, status);
+            return true;
+        },
+        memberStatus: (id, h) => groups.get(id)?.members.get(h),
+        isClosed: () => false,
         _save() {},
     };
     const GroupMsgStore = {
