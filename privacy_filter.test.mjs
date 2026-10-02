@@ -519,7 +519,7 @@ test("a filter that throws drops the message, unproved", async () => {
 
 // ── the rule ───────────────────────────────────────────────────────────────
 
-test("filter off: a stranger's DM is kept and listed as before, but not allowlisted; back on, the next one is dropped", async () => {
+test("filter off: a stranger's DM is kept as a conversation, not a contact, and not allowlisted; back on, the next one is dropped", async () => {
     const r = recipient();
     const stranger = Identity.create();
     const S = lxmfHash(stranger);
@@ -527,7 +527,10 @@ test("filter off: a stranger's DM is kept and listed as before, but not allowlis
     r.packet(lxm(stranger, r.me, "first", named("Sam")));
     await settle();
     assert.equal(r.proofs.length, 1, "proved");
-    assert.equal(r.ContactStore.isContact(S), true, "auto-added and listed, as before the filter");
+    assert.deepEqual([r.ContactStore.get(S).hidden, r.ContactStore.isContact(S)], [true, false],
+        "a hidden row: a DM makes no contact (James, 2026-10-02), as iOS and Android list no stranger among the contacts");
+    assert.deepEqual(r.ContactStore.chats((h) => r.MsgStore.get(h).length > 0).map((c) => c.destHash), [S],
+        "the chat list shows the conversation by its message");
     assert.equal(r.ContactStore.allowlisted(S), false, "a plain row, as iOS and Android make for a sender they accept");
     assert.equal(r.ContactStore.get(S).messageName, "Sam", "its name taken");
     assert.equal(r.MsgStore.get(S).length, 1);
@@ -2870,28 +2873,31 @@ test("the user allowlists a peer by adding it, writing to it, or creating a grou
     const { ContactStore, MsgStore } = stores(me);
     const peer = Identity.create();
     const P = lxmfHash(peer);
-    ContactStore.add(P, false, peer.getPublicKey().toString("hex"));   // a stranger kept while the filter was off
+    ContactStore.keep(P, peer.getPublicKey().toString("hex"));   // a stranger kept while the filter was off
     assert.equal(ContactStore.allowlisted(P), false);
     const send = compile("sendMessage(contact, content, attachments = [])", { ContactStore, MsgStore, console: quiet })({
         _initialized: false, sendingIdentity: () => ({ hash: lxmfHash(me) }),
     });
     send(ContactStore.get(P), "hello back");
     assert.equal(ContactStore.allowlisted(P), true, "the user's own DM allowlists the recipient");
+    assert.equal(ContactStore.isContact(P), false, "and makes no contact of them: allowlisting lists nothing");
 
     // Add Contact, New Conversation (a hash or an lxma:// link) and the
-    // harness's addPeer: listed and allowlisted.
+    // harness's addPeer: listed and allowlisted, all through _addContact
+    // (contacts_explicit.test.mjs drives them).
     for (const signature of ["_renderAddContactModal()", "_renderDirectForm(top, scroll, footer)"]) {
-        assert.match(methodBody(signature), /ContactStore\.add\(hash, false, publicKey\);\s+ContactStore\.allow\(hash\);/, signature);
+        assert.match(methodBody(signature), /this\._addContact\(hash, publicKey\);/, signature);
     }
-    assert.match(app, /addPeer\(destHash, publicKeyHex\) \{[\s\S]*?ContactStore\.add\(destHash, false, publicKeyHex \|\| null\);\s+ContactStore\.allow\(destHash\);/);
+    assert.match(methodBody("_addContact(destHash, publicKey = null)"), /ContactStore\.add\(destHash, false, publicKey\);\s+ContactStore\.allow\(c\.destHash\);/);
+    assert.match(app, /addPeer\(destHash, publicKeyHex\) \{[\s\S]*?App\._addContact\(destHash, publicKeyHex \|\| null\);/);
     // Creating a group allowlists its members (iOS createGroupChat).
     assert.match(methodBody("_renderGroupForm(top, scroll, footer)"), /for \(const hash of selected\) ContactStore\.allow\(hash\);/);
 });
 
-test("adding an allowlisted row keeps it allowlisted: a hidden co-member's first DM lists it, and its next DM still passes", async () => {
+test("an allowlisted hidden row stays allowlisted and hidden: a co-member's DMs are a conversation and pass; adding keeps the mark", async () => {
     // _acceptGroupInvite allowlists members and keeps them hidden; the
-    // message handler lists the row with ContactStore.add on a first DM
-    // (as _handleDistroBlob does for a distro sender).
+    // message handler keeps the row hidden on a DM (James, 2026-10-02: a
+    // DM makes no contact), as _handleDistroBlob does for a distro sender.
     const r = recipient();
     const member = Identity.create();
     const M = lxmfHash(member);
@@ -2900,7 +2906,7 @@ test("adding an allowlisted row keeps it allowlisted: a hidden co-member's first
 
     r.packet(lxm(member, r.me, "first DM"));
     await settle();
-    assert.deepEqual([r.ContactStore.isContact(M), r.ContactStore.allowlisted(M)], [true, true], "listed, still allowlisted");
+    assert.deepEqual([r.ContactStore.isContact(M), r.ContactStore.allowlisted(M)], [false, true], "still hidden, still allowlisted");
     r.packet(lxm(member, r.me, "second DM"));
     await settle();
     assert.deepEqual(r.MsgStore.get(M).map((m) => m.content), ["first DM", "second DM"]);
@@ -2917,7 +2923,7 @@ test("adding an allowlisted row keeps it allowlisted: a hidden co-member's first
     assert.equal(r.ContactStore.allowlisted(other), true);
 });
 
-test("distro fan-out is never filtered: a stranger's message to the distro is stored, listed and not allowlisted", () => {
+test("distro fan-out is never filtered: a stranger's message to the distro is stored as a conversation, not a contact, and not allowlisted", () => {
     const me = Identity.create(), distro = Identity.create(), stranger = Identity.create();
     const S = lxmfHash(stranger), D = Buffer.from(lxmfHash(distro), "hex");
     const { ContactStore, MsgStore, PrivacyFilter } = stores(me);
@@ -2941,6 +2947,6 @@ test("distro fan-out is never filtered: a stranger's message to the distro is st
     })({ ownHash: lxmfHash(me), _pendingTickets: new Map(), _onMsg: [] });
     assert.equal(handleBlob(null, blob), true);
     assert.deepEqual(MsgStore.get(S).map((x) => x.content), ["to your distro"]);
-    assert.deepEqual([ContactStore.isContact(S), ContactStore.allowlisted(S)], [true, false],
-        "a plain row, as iOS and Android make (ensureContact)");
+    assert.deepEqual([ContactStore.get(S).hidden, ContactStore.isContact(S), ContactStore.allowlisted(S)], [true, false, false],
+        "a plain row, as iOS and Android make (ensureContact): hidden, no contact (James, 2026-10-02)");
 });

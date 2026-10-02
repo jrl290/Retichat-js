@@ -217,7 +217,7 @@ test("the chat list orders and dates a conversation by its latest message, so a 
     const env = {
         h, document: { createDocumentFragment: () => frag }, navigator: {}, PrivacyFilter: { on: false },
         DistroManager: {}, RnsClient: { ownHash: "e".repeat(32) }, ownLxmfDestinationHash: () => "e".repeat(32),
-        ContactStore: { listed: () => [{ destHash: A, lastSeen: 1 }, { destHash: B, lastSeen: 1 }], name: (x) => x.slice(0, 1) },
+        ContactStore: { chats: () => [{ destHash: A, lastSeen: 1 }, { destHash: B, lastSeen: 1 }], name: (x) => x.slice(0, 1) },
         GroupStore: { getAll: () => [{ groupId: G, groupName: "G", lastActivity: 1 }] },
         ChannelStore: { getAll: () => [{ channelName: C, lastActivity: 1 }] },
         MsgStore: { get: (x) => records[x], preview: (x) => records[x].at(-1).content },

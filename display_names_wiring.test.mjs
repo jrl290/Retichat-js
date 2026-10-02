@@ -1269,10 +1269,12 @@ test("§5.2 a group member with no row still gets its name: a hidden row, named 
     r.deliver(lxm(carol, me, "old, relayed late", groupFields("Carol", null, [[GROUP_FIELDS.GROUP_SENDER, C]]), carol, t + 5));
     assert.equal(r.ContactStore.name(C), "Caz", "an older group message does not undo it");
 
-    // A DM from her makes her a contact, with what the row already holds.
+    // A DM from her is a conversation, with what the row already holds; it
+    // makes her no contact (James, 2026-10-02: only the user adds one).
     r.deliver(lxm(carol, me, "a DM", new Map(), carol, t + 20));
-    assert.equal(r.ContactStore.isContact(C), true);
-    assert.equal(r.ContactStore.listed().some((c) => c.destHash === C), true, "listed now there is a conversation");
+    assert.equal(r.ContactStore.isContact(C), false, "still no contact");
+    assert.equal(r.ContactStore.listed().some((c) => c.destHash === C), false, "not in the contact list");
+    assert.equal(r.ContactStore.chats(() => true).some((c) => c.destHash === C), true, "in the chat list, by its conversation");
     assert.equal(r.ContactStore.name(C), "Caz");
     assert.equal(r.ContactStore.get(C).publicKey, carol.getPublicKey().toString("hex"));
 });
@@ -1436,11 +1438,15 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     s.sSet("contacts_v2", [{ destHash: B, localName: null, messageName: null, announceName: null, legacyName: null, lastSeen: 1 }]);
     assert.equal(contactStore(s).isContact(B), true);
 
-    for (const method of ["_buildSidebarContent()", "_renderDirectForm(top, scroll, footer)", "_renderGroupForm(top, scroll, footer)"]) {
+    for (const method of ["_renderDirectForm(top, scroll, footer)", "_renderGroupForm(top, scroll, footer)"]) {
         const body = methodBody(method);
         assert.match(body, /ContactStore\.listed\(\)/, `${method} lists contacts only`);
-        assert.doesNotMatch(body, /ContactStore\.getAll\(\)/, method);
+        assert.doesNotMatch(body, /ContactStore\.(getAll|chats)\(/, method);
     }
+    // The chat list: the contacts and the conversations (a hidden row with
+    // DM records), never a hidden row with none (contacts_explicit.test.mjs).
+    assert.match(methodBody("_buildSidebarContent()"), /ContactStore\.chats\(\(hash\) => MsgStore\.get\(hash\)\.length > 0\)/);
+    assert.doesNotMatch(methodBody("_buildSidebarContent()"), /ContactStore\.(getAll|listed)\(/);
     for (const method of ["async _sendGroupEnvelope(memberHash, content, fields)", "async openGroupConversation(groupId)",
         "_rememberGroupMemberKeys(memberKeys)", "_handleChannelPacket(packetData)", "_acceptGroupInvite(groupId)"]) {
         assert.doesNotMatch(methodBody(method), /ContactStore\.add\(/, `${method} never adds a contact`);

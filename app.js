@@ -707,14 +707,31 @@ const GROUP_ACTIONS_THAT_RELAY = new Set(["relay_req"]);
 // =========================================================================
 //  CONTACT STORE — the peers this client holds a row for
 //
-//  A row is either a contact the user has (added by hand, or a DM
-//  conversation) or a hidden row (`hidden: true`) kept only to hold what
-//  the client learned about a peer it has not added: a group member's or
-//  channel poster's public key, and the names DISPLAY_NAMES.md §5.1 stores
-//  for any sender, so group labels, member lists and system notices can
-//  name them (as iOS and Android keep a plain contact row). Hidden rows are
-//  never listed (chat list, contacts, group picker: audit L4); adding the
-//  contact or a DM with it lists the row, names and key included.
+//  A row is either a contact (listed) or a hidden row (`hidden: true`).
+//  A contact exists only because the user added it (James, 2026-10-02:
+//  "prevent adding contacts that aren't explicitly added"): Add Contact,
+//  New Conversation (a typed or pasted hash, lxmf:// or lxma:// link), or
+//  "Add contact" on a conversation's contact-info sheet, all through
+//  App._addContact, the one caller of add() (and RetichatTest.addPeer
+//  standing in for the user). Every other peer gets a hidden row, holding
+//  what the client learned about it: a group member's or channel poster's
+//  public key, the names DISPLAY_NAMES.md §5.1 stores for any sender (so
+//  group labels, member lists and system notices can name them, as iOS and
+//  Android keep a plain contact row), and the sender of a DM or a distro
+//  message, and the recipient of a distro sent copy. Group members and
+//  channel posters are accepted by association, never listed. A row stored
+//  before the flag existed (no `hidden` key) stays a contact: nothing
+//  demotes the rows older builds listed by themselves (James, 2026-10-02:
+//  "You don't need to clean up anything").
+//
+//  CONTACTS AND CONVERSATIONS. The contacts (listed()) are what the
+//  surfaces that offer contacts show: the New Conversation list and the
+//  group picker. The chat list (chats()) shows every contact, with "Tap to
+//  chat" until there is a message (iOS createDirectChat, Android
+//  getOrCreateDirectChat: a chat with an empty preview), and every hidden
+//  row with a DM conversation (MsgStore records), with its preview, as iOS
+//  and Android show the chat of a sender they accepted without making it a
+//  contact. Such a conversation's contact-info sheet offers "Add contact".
 //
 //  Separately, a row is `allowlisted` or not: iOS ContactEntity.isAllowlisted,
 //  Android ContactEntity.isAllowlisted. The privacy filter (PrivacyFilter)
@@ -727,10 +744,12 @@ const GROUP_ACTIONS_THAT_RELAY = new Set(["relay_req"]);
 //  invite allows nobody until the user accepts it: until 2026-10-01 an
 //  allowlisted contact's invite allowlisted every co-member it listed with
 //  its key as it arrived.
-//  A row a message created while the filter was off, a distro sender's and a
-//  distro sent-copy recipient's are listed but not allowlisted, as iOS and
-//  Android make a plain row for them. Listing and allowlisting are
-//  independent: a group member is allowlisted and stays hidden.
+//  A row a DM created while the filter was off, a distro sender's and a
+//  distro sent-copy recipient's are hidden and not allowlisted, as iOS and
+//  Android make a plain row for them (ensureContact). Listing and
+//  allowlisting are independent: allowlisting never lists a row (a group
+//  member is allowlisted and stays hidden, and so does a sender the user
+//  writes back to), and a contact is allowlisted because adding it allows it.
 // =========================================================================
 const ContactStore = {
     _contacts: new Map(),
@@ -781,10 +800,11 @@ const ContactStore = {
     onChange(fn) { this._listeners.push(fn); fn(this.getAll()); },
     _notify() { const all = this.getAll(); this._listeners.forEach(fn => fn(all)); },
 
-    /** Add a contact by destination hash. Returns the contact. Adding one
-     *  that exists keeps everything it holds, names, key and allowlisting
-     *  included, and lists a hidden row. It does not allowlist: a peer the
-     *  user adds is also passed to allow(). */
+    /** Add a contact by destination hash: the user's own act, and only
+     *  that (App._addContact is its one caller). Returns the contact.
+     *  Adding one that exists keeps everything it holds, names, key and
+     *  allowlisting included, and lists a hidden row. It does not
+     *  allowlist: a peer the user adds is also passed to allow(). */
     add(destHash, isDistro = false, publicKey = null) {
         return this._put(destHash, isDistro, publicKey, false);
     },
@@ -867,8 +887,9 @@ const ContactStore = {
     },
 
     /** The row for a peer the user has not added (a group member, a channel
-     *  poster): created hidden when there is none, returned as it is when
-     *  there is one. Returns the row.
+     *  poster, the sender of a DM or a distro message, a distro sent copy's
+     *  recipient): created hidden when there is none, returned as it is
+     *  when there is one, a contact staying a contact. Returns the row.
      *
      *  `nameOnly` marks a row created only to hold the name of a group
      *  sender the client had no row for (_handleGroupMessage). Until
@@ -1032,9 +1053,15 @@ const ContactStore = {
     get(destHash) { return this._contacts.get(destHash) ?? null; },
     /** Every row, hidden ones included: for work over stored conversations. */
     getAll() { return [...this._contacts.values()].sort((a,b) => b.lastSeen - a.lastSeen); },
-    /** The user's contacts, for the surfaces that list them (chat list,
-     *  contacts, group picker): hidden rows are left out. */
+    /** The user's contacts, for the surfaces that offer contacts (the New
+     *  Conversation list, the group picker): hidden rows are left out, a
+     *  conversation with one included. */
     listed() { return this.getAll().filter(c => !c.hidden); },
+    /** The rows the chat list shows: every contact, and every hidden row
+     *  with a DM conversation (`hasConversation(destHash)`: MsgStore holds
+     *  records for it). A hidden row with none (a group member, a channel
+     *  poster) is not shown. */
+    chats(hasConversation) { return this.getAll().filter(c => !c.hidden || hasConversation(c.destHash)); },
 
     _save() { sSet("contacts_v2", [...this._contacts.values()]); },
 };
@@ -2605,18 +2632,22 @@ const RnsClient = {
             }
 
             // The privacy filter has let this DM through (PrivacyFilter): its
-            // sender is allowlisted, or the filter is off. Either way the
-            // conversation gets a listed row so it appears in the UI; a
-            // hidden row (a group member's, a channel poster's) is listed
-            // now that there is a conversation. A row made here is not
-            // allowlisted (iOS and Android make a plain row for a sender
-            // they accept), so a stranger let in while the filter was off is
-            // dropped again once it is on, unless the user adds or answers
-            // them.
-            if (!ContactStore.isContact(srcHash)) {
-                console.log(`[rns] 📇 Auto-adding contact: ${srcHash.slice(0,12)}...`);
-                ContactStore.add(srcHash);
-                // Its name, under the same §5.2 rule as above: a new contact
+            // sender is allowlisted, or the filter is off. A DM never makes
+            // its sender a contact (James, 2026-10-02: "prevent adding
+            // contacts that aren't explicitly added"): a sender with no row
+            // gets a hidden one, as keep() gives any peer, and a hidden row
+            // (a group member's, a channel poster's) stays hidden. The chat
+            // list shows the conversation because it has messages
+            // (ContactStore.chats), as iOS and Android show the chat of a
+            // sender they accept without listing it among the contacts
+            // (ensureContact, not allowlisted); its contact-info sheet offers
+            // "Add contact". A row made here is not allowlisted, so a
+            // stranger let in while the filter was off is dropped again once
+            // it is on, unless the user adds or answers them.
+            const knownSender = ContactStore.known(srcHash);
+            ContactStore.keep(srcHash);
+            if (!knownSender) {
+                // Its name, under the same §5.2 rule as above: a new row
                 // has no key yet, so the source is unknown and the name only
                 // fills the empty slot. (A row that existed already took it
                 // above; this same timestamp is then not newer, a no-op.)
@@ -6349,10 +6380,12 @@ const RnsClient = {
                 const recipientHex = sentCopy.toHex;
                 // No contact request and no stranger filter: this device's own
                 // side of a conversation opens it. No notification either —
-                // nobody is told about their own message.
-                if (!ContactStore.isContact(recipientHex)) {
-                    ContactStore.add(recipientHex);
-                }
+                // nobody is told about their own message. The recipient is
+                // no contact for it (James, 2026-10-02: only the user adds
+                // one): a hidden row, as iOS and Android make a plain row
+                // (ensureContact), and the conversation shows in the chat
+                // list by its messages (ContactStore.chats).
+                ContactStore.keep(recipientHex);
                 // "sent", never "proved"/"delivered": this device holds no
                 // evidence of delivery, only that the distro said it. §17.11
                 // copies are text only (SPEC: "attachments are not copied"),
@@ -6399,15 +6432,16 @@ const RnsClient = {
             }
 
             console.log(`[distro] 📥 Message from ${srcHashHex.slice(0,12)}: "${content.slice(0,60)}"`);
-            // Auto-add contact and store message. No privacy filter here:
-            // mail to the distro is mail to this person (iOS
+            // Keep the sender's row and store the message. No privacy filter
+            // here: mail to the distro is mail to this person (iOS
             // handleDistroMessage, Android onDistroMessageReceived). The row
-            // is listed, not allowlisted, as the phones make a plain row
-            // (ensureContact): a DM from the sender to this device's own
-            // address still needs the user to add or answer them.
-            if (!ContactStore.isContact(srcHashHex)) {
-                ContactStore.add(srcHashHex);
-            }
+            // is hidden and not allowlisted, as the phones make a plain row
+            // (ensureContact): the sender is no contact until the user adds
+            // them (James, 2026-10-02), the conversation shows in the chat
+            // list by its messages (ContactStore.chats), and a DM from the
+            // sender to this device's own address still needs the user to
+            // add or answer them.
+            ContactStore.keep(srcHashHex);
             // DISPLAY_NAMES.md §5.2 on the distro path too: the sender's 0xD1,
             // taken according to the LXMF signature, checked here exactly as
             // the router checks the direct paths (LXMessage.verify).
@@ -7630,15 +7664,17 @@ const App = {
     // ===== SIDEBAR CONTENT =====
 
     _buildSidebarContent() {
-        const contacts = ContactStore.listed();
+        // The contacts, and the conversations with peers that are not one
+        // (ContactStore.chats: a hidden row with DM records).
+        const dms = ContactStore.chats((hash) => MsgStore.get(hash).length > 0);
         const groups = GroupStore.getAll();
         const channels = ChannelStore.getAll();
 
-        // Build unified chat entry list (contacts + groups + channels), sorted
+        // Build unified chat entry list (DMs + groups + channels), sorted
         // by last activity: the latest message's time (lastMessageTime; a
         // message pulled late keeps the time it was sent).
         const entries = [];
-        for (const c of contacts) {
+        for (const c of dms) {
             const lastTs = lastMessageTime(MsgStore.get(c.destHash), c.lastSeen);
             entries.push({ type: "dm", id: c.destHash, name: ContactStore.name(c.destHash),
                 lastTs, data: c, preview: MsgStore.preview(c.destHash) });
@@ -7835,6 +7871,11 @@ const App = {
         );
     },
 
+    /** A DM's row in the chat list. "Tap to chat" only for a contact with
+     *  no message yet (iOS and Android show the empty preview of a chat the
+     *  user started); a conversation shows its last message, even one
+     *  whose preview is empty (no text, no attachment), never "Tap to
+     *  chat". */
     _buildContactItem(c) {
         const name = ContactStore.name(c.destHash);
         const preview = MsgStore.preview(c.destHash);
@@ -7853,9 +7894,11 @@ const App = {
             }, avatarText),
             h("div", { className: "contact-info" },
                 h("div", { className: "contact-name" }, name),
-                preview
+                preview !== null
                     ? h("div", { className: "contact-preview" }, preview)
-                    : h("div", { className: "contact-preview", style: { fontStyle: "italic" } }, "Tap to chat"),
+                    : c.hidden
+                        ? null
+                        : h("div", { className: "contact-preview", style: { fontStyle: "italic" } }, "Tap to chat"),
             ),
             h("div", { className: "contact-meta" },
                 h("div", { className: "contact-time" }, lastTs ? fmtDate(lastTs) : ""),
@@ -8442,6 +8485,21 @@ const App = {
         this.render();
         // Scroll to bottom after render
         requestAnimationFrame(() => this._scrollChatBottom());
+    },
+
+    /** The one place a contact is made, and only by the user (James,
+     *  2026-10-02: "prevent adding contacts that aren't explicitly added"):
+     *  Add Contact, New Conversation (a typed or pasted hash, lxmf:// or
+     *  lxma:// link; the web has no QR scanner and opens no links itself),
+     *  "Add contact" on a conversation's contact-info sheet, and
+     *  RetichatTest.addPeer standing in for the user. Listed and
+     *  allowlisted (iOS createDirectChat, Android addContact); a row the
+     *  client already holds keeps its names, key and conversation. Throws
+     *  for a hash that is not 32 hex. Returns the row. */
+    _addContact(destHash, publicKey = null) {
+        const c = ContactStore.add(destHash, false, publicKey);
+        ContactStore.allow(c.destHash);
+        return c;
     },
 
     /** Send a path request to discover the route to a destination.
@@ -9241,8 +9299,7 @@ const App = {
             try {
                 // The user added it: listed and allowlisted (iOS
                 // createDirectChat, Android addContact).
-                ContactStore.add(hash, false, publicKey);
-                ContactStore.allow(hash);
+                this._addContact(hash, publicKey);
                 this._requestPathForContact(hash);
                 this.state.showAddContact = false;
                 this.render();
@@ -9275,6 +9332,10 @@ const App = {
                 h("div", { className: "field-hint" },
                     "You can also paste an lxmf:// or lxma:// link from another Retichat user."),
             ),
+        );
+        // Its own appendChild: one call took both until 2026-10-02, and the
+        // DOM's appendChild takes one node, so the buttons were never shown.
+        body.appendChild(
             h("div", { className: "btn-row", style: { marginTop: "16px" } },
                 h("button", { className: "btn btn-primary", onClick: doAdd }, "Add Contact"),
                 h("button", { className: "btn btn-secondary",
@@ -9363,6 +9424,24 @@ const App = {
         // the state that does matter — still waiting for it — is already on the
         // chat header and the disabled composer.
 
+        // A conversation with someone who is not a contact (a DM, a distro
+        // message, the user's own distro sent copy): the user makes them one
+        // here, explicitly, as Add Contact does (_addContact); nothing else
+        // does (James, 2026-10-02). The line takes the button's place, so a
+        // name typed above stays in its field.
+        if (c.hidden) {
+            const addRow = h("div", { className: "settings-section", id: "ci-add-contact" },
+                h("div", { className: "field-hint" }, "Not in your contacts."),
+                h("button", { className: "btn btn-secondary btn-block",
+                    onClick: () => {
+                        this._addContact(c.destHash);
+                        this._requestPathForContact(c.destHash);
+                        addRow.replaceWith(h("div", { className: "field-hint", id: "ci-add-contact" }, "Added to your contacts."));
+                    } }, "Add contact"),
+            );
+            body.appendChild(addRow);
+        }
+
         // Actions
         body.appendChild(
             h("div", { className: "btn-row", style: { marginBottom: "8px" } },
@@ -9402,7 +9481,14 @@ const App = {
         if (!confirm(`Delete conversation with "${name}" and all messages? This cannot be undone.`)) return;
         const hash = c.destHash;
         MsgStore.remove(hash);
-        ContactStore.remove(hash);
+        // A contact goes with its conversation. A conversation with someone
+        // who is not a contact leaves their hidden row as it was (key, names,
+        // allowlisting, which a group they are in or a channel they post in
+        // still reads), and with no messages left it leaves the chat list
+        // (ContactStore.chats), as deleting a chat on iOS or Android keeps
+        // its contact row. Read now: "Add contact" on the same sheet may
+        // have made it a contact since the sheet was drawn.
+        if (!ContactStore.get(hash)?.hidden) ContactStore.remove(hash);
         this.state.showContactInfo = false;
         if (this.state.activeHash === hash) this.state.activeHash = null;
         document.body.classList.remove("narrow-chat-open");
@@ -9526,8 +9612,7 @@ const App = {
             try {
                 // The user added it: listed and allowlisted (iOS
                 // createDirectChat, Android addContact).
-                ContactStore.add(hash, false, publicKey);
-                ContactStore.allow(hash);
+                this._addContact(hash, publicKey);
                 this._requestPathForContact(hash);
                 this.state.showNewConversation = false;
                 this.render();
@@ -10214,8 +10299,7 @@ window.RetichatTest = {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         // As the Add Contact flow does: listed and allowlisted, so the
         // privacy filter, when it is on, keeps the peer's messages.
-        ContactStore.add(destHash, false, publicKeyHex || null);
-        ContactStore.allow(destHash);
+        App._addContact(destHash, publicKeyHex || null);
         if (!publicKeyHex) App._requestPathForContact(destHash);
         return ContactStore.get(destHash);
     },

@@ -284,7 +284,9 @@ function makeReceiver(distro, deviceHash) {
     const contacts = new Set();
     const seen = new Set();
     const MsgStore = { add: (hash, m) => { const s = { id: String(stored.length), timestamp: -1, ...m }; stored.push({ hash, msg: s }); return s; } };
-    const ContactStore = { isContact: (h) => contacts.has(h), add: (h) => contacts.add(h), touch() {}, acceptMessageName() { return false; } };
+    // The rows the receiver keeps: keep() only, a hidden row (James,
+    // 2026-10-02: a distro message makes no contact); no add() to call.
+    const ContactStore = { keep: (h) => contacts.add(h), touch() {}, acceptMessageName() { return false; } };
     const DistroSeen = { check: (k) => { if (seen.has(k)) return true; seen.add(k); return false; }, forget: (k) => seen.delete(k) };
     const harness = [];
     const Harness = { event: (name, data) => harness.push({ name, data }), error() {} };
@@ -324,7 +326,7 @@ test("another device's copy is stored as OUTGOING in the conversation with R", (
     assert.equal(msg.via, "distro");
     assert.equal(msg.content, "sent on the phone");
     assert.equal(msg.timestamp, sentAtMs, "the copy's LXMF timestamp in ms, not its arrival time");
-    assert.ok(rx.contacts.has(R), "conversation created");
+    assert.ok(rx.contacts.has(R), "the recipient's row kept (hidden: no contact), so the conversation shows by its messages");
     assert.equal(rx.events.length, 1);
     assert.equal(rx.events[0].peer, R);
 

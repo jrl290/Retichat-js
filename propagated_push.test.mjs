@@ -88,7 +88,7 @@ function page({ me = Identity.create(), storage = memoryStorage(), node = propag
     LxmfSeen.init();
     const contacts = new Map();
     const ContactStore = {
-        isContact: (h) => contacts.has(h), add: (h) => { contacts.set(h, { destHash: h }); return contacts.get(h); },
+        known: (h) => contacts.has(h), keep: (h) => { if (!contacts.has(h)) contacts.set(h, { destHash: h, hidden: true }); return contacts.get(h); },
         get: (h) => contacts.get(h) ?? null, touch() {}, setReachable() {}, _save() {},
         acceptMessageName() { return false; },
     };
