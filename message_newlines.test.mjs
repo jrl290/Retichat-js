@@ -13,8 +13,11 @@
  *
  * This file pins each link of the chain under Node: the display rule, the
  * Enter rule, the bubble, the composers, the send paths, the codecs, the
- * stylesheet. message_newlines_page.test.mjs checks the drawn result in
- * Chromium (`npm run test:full`).
+ * receive handlers (connect()'s router handler for DMs, _handleGroupMessage
+ * and its relay, _handleChannelPacket, _handleDistroBlob, cut out of app.js
+ * and run over the real router, codecs and stores), the stylesheet.
+ * message_newlines_page.test.mjs checks the drawn result in Chromium
+ * (`npm run test:full`).
  *
  * Run: node --test message_newlines.test.mjs
  */
@@ -26,24 +29,36 @@ import { bubbleText, enterSends, TOUCH_FIRST } from "./lib/message_text.js";
 import { clean as cleanDisplayName } from "./lib/display_name.js";
 import { emptyInvalidStrs } from "./lib/rns/msgpack.js";
 import MsgPack from "./lib/rns/msgpack.js";
+import Cryptography from "./lib/rns/cryptography.js";
 import Identity from "./lib/rns/identity.js";
 import Destination from "./lib/rns/destination.js";
 import LXMessage from "./lib/rns/lxmf/lxmf_message.js";
 import { channelLxmPack, channelLxmUnpack } from "./lib/rns/rfed_channel.js";
-import { app, compile, fn, install, methodBody } from "./test_app_source.mjs";
+import LXMF, { GROUP_FIELDS } from "./lib/rns/lxmf/lxmf.js";
+import LXMRouter from "./lib/rns/lxmf/lxmf_router.js";
+import EventEmitter from "./lib/rns/utils/events.js";
+import * as DN from "./lib/display_name.js";
+import { ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
+import { ChannelPublishes } from "./lib/channel_publish.js";
+import { sentTimeMs } from "./lib/day_markers.js";
+import { linkPair, settle } from "./test_link_pair.mjs";
+import { app, build, compile, constValue, fn, install, memoryStorage, messageHandler, methodBody } from "./test_app_source.mjs";
 
 const MULTI = "line one\nline two\r\nline three";
 
 // ── the display rule ────────────────────────────────────────────────────────
 
-test("bubbleText keeps every line break, reads CR LF and a lone CR as one break each, and trims both ends only", () => {
+test("bubbleText keeps every line break and the first line's indentation, reads CR LF and a lone CR as one break each, and leaves out only the blank lines before the text and the white space after it", () => {
     assert.equal(bubbleText("a\nb"), "a\nb");
     assert.equal(bubbleText(MULTI), "line one\nline two\nline three");
     assert.equal(bubbleText("a\rb"), "a\nb", "a lone CR (classic Mac) is a break, not a space");
     assert.equal(bubbleText("a\n\n\nb"), "a\n\n\nb", "blank lines inside are kept");
     assert.equal(bubbleText("a  \tb"), "a  \tb", "spaces inside are kept");
-    assert.equal(bubbleText("\n\n  a\nb  \n\n"), "a\nb", "white space at either end is not shown, as iOS stores a received message");
+    assert.equal(bubbleText("    def f():\n        return 1"), "    def f():\n        return 1",
+        "the first line keeps its indentation, so indented text keeps its shape");
+    assert.equal(bubbleText("\n \t\r\n  a\nb  \n\n"), "  a\nb", "blank lines before the text and white space after it are not shown");
     assert.equal(bubbleText(" \r\n\t"), "");
+    assert.equal(bubbleText("\t \n \r \n"), "");
     assert.equal(bubbleText(""), "");
     assert.equal(bubbleText(null), "");
     assert.equal(bubbleText(undefined), "");
@@ -244,6 +259,169 @@ test("display-name cleaning still makes a name one line, and is never given mess
     const calls = app.match(/clean(?:Display|Announce)Name\(([^)]*)\)/g) ?? [];
     assert.ok(calls.length > 0);
     for (const c of calls) assert.doesNotMatch(c, /content/, c);
+});
+
+// ── the receive handlers: what arrives is what is stored, and drawn ─────────
+//
+// The handlers run as shipped (cut out of app.js), fed the bytes a sender
+// packs, over the real router, codecs and stores. RX is what an Android or
+// another LXMF client sends untrimmed: an indented first line, a CR LF, a
+// blank line, a tab and a trailing line break. It is stored byte for byte
+// (also once the store is read back from storage, as after a reload), and
+// the bubble draws it through bubbleText.
+
+const RX = "  indented first\nsecond\r\n\n    fourth\twith tab\n";
+const RX_SHOWN = "  indented first\nsecond\n\n    fourth\twith tab";
+const quiet = { log() {}, warn() {}, error() {} };
+const Harness = { recordInbound() {}, event() {}, error() {} };
+const hex = (identity) => lxmfHash(identity).toString("hex");
+
+/** A signed LXMF message `from` sends to `toHash`, in its full packing
+ *  (destination | source | signature | payload). */
+function packedFrom(from, toHash, content, fields = new Map()) {
+    const m = new LXMessage();
+    m.timestamp = Date.now() / 1000;
+    m.sourceHash = lxmfHash(from);
+    m.destinationHash = Buffer.from(toHash, "hex");
+    m.title = "";
+    m.content = content;
+    m.fields = fields;
+    return m.pack(from, false);
+}
+
+/** The page's stores over memory, and `reread(name)`: the same store built
+ *  afresh over the same storage, as a reload builds it. */
+function stores() {
+    const storage = memoryStorage();
+    const ContactStore = build("ContactStore", {
+        sGet: storage.sGet, sSet: storage.sSet, LXMF, Date,
+        migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
+        cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
+    });
+    ContactStore.init();
+    const make = (name) => build(name, { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });
+    return {
+        storage, ContactStore, reread: make,
+        MsgStore: make("MsgStore"), GroupMsgStore: make("GroupMsgStore"), ChannelMsgStore: make("ChannelMsgStore"),
+    };
+}
+
+/** The record as stored, as read back after a reload, and as its bubble shows it. */
+function assertKept(s, storeName, key, what) {
+    const [rec] = s[storeName].get(key);
+    assert.ok(rec, `${what}: stored`);
+    assert.equal(rec.content, RX, `${what}: stored byte for byte`);
+    assert.equal(s.reread(storeName).get(key)[0].content, RX, `${what}: and after a reload`);
+    const row = bubbles()._buildMsgBubble(rec, rec.dir === "in" ? { label: "Bob", secondary: null } : null);
+    assert.equal(byClass(row, "msg-text")[0].textContent, RX_SHOWN, `${what}: the bubble shows every line`);
+}
+
+/** A recipient as connect() builds it: the router on its lxmf.delivery
+ *  destination, the shipped message handler behind it, and the shipped
+ *  _handleGroupMessage and _performGroupRelay behind that. */
+function recipient({ groups = new Map(), relayed = [] } = {}) {
+    const me = Identity.create();
+    const s = stores();
+    const self = {
+        _onMsg: [], _pendingTickets: new Map(), ownHash: hex(me), _handleDistroIdentityTransfer() {},
+        _fanoutGroupEnvelope: async (targets, content, fields) => { relayed.push({ targets, content, fields }); return { fulfilled: targets.length, total: targets.length, methods: [] }; },
+        _sendGroupEnvelope: async () => ({ method: "direct" }),
+    };
+    install(self, {
+        GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
+            isClosed: () => false, heldChanges: () => [], _save() {} },
+        GroupMsgStore: s.GroupMsgStore, ContactStore: s.ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
+        ownLxmfDestinationHash: () => hex(me),
+        // The group rule is not what this tests (privacy_filter.test.mjs pins it).
+        PrivacyFilter: { groupAccepts: () => true, groupMember: (group, src) => src },
+    }, ["_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
+        "async _performGroupRelay(group, content, originalSender, alreadySeen, requester)"]);
+    const destination = new EventEmitter();
+    destination.hash = lxmfHash(me);
+    const router = new LXMRouter({ registerDestination: () => destination }, me);
+    router.on("message", messageHandler({
+        Buffer, LxmfSeen: { check: () => false }, Harness, console: quiet,
+        RnsClient: { ownHash: hex(me) }, LXMF, LXMessage, ContactStore: s.ContactStore, MsgStore: s.MsgStore,
+        decodeDisplayName: DN.decodePayload, sentTimeMs,
+    })(self));
+    return {
+        ...s, me, myHash: hex(me), router, destination,
+        /** An opportunistic packet's plaintext, as the destination hands it on. */
+        packet(packed) { destination.emit("packet", { data: packed.subarray(16), packet: { prove() {} } }); },
+    };
+}
+
+test("a DM's line breaks, indentation and CR LF are stored as they came, opportunistic or over a link, and drawn line by line", async () => {
+    const r = recipient();
+    const bob = Identity.create();
+    r.packet(packedFrom(bob, r.myHash, RX));
+    await settle();
+    assertKept(r, "MsgStore", hex(bob), "opportunistic");
+
+    const r2 = recipient();
+    const pair = linkPair();
+    pair.b.accept = () => {};
+    r2.destination.emit("link_request", pair.b);
+    await settle();
+    pair.a.send(packedFrom(bob, r2.myHash, RX));
+    await settle(6);
+    assertKept(r2, "MsgStore", hex(bob), "a link packet");
+});
+
+test("a group message's line breaks are stored as they came and drawn line by line; a relay request hands them on unchanged", async () => {
+    const bob = Identity.create(), carol = Identity.create();
+    const G = "9".repeat(32);
+    const relayed = [];
+    const groups = new Map([[G, { groupId: G, groupName: "G", groupStatus: "active", lastActivity: 0,
+        members: new Map([[hex(bob), "accepted"], [hex(carol), "accepted"]]) }]]);
+    const r = recipient({ groups, relayed });
+    r.packet(packedFrom(bob, r.myHash, RX, new Map([[GROUP_FIELDS.GROUP_ID, G]])));
+    await settle();
+    assertKept(r, "GroupMsgStore", G, "a group message");
+
+    r.packet(packedFrom(bob, r.myHash, RX, new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "relay_req"]])));
+    await settle();
+    assert.deepEqual(relayed.map(({ targets, content }) => ({ targets, content })), [{ targets: [hex(carol)], content: RX }],
+        "relayed to the member the requester could not reach, byte for byte");
+    assert.equal(r.GroupMsgStore.get(G).length, 1, "a relay request is not itself a message here");
+});
+
+test("a channel post's line breaks are stored as they came and drawn line by line", () => {
+    const me = Identity.create(), carol = Identity.create();
+    const s = stores();
+    const CHANNEL = "public.newlines";
+    const names = { get: s.storage.sGet, set: s.storage.sSet };
+    const handlePost = compile("_handleChannelPacket(packetData)", {
+        Buffer, DistroManager: { has: false }, Harness, console: quiet, channelLxmUnpack, ContactStore: s.ContactStore,
+        ChannelStore: { getByHash: () => ({ channelName: CHANNEL }), touch() {} },
+        ChannelMsgStore: s.ChannelMsgStore, ownLxmfDestinationHash: () => hex(me), sentTimeMs,
+        ChannelSenderNamesStore: new ChannelSenderNames(names), ChannelPostNamesStore: new ChannelPostNames(names),
+    })({ _channelPublishes: new ChannelPublishes(), _onMsg: [] });
+    assert.equal(handlePost(channelLxmPack(CHANNEL, carol, RX, DN.ABSENT).wire), true);
+    assertKept(s, "ChannelMsgStore", CHANNEL, "a channel post");
+});
+
+test("a message for this device's distro, and a sibling device's sent-copy, keep their line breaks", () => {
+    const device = Identity.create(), distro = Identity.create(), dave = Identity.create();
+    const s = stores();
+    const D = hex(distro);
+    const handleBlob = compile("_handleDistroBlob(distroHash, blob)", {
+        DistroManager: { identity: distro, lxmfDeliveryHash: D },
+        MsgPack, Buffer, DistroSeen: build("DistroSeen", { sGet: s.storage.sGet, sSet: s.storage.sSet }), Harness,
+        ContactStore: s.ContactStore, MsgStore: s.MsgStore, LXMF, Cryptography, LXMessage,
+        decodeDisplayName: DN.decodePayload, ownLxmfDestinationHash: () => hex(device), console: quiet,
+        DISTRO_ATTACHMENT_PLACEHOLDER: constValue("DISTRO_ATTACHMENT_PLACEHOLDER"), sentTimeMs,
+    })({ ownHash: hex(device), _pendingTickets: new Map(), _onMsg: [] });
+    const blob = (packed) => Buffer.concat([Buffer.from(D, "hex"), distro.encrypt(packed.subarray(16))]);
+
+    assert.equal(handleBlob(null, blob(packedFrom(dave, D, RX))), true);
+    assertKept(s, "MsgStore", hex(dave), "a distro message");
+
+    const R = "0123456789abcdef0123456789abcdef";
+    const sentCopy = new Map([[0xFB, "rfed.distro.sent"], [0xFC, R], [0xFD, "fedcba9876543210fedcba9876543210"]]);
+    assert.equal(handleBlob(null, blob(packedFrom(distro, D, RX, sentCopy))), true);
+    assert.equal(s.MsgStore.get(R)[0].dir, "out");
+    assertKept(s, "MsgStore", R, "a sibling's sent-copy");
 });
 
 // ── the stylesheet ──────────────────────────────────────────────────────────

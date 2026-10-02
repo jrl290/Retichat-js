@@ -7,7 +7,10 @@
  * none could be typed (message_newlines.test.mjs has the chain under Node).
  * This loads the real page in Chromium under the nodes' .htaccess policy
  * (style-src 'self': no inline style attribute) and checks what is drawn:
- *   - a received message of three lines, CR LF in one, is three lines in a
+ *   - a DM and a group message that arrive over the exchange as LXMF
+ *     packets, line breaks, a CR LF and an indented first line in them, are
+ *     stored byte for byte and drawn line by line, indentation kept;
+ *   - a stored message of three lines, CR LF in one, is three lines in a
  *     DM, a group and a channel bubble;
  *   - one typed with Shift+Enter is sent and stored with its line breaks and
  *     drawn as three lines in each;
@@ -15,8 +18,11 @@
  *   - each chat-list preview is one line;
  *   - copying a bubble's text copies its line breaks;
  *   - on a phone the return key breaks the line and the send button sends.
- * The page's exchange is a stand-in on this server (no node is contacted);
- * the page's modules come from esm.sh, as in production.
+ * The page's exchange is a stand-in on this server (no node is contacted)
+ * that hands the page the packets a test gives it; the page's modules come
+ * from esm.sh, as in production. A channel post reaches the page over an
+ * rfed link, which the stand-in does not speak: message_newlines.test.mjs
+ * runs the shipped channel handler on a real post instead.
  *
  * It runs only with RETICHAT_BOOT_TESTS=1 (`npm run test:full`; deploy.sh
  * always sets it), as the other Chromium tests do.
@@ -31,7 +37,8 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Identity, Destination } from "./lib/rns/reticulum.js";
+import { Identity, Destination, Packet, LXMessage, GROUP_FIELDS } from "./lib/rns/reticulum.js";
+import Transport from "./lib/rns/transport.js";
 
 const htaccess = readFileSync(new URL("./.htaccess", import.meta.url), "utf8");
 const POLICY = htaccess.match(/^\s*Header\s+(?:always\s+)?set\s+Content-Security-Policy\s+"([^"]+)"\s*$/m)[1];
@@ -58,8 +65,10 @@ async function launchChromium(t) {
 }
 
 /** The page from this directory, index.html under the nodes' policy, and a
- *  stand-in exchange that registers the page and delivers nothing. */
+ *  stand-in exchange that registers the page and delivers the packets given
+ *  to deliver() (base64), each once, on its next exchange. */
 async function servePage() {
+    const queued = [];
     const ROOT = fileURLToPath(new URL(".", import.meta.url));
     const TYPES = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".png": "image/png", ".json": "application/json" };
     const json = (res, body) => res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(body));
@@ -73,7 +82,7 @@ async function servePage() {
                 return;
             }
             if (path === "/exchange/v1/interfaces/exchange") {
-                json(res, { delivery_packets: [], delivery_batch_id: null, idle_exchange_interval_ms: 100 });
+                json(res, { delivery_packets: queued.splice(0), delivery_batch_id: null, idle_exchange_interval_ms: 100 });
                 return;
             }
             res.writeHead(200).end();
@@ -89,7 +98,7 @@ async function servePage() {
         }
     });
     await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
-    return { origin: `http://127.0.0.1:${server.address().port}`, close() { server.close(); } };
+    return { origin: `http://127.0.0.1:${server.address().port}`, deliver: (b64) => queued.push(b64), close() { server.close(); } };
 }
 
 /** A failure bound for a test step: `promise`, or a failure naming `what`
@@ -102,6 +111,31 @@ function within(promise, what) {
 
 const deliveryHash = (id) => Destination.hash(id, "lxmf", "delivery").toString("hex");
 const id = (byte) => Identity.fromPrivateKey(Buffer.from(byte.repeat(64), "hex"));
+
+/** The opportunistic LXMF packet `from` sends to `to`, as a node hands it
+ *  on: a DATA packet to `to`'s lxmf.delivery, encrypted to its key,
+ *  carrying the message without its destination hash. Base64. */
+function lxmfPacket(from, to, content, fields = new Map()) {
+    const m = new LXMessage();
+    m.timestamp = Date.now() / 1000;
+    m.sourceHash = Destination.hash(from, "lxmf", "delivery");
+    m.destinationHash = Destination.hash(to, "lxmf", "delivery");
+    m.title = "";
+    m.content = content;
+    m.fields = fields;
+    const packed = m.pack(from, false);
+    const p = new Packet();
+    p.headerType = Packet.HEADER_1;
+    p.packetType = Packet.DATA;
+    p.transportType = Transport.BROADCAST;
+    p.context = Packet.NONE;
+    p.contextFlag = Packet.FLAG_UNSET;
+    p.destination = { encrypt: (data) => to.encrypt(data) };
+    p.destinationHash = m.destinationHash;
+    p.destinationType = Destination.SINGLE;
+    p.data = packed.subarray(LXMessage.DESTINATION_LENGTH);
+    return p.pack().toString("base64");
+}
 
 const RECEIVED = "line one\nline two\r\nline three";
 const SHOWN = "line one\nline two\nline three";
@@ -175,7 +209,7 @@ const drawn = (locator) => locator.evaluate((el) => {
 /** The stored records of a conversation. */
 const stored = (page, key) => page.evaluate((k) => JSON.parse(localStorage.getItem(`retichat_${k}`)), key);
 
-chromiumTest("the real page: a message's line breaks are drawn in DM, group and channel bubbles, received and sent with Shift+Enter; a long word wraps; previews stay one line; a copy keeps the breaks", async (t) => {
+chromiumTest("the real page: a message's line breaks are drawn in DM, group and channel bubbles, stored and sent with Shift+Enter; a long word wraps; previews stay one line; a copy keeps the breaks", async (t) => {
     const browser = await launchChromium(t);
     if (!browser) return;
     const served = await servePage();
@@ -200,8 +234,8 @@ chromiumTest("the real page: a message's line breaks are drawn in DM, group and 
         for (const chat of chats) {
             await page.locator(".contact-item", { hasText: chat.name }).first().click();
             const received = page.locator(`.msg-row[data-msg-id="${chat.received}"] .msg-text`);
-            await within(received.waitFor(), `${chat.name}: the received bubble`);
-            assert.deepEqual(await drawn(received), { text: SHOWN, lines: 3 }, `${chat.name}: the received message is three lines`);
+            await within(received.waitFor(), `${chat.name}: the stored message's bubble`);
+            assert.deepEqual(await drawn(received), { text: SHOWN, lines: 3 }, `${chat.name}: the stored message is three lines`);
 
             // Typed with Shift+Enter, sent with Enter.
             const composer = page.locator("#composer-input");
@@ -220,7 +254,7 @@ chromiumTest("the real page: a message's line breaks are drawn in DM, group and 
             const out = (await stored(page, chat.key)).filter((m) => m.dir === "out");
             assert.deepEqual(out.map((m) => m.content), ["first\nsecond\nthird"], `${chat.name}: stored as typed`);
             assert.equal((await stored(page, chat.key)).find((m) => m.id === chat.received).content, RECEIVED,
-                `${chat.name}: the received record is not rewritten`);
+                `${chat.name}: the stored record is not rewritten`);
         }
 
         // A word longer than the bubble wraps inside it.
@@ -254,6 +288,49 @@ chromiumTest("the real page: a message's line breaks are drawn in DM, group and 
         await page.keyboard.press("ControlOrMeta+V");
         assert.equal(await page.locator("#composer-input").inputValue(), "pasted one\npasted two");
 
+        assert.deepEqual(await complaints(), { pageErrors: [], dialogs: [], elsewhere: [], csp: [] },
+            "no error, no dialog, nothing left this machine but esm.sh, no CSP violation");
+        await context.close();
+    } finally {
+        await browser.close();
+        served.close();
+    }
+});
+
+/** Sent untrimmed (as Android sends): an indented first line, a CR LF,
+ *  an indented third line and a trailing line break. */
+const WIRE = "  indented first\nline two\r\n    line three\n";
+const WIRE_SHOWN = "  indented first\nline two\n    line three";
+
+chromiumTest("the real page: a DM and a group message arriving over the exchange are stored as they came and drawn line by line, the first line's indentation kept", async (t) => {
+    const browser = await launchChromium(t);
+    if (!browser) return;
+    const served = await servePage();
+    try {
+        const { A, storage } = seed();
+        const [own, alice] = [id("11"), id("22")];
+        const { context, page, complaints } = await openPage(browser, served.origin, storage, { viewport: { width: 1280, height: 800 } });
+        const arrivals = [
+            { name: "Alice", key: `msg_${A}`, fields: new Map() },
+            { name: "Gee", key: `gmsg_${GID}`, fields: new Map([[GROUP_FIELDS.GROUP_ID, GID]]) },
+        ];
+        const seeded = ["dm-in", "dm-long", "group-in"];
+        for (const chat of arrivals) {
+            served.deliver(lxmfPacket(alice, own, WIRE, chat.fields));
+            // The page's own receive path: exchange, transport, router,
+            // connect()'s handler (and _handleGroupMessage), the store.
+            const arrived = await within(page.waitForFunction(([k, old]) =>
+                (JSON.parse(localStorage.getItem(`retichat_${k}`)) ?? []).find((m) => m.dir === "in" && !old.includes(m.id)) ?? null,
+            [chat.key, seeded], { timeout: 0 }), `${chat.name}: the message from the exchange stored`);
+            const rec = await arrived.jsonValue();
+            assert.equal(rec.content, WIRE, `${chat.name}: stored byte for byte`);
+
+            await page.locator(".contact-item", { hasText: chat.name }).first().click();
+            const bubble = page.locator(`.msg-row[data-msg-id="${rec.id}"] .msg-text`);
+            await within(bubble.waitFor(), `${chat.name}: its bubble`);
+            assert.deepEqual(await drawn(bubble), { text: WIRE_SHOWN, lines: 3 },
+                `${chat.name}: three lines, the first and third indented as sent`);
+        }
         assert.deepEqual(await complaints(), { pageErrors: [], dialogs: [], elsewhere: [], csp: [] },
             "no error, no dialog, nothing left this machine but esm.sh, no CSP violation");
         await context.close();
