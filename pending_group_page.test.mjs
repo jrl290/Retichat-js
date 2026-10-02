@@ -205,3 +205,79 @@ chromiumTest("the real page: opening a pending group's chat sends nothing that n
         served.close();
     }
 });
+
+chromiumTest("the real page: declining a pending invite sends the user's leave, as leaving does (James, 2026-10-02): every listed member is asked for, the inviter and the one still invited alike, and the group is closed at once", async (t) => {
+    // privacy_filter.test.mjs runs the same code over stubs and checks the
+    // message itself; here the real page, on the user's click. The stand-in
+    // exchange answers no path request, so what shows is each member's
+    // path asked, the first step of the leave's delivery to it.
+    const browser = await launchChromium(t);
+    if (!browser) return;
+    const served = await servePageAndExchange();
+    const { origin, packets, afterExchanges } = served;
+    try {
+        const [own, inviter, other, gone] = [id("11"), id("22"), id("33"), id("55")];
+        const [ME, I, O, X] = [own, inviter, other, gone].map(deliveryHash);
+        const row = (who, allowlisted) => ({ destHash: deliveryHash(who), publicKey: who.getPublicKey().toString("hex"), hidden: true, allowlisted,
+            localName: null, messageName: null, messageNameAt: null, announceName: null, legacyName: null, isDistro: false });
+        const PENDING = "ef".repeat(16);
+        const context = await browser.newContext({ serviceWorkers: "block" });
+        const elsewhere = [];
+        await context.route("**/*", (route) => {
+            const u = new URL(route.request().url());
+            if (u.origin === origin || (u.protocol === "https:" && u.hostname === "esm.sh")) return route.continue();
+            elsewhere.push(route.request().url());
+            return route.abort("blockedbyclient");
+        });
+        // An invite from an allowlisted contact (I), listing O (key held,
+        // not allowlisted, not answered) and X (who declined before).
+        await context.addInitScript((seed) => {
+            if (sessionStorage.getItem("seeded")) return;
+            for (const [k, v] of Object.entries(seed)) localStorage.setItem(`retichat_${k}`, JSON.stringify(v));
+            sessionStorage.setItem("seeded", "1");
+        }, {
+            identity_private_key: "11".repeat(64),
+            groupMembersAllowlisted: 2,
+            contacts_v2: [row(inviter, true), row(other, false), row(gone, false)],
+            groups_v1: [
+                { groupId: PENDING, groupName: "Pending G", groupStatus: "pending", lastActivity: 2,
+                    members: [{ hash: I, status: "accepted" }, { hash: O, status: "invited" }, { hash: X, status: "left" }, { hash: ME, status: "invited" }] },
+            ],
+        });
+        const page = await context.newPage();
+        const pageErrors = [], dialogs = [];
+        page.on("pageerror", (e) => pageErrors.push(e.message));
+        page.on("dialog", (d) => { dialogs.push(d.message()); d.accept().catch(() => {}); });
+        const named = (...hashes) => hashes.filter((h) => packets.some((p) => p.includes(Buffer.from(h, "hex"))));
+        const untilNamed = (what, ...hashes) => {
+            let failed = false;
+            return within((async () => {
+                while (!failed && named(...hashes).length < hashes.length) await afterExchanges(1);
+            })(), what).catch((e) => { failed = true; throw e; });
+        };
+
+        await page.goto(`${origin}/index.html`);
+        await within(page.waitForFunction(() => window.RetichatTest?.state().status === "online", null, { timeout: 0 }), "the page online on its exchange");
+        await untilNamed("the page's own announce", ME);
+        await page.locator(".contact-item", { hasText: "Pending G" }).first().click();
+        await page.locator(".pending-invite-bar").waitFor();
+        await within(afterExchanges(2), "two exchanges after the chat opened");
+        assert.deepEqual(named(I, O, X), [], "opening the invite asks nothing of anyone");
+
+        // The user declines.
+        await page.getByRole("button", { name: "Decline", exact: true }).first().click();
+        assert.deepEqual(dialogs, ["Decline this group invite? You won't be able to join this group later."]);
+        const stored = (key) => page.evaluate((k) => JSON.parse(localStorage.getItem(`retichat_${k}`)), key);
+        assert.equal((await stored("groups_v1")).some((g) => g.groupId === PENDING), false, "the group is gone at once");
+        assert.deepEqual(await stored("groups_closed_v1"), [[PENDING, "rejected"]], "and recorded as declined");
+        await untilNamed("the leave on its way to the inviter and to the member still invited", I, O);
+        await within(afterExchanges(2), "two more exchanges");
+        assert.deepEqual(named(X), [], "nothing for X, who declined before");
+        assert.equal(await page.locator(".contact-item", { hasText: "Pending G" }).count(), 0, "not offered any more");
+        assert.deepEqual([pageErrors, elsewhere], [[], []], "no error, nothing left this machine but esm.sh");
+        await context.close();
+    } finally {
+        await browser.close();
+        served.close();
+    }
+});

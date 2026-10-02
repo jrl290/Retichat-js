@@ -58,6 +58,9 @@ import EventEmitter from "./lib/rns/utils/events.js";
 import * as DN from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
+import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
+import { applyGroupFields } from "./lib/retichat_field.js";
+import { NameLedger } from "./lib/name_ledger.js";
 import { installPropagated } from "./test_app_source.mjs";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 
@@ -1284,9 +1287,10 @@ test("group model: an invite for a group held here changes nobody's membership, 
 
 test("group model: the user's decline and leave are final: an invite to that group is dropped unproved from anyone, filter on or off, after a reload too; nothing offers it again", async () => {
     // "Once the group is rejected/left, that person cannot rejoin." The
-    // decline is silent (as iOS and Android: no wire reject); the leave
-    // sends one to the accepted members. Either is recorded
-    // (GroupStore.close), bounded, and survives a reload.
+    // decline and the leave each send the user's leave (James, 2026-10-02:
+    // "Make the decline message the same as the leave message"; until then
+    // a decline was silent, as iOS and Android still are). Either is
+    // recorded (GroupStore.close), bounded, and survives a reload.
     for (const filter of [true, false]) {
         const on = filter ? "filter on" : "filter off";
         const c = answeringClient({ filter });
@@ -1303,6 +1307,7 @@ test("group model: the user's decline and leave are final: an invite to that gro
         assert.equal(r.GroupStore.get(G1)?.groupStatus, "pending", on);
         c.declineInvite(G1);
         assert.deepEqual([r.GroupStore.get(G1), r.GroupStore.isClosed(G1)], [null, true], `${on}: gone, and recorded`);
+        assert.deepEqual(c.leaves, [G1], `${on}: the user's leave is sent for the declined group`);
         const proved = r.proofs.length;
         r.packet(c.invite(inviter, G1, [inviter, b]));
         r.packet(c.invite(s, G1, [s, b]));
@@ -1321,7 +1326,7 @@ test("group model: the user's decline and leave are final: an invite to that gro
         c.acceptInvite(G2);
         assert.equal(r.GroupStore.get(G2).groupStatus, "active");
         c.leaveGroup(G2);
-        assert.deepEqual(c.leaves, [G2], `${on}: the leave is sent`);
+        assert.deepEqual(c.leaves, [G1, G2], `${on}: the leave is sent`);
         assert.deepEqual([r.GroupStore.get(G2), r.GroupStore.isClosed(G2)], [null, true], `${on}: gone, and recorded`);
         const provedAfterLeave = r.proofs.length;
         r.packet(c.invite(inviter, G2, [inviter, b]));
@@ -1536,13 +1541,13 @@ test("group trust rule, a group the user has not accepted: a listed member who i
     const p = await pendingGroup();
 
     // The user declines: nobody the group brought is left allowed, and X's
-    // DM is dropped unproved.
-    const decline = compile("_declineGroupInvite(groupId)", {
-        confirm: () => true, GroupMsgStore: p.posts, GroupStore: p.r.GroupStore,
-        document: { body: { classList: { remove() {} } } },
-    })({ state: { activeHash: null }, render() {} });
-    decline(p.G);
+    // DM is dropped unproved. The decline sends the user's leave (a
+    // recorder here; the real send path: leavingClient).
+    const leaves = [];
+    quittingPage({ GroupStore: p.r.GroupStore, GroupMsgStore: p.posts,
+        RnsClient: { sendGroupLeave: async (id) => { leaves.push(id); } } })._declineGroupInvite(p.G);
     assert.equal(p.r.GroupStore.get(p.G), null, "declined");
+    assert.deepEqual(leaves, [p.G], "the user's leave is sent");
     assert.deepEqual(p.allowed(p.B, p.C, p.D, p.X), [false, false, false, false], "a decline leaves nobody allowed");
     const proofs = p.r.proofs.length;
     p.r.packet(lxm(p.ids.x, p.r.me, "hello from X"));
@@ -1583,11 +1588,27 @@ test("group trust rule: once the user accepts, every listed member is allowed (X
 });
 
 /**
+ * The page's real _declineGroupInvite and _leaveGroup, and the _quitGroup
+ * behind both, over `GroupStore` and `GroupMsgStore`, the user saying yes to
+ * the confirmation; `RnsClient` is what sends the leave (a recorder, or the
+ * real send path: leavingClient).
+ */
+function quittingPage({ GroupStore, GroupMsgStore, RnsClient }) {
+    const page = { state: { activeHash: null }, render() {} };
+    const env = { confirm: () => true, GroupStore, GroupMsgStore, RnsClient, console: quiet,
+        document: { body: { classList: { remove() {} } } } };
+    for (const signature of ["_quitGroup(groupId, how)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)"]) {
+        page[signature.slice(0, signature.indexOf("("))] = compile(signature, env)(page);
+    }
+    return page;
+}
+
+/**
  * A web client that holds a group invite and answers it with the real
  * handlers: _handleGroupMessage behind the router, the real
  * _rememberGroupMemberKeys, _acceptGroupInvite, _declineGroupInvite and
  * _leaveGroup (`accepts` and `leaves` are the groups it sent an accept or a
- * leave for). `filter` as recipient() takes it.
+ * leave for: a decline sends the leave too). `filter` as recipient() takes it.
  */
 function answeringClient({ filter = true } = {}) {
     const r = recipient({ filter });
@@ -1607,15 +1628,8 @@ function answeringClient({ filter = true } = {}) {
             sendGroupAccept: async (id) => { accepts.push(id); } },
         alert: (m) => alerts.push(m),
     })({ render() {} });
-    const page = { state: { activeHash: null }, render() {} };
-    const document = { body: { classList: { remove() {} } } };
-    const declineInvite = compile("_declineGroupInvite(groupId)", {
-        confirm: () => true, GroupMsgStore: posts, GroupStore: r.GroupStore, document,
-    })(page);
-    const leaveGroup = compile("_leaveGroup(groupId)", {
-        confirm: () => true, GroupMsgStore: posts, GroupStore: r.GroupStore, document, console: quiet,
-        RnsClient: { sendGroupLeave: async (id) => { leaves.push(id); } },
-    })(page);
+    const { _declineGroupInvite: declineInvite, _leaveGroup: leaveGroup } = quittingPage({
+        GroupStore: r.GroupStore, GroupMsgStore: posts, RnsClient: { sendGroupLeave: async (id) => { leaves.push(id); } } });
     /** `from`'s invite to group `groupId` listing `members` (identities),
      *  each with its key, as one invite chunk. */
     const invite = (from, groupId, members) => lxm(from, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, groupId],
@@ -2084,10 +2098,8 @@ test("group model, signatures: a held accept survives a reload and is decided wh
             [["joined the group", B], ['You joined "Group"', null]], `${on}: said before the user's own join`);
 
         // Declining G2 removes it and what was held for it.
-        const decline = compile("_declineGroupInvite(groupId)", {
-            confirm: () => true, GroupMsgStore: posts, GroupStore: again.GroupStore, document: { body: { classList: { remove() {} } } },
-        })({ state: { activeHash: null }, render() {} });
-        decline(G2);
+        quittingPage({ GroupStore: again.GroupStore, GroupMsgStore: posts,
+            RnsClient: { sendGroupLeave: async () => {} } })._declineGroupInvite(G2);
         assert.deepEqual([again.GroupStore.heldChanges(), again.storage.sGet("groups_held_v1")], [[], []], `${on}: released and persisted`);
     }
 });
@@ -2374,6 +2386,314 @@ test("group trust rule: a plain post names its author (GROUP_SENDER) only from a
         ], on);
         assert.deepEqual(f.memberList().map(([h]) => h).includes(S), false, `${on}: the stranger is no member`);
         assert.deepEqual([r.ContactStore.allowlisted(S), r.ContactStore.get(N)], [false, null], `${on}: nor allowed; nobody named gets a row`);
+    }
+});
+
+// ── a decline is the user's leave (James, 2026-10-02) ──────────────────────
+
+/**
+ * The real group send path of the client behind `c` (answeringClient):
+ * sendGroupLeave and, behind it, _fanoutGroupEnvelope, _sendGroupEnvelope,
+ * _deliverGroupEnvelope, _decideMessageName, _requestGroupPeer,
+ * _waitForGroupPeer, _markGroupPeerReady and _ensureGroupLink, over `c`'s
+ * stores; in front of it the page's real _declineGroupInvite, _leaveGroup
+ * and _quitGroup (`page`). Stubbed at the edge only: the transport records
+ * each path request (`paths`), a link to a member records the bytes it is
+ * given (`sent`: [member hash, the full packing that reaches it]), and the
+ * fallback registry each propagated fallback armed (`fallbacks`: member
+ * hash). `announce(id)` is `id`'s lxmf.delivery announce reaching the page,
+ * as its handler takes it (ContactStore.updateFromAnnounce, then
+ * _markGroupPeerReady). `messageName` is the user's Message Display Name.
+ */
+function leavingClient(c, { messageName = "Dee" } = {}) {
+    const { r } = c;
+    const paths = [], sent = [], fallbacks = [];
+    class WireLink {
+        static ACTIVE = Link.ACTIVE;
+        static MDU = Link.MDU;
+        constructor() { this.status = 0; this.handlers = new Map(); }
+        on(event, handler) { this.handlers.set(event, handler); }
+        establish(destination) {
+            this.to = destination.hash.toString("hex");
+            this.status = Link.ACTIVE;
+            queueMicrotask(() => this.handlers.get("established")?.());
+        }
+        send(bytes) { sent.push([this.to, Buffer.from(bytes)]); return { packetHash: Cryptography.fullHash(bytes) }; }
+        sendResource() { throw new Error("a leave is never a Resource"); }
+        close() {}
+    }
+    const rc = {
+        get ownHash() { return this._lxmfRouter?.destination?.hash?.toString("hex") ?? null; },
+        _lxmfRouter: { destination: { hash: Destination.hash(r.me, "lxmf", "delivery") } },
+        _rns: {
+            transport: { requestPath: (hash) => paths.push(hash) },
+            registerDestination: (identity) => ({ hash: Destination.hash(identity, "lxmf", "delivery") }),
+        },
+        _groupPathsRequested: new Set(), _groupPeerReady: new Set(), _groupPeerWaiters: new Map(),
+        _groupLinks: new Map(), _groupLinkPromises: new Map(), _pendingPacketHashes: new Map(),
+        _groupFallbacks: { schedule: (key) => { fallbacks.push(key.slice(0, key.indexOf(":"))); return true; }, prove() {} },
+    };
+    const env = {
+        GroupStore: r.GroupStore, ContactStore: r.ContactStore, console: quiet, Identity, Destination, Buffer, LXMessage, Date,
+        Link: WireLink, GroupDeliveryEvidence, applyGroupFields, applyDisplayName: DN.applyToFields, IdMgr: { id: r.me },
+        NameLedgerStore: new NameLedger({ get: r.storage.sGet, set: r.storage.sSet }), OwnNames: { message: messageName },
+        crypto: globalThis.crypto, ownLxmfDestinationHash: () => lxmfHash(r.me),
+    };
+    for (const signature of [
+        "async sendGroupLeave(groupId)", "async _fanoutGroupEnvelope(targets, content, fields)",
+        "async _sendGroupEnvelope(memberHash, content, fields)",
+        "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
+        "_decideMessageName(sourceHex, recipientHex)", "_requestGroupPeer(memberHash)", "_waitForGroupPeer(memberHash)",
+        "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)",
+    ]) rc[signature.replace(/^async /, "").split("(")[0]] = compile(signature, env)(rc);
+    const page = quittingPage({ GroupStore: r.GroupStore, GroupMsgStore: c.posts, RnsClient: rc });
+    const announce = (id) => {
+        r.ContactStore.updateFromAnnounce(lxmfHash(id), { appData: null, identity: id });
+        rc._markGroupPeerReady(lxmfHash(id));
+    };
+    /** Each message sent, [member hash, as that member parses it]. */
+    const decoded = (from = 0) => sent.slice(from).map(([to, bytes]) =>
+        [to, LXMessage.fromBytes(bytes.subarray(16), bytes.subarray(0, 16), () => r.me)]);
+    return { rc, page, paths, sent, fallbacks, announce, decoded };
+}
+
+/** What a group control message is, but for its group id. */
+function controlShape(m) {
+    const g = LXMessage.extractGroupFields(m.fields);
+    return { fields: [...m.fields.keys()], name: m.displayName, title: m.title, content: m.content, signed: m.signatureValidated,
+        group: { ...g, groupId: "(the group)", memberKeys: [...g.memberKeys] } };
+}
+
+test("a decline is the user's leave (James, 2026-10-02: \"Make the decline message the same as the leave message\"): the same message, fields, signature and fallback a leave has, to every member on the list but this device and those that left, a member whose key comes later included; the group is closed at once, and nothing allows anyone", async () => {
+    // Until 2026-10-02 a decline sent nothing (iOS and Android still send
+    // nothing), so only the decliner's device knew, and a leave went to the
+    // members marked accepted only.
+    for (const filter of [true, false]) {
+        const on = filter ? "filter on" : "filter off";
+        const c = answeringClient({ filter });
+        const { r, ME } = c;
+        const sender = leavingClient(c);
+        const [inviter, b, m, x, k] = [1, 2, 3, 4, 5].map(() => Identity.create());
+        const [I, B, M, X, K] = [inviter, b, m, x, k].map(lxmfHash);
+        r.ContactStore.add(I, false, inviter.getPublicKey().toString("hex"));
+        r.ContactStore.allow(I);
+        const members = [inviter, b, m, x, k];
+        const ctl = (groupId, action) => new Map([[GROUP_FIELDS.GROUP_ID, groupId], [GROUP_FIELDS.GROUP_ACTION, action]]);
+        const [G1, G2, G3] = ["d1".repeat(16), "d2".repeat(16), "d3".repeat(16)];
+
+        // An invite listing I (the inviter), B, M, X and K. Every key but
+        // K's has come (one per invite message). B accepted, X declined
+        // (its leave), M and K have not answered.
+        for (const keyOf of [inviter, b, m, x]) r.packet(inviteChunk(inviter, r.me, G1, members, keyOf));
+        await settle();
+        r.packet(lxm(b, r.me, "", ctl(G1, "accept")));
+        r.packet(lxm(x, r.me, "", ctl(G1, "leave")));
+        await settle();
+        assert.deepEqual(Object.fromEntries(r.GroupStore.get(G1).members),
+            { [I]: "accepted", [B]: "accepted", [M]: "invited", [X]: "left", [K]: "invited", [ME]: "invited" }, on);
+        assert.equal(r.ContactStore.get(K)?.publicKey ?? null, null, `${on}: K's key has not come`);
+        assert.deepEqual(sender.paths, [], `${on}: nothing asked of anyone before the user answers (e6d5862)`);
+
+        // The user declines: the group is closed at once.
+        sender.page._declineGroupInvite(G1);
+        assert.deepEqual([r.GroupStore.get(G1), r.GroupStore.isClosed(G1), c.posts.get(G1)], [null, true, []], `${on}: closed at once`);
+        await settle();
+        assert.deepEqual([...sender.paths].sort(), [I, B, M, K].sort(),
+            `${on}: the user's own act asks for every member but this device and X, who left`);
+        assert.deepEqual(sender.sent, [], `${on}: nothing goes before a member is reachable`);
+
+        // Their announces come: the leave goes to each, and to K once his
+        // announce brings his key, though the group is long closed here.
+        for (const id of [inviter, b, m]) sender.rc._markGroupPeerReady(lxmfHash(id));
+        await settle();
+        assert.deepEqual(sender.sent.map(([to]) => to).sort(), [I, B, M].sort(), on);
+        sender.announce(k);
+        await settle();
+        const declined = new Map(sender.decoded());
+        assert.deepEqual([...declined.keys()].sort(), [I, B, M, K].sort(),
+            `${on}: once to every member on the list that has not left, invited ones included; never X, never this device`);
+        assert.deepEqual([...sender.fallbacks].sort(), [I, B, M, K].sort(), `${on}: each armed with the propagated fallback, as every group send`);
+        for (const [to, msg] of declined) {
+            assert.equal(msg.signatureValidated, true, `${on}: signed by this device (${to.slice(0, 8)})`);
+            assert.deepEqual([msg.title, msg.content], ["", ""], on);
+            const g = LXMessage.extractGroupFields(msg.fields);
+            assert.deepEqual([g.groupId, g.groupAction, g.groupSender, g.members, g.groupName], [G1, "leave", ME, [], null],
+                `${on}: GROUP_ID, the action "leave", GROUP_SENDER this device, and nothing else of the group`);
+        }
+        assert.deepEqual([B, M, K, X].map((h) => r.ContactStore.allowlisted(h)), [false, false, false, false],
+            `${on}: sending it allows nobody (only the user's accept does)`);
+        assert.equal(r.ContactStore.get(ME), null, `${on}: and this device has no row`);
+
+        // The user's leave of a joined group with the same members and
+        // answers: the same message, to the same members.
+        for (const keyOf of members) r.packet(inviteChunk(inviter, r.me, G2, members, keyOf));
+        await settle();
+        r.packet(lxm(b, r.me, "", ctl(G2, "accept")));
+        r.packet(lxm(x, r.me, "", ctl(G2, "leave")));
+        await settle();
+        c.acceptInvite(G2);
+        assert.deepEqual([c.alerts, r.GroupStore.get(G2).groupStatus], [[], "active"], on);
+        const before = sender.sent.length;
+        sender.page._leaveGroup(G2);
+        assert.deepEqual([r.GroupStore.get(G2), r.GroupStore.isClosed(G2)], [null, true], on);
+        await settle();
+        const left = new Map(sender.decoded(before));
+        assert.deepEqual([...left.keys()].sort(), [...declined.keys()].sort(), `${on}: the same members, invited ones included`);
+        for (const [to, msg] of left) {
+            assert.deepEqual(controlShape(msg), controlShape(declined.get(to)), `${on}: the leave is the decline's message, but for the group id (${to.slice(0, 8)})`);
+        }
+        assert.deepEqual(r.storage.sGet("groups_closed_v1"), [[G1, "rejected"], [G2, "left"]], `${on}: each recorded as what the user did`);
+
+        // Offline (no router, so no ownHash): this device is still no
+        // target and gets no row; the leave fails for each member (said),
+        // and the group is closed all the same.
+        for (const keyOf of members) r.packet(inviteChunk(inviter, r.me, G3, members, keyOf));
+        await settle();
+        Object.assign(sender.rc, { _lxmfRouter: null, _rns: null });
+        const sentBefore = sender.sent.length;
+        sender.page._declineGroupInvite(G3);
+        await settle();
+        assert.deepEqual([r.GroupStore.get(G3), r.GroupStore.isClosed(G3)], [null, true], on);
+        assert.equal(sender.sent.length, sentBefore, `${on}: nothing could go`);
+        assert.equal(r.ContactStore.get(ME), null, `${on}: no row for this device`);
+    }
+});
+
+/**
+ * The group info modal's member rows as the real _renderGroupInfoModal
+ * draws them for group `G` at `r` (the real h() over a minimal DOM): member
+ * hash -> the text of its row's name cell (its label and status mark).
+ */
+function groupInfoRows(r, G) {
+    class Node_ {
+        constructor(tag) { this.tag = tag; this.children = []; this.className = ""; this.attrs = {}; this.style = {}; }
+        appendChild(child) { this.children.push(child); return child; }
+        setAttribute(k, v) { this.attrs[k] = v; }
+        addEventListener() {}
+        get textContent() { return this.children.map((child) => child.textContent ?? "").join(""); }
+    }
+    const document = { createElement: (tag) => new Node_(tag), createTextNode: (text) => ({ textContent: text }) };
+    const root = new Node_("div");
+    const page = { state: { groupInfoId: G, showGroupInfo: true }, root, render() {},
+        _groupMemberLabel: (hash) => r.ContactStore.name(hash), _paintMemberAvatar() {} };
+    compile("_renderGroupInfoModal()", { GroupStore: r.GroupStore, h: fn("h", "tag, a={}, ...kids", { document }) })(page)();
+    const rows = new Map();
+    const walk = (node) => {
+        if (node.attrs?.["data-member-hash"]) rows.set(node.attrs["data-member-hash"], node.children[1].textContent);
+        for (const child of node.children ?? []) walk(child);
+    };
+    walk(root);
+    return rows;
+}
+
+test("a decline, received: the decliner's leave (its real bytes) counts at every member as any leave does, from a member still invited: in the creator's group, a member's joined group and a pending one (held there until the decliner's key comes); final (a later accept is dropped unproved); said and shown as a member who left, as one that left after accepting is", async () => {
+    // James's group model (2026-10-01): "Each person can accept or reject.
+    // And each person can leave at any time. Once the group is
+    // rejected/left, that person cannot rejoin." A reject reaches the
+    // others as the decliner's leave (2026-10-02). `recipient()` checks
+    // signatures against the last client made, so each delivery names
+    // whose store is asked.
+    for (const filter of [true, false]) {
+        const on = filter ? "filter on" : "filter off";
+        const creator = recipient({ filter });
+        creator.recall = LXMessage.recall;
+        creator.posts = withGroupHandler(creator);
+        const [dc, bc, pc, lc] = [1, 2, 3, 4].map(() => { const x = answeringClient({ filter }); x.recall = LXMessage.recall; return x; });
+        const ids = [creator.me, dc.r.me, bc.r.me, pc.r.me, lc.r.me];
+        const [A, D, B, P, L] = ids.map(lxmfHash);
+        const keyHex = (id) => id.getPublicKey().toString("hex");
+        const at = (x) => x.r ?? x;
+        const deliver = async (x, ...packed) => {
+            LXMessage.recall = x.recall;
+            for (const p of packed) at(x).packet(p);
+            await settle();
+        };
+
+        // A creates G with D, B, P and L, and invites each: one message per
+        // member key. P has every key but D's so far.
+        for (const id of ids.slice(1)) creator.ContactStore.keep(lxmfHash(id), keyHex(id));
+        const G = creator.GroupStore.create("G", [D, B, P, L]).groupId;
+        const invites = (x, without = null) => ids.filter((id) => id !== x.r.me && id !== without)
+            .map((keyOf) => inviteChunk(creator.me, x.r.me, G, ids.filter((id) => id !== x.r.me), keyOf));
+        for (const x of [dc, bc, pc, lc]) {
+            x.r.ContactStore.add(A, false, keyHex(creator.me));
+            x.r.ContactStore.allow(A);
+            await deliver(x, ...invites(x, x === pc ? dc.r.me : null));
+        }
+        assert.deepEqual([dc, bc, pc, lc].map((x) => x.r.GroupStore.get(G)?.groupStatus), ["pending", "pending", "pending", "pending"], on);
+        assert.equal(pc.r.ContactStore.get(D)?.publicKey ?? null, null, `${on}: P does not have D's key yet`);
+        bc.acceptInvite(G);
+        lc.acceptInvite(G);
+        assert.deepEqual([bc, lc].map((x) => x.r.GroupStore.get(G).groupStatus), ["active", "active"], on);
+        // L's accept reaches the others.
+        for (const x of [creator, bc, pc]) await deliver(x, lxm(lc.r.me, at(x).me, "", new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "accept"]])));
+        const status = (x, h) => at(x).GroupStore.get(G)?.members.get(h);
+        assert.deepEqual([creator, bc, pc].map((x) => [status(x, D), status(x, L)]), [["invited", "accepted"], ["invited", "accepted"], ["invited", "accepted"]], on);
+
+        // D declines, with the real send path. (B's and L's accepts allowed
+        // every listed member there, D included, as the trust rule says.)
+        const allowedD = () => [creator, bc, pc, lc].map((x) => at(x).ContactStore.allowlisted(D));
+        assert.deepEqual(allowedD(), [false, true, false, true], on);
+        const ds = leavingClient(dc, { messageName: "Dee" });
+        ds.page._declineGroupInvite(G);
+        await settle();
+        for (const h of [A, B, P, L]) ds.rc._markGroupPeerReady(h);
+        await settle();
+        const declineTo = new Map(ds.sent);
+        assert.deepEqual([...declineTo.keys()].sort(), [A, B, P, L].sort(), `${on}: D's leave goes to every listed member`);
+
+        // Each counts it: D left, said once, by D's hash. (The notices about
+        // members: not the invite's, nor the user's own join.)
+        const notices = (x) => (x.posts.get(G) ?? []).filter((msg) => msg.dir === "system" && msg.actor && !msg.content.startsWith("invited you to"))
+            .map((msg) => [msg.content, msg.actor]);
+        const proofs = (x) => at(x).proofs.length;
+        for (const x of [creator, bc, lc]) {
+            const proved = proofs(x);
+            await deliver(x, declineTo.get(lxmfHash(at(x).me)));
+            assert.equal(proofs(x), proved + 1, `${on}: proved`);
+            assert.equal(status(x, D), "left", `${on}: D left, at ${lxmfHash(at(x).me).slice(0, 4)}`);
+        }
+        // At P, D's key is not here yet: held until it comes, then counted.
+        await deliver(pc, declineTo.get(P));
+        assert.deepEqual([status(pc, D), heldEvents(pc.r, "group-change-held")], ["invited", [[D.slice(0, 12), "leave"]]], `${on}: held at P`);
+        await deliver(pc, inviteChunk(creator.me, pc.r.me, G, ids.filter((id) => id !== pc.r.me), dc.r.me));
+        assert.deepEqual([status(pc, D), pc.r.GroupStore.heldChanges()], ["left", []], `${on}: counted at P once D's key came`);
+
+        // L, who had accepted, leaves, with the real send path: to every
+        // listed member that has not left, so not to D.
+        const ls = leavingClient(lc, { messageName: "Lee" });
+        ls.page._leaveGroup(G);
+        await settle();
+        for (const h of [A, B, P]) ls.rc._markGroupPeerReady(h);
+        await settle();
+        const leaveTo = new Map(ls.sent);
+        assert.deepEqual([[...ls.paths].sort(), [...leaveTo.keys()].sort()], [[A, B, P].sort(), [A, B, P].sort()],
+            `${on}: L's leave goes to every member that has not left, and nothing is asked of D, who declined`);
+        for (const [x, h] of [[creator, A], [bc, B], [pc, P]]) await deliver(x, leaveTo.get(h));
+
+        // D and L are shown the same: "left the group", and the door in the
+        // member list. The creator's, a joined member's and a pending
+        // member's clients alike.
+        const systemText = fn("systemMessageText", "m", { ContactStore: creator.ContactStore });
+        for (const x of [creator, bc, pc]) {
+            const where = `${on}, at ${x === creator ? "the creator" : x === bc ? "a joined member" : "a pending member"}`;
+            assert.deepEqual([status(x, D), status(x, L)], ["left", "left"], where);
+            assert.deepEqual(notices(x), [["joined the group", L], ["left the group", D], ["left the group", L]], where);
+            const rows = groupInfoRows(at(x), G);
+            assert.deepEqual([rows.get(D), rows.get(L)], [`${at(x).ContactStore.name(D)} 🚪`, `${at(x).ContactStore.name(L)} 🚪`], where);
+        }
+        assert.deepEqual([D, L].map((h) => systemText({ dir: "system", content: "left the group", actor: h })),
+            [`${creator.ContactStore.name(D)} left the group`, `${creator.ContactStore.name(L)} left the group`], on);
+
+        // Final: D's later accept is dropped unproved, everywhere; D stays left.
+        for (const x of [creator, bc, pc]) {
+            const proved = proofs(x);
+            await deliver(x, lxm(dc.r.me, at(x).me, "", new Map([[GROUP_FIELDS.GROUP_ID, G], [GROUP_FIELDS.GROUP_ACTION, "accept"]])));
+            assert.equal(proofs(x), proved, `${on}: D's accept dropped unproved`);
+            assert.equal(status(x, D), "left", on);
+            assert.deepEqual(notices(x).at(-1), ["left the group", L], `${on}: no "joined"`);
+        }
+        assert.deepEqual(allowedD(), [false, true, false, true], `${on}: and the decline changed nobody's standing`);
     }
 });
 

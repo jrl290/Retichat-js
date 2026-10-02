@@ -596,7 +596,10 @@ function ownLxmfDestinationHash() {
  *     GROUP_SENDER the member), so one about anyone else is never genuine.
  *     A hash that is not on the list is no member and never becomes one;
  *     a member that left has left for good, and its later accept is
- *     dropped. A member listed in a group the user has not accepted yet is
+ *     dropped. A member's decline is its leave (the same message: James,
+ *     2026-10-02, App._quitGroup), from a member still "invited": it
+ *     counts as any leave does, and is as final. A member listed in a
+ *     group the user has not accepted yet is
  *     allowed nothing by its accept (the user's accept allows the members,
  *     _acceptGroupInvite), but it is recorded: the group's messages fan out
  *     to accepted members only (_dispatchGroupMessage), and nobody sends it
@@ -4569,7 +4572,10 @@ const RnsClient = {
      *  user's accept allows every member then, and a decline no one). A
      *  leave is for good: the member's later accept is dropped
      *  (shouldProcessGroupMessage), and updateMember never moves a member
-     *  back from left. A member already accepted, or one not on the list,
+     *  back from left. A member's decline arrives as its leave (the same
+     *  message, from the web since 2026-10-02) while it is still
+     *  "invited", and is counted, said ("left the group") and shown as
+     *  any leave is. A member already accepted, or one not on the list,
      *  changes nothing and gets no notice. Until 2026-10-01 an accept naming
      *  another hash (GROUP_SENDER) from an allowed source made that hash a
      *  member, allowlisted. The open chat is told with `event`: the message
@@ -4730,20 +4736,43 @@ const RnsClient = {
         });
     },
 
-    /** Send leave to all accepted members. */
+    /** The user's leave of group `groupId`, sent when the user leaves a
+     *  joined group and when the user declines an invite (James,
+     *  2026-10-02: "Make the decline message the same as the leave
+     *  message"; App._quitGroup is the one caller for both). One message:
+     *  GROUP_ID, GROUP_ACTION "leave" and GROUP_SENDER this device, no
+     *  content, signed and delivered as every group message is
+     *  (_fanoutGroupEnvelope: directly, else through the propagation node),
+     *  to every member on the list but this device and the members that
+     *  left. A member still "invited" here is sent it too: in a pending
+     *  group nearly every member is (only the inviter starts accepted,
+     *  GroupStore.addPending), and in a joined one an invited member may
+     *  have accepted already (its accept still on its way) or accept later,
+     *  and either way must not go on counting this device as a member. A
+     *  member that left has closed the group and drops anything for it. A
+     *  member whose key is not here yet (a pending group's keys come one
+     *  per invite message) is asked for, and sent the leave once its
+     *  announce brings the key (_sendGroupEnvelope). The list is read
+     *  before the first await, so the caller closes the group at once and
+     *  the leave does not depend on it. Returns the fan-out's delivery.
+     *  Until 2026-10-02 a leave went to the members marked accepted only,
+     *  and a decline sent nothing. */
     async sendGroupLeave(groupId) {
         const group = GroupStore.get(groupId);
-        if (!group) return;
-        const ownHash = this.ownHash;
-
+        if (!group) return null;
+        // This device: never a target, so never kept as a contact (audit
+        // L4), also with no router (offline, ownHash null).
+        const ownHash = this.ownHash ?? ownLxmfDestinationHash();
         const targets = [...group.members.entries()]
-            .filter(([hash, status]) => hash !== ownHash && status === "accepted")
+            .filter(([hash, status]) => hash !== ownHash && status !== "left")
             .map(([hash]) => hash);
-        await this._fanoutGroupEnvelope(targets, "", {
+        const delivery = await this._fanoutGroupEnvelope(targets, "", {
             groupId,
             groupAction: "leave",
             groupSender: ownHash,
         });
+        console.log(`[retichat] 👥 Leave for group ${groupId.slice(0,8)} delivered to ${delivery.fulfilled} of ${delivery.total} member(s)`);
+        return delivery;
     },
 
     async sendGroupRelayRequest(groupId, content, originalSender, alreadySeen, relayerHash) {
@@ -8539,27 +8568,40 @@ const App = {
         this.render();
     },
 
-    /** The user declines a pending invite: silently, as iOS and Android
-     *  (no wire message: nobody has the user as accepted), and for good
-     *  (James's group model, 2026-10-01: "Once the group is rejected/left,
-     *  that person cannot rejoin"): GroupStore.close records it, so a later
-     *  invite to the group is ignored and never offered again. */
+    /** The user declines a pending invite. The members are told with the
+     *  user's leave, the very message a leave of a joined group sends
+     *  (James, 2026-10-02: "Make the decline message the same as the leave
+     *  message"; _quitGroup), so their clients show the user as a member
+     *  who left. And it is for good (James's group model, 2026-10-01:
+     *  "Once the group is rejected/left, that person cannot rejoin"):
+     *  GroupStore.close records it, so a later invite to the group is
+     *  ignored and never offered again. Until 2026-10-02 a decline sent
+     *  nothing (iOS and Android still send nothing), so only this device
+     *  knew. */
     _declineGroupInvite(groupId) {
         if (!confirm("Decline this group invite? You won't be able to join this group later.")) return;
-        GroupMsgStore.remove(groupId);
-        GroupStore.close(groupId, "rejected");
-        if (this.state.activeHash === groupId) this.state.activeHash = null;
-        document.body.classList.remove("narrow-chat-open");
-        this.render();
+        this._quitGroup(groupId, "rejected");
     },
 
-    /** The user leaves a joined group: a leave to its accepted members,
-     *  and for good, as a decline (GroupStore.close). */
+    /** The user leaves a joined group: the user's leave to its members,
+     *  and for good, as a decline (_quitGroup). */
     _leaveGroup(groupId) {
         if (!confirm("Leave this group? You won't receive future messages, and you won't be able to rejoin it.")) return;
+        this._quitGroup(groupId, "left");
+    },
+
+    /** A decline (`how` "rejected") or a leave ("left") of group `groupId`,
+     *  one path for both: the user's leave goes to the members
+     *  (RnsClient.sendGroupLeave, which reads the member list as it is
+     *  called), then the group is closed here for good (GroupStore.close)
+     *  and its chat goes. Neither waits for the other: the close is at
+     *  once, and the leave goes on after it. The user asked for it, so a
+     *  pending group's members are sent it too, though opening that
+     *  group's chat asks nothing of them (RnsClient.openGroupConversation). */
+    _quitGroup(groupId, how) {
         RnsClient.sendGroupLeave(groupId).catch(e => console.warn("Group leave send failed:", e.message));
         GroupMsgStore.remove(groupId);
-        GroupStore.close(groupId, "left");
+        GroupStore.close(groupId, how);
         if (this.state.activeHash === groupId) this.state.activeHash = null;
         document.body.classList.remove("narrow-chat-open");
         this.render();
