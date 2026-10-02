@@ -750,6 +750,9 @@ const GROUP_ACTIONS_THAT_RELAY = new Set(["relay_req"]);
 //  allowlisting are independent: allowlisting never lists a row (a group
 //  member is allowlisted and stays hidden, and so does a sender the user
 //  writes back to), and a contact is allowlisted because adding it allows it.
+//  Deleting a hidden row's conversation takes its allowlisting away unless
+//  a group the user has joined lists it (App._deleteContact, disallow()):
+//  with the conversation gone the row shows nowhere, so nothing else could.
 // =========================================================================
 const ContactStore = {
     _contacts: new Map(),
@@ -825,6 +828,18 @@ const ContactStore = {
 
     /** Whether the user allowlisted `destHash` (allow()). */
     allowlisted(destHash) { return this._contacts.get(destHash)?.allowlisted === true; },
+
+    /** Undo allow() for `destHash`: the privacy filter keeps its DMs and
+     *  invites out again. The row stays, with its listing, key and names.
+     *  Only App._deleteContact calls it, for a conversation's hidden row
+     *  whose allowlisting no group the user has joined vouches for. */
+    disallow(destHash) {
+        const c = this._contacts.get(destHash);
+        if (c?.allowlisted === true) {
+            c.allowlisted = false;
+            this._save();
+        }
+    },
 
     /**
      * One-time step of the privacy filter's migration, under James's group
@@ -9428,15 +9443,17 @@ const App = {
         // message, the user's own distro sent copy): the user makes them one
         // here, explicitly, as Add Contact does (_addContact); nothing else
         // does (James, 2026-10-02). The line takes the button's place, so a
-        // name typed above stays in its field.
+        // name typed above stays in its field. Each line sits in a
+        // .settings-field, which is what styles a .field-hint (style.css).
         if (c.hidden) {
+            const line = (text) => h("div", { className: "settings-field" }, h("div", { className: "field-hint" }, text));
             const addRow = h("div", { className: "settings-section", id: "ci-add-contact" },
-                h("div", { className: "field-hint" }, "Not in your contacts."),
+                line("Not in your contacts."),
                 h("button", { className: "btn btn-secondary btn-block",
                     onClick: () => {
                         this._addContact(c.destHash);
                         this._requestPathForContact(c.destHash);
-                        addRow.replaceWith(h("div", { className: "field-hint", id: "ci-add-contact" }, "Added to your contacts."));
+                        addRow.replaceWith(h("div", { className: "settings-section", id: "ci-add-contact" }, line("Added to your contacts.")));
                     } }, "Add contact"),
             );
             body.appendChild(addRow);
@@ -9481,14 +9498,22 @@ const App = {
         if (!confirm(`Delete conversation with "${name}" and all messages? This cannot be undone.`)) return;
         const hash = c.destHash;
         MsgStore.remove(hash);
-        // A contact goes with its conversation. A conversation with someone
-        // who is not a contact leaves their hidden row as it was (key, names,
-        // allowlisting, which a group they are in or a channel they post in
-        // still reads), and with no messages left it leaves the chat list
+        // A contact goes with its conversation, allowlisting and all. A
+        // conversation with someone who is not a contact keeps their hidden
+        // row (the key and names a group they are in or a channel they post
+        // in still reads), and with no messages left it leaves the chat list
         // (ContactStore.chats), as deleting a chat on iOS or Android keeps
-        // its contact row. Read now: "Add contact" on the same sheet may
-        // have made it a contact since the sheet was drawn.
+        // its contact row. Its allowlisting goes, unless a group the user
+        // has joined lists them (James's group trust rule: "If the invite is
+        // accepted, the other group members are considered allowed"): the
+        // user's reply allowlisted a stranger (sendMessage), and once the
+        // conversation is gone nothing on the web shows that row or can undo
+        // it, so with the filter on their next DM would come back in. Until
+        // 6b4141f the row was a contact and delete removed it, so the filter
+        // dropped that DM; it still does. Read now: "Add contact" on the
+        // same sheet may have made it a contact since the sheet was drawn.
         if (!ContactStore.get(hash)?.hidden) ContactStore.remove(hash);
+        else if (!GroupStore.hasJoinedMember(hash)) ContactStore.disallow(hash);
         this.state.showContactInfo = false;
         if (this.state.activeHash === hash) this.state.activeHash = null;
         document.body.classList.remove("narrow-chat-open");

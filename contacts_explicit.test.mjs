@@ -21,8 +21,10 @@
  *     hidden row (key, names), shown nowhere. Allowlisting (accepting a
  *     group, the user's own DM) lists nothing.
  *   - Deleting a conversation that is no contact keeps the hidden row (the
- *     key a group still checks signatures with); deleting a contact's
- *     removes the contact, as before.
+ *     key a group still checks signatures with) and takes its allowlisting
+ *     away unless a group the user joined lists it, so the privacy filter
+ *     drops what it dropped before (the row was a contact and delete removed
+ *     it); deleting a contact's removes the contact, as before.
  *   - No clean-up: a row stored without the `hidden` key by an older build
  *     stays a contact.
  *
@@ -39,6 +41,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Buffer } from "node:buffer";
+import { readFileSync } from "node:fs";
 import MsgPack from "./lib/rns/msgpack.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import Identity from "./lib/rns/identity.js";
@@ -473,13 +476,14 @@ test("deleting a conversation that is no contact keeps the hidden row (a group s
     const p = page();
     const member = Identity.create(), M = lxmfHash(member);
     p.ContactStore.keep(M, keyHex(member));
-    p.ContactStore.allow(M);                       // a member of a group the user accepted
+    p.GroupStore.create("Walkers", [M]);           // a group the user created with them,
+    p.ContactStore.allow(M);                       // which allows its members
     await p.dm(lxm(member, p.own(), "a DM"));
     assert.deepEqual(chatNames(p), [short(M)]);
     p.ui._deleteContact(p.ContactStore.get(M));
     assert.deepEqual(p.MsgStore.get(M), [], "the conversation is gone");
     const row = p.ContactStore.get(M);
-    assert.deepEqual([row?.hidden, row?.publicKey, row?.allowlisted], [true, keyHex(member), true], "the row stays as it was");
+    assert.deepEqual([row?.hidden, row?.publicKey, row?.allowlisted], [true, keyHex(member), true], "the row stays as it was: the group still allows them");
     assert.deepEqual(chatList(p), [], "and leaves the chat list");
 
     // "Add contact" then "Delete Conversation" on the same sheet: a contact now.
@@ -493,6 +497,72 @@ test("deleting a conversation that is no contact keeps the hidden row (a group s
     p.ui._addContact(friend);
     p.ui._deleteContact(p.ContactStore.get(friend));
     assert.equal(p.ContactStore.get(friend), null);
+});
+
+test("deleting a stranger's conversation the user replied to takes the reply's allowlisting away: with the filter on their next DM is dropped, as before 6b4141f", async () => {
+    for (const pendingGroup of [false, true]) {
+        const p = page();
+        const stranger = Identity.create(), S = lxmfHash(stranger);
+        // A group invite still pending lists them: no group the user has
+        // joined, so it allows nobody (the group trust rule).
+        if (pendingGroup) p.GroupStore.addPending("7".repeat(32), "Pending", lxmfHash(Identity.create()), [S]);
+        await p.dm(lxm(stranger, p.own(), "hello from nowhere"));
+        p.ContactStore.updateFromAnnounce(S, { appData: null, identity: stranger });
+        const send = compile("sendMessage(contact, content, attachments = [])", { ContactStore: p.ContactStore, MsgStore: p.MsgStore, console: quiet })({
+            _initialized: false, sendingIdentity: () => ({ hash: p.own() }),
+        });
+        send(p.ContactStore.get(S), "hello back");
+        assert.equal(p.ContactStore.allowlisted(S), true, "the reply allowlisted them (sendMessage)");
+
+        button(infoSheet(p, S), "🗑 Delete Conversation").fire("click");
+        const row = p.ContactStore.get(S);
+        assert.deepEqual([row?.hidden, row?.publicKey, row?.allowlisted], [true, keyHex(stranger), false],
+            "the hidden row keeps its key and names, not the allowlisting nothing would show any more");
+        assert.deepEqual(chatList(p), []);
+
+        p.PrivacyFilter.set(true);
+        await p.dm(lxm(stranger, p.own(), "after delete, filter on"));
+        assert.deepEqual([p.MsgStore.get(S), chatList(p)], [[], []], "dropped by the filter, as when delete removed their contact");
+        assert.equal(p.ContactStore.allowlisted(S), false, "and it stays out after a reload");
+        assert.equal(page({ me: p.me, storage: p.storage }).ContactStore.allowlisted(S), false);
+
+        // With the filter off they come back as a conversation again, never a contact.
+        p.PrivacyFilter.set(false);
+        await p.dm(lxm(stranger, p.own(), "after delete, filter off"));
+        assert.deepEqual(chatList(p), [{ name: short(S), preview: "after delete, filter off" }]);
+        assert.deepEqual([p.ContactStore.isContact(S), offered(p, S)], [false, { contacts: false, picker: false }]);
+    }
+});
+
+/** The selectors style.css styles a .field-hint with (descendant selectors of classes only). */
+const hintSelectors = [...readFileSync(new URL("./style.css", import.meta.url), "utf8").replace(/\/\*[\s\S]*?\*\//g, "")
+    .matchAll(/([^{}]+)\{[^{}]*\}/g)].flatMap((m) => m[1].split(",")).map((s) => s.trim())
+    .filter((s) => /\.field-hint$/.test(s) && /^[\w\-.\s]+$/.test(s));
+/** Whether `el` (with its ancestors) matches a descendant selector of class compounds. */
+function cssMatches(el, selector) {
+    const parts = selector.split(/\s+/).map((p) => p.split(".").filter(Boolean));
+    const has = (e, classes) => classes.every((c) => e.className.split(" ").includes(c));
+    if (!has(el, parts.at(-1))) return false;
+    let i = parts.length - 2;
+    for (let e = el.parent; e && i >= 0; e = e.parent) if (has(e, parts[i])) i--;
+    return i < 0;
+}
+
+test("the sheet's 'Not in your contacts.' and 'Added to your contacts.' are styled hints: each matches a style.css rule for .field-hint", async () => {
+    assert.ok(hintSelectors.includes(".settings-field .field-hint"), `style.css styles .field-hint: ${hintSelectors}`);
+    const p = page();
+    const S = lxmfHash(Identity.create());
+    p.ContactStore.keep(S);
+    const sheet = infoSheet(p, S);
+    const hints = (root) => root.all(classed("field-hint"));
+    const lines = () => hints(sheet.find((e) => e.attrs.id === "ci-add-contact"));
+    assert.deepEqual(lines().map((e) => e.textContent), ["Not in your contacts."]);
+    button(sheet, "Add contact").fire("click");
+    assert.deepEqual(lines().map((e) => e.textContent), ["Added to your contacts."]);
+    assert.ok(classed("settings-section")(sheet.find((e) => e.attrs.id === "ci-add-contact")), "in its own section, not flush against Save");
+    for (const hint of hints(sheet)) {
+        assert.ok(hintSelectors.some((s) => cssMatches(hint, s)), `"${hint.textContent}" matches no .field-hint rule (${hintSelectors.join(" | ")})`);
+    }
 });
 
 // ── no clean-up ────────────────────────────────────────────────────────────
