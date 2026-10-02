@@ -65,6 +65,7 @@ import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } fr
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
+import { bubbleText, enterSends, TOUCH_FIRST } from "./lib/message_text.js";
 import { exchangeUrlRefusal, exchangeRefusalFromViolation } from "./lib/connect_policy.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
@@ -7997,9 +7998,7 @@ const App = {
                     placeholder: c.publicKey ? "Message…" : "Waiting for public key…",
                     rows: 1,
                     disabled: !c.publicKey,
-                    onKeydown: (e) => {
-                        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.sendMessage(); }
-                    },
+                    onKeydown: (e) => this._composerKeydown(e),
                     onInput: (e) => {
                         e.target.style.height = "auto";
                         e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
@@ -8082,9 +8081,7 @@ const App = {
                         id: "composer-input",
                         placeholder: "Message…",
                         rows: 1,
-                        onKeydown: (e) => {
-                            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.sendMessage(); }
-                        },
+                        onKeydown: (e) => this._composerKeydown(e),
                         onInput: (e) => {
                             e.target.style.height = "auto";
                             e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
@@ -8132,11 +8129,14 @@ const App = {
         // A send in progress shows its transfer (0.10 + 0.90 x the Resource's
         // fraction), as iOS's bar does (4744376).
         const progress = isOwn && m.status === "sending" ? RnsClient._sendTransfers.progressOf(m.id) : null;
+        // The text in an element of its own, whose white-space keeps its
+        // line breaks (.msg-text; lib/message_text.js).
+        const text = bubbleText(m.content);
         return h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": m.id },
             h("div", { className: "msg-bubble" },
                 (!isOwn && sender) ? this._buildSenderLabel(sender) : null,
                 this._buildAttachments(m),
-                m.content,
+                text ? h("div", { className: "msg-text" }, text) : null,
                 progress !== null ? this._buildProgressBar(progress) : null,
                 isOwn && m.status === "failed" && m.sendError ? h("div", { className: "msg-attach-note" }, `Not sent: ${m.sendError}`) : null,
                 h("div", { className: "msg-meta" },
@@ -8414,9 +8414,7 @@ const App = {
                     id: "composer-input",
                     placeholder: "Message #" + ch.channelName + "…",
                     rows: 1,
-                    onKeydown: (e) => {
-                        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.sendMessage(); }
-                    },
+                    onKeydown: (e) => this._composerKeydown(e),
                     onInput: (e) => {
                         e.target.style.height = "auto";
                         e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
@@ -8547,9 +8545,20 @@ const App = {
         }
     },
 
+    /** A keydown in a composer (DM, group, channel): Enter sends, unless it
+     *  is to break the line (enterSends: Shift+Enter, the return key of a
+     *  phone, the end of an IME composition). */
+    _composerKeydown(e) {
+        if (!enterSends(e, window.matchMedia?.(TOUCH_FIRST).matches ?? false)) return;
+        e.preventDefault();
+        this.sendMessage();
+    },
+
     sendMessage() {
         const ta = document.getElementById("composer-input");
         if (!ta) return;
+        // Both ends trimmed, as iOS does (ConversationView sendMessage); the
+        // line breaks inside are sent as typed.
         const content = ta.value.trim();
         const chatId = this.state.activeHash;
         const attachments = this._pendingAttachments.get(chatId) ?? [];

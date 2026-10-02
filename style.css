@@ -668,6 +668,15 @@ html, body {
     align-items: flex-start;
 }
 
+/* A message's text (App._buildMsgBubble): its line breaks drawn as sent.
+   Until 2026-10-02 the text sat in the bubble under white-space: normal,
+   which draws every line break as a space. A word longer than the bubble
+   still breaks anywhere instead of widening it. */
+.msg-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .msg-meta {
     font-size: 10px;
     opacity: 0.65;

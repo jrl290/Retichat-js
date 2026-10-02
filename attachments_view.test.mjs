@@ -25,6 +25,7 @@ import { formatSize } from "./lib/attachment_limits.js";
 import { AttachmentStore, memoryBackend } from "./lib/attachment_store.js";
 import { ObjectUrls, blobType, INLINE_TYPES } from "./lib/object_urls.js";
 import { SendTransfers } from "./lib/send_progress.js";
+import { bubbleText } from "./lib/message_text.js";
 import { compile, fn, install } from "./test_app_source.mjs";
 
 // ── a fake DOM, just enough for h() and the bubble ──────────────────────────
@@ -84,7 +85,7 @@ function view() {
     const transfers = new SendTransfers();
     const app = { _statusIcon: (s) => ({ sending: "●", failed: "✗", proved: "✓✓" }[s] ?? "") };
     install(app, {
-        h, document, Attachments, AttachmentUrls, isImageAttachment, formatSize,
+        h, document, Attachments, AttachmentUrls, isImageAttachment, formatSize, bubbleText,
         fmtTime: () => "12:00", RnsClient: { _sendTransfers: transfers }, console: { warn() {} },
     }, [
         "_buildMsgBubble(m, sender = null)", "_buildAttachments(m)", "_attachmentLink(a)", "_loadAttachment(el, a)",
