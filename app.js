@@ -12,7 +12,8 @@
  *
  * Matches Retichat UX:
  *   - Add Contact by entering a destination hash (no public peer directory)
- *   - Privacy filter: only accept messages from contacts you've added
+ *   - Privacy filter (Settings; off unless the user turns it on): only
+ *     accept messages from contacts you've added
  *   - Share your identity (destination hash) so others can add you
  */
 
@@ -1452,11 +1453,14 @@ GroupStore.init();
 // =========================================================================
 //  PRIVACY FILTER — which received LXMF messages this client keeps
 //
-//  iOS: UserPreferences.filterStrangers (on by default), allowlistDecision
-//  and groupMessagePolicy (ChatRepository.swift:3002-3070), applied in
+//  iOS: UserPreferences.filterStrangers, allowlistDecision and
+//  groupMessagePolicy (ChatRepository.swift:3002-3070), applied in
 //  handleIncomingMessage (:1947-1972). Android copies it exactly:
 //  DeliveryPolicy.kt, applied in onMessageReceived (ChatRepository.kt
-//  :1378-1394). With the filter on, a direct message is kept only from an
+//  :1378-1394). The phones turn it on by default; the web does not
+//  (departure decided by James 2026-10-01: "on retichat.com I don't want
+//  the Privacy Filter on by default"; init). With the filter on, a direct
+//  message is kept only from an
 //  allowlisted contact (ContactStore.allow); a group invite only from an
 //  allowlisted source; a plain group message when its group exists here,
 //  whoever sent it; a distro identity transfer is offered whoever sent it.
@@ -1513,11 +1517,17 @@ GroupStore.init();
 //  received (_buildDistroIdentitySection), or the key is pasted (Import).
 // =========================================================================
 const PrivacyFilter = {
-    _on: true,
+    _on: false,
 
-    /** On unless the user turned it off: iOS filterStrangers and Android
-     *  filter_strangers both default to true (UserPreferences.swift:192-195). */
-    init() { this._on = sGet("filterStrangers") !== false; },
+    /** Off unless the user turned it on. Departure decided by James
+     *  2026-10-01: the web defaults off; the phones keep on (iOS
+     *  filterStrangers and Android filter_strangers default to true,
+     *  UserPreferences.swift:192-195). Only the Settings switch stores it
+     *  (set; and the harness, through Debug.privacyFilter and
+     *  debug.html?privacy=), so a user who never touched it is off from this
+     *  build on (from 2026-09-30 until then the web read nothing stored as
+     *  on), and one who turned it on stays on. */
+    init() { this._on = sGet("filterStrangers") === true; },
 
     get on() { return this._on; },
 
@@ -8691,14 +8701,20 @@ const App = {
             // from that link allowlists the distro, which the transfer does
             // not come from (signed as the device: Android
             // RfedDistroClient.sendIdentityTo, iOS sendIdentity, this
-            // page's _sendDistroViaLxmf).
-            section.appendChild(h("div", { className: "field-hint", id: "distro-receive-hint" },
-                "To receive it from another of your devices, first add that device as a contact here, " +
-                "by its own address: the Contact link under “This device” on its Identity screen " +
-                "(“Device Identity” on a web page), not its Distro address. The transfer comes from the device's own address, " +
-                "so a contact made from its Distro address does not let it through. " +
-                "Or turn the Privacy filter off in Settings. Otherwise the transfer is dropped and nothing appears. " +
-                "Then, on that device, choose “Add another device” and send to this device's address:"));
+            // page's _sendDistroViaLxmf). Only while the filter is on: off
+            // (the web's default since 2026-10-01, James), nothing drops the
+            // transfer, and only the step on the other device is said.
+            section.appendChild(PrivacyFilter.on
+                ? h("div", { className: "field-hint", id: "distro-receive-hint" },
+                    "To receive it from another of your devices, first add that device as a contact here, " +
+                    "by its own address: the Contact link under “This device” on its Identity screen " +
+                    "(“Device Identity” on a web page), not its Distro address. The transfer comes from the device's own address, " +
+                    "so a contact made from its Distro address does not let it through. " +
+                    "Or turn the Privacy filter off in Settings. Otherwise the transfer is dropped and nothing appears. " +
+                    "Then, on that device, choose “Add another device” and send to this device's address:")
+                : h("div", { className: "field-hint", id: "distro-receive-steps" },
+                    "To receive it from another of your devices, choose “Add another device” on that device " +
+                    "and send to this device's address:"));
             section.appendChild(kvRow("This device", RnsClient.ownHash || ownLxmfDestinationHash(), { empty: "unavailable" }));
             return section;
         }
@@ -9894,7 +9910,7 @@ window.RetichatTest = {
     addPeer(destHash, publicKeyHex) {
         destHash = destHash.toLowerCase().replace(/[^0-9a-f]/g, "");
         // As the Add Contact flow does: listed and allowlisted, so the
-        // privacy filter (on by default) keeps the peer's messages.
+        // privacy filter, when it is on, keeps the peer's messages.
         ContactStore.add(destHash, false, publicKeyHex || null);
         ContactStore.allow(destHash);
         if (!publicKeyHex) App._requestPathForContact(destHash);
@@ -9903,10 +9919,12 @@ window.RetichatTest = {
 
     /** The privacy filter (Settings "Privacy filter"): with no argument,
      *  whether it is on; with a boolean, turn it on or off (persisted, as
-     *  the toggle does) and return the new state. A stage that needs a
-     *  stranger's message kept turns it off first; debug.html?privacy=0
-     *  does it before the page boots. Drops are recorded as Harness events
-     *  of kind "privacy-drop" ({src, path, at: "source"|"message"}). */
+     *  the toggle does) and return the new state. It is off unless turned
+     *  on (since 2026-10-01, James): a stage that needs a stranger's
+     *  message dropped turns it on first, and debug.html?privacy=1 does it
+     *  before the page boots (privacy=0 stores it off). Drops are recorded
+     *  as Harness events of kind "privacy-drop" ({src, path, at:
+     *  "source"|"message"}). */
     privacyFilter(on) {
         if (on !== undefined) PrivacyFilter.set(on);
         return PrivacyFilter.on;
@@ -9967,7 +9985,7 @@ Harness (headless):
   .fetchPropagated() — one /get fetch from the propagation node
   .got(marker)    — true if a message containing marker arrived
   .addPeer(h,pk)  — add a peer (allowlisted), optionally with its public key
-  .privacyFilter([on]) — read, or turn on/off, the privacy filter
+  .privacyFilter([on]) — read, or turn on/off, the privacy filter (off unless turned on)
   .distro()       — distro identity state
   .generateDistro() / .adoptDistro(privHex) / .pullDistro()
   .tab()          — "active" | "inactive" (one active tab per identity)

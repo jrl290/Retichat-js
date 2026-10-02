@@ -2,13 +2,15 @@
  * THE PRIVACY FILTER — which received LXMF messages the web client keeps,
  * and what a dropped one costs.
  *
- * Parity target: iOS UserPreferences.filterStrangers (on by default),
- * ChatRepository.swift allowlistDecision / groupMessagePolicy; Android
- * DeliveryPolicy.kt (the same rule). With the filter on, a DM is kept only
- * from an allowlisted contact, a group invite only from an allowlisted
- * source, any other group message when the group exists here; a distro
- * identity transfer is offered whoever sent it; distro fan-out is never
- * filtered.
+ * Parity target: iOS UserPreferences.filterStrangers, ChatRepository.swift
+ * allowlistDecision / groupMessagePolicy; Android DeliveryPolicy.kt (the
+ * same rule). The phones turn the filter on by default; the web does not
+ * (departure decided by James 2026-10-01), and the tests below that are
+ * about the filter turn it on as the Settings switch does (stores()). With
+ * the filter on, a DM is kept only from an allowlisted contact, a group
+ * invite only from an allowlisted source, any other group message when the
+ * group exists here; a distro identity transfer is offered whoever sent it;
+ * distro fan-out is never filtered.
  *
  * "Drop costs nothing" (James, 2026-09-30): the LXMF router asks the filter
  * on the decrypted bytes (the source, bytes 0..16 of the plaintext) before
@@ -152,11 +154,17 @@ const FIELD_TICKET = 0x0C;
 const TICKET = "0123456789abcdef";
 
 /** The real ContactStore, GroupStore, PrivacyFilter and MsgStore over one
- *  storage, as a page load builds them. */
-function stores(me, storage = memory()) {
+ *  storage, as a page load builds them. The web's filter is off unless the
+ *  user turns it on (James, 2026-10-01); most tests here are about what it
+ *  does when on, so `filter` (true by default) is stored first, as the
+ *  Settings switch stores it, unless the storage already holds a choice.
+ *  `filter: null` stores nothing: the page as a user who never touched the
+ *  switch loads it. */
+function stores(me, storage = memory(), { filter = true } = {}) {
     const events = [];
     const Harness = { recordInbound() {}, event: (kind, detail) => events.push({ kind, detail }), error() {} };
     const { sGet, sSet } = storage;
+    if (filter !== null && sGet("filterStrangers") === null) sSet("filterStrangers", filter);
     const ContactStore = build("ContactStore", {
         sGet, sSet, LXMF, Date,
         migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
@@ -181,8 +189,8 @@ function stores(me, storage = memory()) {
  * A web client receiving: the real LXMRouter given the real PrivacyFilter,
  * as connect() builds it, and the real message handler behind it.
  */
-function recipient({ me = Identity.create(), storage } = {}) {
-    const s = stores(me, storage);
+function recipient({ me = Identity.create(), storage, filter = true } = {}) {
+    const s = stores(me, storage, { filter });
     const destination = new EventEmitter();
     destination.hash = Destination.hash(me, "lxmf", "delivery");
     const router = new LXMRouter({ registerDestination: () => destination }, me, { filter: s.PrivacyFilter });
@@ -242,17 +250,41 @@ const ticketed = (fields = []) => new Map([...fields, [FIELD_TICKET, TICKET]]);
 const linkReplies = (wire) => wire.b.filter((p) => p.packetType === Packet.DATA && p.context === Packet.NONE);
 const linkProofs = (wire) => wire.b.filter((p) => p.packetType === Packet.PROOF && p.context === Packet.NONE);
 
-// ── on by default, persisted ───────────────────────────────────────────────
+// ── off by default on the web, persisted ──────────────────────────────────
 
-test("the filter is on by default, and the Settings toggle is persisted and applied at once", () => {
+test("the filter is off by default on the web (James, 2026-10-01): never touched is off, an explicit on stays on; the Settings toggle is persisted and applied at once", async () => {
+    // "on retichat.com I don't want the Privacy Filter on by default". The
+    // phones keep on (iOS filterStrangers, Android filter_strangers). Only
+    // the Settings switch stores it, so a user who never touched it (nothing
+    // stored, the 2026-09-30 build's default on) is off now, and one who
+    // turned it on, or off, keeps that.
     const me = Identity.create();
     const s = memory();
-    assert.equal(stores(me, s).PrivacyFilter.on, true, "on with nothing stored (iOS and Android default)");
-    stores(me, s).PrivacyFilter.set(false);
+    assert.equal(stores(me, s, { filter: null }).PrivacyFilter.on, false, "off with nothing stored");
+    assert.equal(s.sGet("filterStrangers"), null, "and reading it stores nothing");
+    stores(me, s, { filter: null }).PrivacyFilter.set(true);
+    assert.equal(s.sGet("filterStrangers"), true);
+    assert.equal(stores(me, s, { filter: null }).PrivacyFilter.on, true, "the user's explicit on survives a reload");
+    stores(me, s, { filter: null }).PrivacyFilter.set(false);
     assert.equal(s.sGet("filterStrangers"), false);
-    assert.equal(stores(me, s).PrivacyFilter.on, false, "a reload keeps it off");
-    stores(me, s).PrivacyFilter.set(true);
-    assert.equal(stores(me, s).PrivacyFilter.on, true);
+    assert.equal(stores(me, s, { filter: null }).PrivacyFilter.on, false, "a reload keeps it off");
+    const junk = memory();
+    for (const stored of ["true", 1, "on"]) {
+        junk.sSet("filterStrangers", stored);
+        assert.equal(stores(me, junk, { filter: null }).PrivacyFilter.on, false, `${JSON.stringify(stored)} is no explicit on`);
+    }
+    assert.match(app, /\nPrivacyFilter\.init\(\);\n/, "the page reads it at load");
+
+    // A page that never touched it keeps a stranger's DM, proved, as before
+    // the filter (and as a phone with the filter off does).
+    const r = recipient({ filter: null });
+    assert.equal(r.PrivacyFilter.on, false);
+    const stranger = Identity.create();
+    r.packet(lxm(stranger, r.me, "hello from someone you never added"));
+    await settle();
+    assert.deepEqual(r.MsgStore.get(lxmfHash(stranger)).map((m) => m.content), ["hello from someone you never added"]);
+    assert.equal(r.proofs.length, 1, "proved");
+    assert.deepEqual(r.drops(), [], "nothing dropped");
 
     const settings = methodBody("_renderSettingsModal()");
     assert.match(settings, /h\("h3", \{\}, "Privacy"\)/, "a Privacy section, as on iOS and Android");
@@ -1702,10 +1734,12 @@ test("migration, once: every member of a group held as active passes the filter,
     assert.ok(step < start.indexOf("ActiveTab.start"), "before the first message can arrive");
 });
 
-test("the Identity screen says where a distro identity is received: add the sending device first, and this device's address", () => {
+test("the Identity screen says where a distro identity is received: with the filter on, add the sending device first (#distro-receive-hint); off, only the step on that device; and this device's address either way", () => {
     // "Add another device" onto the web is strict (James, 2026-09-30): the
     // transfer comes from the other device's own address, which the filter
-    // drops unless that device is a contact here.
+    // drops unless that device is a contact here. The filter is off unless
+    // the user turns it on (James, 2026-10-01), and off nothing drops it, so
+    // the hint is shown only while it is on.
     class El {
         constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.style = {}; this.className = ""; }
         appendChild(c) { this.children.push(c); return c; }
@@ -1726,8 +1760,8 @@ test("the Identity screen says where a distro identity is received: add the send
     const h = fn("h", "tag, a={}, ...kids", { document });
     const kvRow = fn("kvRow", "key, value, opts = {}", { h, navigator: {}, setTimeout });
     const OWN = "0123456789abcdef0123456789abcdef";
-    const section = (DistroManager, ownHash = OWN) => compile("_buildDistroIdentitySection()", {
-        h, kvRow, DistroManager, RnsClient: { ownHash }, ownLxmfDestinationHash: () => OWN,
+    const section = (DistroManager, ownHash = OWN, filterOn = true) => compile("_buildDistroIdentitySection()", {
+        h, kvRow, DistroManager, RnsClient: { ownHash }, ownLxmfDestinationHash: () => OWN, PrivacyFilter: { on: filterOn },
     })({ state: {} })();
 
     const receive = section({ has: false });
@@ -1752,8 +1786,21 @@ test("the Identity screen says where a distro identity is received: add the send
     assert.match(section({ has: false }, null).find((c) => c.className === "kv-row" && /This device/.test(c.text)).text,
         new RegExp(OWN), "before the router is up, from the identity");
 
+    assert.equal(receive.find((c) => c.attrs.id === "distro-receive-steps"), null, "one hint, not two");
+
+    // Filter off (the web's default): no word of contacts or the filter,
+    // the step on the other device, and this device's address.
+    const open = section({ has: false }, OWN, false);
+    assert.equal(open.find((c) => c.attrs.id === "distro-receive-hint"), null, "no add-device hint while the filter is off");
+    const steps = open.find((c) => c.attrs.id === "distro-receive-steps");
+    assert.ok(steps, "the step on the other device");
+    assert.match(steps.text, /choose “Add another device” on that device and send to this device's address:/);
+    assert.doesNotMatch(steps.text, /contact|Privacy filter|dropped/);
+    assert.match(open.find((c) => c.className === "kv-row" && /This device/.test(c.text)).text, new RegExp(OWN));
+
     const sending = section({ has: true, lxmfDeliveryHash: "d".repeat(32), hash: "e".repeat(32), pubKey: "f".repeat(128), exportLxmaUri: () => "lxma://x" });
     assert.equal(sending.find((c) => c.attrs.id === "distro-receive-hint"), null, "not on the sending side");
+    assert.equal(sending.find((c) => c.attrs.id === "distro-receive-steps"), null);
 });
 
 test("the user allowlists a peer by adding it, writing to it, or creating a group with it", () => {

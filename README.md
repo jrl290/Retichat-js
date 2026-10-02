@@ -77,7 +77,7 @@ Node A                               Node B
 - **Dark theme by default** with light mode toggle (matches iOS design language)
 - **HTTP exchange transport** — no WebSocket, no raw sockets, works behind any hosting
 - **End-to-end encryption** — AES-256-CBC + X25519 key exchange matching Python RNS reference
-- **Privacy filter** — only accept messages from contacts you've explicitly added
+- **Privacy filter** — only accept messages from contacts you've explicitly added (off unless you turn it on in Settings; the phone apps turn it on by default)
 - **Contact management** — add by destination hash or lxmf:///lxma:// link, share your own identity
 - **Glass-morphism UI** — translucent surfaces matching iOS GlassBackground design language
 

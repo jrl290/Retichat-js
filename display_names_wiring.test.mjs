@@ -135,9 +135,12 @@ function groupRule() {
     return { groupTrustsSource, GROUP_ACTIONS_THAT_RELAY,
         shouldProcessGroupMessage: appFunction("shouldProcessGroupMessage", { groupTrustsSource, GROUP_ACTIONS_THAT_RELAY }) };
 }
-/** The real PrivacyFilter over `storage` (on unless stored off), as a page
- *  load builds it. */
+/** The real PrivacyFilter over `storage`, as a page load builds it. The
+ *  web's filter is off unless the user turns it on (James, 2026-10-01);
+ *  these tests are about it on, so it is stored on first, as the Settings
+ *  switch stores it, unless `storage` already holds a choice. */
 function privacyFilter(storage, ContactStore, GroupStore) {
+    if (storage.sGet("filterStrangers") === null) storage.sSet("filterStrangers", true);
     const filter = build("PrivacyFilter", {
         sGet: storage.sGet, sSet: storage.sSet, ContactStore, GroupStore, Harness, LXMF, LXMessage, Buffer, ...groupRule(),
     });

@@ -77,7 +77,8 @@
   var iface = P.get("iface");
   if (iface) put("interfaceName", iface);
 
-  // app.js PrivacyFilter reads retichat_filterStrangers (absent: on).
+  // app.js PrivacyFilter reads retichat_filterStrangers (absent: off, since
+  // 2026-10-01; privacy=1 turns it on before the page boots).
   var privacy = P.get("privacy");
   if (privacy === "0") put("filterStrangers", false);
   else if (privacy === "1") put("filterStrangers", true);
