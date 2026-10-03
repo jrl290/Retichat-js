@@ -51,6 +51,7 @@ import {
     ChannelMembership, DISTRO_CHANNEL_TYPE, channelSyncDisposition, channelSyncFields, joinNameAccepted,
     readChannelSync, supersedes,
 } from "./lib/channel_sync.js";
+import { DistroUploads } from "./lib/distro_upload.js";
 import { build, install, methodBody, memoryStorage } from "./test_app_source.mjs";
 
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
@@ -63,13 +64,26 @@ const H = 3_600_000;
  *  sends (C, a post's "sent") have finished their hops. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-/** The clock app.js reads (Date.now), set by the test. */
-function fakeClock(t, start = 1_790_000_000_000) {
+/** The clock app.js reads (Date.now), set by the test. With `tick`, every
+ *  read moves it on by 1 ms, as a real clock moves between two reads. */
+function fakeClock(t, start = 1_790_000_000_000, { tick = false } = {}) {
     const real = Date.now;
     const clock = { now: start };
-    Date.now = () => clock.now;
+    Date.now = tick ? () => clock.now++ : () => clock.now;
     t.after(() => { Date.now = real; });
     return clock;
+}
+
+/** A LINK-type packet as Link.newLinkPacket builds it: `pack()` gives the
+ *  bytes the fake link transmits, and its hash is the upload's own. */
+const linkPacket = (data) => ({ packetHash: Cryptography.fullHash(Buffer.from(data)), pack: () => Buffer.from(data) });
+
+/** _onPacketsLost, whose parameter is destructured, compiled by hand. */
+function installPacketsLost(self, env) {
+    const body = methodBody("_onPacketsLost({ packetHashes, reason })").replaceAll("this.", "self.");
+    const names = Object.keys(env);
+    const f = new Function(...names, "self", "arg", `const { packetHashes, reason } = arg; ${body}`);
+    self._onPacketsLost = (arg) => f(...names.map((n) => env[n]), self, arg);
 }
 
 /**
@@ -78,7 +92,7 @@ function fakeClock(t, start = 1_790_000_000_000) {
  * Name. RFed is played at the seams (see the header); `holdUnsubscribe`
  * keeps each /rfed/unsubscribe unanswered until `release()`.
  */
-function device(distro, { label = "device", ownName = null, resubscribed = true, holdUnsubscribe = false } = {}) {
+function device(distro, { label = "device", ownName = null, resubscribed = true, holdUnsubscribe = false, proofs = "auto" } = {}) {
     const me = Identity.create();
     const storage = memoryStorage();
     const { sGet, sSet } = storage;
@@ -100,8 +114,15 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         ? { has: true, identity, lxmfDeliveryHash: lxmfHash(identity), pubKey: identity.getPublicKey().toString("hex") }
         : { has: false, identity: null, lxmfDeliveryHash: null, pubKey: null });
     hold(distro);
+    const logged = [];      // the error and warn lines of the shipped code
+    const log = {
+        log() {},
+        warn: (...args) => logged.push(["warn", args.join(" ")]),
+        error: (...args) => logged.push(["error", args.join(" ")]),
+    };
     const env = {
-        Buffer, Destination, Cryptography, MsgPack, LXMessage, LXMF, Link: { MDU: 100_000 }, console: quiet,
+        Buffer, Destination, Cryptography, MsgPack, LXMessage, LXMF, Link: { MDU: 100_000, ACTIVE: 0x02, CLOSED: 0x04 },
+        Packet: { NONE: 0x00 }, console: log,
         IdMgr: { has: true, id: me, hash: me.hash.toString("hex") },
         DistroManager, DistroSeen, Harness,
         ContactStore: { keep: (h) => { contacts.add(h); return { publicKey: null }; }, _save() {}, touch() {}, acceptMessageName() {} },
@@ -118,13 +139,46 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
     const requests = [];    // [path, payload] to rfed, in the order sent
     const published = [];   // each post's /channel/publish payload: channel_hash | blob
     const held = [];
+    // The §1 watch's timers, run by the test (fireTimers), never by a clock.
+    const timers = [];
+    // The propagation link C goes on: the node proves each upload packet at
+    // once (`proofs: "auto"`), or when the test says (`prove()`).
+    const proofKeys = [];
+    const propagationLink = (name = "link") => ({
+        name, status: 0x02, sent: [],
+        newLinkPacket: (context, data) => linkPacket(data),
+        _transmit(raw) {
+            if (this.status === 0x04) return null;
+            this.sent.push(Buffer.from(raw));
+            uploads.push(Buffer.from(raw));
+            const key = Cryptography.fullHash(Buffer.from(raw)).subarray(0, 16).toString("hex");
+            proofKeys.push(key);
+            if (proofs === "auto") queueMicrotask(() => prove(key));
+            return raw;
+        },
+        sendResource: async (d) => { uploads.push(Buffer.from(d)); },
+    });
+    /** The propagation node's proof of the upload packet `key` (the
+     *  proof handler, RnsClient.connect's "proof" listener). */
+    const prove = (key = proofKeys.at(-1)) => {
+        const pending = self._pendingPacketHashes.get(key);
+        if (!pending) return false;
+        self._pendingPacketHashes.delete(key);
+        pending.onProof?.(pending.messageId);
+        return true;
+    };
     const self = {
         ownHash: lxmfHash(me),
         _cfg: { rfedNodeHash: RFED },
         _channelsResubscribed: resubscribed, _channelsInitialized: false,
         _rfedSubscriptionPromises: new Map(), _rfedUnsubscribes: new Map(), _rfedStampRefreshed: new Set(),
         _rfedOpenedChannelHashes: new Set(), _rfedStreamPromises: new Map(),
-        _pendingTickets: new Map(), _pendingPacketHashes: new Map(),
+        _pendingTickets: new Map(), _pendingPacketHashes: new Map(), _pendingTimeouts: new Map(),
+        _distroUploads: new DistroUploads({
+            now: () => Date.now(), log,
+            setTimer: (fn, ms) => { const timer = { fn, ms, cleared: false }; timers.push(timer); return timer; },
+            clearTimer: (timer) => { timer.cleared = true; },
+        }),
         _onMsg: [(m, peer) => ui.push({ kind: m?.kind ?? null, synced: m?.synced ?? null, peer })],
         _channelPublishes: new ChannelPublishes(), _rfedSendChain: Promise.resolve(),
         _rfedRequest: async (aspects, path, payload) => {
@@ -134,10 +188,12 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         },
         _configureChannelStream: async () => {},
         openChannel: async () => {},
-        _whenPropagationLinkUp: async () => ({
-            send: (d) => { uploads.push(Buffer.from(d)); return {}; },
-            sendResource: async (d) => { uploads.push(Buffer.from(d)); },
-        }),
+        _propLinks: [],
+        _whenPropagationLinkUp: async () => {
+            const up = self._propLinks.find((l) => l.status === 0x02) ?? propagationLink(`link${self._propLinks.length + 1}`);
+            if (!self._propLinks.includes(up)) self._propLinks.push(up);
+            return up;
+        },
         _buildPropagationPacked: async (packed) => packed,
         _exchangeIsDown: () => false,
         _ensureChannelStreamConfigured: async () => {},
@@ -165,13 +221,17 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         "async _unsubscribeChannel(channelName, rfedNodeHash)",
         "_syncChannelMembership(op, ch)",
         "async _sendDistroChannelSync(op, channelName, atMs)",
+        "async _uploadForDistro(link, recipientHex, propagationPacked, label)",
         "_handleDistroBlob(distroHash, blob)",
         "_handleDistroChannelSync(marker, facts)",
         "_applyDistroChannelSync(change, byHex)",
     ]);
+    installPacketsLost(self, env);
     return {
         label, me, hash: lxmfHash(me), self, env, storage, ChannelStore, ChannelMsgStore, DistroManager, hold,
-        uploads, requests, published, events, ui, contacts,
+        uploads, requests, published, events, ui, contacts, logged, timers, proofKeys, prove,
+        /** Run the §1 watch's timers that are due and not cleared. */
+        fireTimers: () => timers.splice(0).filter((timer) => !timer.cleared).forEach((timer) => timer.fn()),
         release: () => held.splice(0).forEach((resolve) => resolve()),
         channels: () => ChannelStore.getAll().map((c) => c.channelName).sort(),
         record: (name) => env.ChannelMembershipStore.get(channelIdentity(name).hash.toString("hex")),
@@ -555,6 +615,67 @@ test("ChannelMsgStore keeps one post per (source, timestamp), and two posts of t
     assert.deepEqual(a.ChannelMsgStore.get(CH).filter((m) => m.dir === "out").map((m) => [m.content, m.status]), [["one", "sent"], ["two", "sent"]]);
 });
 
+// The record's identity is the one the post is packed with (review of
+// 69ff01e, 2026-10-03): ChannelMsgStore.add stamps its own Date.now() on a
+// record that has none, which is another millisecond whenever the
+// next-free-millisecond loop moved on or the clock did, and every other test
+// here freezes the clock.
+
+test("two posts in one millisecond, then a reload: rfed's echo of each is dropped against its record", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro);
+    a.ChannelStore.join(CH, RFED);
+    await Promise.all([a.self.sendChannelMessage(CH, "one"), a.self.sendChannelMessage(CH, "two")]);
+    assert.equal(a.published.length, 2);
+    // The reload: memory is new, storage is not; rfed's echoes are pulled.
+    a.self._chanSeenIds = new Set();
+    a.self._channelPublishes = new ChannelPublishes();
+    for (const wire of a.published) assert.equal(a.self._handleChannelPacket(wire), true);
+    const posts = a.ChannelMsgStore.get(CH).filter((m) => m.dir !== "system");
+    assert.deepEqual(posts.map((m) => [m.content, m.dir, m.status]), [["one", "out", "sent"], ["two", "out", "sent"]],
+        "two bubbles, each the user's, sent");
+});
+
+test("with a clock that moves between reads, an own post's record keeps the timestamp it is packed with, and its echo after a reload is dropped", async (t) => {
+    fakeClock(t, 1_790_000_000_000, { tick: true });
+    const distro = Identity.create();
+    const a = device(distro);
+    a.ChannelStore.join(CH, RFED);
+    await a.self.sendChannelMessage(CH, "one");
+    const [record] = a.ChannelMsgStore.get(CH).filter((m) => m.dir === "out");
+    assert.deepEqual([record.srcHash, record.timestamp], [lxmfHash(distro), channelLxmUnpack(CH, a.published[0]).tsMs]);
+    a.self._chanSeenIds = new Set();
+    a.self._channelPublishes = new ChannelPublishes();
+    assert.equal(a.self._handleChannelPacket(a.published[0]), true);
+    assert.deepEqual(a.ChannelMsgStore.get(CH).filter((m) => m.dir !== "system").map((m) => [m.content, m.dir, m.status]),
+        [["one", "out", "sent"]], "one bubble");
+});
+
+test("a post that fails with the exchange down takes an identity of its own, the next free millisecond, and keeps it", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro);
+    a.ChannelStore.join(CH, RFED);
+    await a.self.sendChannelMessage(CH, "sent");
+    a.self._exchangeIsDown = () => true;
+    await a.self.sendChannelMessage(CH, "failed");
+    a.self._exchangeIsDown = () => false;
+    await a.self.sendChannelMessage(CH, "sent again");
+    const D = lxmfHash(distro);
+    const own = () => a.ChannelMsgStore.get(CH).filter((m) => m.dir === "out")
+        .map((m) => [m.content, m.status, m.srcHash === D ? "D" : m.srcHash, m.timestamp - clock.now]);
+    assert.deepEqual(own(), [["sent", "sent", "D", 0], ["failed", "failed", "D", 1], ["sent again", "sent", "D", 2]],
+        "one identity each: the failed post holds the millisecond it took");
+    assert.deepEqual(a.published.map((w) => channelLxmUnpack(CH, w).tsMs - clock.now), [0, 2]);
+    // A reload, and rfed's echoes pulled: each lands on its own record.
+    a.self._chanSeenIds = new Set();
+    a.self._channelPublishes = new ChannelPublishes();
+    for (const wire of a.published) assert.equal(a.self._handleChannelPacket(wire), true);
+    assert.deepEqual(own(), [["sent", "sent", "D", 0], ["failed", "failed", "D", 1], ["sent again", "sent", "D", 2]],
+        "nothing stored twice, and the failed post stays failed");
+});
+
 // ═════════════════════════════════════════════════════════════════════════
 //  4. The Channel Display Name rule across the distro's devices
 //     (DISPLAY_NAMES.md §9, "Posting as the distro": the four tests)
@@ -638,6 +759,55 @@ test("§4.2: when both devices have unset their names, one clear is sent", async
     assert.equal(readerSees(), null, "the reader shows D with no channel name");
 });
 
+test("§4.2: a device that has a name never learns a sibling's clear: it keeps its record and does not repeat its name", async (t) => {
+    const { a, b, post, readerSees } = threeInAChannel(t, { aName: "Ann", bName: "Ann" });
+    assert.deepEqual([(await post(a, "a0")).state, (await post(b, "b0")).state], ["name", "absent"]);
+    // A's name is unset: A clears it once (rule: unset after including).
+    a.env.OwnNames.channel = null;
+    assert.deepEqual([(await post(a, "a1")).state, readerSees()], ["clear", null]);
+    // B still holds "Ann". A's clear is not what B would send (§4.2 "a clear
+    // while it has one"), so B's record stays "Ann", and B's next post is
+    // decided on B's own triggers alone: none has fired.
+    assert.equal(b.env.ChannelPostNamesStore.included(CH, lxmfHash(b.DistroManager.identity)).lastDigest, DN.digestHex("Ann"));
+    assert.deepEqual([(await post(b, "b1")).state, readerSees()], ["absent", null],
+        "D's posts show no channel name until a device's own trigger includes one");
+});
+
+test("§4.2: what is learned is never later than this device's clock: a sibling's clock running ahead holds back no new sender", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const b = device(distro, { label: "B", ownName: "Ann" });
+    b.ChannelStore.join(CH, RFED);
+    const D = lxmfHash(distro);
+    // B included "Ann" an hour ago.
+    clock.now -= H;
+    await b.self.sendChannelMessage(CH, "an hour ago");
+    clock.now += H;
+    assert.equal(channelLxmUnpack(CH, b.published[0]).displayName.state, "name");
+    // Sibling A, its clock 10 minutes ahead, posts "Ann" now: B learns it.
+    const t0 = clock.now;
+    const fromA = channelLxmPack(CH, distro, "from A", DN.nameState("Ann"), t0 + 10 * 60_000);
+    assert.equal(b.self._handleChannelPacket(fromA.wire), true);
+    assert.deepEqual(b.env.ChannelPostNamesStore.included(CH, D), { lastDigest: DN.digestHex("Ann"), lastIncludedAt: t0 },
+        "recorded at this device's clock, not 10 minutes in its future");
+    // A reader B has never seen posts 2 minutes later: rule 2.
+    clock.now = t0 + 2 * 60_000;
+    const stranger = channelLxmPack(CH, Identity.create(), "hello", DN.ABSENT, clock.now);
+    assert.equal(b.self._handleChannelPacket(stranger.wire), true);
+    clock.now = t0 + 3 * 60_000;
+    await b.self.sendChannelMessage(CH, "to the newcomer");
+    assert.deepEqual(channelLxmUnpack(CH, b.published.at(-1)).displayName, DN.nameState("Ann"),
+        "the new sender arrived after what B last included, so B's post carries the name");
+
+    // The unit: the post's time when it is not ahead of this device's clock.
+    const storage = memoryStorage();
+    const posts = new ChannelPostNames({ get: storage.sGet, set: storage.sSet });
+    assert.equal(posts.learn(CH, D, DN.nameState("Ann"), 500, "Ann", 900), true);
+    assert.equal(posts.included(CH, D).lastIncludedAt, 500);
+    assert.equal(posts.learn(CH, D, DN.nameState("Ann"), 2_000, "Ann", 1_000), true);
+    assert.equal(posts.included(CH, D).lastIncludedAt, 1_000);
+});
+
 test("§4.2: the rule's state is per posting identity, and what the device included before 2026-10-03 becomes the device's", (t) => {
     fakeClock(t);
     const storage = memoryStorage();
@@ -713,6 +883,107 @@ test("the user's join sends one C to the distro: D to D, signed by D, the marker
     assert.equal(LXMF.isDeliveryNotification(fields, ""), true);
     assert.deepEqual(a.record("public.tea"), { op: "join", at: clock.now }, "recorded for rule 5");
     assert.deepEqual(a.events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => [e.detail.op, e.detail.how]), [["join", "packet"]]);
+});
+
+// C is sent once the propagation node has it (review of 69ff01e,
+// 2026-10-03; CHECK_THESE_THINGS_FIRST §14): until then the log said
+// "propagated" and the Harness event fired when the packet was queued.
+
+test("C is said sent when the propagation node proves its upload, never when the packet is queued", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.equal(a.uploads.length, 1, "uploaded");
+    const sent = () => a.events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => [e.detail.op, e.detail.how]);
+    assert.deepEqual(sent(), [], "not sent while unproved");
+    assert.equal(a.self._pendingPacketHashes.has(a.proofKeys[0]), true, "its proof is waited for");
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(sent(), [["join", "packet"]]);
+    assert.deepEqual(a.logged, [], "a proof in time is no §1 violation");
+    assert.equal(a.timers.length, 1);
+    assert.equal(a.timers[0].cleared, true, "the §1 watch stopped at the proof");
+});
+
+test("C whose packet the exchange lost is reported lost, never said sent, and is not sent again", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.ChannelStore.join("public.tea", RFED);
+    await a.self.leaveChannel("public.tea");
+    await settle();
+    assert.equal(a.uploads.length, 1);
+    a.self._onPacketsLost({ packetHashes: [Cryptography.fullHash(a.uploads[0]).toString("hex")], reason: "the exchange failed" });
+    await settle();
+    assert.deepEqual(a.events.filter((e) => e.kind === "distro-channel-sync-sent"), []);
+    assert.deepEqual(a.events.filter((e) => e.kind === "error").map((e) => [e.detail.where, e.detail.message]),
+        [["distro-channel-sync", "its packet was lost (the exchange failed)"]]);
+    assert.equal(a.uploads.length, 1, "no second upload (DESIGN_PRINCIPLES §3)");
+    assert.deepEqual(a.channels(), [], "the leave stands here whatever became of C");
+    // A proof that comes after all is logged, and changes nothing.
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.events.filter((e) => e.kind === "distro-channel-sync-sent"), []);
+    assert.ok(a.logged.some(([level, line]) => level === "warn" && line.includes("proved after all")));
+});
+
+test("§1: 5 s with no proof of C is said then, and a proof after that is logged with its time; neither decides it", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.deepEqual(a.timers.map((timer) => timer.ms), [5_001]);
+    a.fireTimers();
+    assert.deepEqual(a.logged.map(([level, line]) => [level, /§1 VIOLATION: the propagation node has not proved the join of #public\.tea/.test(line)]),
+        [["error", true]]);
+    assert.deepEqual(a.events.filter((e) => e.kind === "distro-channel-sync-sent"), [], "said, not decided");
+    clock.now += 6_000;
+    a.prove();
+    await settle();
+    assert.ok(a.logged.some(([level, line]) => level === "error" && line.includes("proved the join of #public.tea (§17.12) 6000 ms after its upload")),
+        "a late success is a failure, and logged as one");
+    assert.deepEqual(a.events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => e.detail.op), ["join"], "the proof decides it");
+});
+
+test("a propagation link that went down while C was built: C waits for the next link and goes once, on that one", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro);
+    a.self._buildPropagationPacked = async (packed) => {
+        a.self._propLinks.forEach((l) => { l.status = 0x04; });   // closed while the stamp was mined
+        return packed;
+    };
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.deepEqual(a.self._propLinks.map((l) => [l.name, l.status, l.sent.length]), [["link1", 0x04, 0], ["link2", 0x02, 1]]);
+    assert.equal(a.uploads.length, 1);
+    await settle();
+    assert.deepEqual(a.events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => e.detail.op), ["join"]);
+});
+
+test("C over the link MDU goes as a Resource, sent when the Resource is proved", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro);
+    a.env.Link.MDU = 10;
+    let proveResource;
+    await a.self._whenPropagationLinkUp();
+    a.self._propLinks[0].sendResource = (d) => {
+        a.uploads.push(Buffer.from(d));
+        return new Promise((resolve) => { proveResource = resolve; });
+    };
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.equal(a.uploads.length, 1);
+    assert.deepEqual(a.self._propLinks.map((l) => l.sent.length), [0], "no packet");
+    const sent = () => a.events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => e.detail.how);
+    assert.deepEqual(sent(), [], "not while the Resource moves");
+    proveResource();
+    await settle();
+    assert.deepEqual(sent(), ["resource"]);
 });
 
 test("a sibling applies C with its own key; the sender's echo changes nothing; nothing is sent back", async (t) => {
@@ -806,6 +1077,19 @@ test("rule 4: an unusable C is dropped, and C is never taken for a message", (t)
     }
     assert.deepEqual(b.channels(), []);
     assert.deepEqual(b.events.filter((e) => e.kind === "distro-channel-sync").map((e) => e.detail.rule), [4, 4, 4, 4, 4]);
+});
+
+test("a dropped C is not kept as seen: a second copy is judged again and dropped again, never answered as held", (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const b = device(distro);
+    const fields = new Map([[0x0C, Buffer.alloc(0)], [0xFB, DISTRO_CHANNEL_TYPE], [0xFC, ["join", "Test", 1n]], [0xFD, "cc".repeat(16)]]);
+    const packed = craftC(distro, { fields });
+    // The same blob, live and then pulled: rfed is told "not held" both times.
+    assert.deepEqual(fanOut(distro, packed, [b]), [false]);
+    assert.deepEqual(fanOut(distro, packed, [b]), [false]);
+    assert.deepEqual(b.syncEvents(), ["dropped", "dropped"]);
+    assert.equal(b.events.some((e) => e.kind === "distro-dup"), false);
 });
 
 test("rule 4: a leave of a channel joined before the name rules is applied; a join of that name is dropped", async (t) => {

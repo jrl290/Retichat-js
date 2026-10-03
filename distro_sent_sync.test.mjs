@@ -28,6 +28,7 @@ import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
 import { decodePayload as decodeDisplayName } from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
+import { DistroUploads } from "./lib/distro_upload.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -116,26 +117,54 @@ test("a DM's dispatch sends the copy once, only when sending as the distro to so
     assert.equal((app.match(/_sendDistroSentCopy\(/g) || []).length, 2, "one definition, one call");
 });
 
-function makeSend({ distro, deviceHash }) {
+function makeSend({ distro, deviceHash, proofs = "auto" }) {
     const body = extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)");
+    const upload = extractMethod(app, "async _uploadForDistro(link, recipientHex, propagationPacked, label)");
     const sent = [];
-    const link = { send: (d) => { sent.push({ kind: "packet", data: d }); return {}; },
-        sendResource: async (d) => { sent.push({ kind: "resource", data: d }); } };
+    const events = [];
+    // The propagation link, as _uploadForDistro uses it: a packet is built
+    // (newLinkPacket), transmitted, and proved by the node at once
+    // (`proofs: "auto"`) or when the test calls prove().
+    const link = {
+        status: Link.ACTIVE,
+        newLinkPacket: (context, data) => ({ packetHash: Cryptography.fullHash(Buffer.from(data)), pack: () => Buffer.from(data) }),
+        _transmit: (raw) => {
+            sent.push({ kind: "packet", data: raw });
+            if (proofs === "auto") queueMicrotask(prove);
+            return raw;
+        },
+        sendResource: async (d) => { sent.push({ kind: "resource", data: d }); },
+    };
     const self = {
         ownHash: deviceHash,
         _whenPropagationLinkUp: async () => link,
         _ensurePropagationLink: async () => { throw new Error("the copy must not start the propagation link"); },
         // Identity passthrough so the test can read the LXMF bytes back.
         _buildPropagationPacked: async (packed, pubKeyHex) => { self.encryptedTo = pubKeyHex; return packed; },
+        _pendingPacketHashes: new Map(),
+        _distroUploads: new DistroUploads({ log: { error() {}, warn() {} } }),
     };
+    /** The propagation node's proof of the last upload packet. */
+    function prove() {
+        const [key, pending] = [...self._pendingPacketHashes].at(-1) ?? [];
+        if (!pending) return false;
+        self._pendingPacketHashes.delete(key);
+        pending.onProof(pending.messageId);
+        return true;
+    }
     const DistroManager = distro
         ? { has: true, identity: distro, lxmfDeliveryHash: lxmfHash(distro), pubKey: distro.getPublicKey().toString("hex") }
         : { has: false, identity: null, lxmfDeliveryHash: null, pubKey: null };
-    const Harness = { event() {}, error() {} };
-    const Link = { MDU: 100000 };
-    const fn = new Function("DistroManager", "LXMessage", "LXMF", "Buffer", "Link", "Harness", "self", "recipientHex", "title", "content",
+    const Harness = { event: (kind, detail) => events.push({ kind, detail }), error() {} };
+    const LinkConsts = { MDU: 100000, ACTIVE: Link.ACTIVE };
+    const quiet = { log() {}, warn() {}, error() {} };
+    const uploadFn = new Function("Link", "Packet", "console", "self", "link", "recipientHex", "propagationPacked", "label",
+        `return (async () => {${upload.replaceAll("this.", "self.")}})();`);
+    self._uploadForDistro = (...args) => uploadFn(LinkConsts, Packet, quiet, self, ...args);
+    const fn = new Function("DistroManager", "LXMessage", "LXMF", "Buffer", "Link", "Harness", "console", "self", "recipientHex", "title", "content",
         `return (async () => {${body.replaceAll("this.", "self.")}})();`);
-    return { run: (to, content) => fn(DistroManager, LXMessage, LXMF, Buffer, Link, Harness, self, to, "", content), sent, self };
+    return { run: (to, content) => fn(DistroManager, LXMessage, LXMF, Buffer, LinkConsts, Harness, quiet, self, to, "", content),
+        sent, self, events, prove };
 }
 
 test("the copy is D→D, signed by D, with 0xFB/0xFC/0xFD, propagated to D", async () => {
@@ -160,6 +189,22 @@ test("the copy is D→D, signed by D, with 0xFB/0xFC/0xFD, propagated to D", asy
     assert.equal(fields.has(0x0C), false, "no ticket: no delivery notification for the copy");
 });
 
+test("the copy is said propagated when the propagation node proves it, never when its packet is queued", async () => {
+    // Review of 69ff01e (2026-10-03), CHECK_THESE_THINGS_FIRST §14: until
+    // then the log said "propagated" and "distro-sent-copy" fired as soon as
+    // link.send queued the packet, with nothing watching for the proof.
+    const distro = Identity.create();
+    const send = makeSend({ distro, deviceHash: OTHER_DEVICE, proofs: "manual" });
+    let done = false;
+    const running = send.run(R, "hello").then(() => { done = true; });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(send.sent.length, 1, "uploaded");
+    assert.deepEqual([done, send.events], [false, []], "not propagated while unproved");
+    assert.equal(send.prove(), true);
+    await running;
+    assert.deepEqual(send.events, [{ kind: "distro-sent-copy", detail: { to: R.slice(0, 12), how: "packet" } }]);
+});
+
 test("the copy waits for the propagation link and never starts it", () => {
     // When M's propagation link comes up is M's own fallback timer's call.
     // (Starting it once meant a flush that re-propagated M inside its direct
@@ -167,6 +212,11 @@ test("the copy waits for the propagation link and never starts it", () => {
     const body = extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)");
     assert.doesNotMatch(body, /_ensurePropagationLink|_establishPropagationLink/);
     assert.match(body, /await this\._whenPropagationLinkUp\(recipientHex\)/);
+    // Nor the upload it hands the copy to, which waits for the link again
+    // only when the link went down while the copy was built.
+    const upload = extractMethod(app, "async _uploadForDistro(link, recipientHex, propagationPacked, label)");
+    assert.doesNotMatch(upload, /_ensurePropagationLink|_establishPropagationLink/);
+    assert.match(body, /this\._uploadForDistro\(link, recipientHex, propagationPacked,/);
     const wait = extractMethod(app, "_whenPropagationLinkUp(recipientHex)");
     assert.doesNotMatch(wait, /_ensurePropagationLink|_establishPropagationLink/);
     const establish = extractMethod(app, "_establishPropagationLink()");

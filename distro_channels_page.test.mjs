@@ -183,7 +183,23 @@ chromiumTest("the real page: a sibling's post is the user's own bubble; a siblin
                 },
                 responseFor: () => Promise.resolve([true, null]),
             });
-            c._whenPropagationLinkUp = async () => ({ send: (d) => { window.__uploads.push(Buffer.from(d).toString("hex")); return {}; } });
+            // The propagation link: an upload packet is transmitted and the
+            // node proves it at once (_uploadForDistro waits for the proof).
+            const propagationLink = {
+                status: 0x02,
+                newLinkPacket: (context, data) => ({ packetHash: Buffer.alloc(32, window.__uploads.length + 1), pack: () => Buffer.from(data) }),
+                _transmit(raw) {
+                    window.__uploads.push(Buffer.from(raw).toString("hex"));
+                    const key = Buffer.alloc(16, window.__uploads.length).toString("hex");
+                    setTimeout(() => {
+                        const pending = c._pendingPacketHashes.get(key);
+                        c._pendingPacketHashes.delete(key);
+                        pending?.onProof(pending.messageId);
+                    }, 0);
+                    return raw;
+                },
+            };
+            c._whenPropagationLinkUp = async () => propagationLink;
             c._buildPropagationPacked = async (packed) => packed;
         });
         /** The channels the chat list shows. */
@@ -236,6 +252,11 @@ chromiumTest("the real page: a sibling's post is the user's own bubble; a siblin
         assert.deepEqual(readChannelSync(upload.subarray(96))?.sync?.op, "leave");
         assert.equal(readChannelSync(upload.subarray(96)).sync.name, OTHER);
         assert.deepEqual(await sidebar(), [`#${ELSEWHERE}`]);
+        // Said sent once the propagation node proved it (_uploadForDistro).
+        await within(page.waitForFunction(() => window.Harness.events.some((e) => e.kind === "distro-channel-sync-sent"), null, { timeout: 0 }),
+            "the leave proved by the propagation node");
+        assert.deepEqual(await page.evaluate(() => window.Harness.events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => [e.detail.op, e.detail.how])),
+            [["leave", "packet"]]);
 
         assert.deepEqual([dialogs, pageErrors, elsewhere], [[`Leave #${OTHER}?`], [], []], "the Leave confirmation only; no error; nothing left this machine but esm.sh");
         await context.close();

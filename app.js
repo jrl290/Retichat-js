@@ -62,6 +62,7 @@ import { applyGroupFields } from "./lib/retichat_field.js";
 import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.js";
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
+import { DistroUploads } from "./lib/distro_upload.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
@@ -2138,6 +2139,10 @@ const RnsClient = {
     // its echo of the post, decides it (lib/channel_publish.js).
     _channelPublishes: new ChannelPublishes(),
     _rfedSendChain: Promise.resolve(),
+    // The uploads made for the distro (the §17.11 sent-copy, the §17.12
+    // membership message) until the propagation node proves each
+    // (lib/distro_upload.js, _uploadForDistro).
+    _distroUploads: new DistroUploads(),
     _groupLinks: new Map(),
     _groupLinkPromises: new Map(),
     _groupPeerReady: new Set(),
@@ -4070,6 +4075,13 @@ const RnsClient = {
     _onPacketsLost({ packetHashes, reason }) {
         for (const packetHash of packetHashes) {
             const pending = this._pendingPacketHashes.get(packetHash.slice(0, 32));
+            if (pending?.distroUpload) {
+                // An upload for the distro (_uploadForDistro): it will never
+                // be proved, and its sender says so. A proof that still
+                // arrives is logged, and changes nothing.
+                this._distroUploads.lost(pending.distroUpload, `its packet was lost (${reason})`);
+                continue;
+            }
             if (pending?.channelPost) {
                 // A channel post's publish request went down with the
                 // exchange: it fails now, and rfed's answer or echo, should
@@ -4213,19 +4225,69 @@ const RnsClient = {
         // timer, so the copy rides the next one.
         const link = await this._whenPropagationLinkUp(recipientHex);
         const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
-        const dispatched = (how) => {
-            console.log(`[distro] 📤 Sent-copy for ${recipientHex.slice(0,8)} propagated to the distro as a ${how} (§17.11)`);
-            Harness.event("distro-sent-copy", { to: recipientHex.slice(0, 12), how });
-        };
-        // Same size rule as every propagation upload (LXMF/LXMRouter.py).
-        if (propagationPacked.length > Link.MDU) {
-            console.log(`[distro] 📤 Sent-copy of ${propagationPacked.length} B for ${recipientHex.slice(0,8)} exceeds the MDU — sending as a resource`);
-            await link.sendResource(propagationPacked);
-            dispatched("resource");
-            return;
+        // Sent once the propagation node has it: its proof, not the
+        // packet's queueing (_uploadForDistro).
+        const how = await this._uploadForDistro(link, recipientHex, propagationPacked,
+            `the sent-copy for ${recipientHex.slice(0,8)} (§17.11)`);
+        console.log(`[distro] 📤 Sent-copy for ${recipientHex.slice(0,8)} propagated to the distro as a ${how}: the propagation node proved it (§17.11)`);
+        Harness.event("distro-sent-copy", { to: recipientHex.slice(0, 12), how });
+    },
+
+    /**
+     * Upload `propagationPacked`, a message for the distro (the §17.11
+     * sent-copy, the §17.12 membership message), on the propagation link
+     * `link`, which the caller waited for (_whenPropagationLinkUp, for
+     * `recipientHex`; never started here). Resolves with how it went,
+     * "packet" or "resource", once the propagation node has it: a packet
+     * when the node proves it, a Resource when it is proved. Rejects when it
+     * never will be: the exchange lost the packet (_onPacketsLost), or the
+     * Resource failed. Fire-and-forget all the same: nothing is shown and
+     * nothing is sent again (DESIGN_PRINCIPLES §3). The packet's proof has a
+     * §1 watch (lib/distro_upload.js).
+     *
+     * Until 2026-10-03 (review of 69ff01e) both callers handed the packet to
+     * link.send and said "propagated" at once, with nothing watching for the
+     * proof (CHECK_THESE_THINGS_FIRST §14), and a link that closed while the
+     * upload was built dropped it in silence.
+     */
+    async _uploadForDistro(link, recipientHex, propagationPacked, label) {
+        // Building the upload (its stamp) yields, and can take seconds: the
+        // link may have closed meanwhile. Nothing has left, so the upload
+        // waits for the link to be up again and goes once, as a DM's parked
+        // copy does (_propagateMessage), never onto a closed link.
+        if (link.status !== Link.ACTIVE) {
+            console.log(`[distro] The propagation link went down while ${label} was built; it goes on the next one`);
+            link = await this._whenPropagationLinkUp(recipientHex);
         }
-        link.send(propagationPacked);
-        dispatched("packet");
+        // Same size rule as every propagation upload (LXMF/LXMRouter.py):
+        // over the MDU it is a Resource, which resolves on its own proof.
+        if (propagationPacked.length > Link.MDU) {
+            console.log(`[distro] 📤 ${label}: ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
+            await link.sendResource(propagationPacked);
+            return "resource";
+        }
+        // A LINK-type DATA packet, through the link as every link send is.
+        const pkt = link.newLinkPacket(Packet.NONE, propagationPacked);
+        const raw = pkt.pack();
+        const upload = this._distroUploads.track(label);
+        // Tracked before the packet can go (DESIGN_PRINCIPLES §5: a proof
+        // never outruns its entry).
+        const proofKey = pkt.packetHash.slice(0, 16).toString("hex");
+        this._pendingPacketHashes.set(proofKey, {
+            contactHash: recipientHex,
+            messageId: proofKey,
+            distroUpload: upload,
+            onProof: () => this._distroUploads.proved(upload),
+        });
+        if (link._transmit(raw) === null) {
+            this._pendingPacketHashes.delete(proofKey);
+            this._distroUploads.lost(upload, "the propagation link closed before the upload");
+        } else {
+            this._distroUploads.left(upload);
+            console.log(`[distro] 📤 ${label}: uploaded as a packet; the propagation node's proof says it has it`);
+        }
+        await upload.outcome;
+        return "packet";
     },
 
     /**
@@ -4258,6 +4320,8 @@ const RnsClient = {
      * sent as _sendDistroSentCopy is: PROPAGATED at once, on the
      * propagation link when it is up; RFed fans it out to every device of
      * D, this one included, and _handleDistroBlob drops that echo by 0xFD.
+     * Resolves once the propagation node has it (_uploadForDistro): then,
+     * not when it is queued, the log and the Harness event say it was sent.
      */
     async _sendDistroChannelSync(op, channelName, atMs) {
         const distroHash = DistroManager.lxmfDeliveryHash;
@@ -4276,17 +4340,12 @@ const RnsClient = {
 
         const link = await this._whenPropagationLinkUp(distroHash);
         const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
-        const dispatched = (how) => {
-            console.log(`[distro] 📤 The ${op} of #${channelName} (at ${atMs}) propagated to the distro as a ${how} (§17.12)`);
-            Harness.event("distro-channel-sync-sent", { op, channel: channelName, at: atMs, how });
-        };
-        if (propagationPacked.length > Link.MDU) {
-            await link.sendResource(propagationPacked);
-            dispatched("resource");
-            return;
-        }
-        link.send(propagationPacked);
-        dispatched("packet");
+        // Sent once the propagation node has it: its proof, not the
+        // packet's queueing (_uploadForDistro).
+        const how = await this._uploadForDistro(link, distroHash, propagationPacked,
+            `the ${op} of #${channelName} (§17.12)`);
+        console.log(`[distro] 📤 The ${op} of #${channelName} (at ${atMs}) propagated to the distro as a ${how}: the propagation node proved it (§17.12)`);
+        Harness.event("distro-channel-sync-sent", { op, channel: channelName, at: atMs, how });
     },
 
     /**
@@ -6113,7 +6172,7 @@ const RnsClient = {
             // device what readers last got from it, but only a value equal to
             // what it would send itself is recorded (ChannelPostNames.learn).
             if (srcHashHex === postingHash) {
-                ChannelPostNamesStore.learn(ch.channelName, postingHash, displayName, postAt, OwnNames.channel);
+                ChannelPostNamesStore.learn(ch.channelName, postingHash, displayName, postAt, OwnNames.channel, Date.now());
             }
 
             // Dedup across reloads: the stored post with this identity
@@ -6990,14 +7049,16 @@ const RnsClient = {
         // one; the next free millisecond is this one's.
         let postedAt = Date.now();
         while (ChannelMsgStore.held(channelName, posterHash, postedAt)) postedAt++;
+        // The post's record, whatever becomes of it: its identity is the
+        // one it is packed with, never the store's own clock (ChannelMsgStore
+        // .add stamps Date.now() on a record that has none, which is another
+        // millisecond whenever the loop above moved on, or the clock did).
+        const record = { dir: "out", content, srcHash: posterHash, timestamp: postedAt };
 
         // D3: a post with the exchange down fails now and is never sent
         // (see sendMessage).
         if (this._exchangeIsDown()) {
-            const failed = ChannelMsgStore.add(channelName, {
-                dir: "out", content, status: "failed",
-                srcHash: posterHash, timestamp: postedAt,
-            });
+            const failed = ChannelMsgStore.add(channelName, { ...record, status: "failed" });
             ChannelStore.touch(channelName);
             console.warn(`[retichat] ✗ Post to #${channelName} not sent: the exchange is down`);
             this._onMsg.forEach(fn => fn({kind: "channel-send-complete"}, channelName));
@@ -7005,10 +7066,7 @@ const RnsClient = {
         }
 
         // Add outgoing message optimistically
-        const outMsg = ChannelMsgStore.add(channelName, {
-            dir: "out", content, status: "sending",
-            srcHash: posterHash, timestamp: postedAt,
-        });
+        const outMsg = ChannelMsgStore.add(channelName, { ...record, status: "sending" });
         ChannelStore.touch(channelName);
         this._onMsg.forEach(fn => fn({kind: "channel-send-pending"}, channelName));
 
@@ -10713,8 +10771,12 @@ window.RetichatTest = {
     // Harness events: "channel-own-post" {channel, src, ts, via: "distro" |
     // "device"} when a post of the user's own (a sibling's, or this
     // device's not stored here) is stored as outgoing; "distro-channel-sync-
-    // sent" {op, channel, at, how} when this device sent a membership
-    // message; "distro-channel-sync" {result: "joined" | "left" | "recorded"
+    // sent" {op, channel, at, how} when the propagation node proved a
+    // membership message this device uploaded (never at queueing: one that
+    // is lost is Harness error "distro-channel-sync" instead, and one never
+    // proved logs a §1 line at 5 s, _uploadForDistro); "distro-sent-copy"
+    // {to, how}, the same for a §17.11 sent-copy; "distro-channel-sync"
+    // {result: "joined" | "left" | "recorded"
     // | "echo" | "stale" | "dropped", op, channel, at, rule, reason} for each
     // one it received.
     /** The channels this device holds. */
