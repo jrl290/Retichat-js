@@ -229,6 +229,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         "_oweDistro(entry)",
         "async _sendDistroOutbox(link, trigger)",
         "async _uploadOwed(link, entry)",
+        "_stillOwed(entry)",
         "_distroOwedOutcome(entry, how, error)",
         "_uploadForDistro(link, propagationPacked, label)",
         "_handleDistroBlob(distroHash, blob)",
@@ -1231,9 +1232,272 @@ test("storage that cannot keep what is owed (a full localStorage) is said, and C
     assert.deepEqual(a.events.filter((e) => e.kind === "error").map((e) => [e.detail.where, e.detail.message]),
         [["distro-channel-sync", `the join of #${CH} (§17.12) could not be kept in storage`]]);
     assert.ok(a.logged.some(([level, line]) => level === "error" && line.includes("could not be kept in storage")));
-    assert.equal(a.uploads.length, 1, "it still goes: nothing owed under its id is no later action");
+    assert.equal(a.uploads.length, 1, "it still goes: this page holds it");
     await settle();
     assert.deepEqual(a.sentEvents(), [["join", CH]]);
+});
+
+/** What each upload of `d` carried: "op name" for a C, "sent-copy" for a
+ *  §17.11 copy. */
+const carried = (d) => d.uploads.map((u) => {
+    const sync = readChannelSync(Buffer.from(u).subarray(96))?.sync;
+    return sync ? `${sync.op} ${sync.name}` : "sent-copy";
+});
+
+/** Each build `d` makes (each mines a stamp), by what it carries, the first
+ *  held until `release()`. */
+function holdFirstBuild(d) {
+    const built = [];
+    let release = null;
+    d.self._buildPropagationPacked = (packed) => {
+        const sync = readChannelSync(Buffer.from(packed).subarray(96))?.sync;
+        built.push(sync ? `${sync.op} ${sync.name}` : "sent-copy");
+        if (built.length > 1) return Promise.resolve(packed);
+        return new Promise((resolve) => { release = () => resolve(packed); });
+    };
+    return { built, release: () => release() };
+}
+
+/** Storage that refuses a write of the outbox larger than what it holds, as
+ *  a full localStorage does (app.js sSet drops it without a word), once
+ *  `full.on` is set. A smaller write (an entry dropped) is taken. */
+function fullStorage() {
+    const real = memoryStorage();
+    const full = {
+        on: false, data: real.data, sGet: real.sGet,
+        sSet: (k, v) => {
+            if (full.on && k === "distro_outbox_v1" && JSON.stringify(v).length > (real.data.get(k)?.length ?? 0)) return;
+            real.sSet(k, v);
+        },
+    };
+    return full;
+}
+
+test("storage that refuses the C replacing one owed: the user's newer action goes while the page is open, the one it replaced never goes, and a later page sends neither", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const storage = fullStorage();
+    const a = device(distro, { storage, linkUp: false });
+    const b = device(distro);
+    await a.self.joinChannel(CH);
+    storage.on = true;                    // localStorage is full now
+    clock.now += 10;
+    await a.self.leaveChannel(CH);
+    await settle();
+    assert.deepEqual(a.events.filter((e) => e.kind === "error").map((e) => [e.detail.where, e.detail.message]),
+        [["distro-channel-sync", `the leave of #${CH} (§17.12) could not be kept in storage`]]);
+    assert.deepEqual(a.owed(), [["channel", "leave", CH, clock.now]], "this page holds the leave; the join it replaced is owed no more");
+    assert.deepEqual(device(distro, { me: a.me, storage, linkUp: false }).owed(), [],
+        "a page loaded now (the tab closed) sends neither: storage was written without the join");
+    await a.establish();
+    await settle();
+    // Review of 73a725d: the join stayed owed under the channel's id and
+    // went, after the user had left.
+    assert.deepEqual(carried(a), [`leave ${CH}`]);
+    assert.deepEqual(a.owed(), []);
+    assert.deepEqual(a.sentEvents(), [["leave", CH]]);
+    for (const upload of a.uploads) fanOut(distro, upload, [b]);
+    await settle();
+    assert.deepEqual([a.channels(), b.channels()], [[], []], "the sibling never joins a channel the user left");
+});
+
+test("storage that refuses the C replacing one owed, with the link up: it goes at once, and the earlier C's proof does not bring that one back", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const storage = fullStorage();
+    const a = device(distro, { storage, proofs: "manual" });
+    await a.self.joinChannel(CH);
+    await settle();
+    storage.on = true;
+    clock.now += 10;
+    await a.self.leaveChannel(CH);
+    await settle();
+    // Review of 73a725d: the join still stored under the channel's id was
+    // taken for a later action, and the leave was never sent.
+    assert.deepEqual(carried(a), [`join ${CH}`, `leave ${CH}`]);
+    assert.equal(a.prove(a.proofKeys[0]), true, "the join is proved");
+    await settle();
+    assert.deepEqual(a.owed(), [["channel", "leave", CH, clock.now]]);
+    assert.equal(a.prove(a.proofKeys[1]), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+    assert.deepEqual(a.sentEvents(), [["join", CH], ["leave", CH]]);
+});
+
+test("what a flush listed is checked again before it is built: a C replaced and proved meanwhile is neither built nor sent", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { linkUp: false });
+    const R = "0123456789abcdef0123456789abcdef";
+    await a.self._sendDistroSentCopy(R, "", "sent while the link was down");
+    clock.now += 10;
+    await a.self.joinChannel(CH);
+    const hold = holdFirstBuild(a);
+    const flush = a.establish();          // lists [the sent-copy, the join]; the sent-copy's stamp is mined
+    await settle();
+    clock.now += 10;
+    await a.self.leaveChannel(CH);        // the link is up: the leave goes at once, and is proved
+    await settle();
+    assert.deepEqual(carried(a), [`leave ${CH}`]);
+    hold.release();
+    await flush;
+    await settle();
+    // Review of 73a725d: the join was mined and went last, after the leave,
+    // and the Harness said the join was sent last.
+    assert.deepEqual(carried(a), [`leave ${CH}`, "sent-copy"]);
+    assert.deepEqual(hold.built, ["sent-copy", `leave ${CH}`], "no stamp mined for the join");
+    assert.deepEqual(a.sentEvents(), [["leave", CH]]);
+    assert.deepEqual(a.owed(), []);
+});
+
+test("two flushes on one link (established, then recovered while the first is still built): what the second proved, the first neither builds nor sends again", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { linkUp: false, proofs: "manual" });
+    await a.self.joinChannel(CH);
+    await a.self.joinChannel("public.other");
+    const hold = holdFirstBuild(a);
+    const flush = a.establish();          // lists [CH, public.other]; CH's stamp is mined
+    await settle();
+    // The same link, STALE and heard from again: CH is in flight on it, so
+    // only public.other goes, and is proved.
+    await a.self._sendDistroOutbox(a.self._propLink, "recovered");
+    assert.deepEqual(carried(a), ["join public.other"]);
+    assert.equal(a.prove(), true);
+    await settle();
+    hold.release();
+    await flush;
+    await settle();
+    // Review of 73a725d: public.other was mined and went a second time.
+    assert.deepEqual(carried(a), ["join public.other", `join ${CH}`]);
+    assert.deepEqual(hold.built, [`join ${CH}`, "join public.other"]);
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+});
+
+test("a C proved while it is built again (the node had the upload whose loss was reported) is not sent again", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    await a.self.joinChannel(CH);
+    await settle();
+    a.self._onPacketsLost({ packetHashes: [Cryptography.fullHash(a.uploads[0]).toString("hex")], reason: "the exchange failed" });
+    await settle();
+    const hold = holdFirstBuild(a);
+    const flush = a.self._sendDistroOutbox(a.self._propLink, "recovered");
+    await settle();
+    assert.deepEqual(hold.built, [`join ${CH}`], "still owed, so built again");
+    assert.equal(a.prove(a.proofKeys[0]), true, "the node had the first upload after all");
+    await settle();
+    assert.deepEqual(a.owed(), []);
+    hold.release();
+    await flush;
+    await settle();
+    // Review of 73a725d: nothing owed under its id was taken for a write
+    // storage had refused, and it went again.
+    assert.equal(a.uploads.length, 1);
+    assert.deepEqual(a.sentEvents(), [["join", CH]]);
+});
+
+test("a distro given up while a flush builds: nothing owed to it is sent, nor built with the new distro's key", async (t) => {
+    fakeClock(t);
+    const d1 = Identity.create();
+    const d2 = Identity.create();
+    const a = device(d1, { linkUp: false });
+    await a.self.joinChannel(CH);
+    await a.self.joinChannel("public.other");
+    const hold = holdFirstBuild(a);
+    const flush = a.establish();          // lists both, owed to D1; CH's stamp is mined
+    await settle();
+    a.hold(d2);                           // the user imports another distro meanwhile
+    hold.release();
+    await flush;
+    await settle();
+    assert.equal(a.uploads.length, 0, "nothing owed to D1 went once D2 was held");
+    assert.deepEqual(hold.built, [`join ${CH}`], "and public.other was never built for D2's key");
+    await a.establish();                  // the next flush drops them, saying so
+    assert.deepEqual([a.uploads.length, a.owed().length], [0, 0]);
+});
+
+test("a newer C made while the link is STALE mines nothing then, and goes on 'recovered' although the older C for the channel is still in flight on that link", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    let built = 0;
+    a.self._buildPropagationPacked = async (packed) => { built++; return packed; };
+    await a.self.joinChannel(CH);
+    await settle();
+    const link = a.self._propLink;
+    link.status = 0x03;                   // STALE
+    clock.now += 10;
+    await a.self.leaveChannel(CH);
+    await settle();
+    assert.deepEqual([built, a.uploads.length], [1, 1], "nothing built or sent on a STALE link");
+    link.status = 0x02;                   // the node is heard again: "recovered"
+    await a.self._sendDistroOutbox(link, "recovered");
+    await settle();
+    assert.deepEqual(carried(a), [`join ${CH}`, `leave ${CH}`], "the join's upload on this link holds back only the join");
+    a.prove(a.proofKeys[0]);
+    a.prove(a.proofKeys[1]);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+});
+
+test("an upload whose link went STALE while it was built goes when that link recovers", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const link = a.self._propLink;
+    const hold = holdFirstBuild(a);
+    await a.self.joinChannel(CH);
+    link.status = 0x03;                   // STALE while the stamp is mined
+    hold.release();
+    await settle();
+    assert.equal(a.uploads.length, 0, "nothing onto a STALE link");
+    assert.deepEqual(a.events.filter((e) => e.kind === "error"), [], "nothing left, so nothing was lost");
+    link.status = 0x02;
+    await a.self._sendDistroOutbox(link, "recovered");
+    await settle();
+    assert.deepEqual(carried(a), [`join ${CH}`]);
+});
+
+test("an upload whose build failed is said, stays owed, and goes when the link next comes up, a recovery included", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const link = a.self._propLink;
+    const build = a.self._buildPropagationPacked;
+    a.self._buildPropagationPacked = async () => { throw new Error("the stamp could not be made"); };
+    await a.self.joinChannel(CH);
+    await settle();
+    assert.deepEqual(a.events.filter((e) => e.kind === "error").map((e) => [e.detail.where, e.detail.message]),
+        [["distro-channel-sync", "the stamp could not be made"]]);
+    assert.equal(a.owed().length, 1);
+    a.self._buildPropagationPacked = build;
+    await a.self._sendDistroOutbox(link, "recovered");
+    await settle();
+    assert.deepEqual(carried(a), [`join ${CH}`]);
+});
+
+test("a flush whose link goes STALE while one is built mines nothing more; the rest go when it recovers", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { linkUp: false });
+    await a.self.joinChannel(CH);
+    await a.self.joinChannel("public.other");
+    let built = 0;
+    a.self._buildPropagationPacked = async (packed) => {
+        if (built++ === 0) a.self._propLink.status = 0x03;    // STALE, still the propagation link
+        return packed;
+    };
+    const link = await a.establish();
+    await settle();
+    assert.deepEqual([built, a.uploads.length, a.owed().length], [1, 0, 2], "no stamp mined for a link that is not up");
+    link.status = 0x02;
+    await a.self._sendDistroOutbox(link, "recovered");
+    await settle();
+    assert.deepEqual([built, a.uploads.length, a.owed().length], [3, 2, 0]);
 });
 
 test("the tab closes before the link comes up: the next page sends the C still owed, once", async (t) => {

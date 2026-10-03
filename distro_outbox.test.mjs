@@ -41,6 +41,30 @@ test("put says whether storage kept the entry: the page's storage drops a write 
     assert.equal(outbox(real).box.put(entry("channel:aa", "AAAA")), true);
 });
 
+test("storage that refuses a write: this page holds what is owed, the refused entry in place of the one it replaced, and storage is written without that one", () => {
+    const real = memoryStorage();
+    let full = false;
+    // A full localStorage: a larger write is refused (app.js sSet drops it
+    // without a word), a smaller one is taken.
+    const storage = { get: real.sGet, set: (k, v) => { if (!(full && JSON.stringify(v).length > (real.data.get(k)?.length ?? 0))) real.sSet(k, v); } };
+    const box = new DistroOutbox(storage);
+    assert.equal(box.put(entry("channel:aa", "AAAA")), true);
+    assert.equal(box.put(entry("sent:ff", "BBBB", { kind: "sent", to: "0".repeat(32) })), true);
+    full = true;
+    assert.equal(box.put(entry("channel:aa", "CCCCCCCC", { op: "leave", at: 2 })), false, "refused, and said");
+    // Review of 73a725d: the join stayed owed under the channel's id, and
+    // went to the siblings after the user had left.
+    assert.deepEqual(box.list().map((e) => [e.id, e.packed]), [["sent:ff", "BBBB"], ["channel:aa", "CCCCCCCC"]],
+        "this page owes the newer action, never the one it replaced");
+    assert.equal(box.get("channel:aa").packed, "CCCCCCCC");
+    assert.deepEqual(new DistroOutbox(storage).list().map((e) => e.id), ["sent:ff"], "a later page owes neither");
+    assert.equal(box.settle("channel:aa", "CCCCCCCC"), true);
+    assert.deepEqual(box.list().map((e) => e.id), ["sent:ff"]);
+    // That write was taken: storage is the outbox again, read through.
+    assert.equal(new DistroOutbox(storage).settle("sent:ff", "BBBB"), true);
+    assert.deepEqual(box.list(), []);
+});
+
 test("a later entry under the same id replaces the one owed, and goes to the end", () => {
     const { box } = outbox();
     box.put(entry("channel:aa", "AAAA"));

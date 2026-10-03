@@ -4261,10 +4261,12 @@ const RnsClient = {
      */
     _oweDistro(entry) {
         if (!DistroOutboxStore.put(entry)) {
-            // Storage refused it (a full localStorage): it goes now if the
-            // link is up, but nothing keeps it past this page. Said, never
-            // silent.
-            console.error(`[distro] ✗ ${entry.label} could not be kept in storage: it is sent only if the propagation link is up while this page is open`);
+            // Storage refused it (a full localStorage): this page holds it,
+            // and it goes when the propagation link is up while the page is
+            // open, but nothing keeps it past the page. An earlier action on
+            // the channel it replaced never goes (lib/distro_outbox.js put).
+            // Said, never silent.
+            console.error(`[distro] ✗ ${entry.label} could not be kept in storage: this page holds it, and it goes when the propagation link is up while the page is open; a reload or a closed tab loses it`);
             Harness.error(entry.kind === "channel" ? "distro-channel-sync" : "distro-sent-copy",
                 new Error(`${entry.label} could not be kept in storage`));
         }
@@ -4288,7 +4290,10 @@ const RnsClient = {
      * events and the user's own action are the only triggers: no timer, and
      * nothing goes again but on one of them, so an upload that was lost
      * waits for the link's next coming up (DESIGN_PRINCIPLES §3, §5).
-     * Never rejects.
+     * The list is read once, and each build yields, so each entry is
+     * checked again before it is built (_stillOwed): one proved, replaced or
+     * owed to a distro given up meanwhile is not built and not sent. Never
+     * rejects.
      */
     async _sendDistroOutbox(link, trigger) {
         try {
@@ -4307,6 +4312,13 @@ const RnsClient = {
                     console.log("[distro] ⏳ Propagation link gone mid-flush — what the distro is still owed waits for the next one");
                     return;
                 }
+                // Read when the flush began, and every build before this one
+                // yielded (a stamp can take a minute): a later action on the
+                // channel may have replaced it, an upload made meanwhile (the
+                // user's own action, a "recovered" flush) been proved, or the
+                // distro changed. Until 2026-10-03 (review of 73a725d) it was
+                // mined and sent all the same, after the newer action.
+                if (!this._stillOwed(entry)) continue;
                 const flight = this._distroOutboxInFlight.get(entry.id);
                 if (flight?.link === link && flight.packed === entry.packed) continue;
                 await this._uploadOwed(link, entry);
@@ -4335,13 +4347,14 @@ const RnsClient = {
         try {
             const propagationPacked = await this._buildPropagationPacked(Buffer.from(entry.packed, "base64"), DistroManager.pubKey);
             // Building it yields: a later action on the same channel may
-            // have replaced it meanwhile. Then only the newest action goes.
-            // (None owed under its id is not that: storage may have refused
-            // it, _oweDistro, and it still goes.)
-            const owed = DistroOutboxStore.get(entry.id);
-            if (owed && owed.packed !== entry.packed) {
+            // have replaced it meanwhile, or another upload of it been
+            // proved, or the distro changed. Then it is not sent: only the
+            // newest action goes, once proved it goes no more, and never to
+            // another distro. (One storage refused is still owed: this page
+            // holds it, lib/distro_outbox.js.)
+            if (!this._stillOwed(entry)) {
                 landed();
-                console.log(`[distro] ${entry.label} was replaced by a later action while it was built: not sent`);
+                console.log(`[distro] ${entry.label} was replaced by a later action, proved, or left behind by a change of distro while it was built: not sent`);
                 return;
             }
             upload = this._uploadForDistro(link, propagationPacked, entry.label);
@@ -4375,6 +4388,18 @@ const RnsClient = {
             DistroOutboxStore.settle(entry.id, entry.packed);
             this._distroOwedOutcome(entry, upload.how, null);
         };
+    },
+
+    /**
+     * Whether `entry` is still owed as it is: the message owed under its id
+     * now (not replaced by a later action, not yet proved) and owed to the
+     * distro this device holds now. What a flush listed, or an upload was
+     * built from, may no longer be, since a build yields
+     * (_sendDistroOutbox, _uploadOwed).
+     */
+    _stillOwed(entry) {
+        return DistroOutboxStore.get(entry.id)?.packed === entry.packed
+            && DistroManager.has && DistroManager.lxmfDeliveryHash === entry.distro;
     },
 
     /**
