@@ -33,6 +33,7 @@ import { Reticulum, Identity, Destination, Link, Packet } from "./lib/rns/reticu
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
 import Interface from "./lib/rns/interfaces/interface.js";
 import { compile, constValue, methodName } from "./test_app_source.mjs";
+import { DistroUploads } from "./lib/distro_upload.js";
 
 // ── Harness (as exchange_truth.test.mjs) ───────────────────────────────────
 
@@ -376,7 +377,7 @@ test("the propagation link too: the attempt fails on its lost LINKREQUEST, waits
     const calls = [];
     const self = {
         _cfg: { propagationNodePubKey: propagationNode.getPublicKey().toString("hex"), propagationNodeHash: "b".repeat(32) },
-        _propLink: null, _propLinkPromise: null, _propLinkUpWaiters: [], _propReopenArmed: false,
+        _propLink: null, _propLinkPromise: null, _propReopenArmed: false, _distroUploads: new DistroUploads(),
         _rfedLinks: new Map(), _rfedReopenArmed: new Set(),
         _setStatus() {}, _onExchangeRegistered() {}, _onPacketsLost() {},
         _onPropagationLinkEstablished: async () => { calls.push("established"); },

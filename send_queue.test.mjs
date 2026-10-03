@@ -30,6 +30,7 @@
  */
 import { SendTransfers } from "./lib/send_progress.js";
 import { ChannelPublishes } from "./lib/channel_publish.js";
+import { DistroUploads } from "./lib/distro_upload.js";
 import { addInOrder } from "./lib/message_order.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -320,7 +321,8 @@ function makePropagationClient({ nodeKnown, contacts }) {
             registerDestination: (identity) => ({ hash: Destination.hash(identity, "lxmf", "delivery") }),
             sendData() {},
         },
-        _propLink: null, _propLinkPromise: null, _propLinkUpWaiters: [],
+        _propLink: null, _propLinkPromise: null,
+        _distroUploads: new DistroUploads(), _sendDistroOutbox: async () => {},
         sendingIdentity: () => ({ identity: me, hash: lxmfHash(me), isDistro: false }),
         _fetchPropagatedMessages() {},
         _pullDistroMessages() {},
@@ -737,7 +739,7 @@ test("disconnect resets the propagation link, its re-open and initialization", (
         _rfedStreamPromises: new Map(), _channelPublishes: new ChannelPublishes(),
         _groupLinks: new Map(), _groupLinkPromises: new Map(), _groupPeerReady: new Set(),
         _groupPeerWaiters: new Map(), _groupPathsRequested: new Set(), _groupFallbacks: new Map(),
-        _propLinkUpWaiters: [], _propLinkReject: null,
+        _distroUploads: new DistroUploads(), _distroOutboxInFlight: new Map(), _propLinkReject: null,
         _rns: { interfaces: [] }, _setStatus() {},
         _propLink: oldLink, _propagationInitialized: true, _initialized: true,
         _rfedReopenArmed: new Set(["link", "channel.stream"]), _propReopenArmed: true,

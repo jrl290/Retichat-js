@@ -29,6 +29,8 @@ import Packet from "./lib/rns/packet.js";
 import { decodePayload as decodeDisplayName } from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { DistroUploads } from "./lib/distro_upload.js";
+import { DistroOutbox, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { install, memoryStorage } from "./test_app_source.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -117,11 +119,19 @@ test("a DM's dispatch sends the copy once, only when sending as the distro to so
     assert.equal((app.match(/_sendDistroSentCopy\(/g) || []).length, 2, "one definition, one call");
 });
 
-function makeSend({ distro, deviceHash, proofs = "auto" }) {
-    const body = extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)");
-    const upload = extractMethod(app, "async _uploadForDistro(link, recipientHex, propagationPacked, label)");
+/** Every macrotask queued before this one has run. */
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * The shipped send path of the copy: _sendDistroSentCopy owes it to the
+ * distro (lib/distro_outbox.js), and it goes on the propagation link when
+ * the link is up (`linkUp`) or when it comes up (`up()`, the "established"
+ * handler's _sendDistroOutbox).
+ */
+function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
     const sent = [];
     const events = [];
+    const storage = memoryStorage();
     // The propagation link, as _uploadForDistro uses it: a packet is built
     // (newLinkPacket), transmitted, and proved by the node at once
     // (`proofs: "auto"`) or when the test calls prove().
@@ -137,8 +147,10 @@ function makeSend({ distro, deviceHash, proofs = "auto" }) {
     };
     const self = {
         ownHash: deviceHash,
-        _whenPropagationLinkUp: async () => link,
+        _propLink: linkUp ? link : null,
+        _distroOutboxInFlight: new Map(),
         _ensurePropagationLink: async () => { throw new Error("the copy must not start the propagation link"); },
+        _establishPropagationLink: () => { throw new Error("the copy must not start the propagation link"); },
         // Identity passthrough so the test can read the LXMF bytes back.
         _buildPropagationPacked: async (packed, pubKeyHex) => { self.encryptedTo = pubKeyHex; return packed; },
         _pendingPacketHashes: new Map(),
@@ -155,16 +167,27 @@ function makeSend({ distro, deviceHash, proofs = "auto" }) {
     const DistroManager = distro
         ? { has: true, identity: distro, lxmfDeliveryHash: lxmfHash(distro), pubKey: distro.getPublicKey().toString("hex") }
         : { has: false, identity: null, lxmfDeliveryHash: null, pubKey: null };
-    const Harness = { event: (kind, detail) => events.push({ kind, detail }), error() {} };
-    const LinkConsts = { MDU: 100000, ACTIVE: Link.ACTIVE };
+    const Harness = {
+        event: (kind, detail) => events.push({ kind, detail }),
+        error: (where, e) => events.push({ kind: "error", detail: { where, message: e.message } }),
+    };
     const quiet = { log() {}, warn() {}, error() {} };
-    const uploadFn = new Function("Link", "Packet", "console", "self", "link", "recipientHex", "propagationPacked", "label",
-        `return (async () => {${upload.replaceAll("this.", "self.")}})();`);
-    self._uploadForDistro = (...args) => uploadFn(LinkConsts, Packet, quiet, self, ...args);
-    const fn = new Function("DistroManager", "LXMessage", "LXMF", "Buffer", "Link", "Harness", "console", "self", "recipientHex", "title", "content",
-        `return (async () => {${body.replaceAll("this.", "self.")}})();`);
-    return { run: (to, content) => fn(DistroManager, LXMessage, LXMF, Buffer, LinkConsts, Harness, quiet, self, to, "", content),
-        sent, self, events, prove };
+    const env = {
+        DistroManager, LXMessage, LXMF, Buffer, Cryptography, Packet, Harness, console: quiet,
+        Link: { MDU: 100000, ACTIVE: Link.ACTIVE },
+        DistroOutboxStore: new DistroOutbox({ get: storage.sGet, set: storage.sSet }), sentCopyEntryId, channelSyncEntryId,
+    };
+    install(self, env, [
+        "async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
+        "async _uploadOwed(link, entry)", "_distroOwedOutcome(entry, how, error)", "_uploadForDistro(link, propagationPacked, label)",
+    ]);
+    return {
+        run: async (to, content) => { await self._sendDistroSentCopy(to, "", content); await tick(); },
+        /** The propagation link comes up: its "established" handler sends what is owed. */
+        up: async () => { self._propLink = link; await self._sendDistroOutbox(link, "established"); await tick(); },
+        owed: () => env.DistroOutboxStore.list(),
+        sent, self, events, prove,
+    };
 }
 
 test("the copy is D→D, signed by D, with 0xFB/0xFC/0xFD, propagated to D", async () => {
@@ -195,32 +218,48 @@ test("the copy is said propagated when the propagation node proves it, never whe
     // link.send queued the packet, with nothing watching for the proof.
     const distro = Identity.create();
     const send = makeSend({ distro, deviceHash: OTHER_DEVICE, proofs: "manual" });
-    let done = false;
-    const running = send.run(R, "hello").then(() => { done = true; });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await send.run(R, "hello");
     assert.equal(send.sent.length, 1, "uploaded");
-    assert.deepEqual([done, send.events], [false, []], "not propagated while unproved");
+    assert.deepEqual(send.events, [], "not propagated while unproved");
+    assert.equal(send.owed().length, 1, "owed until the node proves it");
     assert.equal(send.prove(), true);
-    await running;
+    await tick();
     assert.deepEqual(send.events, [{ kind: "distro-sent-copy", detail: { to: R.slice(0, 12), how: "packet" } }]);
+    assert.deepEqual(send.owed(), []);
 });
 
-test("the copy waits for the propagation link and never starts it", () => {
+test("with no propagation link up the copy is owed, never lost and never a reason to start the link; it goes when the link comes up", async () => {
+    // Review of 9f058e9 (2026-10-03): the copy waited in memory on
+    // _whenPropagationLinkUp, which rejected at once while the propagation
+    // node's key was unknown and was rejected by disconnect(), so it was
+    // lost and the sibling never showed the message.
+    const distro = Identity.create();
+    const send = makeSend({ distro, deviceHash: OTHER_DEVICE, linkUp: false });
+    await send.run(R, "while the link is down");
+    assert.deepEqual([send.sent.length, send.owed().length, send.events], [0, 1, []]);
+    await send.up();
+    assert.equal(send.sent.length, 1);
+    assert.equal(Buffer.from(MsgPack.unpack(send.sent[0].data.subarray(96))[2]).toString(), "while the link is down");
+    await tick();
+    assert.deepEqual(send.owed(), []);
+    assert.deepEqual(send.events.map((e) => e.kind), ["distro-sent-copy"]);
+});
+
+test("the copy waits for the propagation link and never starts it: the link's own events send it", () => {
     // When M's propagation link comes up is M's own fallback timer's call.
     // (Starting it once meant a flush that re-propagated M inside its direct
     // window; _flushPropagation now uploads only parked copies.)
-    const body = extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)");
-    assert.doesNotMatch(body, /_ensurePropagationLink|_establishPropagationLink/);
-    assert.match(body, /await this\._whenPropagationLinkUp\(recipientHex\)/);
-    // Nor the upload it hands the copy to, which waits for the link again
-    // only when the link went down while the copy was built.
-    const upload = extractMethod(app, "async _uploadForDistro(link, recipientHex, propagationPacked, label)");
-    assert.doesNotMatch(upload, /_ensurePropagationLink|_establishPropagationLink/);
-    assert.match(body, /this\._uploadForDistro\(link, recipientHex, propagationPacked,/);
-    const wait = extractMethod(app, "_whenPropagationLinkUp(recipientHex)");
-    assert.doesNotMatch(wait, /_ensurePropagationLink|_establishPropagationLink/);
-    const establish = extractMethod(app, "_establishPropagationLink()");
-    assert.match(establish, /this\._propLinkUpWaiters\.splice\(0\)[\s\S]*waiter\.resolve\(link\)/, "released when the link comes up");
+    for (const sig of ["async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
+        "async _uploadOwed(link, entry)", "_uploadForDistro(link, propagationPacked, label)"]) {
+        assert.doesNotMatch(extractMethod(app, sig), /_ensurePropagationLink|_establishPropagationLink/, sig);
+    }
+    assert.match(extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)"), /this\._oweDistro\(\{/);
+    assert.doesNotMatch(app, /_whenPropagationLinkUp|_propLinkUpWaiters/, "nothing waits in memory for the link any more");
+    // "established": after identify, with the parked DM copies.
+    assert.match(extractMethod(app, "async _onPropagationLinkEstablished(link)"),
+        /this\._flushPropagation\(\);\s*this\._sendDistroOutbox\(link, "established"\);/);
+    // "recovered" (STALE -> ACTIVE), on the current link only: makePropagationLink below.
+    assert.match(extractMethod(app, "_establishPropagationLink()"), /this\._sendDistroOutbox\(link, "recovered"\)/);
 });
 
 // Link events are delivered on a later macrotask (utils/events.js defers every
@@ -230,79 +269,109 @@ const afterLinkEvents = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function makePropagationLink() {
     const establish = extractMethod(app, "_establishPropagationLink()");
-    const whenUp = extractMethod(app, "_whenPropagationLinkUp(recipientHex)");
     // The real Link and its real onPacket; only the wire handshake is skipped,
     // since establishment itself is not what is under test.
     class OfflineLink extends Link {
         establish() { this.initiator = true; this.status = Link.PENDING; }
     }
     const pn = Identity.create();
+    const flushes = [];
     const self = {
         _cfg: { propagationNodePubKey: pn.getPublicKey().toString("hex"), propagationNodeHash: "b".repeat(32) },
         _rns: { registerDestination: () => ({}) },
         _propLink: null,
         _propLinkPromise: null,
-        _propLinkUpWaiters: [],
-        _retryPropagationLink() {},
-        _flushPropagation() {},
+        _distroUploads: new DistroUploads({ log: { error() {}, warn() {} } }),
+        _sendDistroOutbox: (link, trigger) => { flushes.push([trigger, link]); },
+        _onPropagationLinkEstablished() {},
+        _onPropagationLinkClosed() {},
     };
     new Function("Identity", "Buffer", "Destination", "Link", "self", establish.replaceAll("this.", "self."))(
         Identity, Buffer, Destination, OfflineLink, self);
-    const up = new Function("Link", "self", "recipientHex", whenUp.replaceAll("this.", "self."));
-    return { self, whenPropagationLinkUp: (to) => up(OfflineLink, self, to) };
+    return { self, flushes };
 }
 
-test("a recovery of a link that is no longer the propagation link releases nothing", async () => {
-    const { self, whenPropagationLinkUp } = makePropagationLink();
+/** Run `fn` with console.log silenced (the link lifecycle logs each event). */
+async function hushed(fn) {
+    const realLog = console.log;
+    console.log = () => {};
+    try { await fn(); } finally { console.log = realLog; }
+}
+
+test("a recovery of a link that is no longer the propagation link sends nothing", async () => {
+    const { self, flushes } = makePropagationLink();
     const old = self._propLink;
     old.status = Link.STALE;
     old.staleSince = Date.now();
-    let released = false;
-    whenPropagationLinkUp(R).then(() => { released = true; });
-    await afterLinkEvents();
     // A new link attempt replaced it before the old one heard from the PN.
     self._propLink = { status: Link.PENDING };
-    const realLog = console.log;
-    console.log = () => {};
-    try {
+    await hushed(async () => {
         old.onPacket({ context: Packet.KEEPALIVE, data: Buffer.from([0xFE]) });
         await afterLinkEvents();
-    } finally { console.log = realLog; }
-    assert.equal(released, false, "waiters stay for the current link's \"established\"");
-    assert.equal(self._propLinkUpWaiters.length, 1);
+    });
+    assert.deepEqual(flushes, [], "what is owed waits for the current link's \"established\"");
 });
 
-test("a copy waiting on a STALE propagation link is released when the link recovers", async () => {
-    const { self, whenPropagationLinkUp } = makePropagationLink();
+test("what the distro is owed goes when a STALE propagation link recovers", async () => {
+    const { self, flushes } = makePropagationLink();
     const link = self._propLink;
     assert.ok(link instanceof Link, "the real Link class");
     // Established earlier, then quiet for staleTime: the keepalive watchdog
-    // marked it STALE. It is not up, so the copy queues.
+    // marked it STALE.
     link.status = Link.STALE;
     link.staleSince = Date.now();
-    let releasedWith = null;
-    whenPropagationLinkUp(R).then((l) => { releasedWith = l; });
-    await afterLinkEvents();
-    assert.equal(releasedWith, null, "a STALE link is not up; the copy waits");
-    assert.equal(self._propLinkUpWaiters.length, 1);
-
     // The PN answers a keepalive. Link.onPacket takes the link straight back
     // to ACTIVE, with no re-establishment, so "established" never fires.
-    link.onPacket({ context: Packet.KEEPALIVE, data: Buffer.from([0xFE]) });
-    assert.equal(link.status, Link.ACTIVE);
-    await afterLinkEvents();
-    assert.equal(releasedWith, link, "released by the recovery, not left for a re-establishment that may never come");
-    assert.equal(self._propLinkUpWaiters.length, 0);
+    await hushed(async () => {
+        link.onPacket({ context: Packet.KEEPALIVE, data: Buffer.from([0xFE]) });
+        assert.equal(link.status, Link.ACTIVE);
+        await afterLinkEvents();
+    });
+    assert.deepEqual(flushes, [["recovered", link]], "sent on the recovery, not left for a re-establishment that may never come");
+});
+
+test("the propagation link's close decides the uploads made on it lost, and only those; a superseded link's too", async () => {
+    // Review of 9f058e9 (2026-10-03): no proof can come over a closed link,
+    // and nothing decided such an upload, so its §1 watch fired 5 s later
+    // saying the proof or the exchange would decide it.
+    const outcome = (u) => u.outcome.then(() => "proved", (e) => `lost: ${e.message}`);
+    const { self } = makePropagationLink();
+    const link = self._propLink;
+    const onIt = self._distroUploads.track("the join of #x (§17.12)", link);
+    const elsewhere = self._distroUploads.track("the sent-copy for 01234567 (§17.11)", { other: true });
+    self._distroUploads.left(onIt);
+    await hushed(async () => {
+        link.status = Link.CLOSED;
+        link._linkClosed();
+        await afterLinkEvents();
+    });
+    assert.equal(await outcome(onIt), "lost: the propagation link closed before the propagation node proved it");
+    assert.equal(onIt.watch, null, "its §1 watch stopped");
+    assert.equal(elsewhere.settled, null, "an upload on another link is not this close's");
+
+    // A STALE link replaced by a new attempt closes later, superseded.
+    const { self: s2 } = makePropagationLink();
+    const old = s2._propLink;
+    const upload = s2._distroUploads.track("the leave of #y (§17.12)", old);
+    s2._propLink = { status: Link.PENDING };
+    await hushed(async () => {
+        old.status = Link.CLOSED;
+        old._linkClosed();
+        await afterLinkEvents();
+    });
+    assert.equal(await outcome(upload), "lost: the propagation link closed before the propagation node proved it");
 });
 
 test("no copy without a distro, or to the distro itself", async () => {
     const none = makeSend({ distro: null, deviceHash: OTHER_DEVICE });
     await none.run(R, "x");
     assert.equal(none.sent.length, 0);
+    assert.deepEqual(none.owed(), []);
     const distro = Identity.create();
     const self = makeSend({ distro, deviceHash: OTHER_DEVICE });
     await self.run(lxmfHash(distro), "x");
     assert.equal(self.sent.length, 0);
+    assert.deepEqual(self.owed(), []);
 });
 
 // ── receive ─────────────────────────────────────────────────────────────────

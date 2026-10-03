@@ -14,7 +14,8 @@
  * branch on Link.MDU to link.sendResource() before it builds a Packet. The
  * distro's two uploads (the §17.11 sent-copy and the §17.12 membership
  * message) hand their packing to _uploadForDistro, which branches the same
- * way (2026-10-03).
+ * way (2026-10-03); since the review of 9f058e9 both are built in one place,
+ * _uploadOwed, from what the distro is owed (lib/distro_outbox.js).
  *
  * Run: node --test propagation_upload_mdu.test.mjs
  */
@@ -37,11 +38,12 @@ function uploadSites() {
     return sites;
 }
 
-test("all four propagation upload sites exist", () => {
+test("all three propagation upload sites exist", () => {
     // The live send path and the deferred flush both upload a DM's copy
-    // through _propagateMessage, so one site covers both.
-    assert.equal(uploadSites().length, 4, "the DM propagated copy (_propagateMessage), the group fallback, the RFed SPEC §17.11 "
-        + "distro sent-copy and the §17.12 channel membership message");
+    // through _propagateMessage, so one site covers both; the distro's two
+    // uploads are both built in _uploadOwed.
+    assert.equal(uploadSites().length, 3, "the DM propagated copy (_propagateMessage), the group fallback, and what the distro "
+        + "is owed (_uploadOwed: the RFed SPEC §17.11 sent-copy and the §17.12 channel membership message)");
 });
 
 /** Where a packet of the upload is built or sent, or the upload is handed
@@ -69,7 +71,7 @@ function assertResourceFirst(window, where) {
     assert.match(window, /propagationPacked\.length > Link\.MDU/, `${where}: no MDU branch before the packet`);
     assert.match(window, /link\.sendResource\(propagationPacked\)|this\._sendWithProgress\(link, propagationPacked,/,
         `${where}: the over-MDU branch must use link.sendResource`);
-    assert.match(window, /\n\s+return( null| "resource")?;\n/, `${where}: the Resource branch must not fall through to the packet`);
+    assert.match(window, /\n\s+return( null| "resource"| upload)?;\n/, `${where}: the Resource branch must not fall through to the packet`);
 }
 
 test("each propagation upload sends over the MDU as a Resource, before any packet is built", () => {
@@ -87,16 +89,16 @@ test("each propagation upload sends over the MDU as a Resource, before any packe
         assertResourceFirst(source.slice(site, next.at), `site at ${site}`);
     }
     // _uploadForDistro: the branch, before its packet.
-    const upload = method("async _uploadForDistro(link, recipientHex, propagationPacked, label)");
+    const upload = method("_uploadForDistro(link, propagationPacked, label)");
     const packetAt = Math.min(...PACKET_PATHS.map((needle) => upload.indexOf(needle)).filter((i) => i !== -1));
     assert.ok(Number.isFinite(packetAt), "_uploadForDistro builds a packet");
     assertResourceFirst(upload.slice(0, packetAt), "_uploadForDistro");
 });
 
-test("the distro's uploads are the two that hand their packing to _uploadForDistro", () => {
+test("the distro's uploads hand their packing to _uploadForDistro from one place, _uploadOwed", () => {
     const handoffs = [];
     for (let i = source.indexOf(HANDOFF); i !== -1; i = source.indexOf(HANDOFF, i + 1)) handoffs.push(i);
     // The method each hand-off is in: the last method header before it.
     const owner = (at) => [...source.slice(0, at).matchAll(/\n    (?:async )?([_A-Za-z]\w*)\([^)\n]*\) \{/g)].at(-1)?.[1];
-    assert.deepEqual(handoffs.map(owner).sort(), ["_sendDistroChannelSync", "_sendDistroSentCopy"]);
+    assert.deepEqual(handoffs.map(owner), ["_uploadOwed"]);
 });

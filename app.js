@@ -63,6 +63,7 @@ import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.j
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
 import { DistroUploads } from "./lib/distro_upload.js";
+import { DistroOutbox, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
@@ -529,6 +530,10 @@ const ChannelSenderNamesStore = new ChannelSenderNames(nameStorage);
 // RFed SPEC §17.12 rule 5: per channel hash, the last membership action this
 // device made or applied (lib/channel_sync.js), kept after a leave.
 const ChannelMembershipStore = new ChannelMembership(nameStorage);
+// What this device still owes its distro through the propagation node, each
+// kept until the node proves it: the §17.12 membership message (the newest
+// action per channel) and the §17.11 sent-copy (lib/distro_outbox.js).
+const DistroOutboxStore = new DistroOutbox(nameStorage);
 
 // =========================================================================
 //  IDENTITY MANAGER
@@ -2143,6 +2148,13 @@ const RnsClient = {
     // membership message) until the propagation node proves each
     // (lib/distro_upload.js, _uploadForDistro).
     _distroUploads: new DistroUploads(),
+    // id → { link, packed }: the entries owed to the distro
+    // (DistroOutboxStore) whose upload is under way, until it is decided
+    // (_uploadOwed), so the same link coming up again ("recovered") does not
+    // send one twice. Each attempt removes its own entry when it ends; one
+    // left by a stopped connection names that connection's link, never the
+    // next one's, so disconnect() need not clear it.
+    _distroOutboxInFlight: new Map(),
     _groupLinks: new Map(),
     _groupLinkPromises: new Map(),
     _groupPeerReady: new Set(),
@@ -2150,7 +2162,6 @@ const RnsClient = {
     _groupPathsRequested: new Set(),
     _groupFallbacks: new GroupFallbackRegistry(),
     _propLinkPromise: null,
-    _propLinkUpWaiters: [],      // _whenPropagationLinkUp: {resolve, reject}
     _channelsInitialized: false,
     _channelsResubscribed: false,
     _pendingTickets: new Map(),  // ticket → {contactHash, messageId}
@@ -3145,30 +3156,31 @@ const RnsClient = {
             this._propLinkPromise = null;
             this._propLinkResolve = null;
             this._propLinkReject = null;
-            const upWaiters = this._propLinkUpWaiters.splice(0);
-            upWaiters.forEach(waiter => waiter.resolve(link));
             this._onPropagationLinkEstablished(link);
         });
 
         // A STALE link that hears from the PN again is ACTIVE without being
         // re-established (Link.onPacket), so "established" above never fires
-        // for it. A §17.11 sent-copy that queued in _whenPropagationLinkUp
-        // while it was STALE is released here, or it would wait for a teardown
-        // and re-establishment that may never come, and die with the tab.
+        // for it. What is owed to the distro (a §17.11 sent-copy, a §17.12
+        // membership message) made while it was STALE goes now, or it would
+        // wait for a teardown and re-establishment that may never come.
         link.on("recovered", () => {
-            const upWaiters = this._propLinkUpWaiters;
             if (this._propLink !== link || link.status !== Link.ACTIVE) {
                 // Events are delivered a tick late: the link may have been
-                // replaced or closed since. The waiters stay queued for the
+                // replaced or closed since. What is owed stays owed for the
                 // next link's "established".
-                if (upWaiters.length) console.log(`[retichat] 🔗 Propagation link recovered but no longer current — ${upWaiters.length} waiter(s) stay queued`);
+                console.log("[retichat] 🔗 Propagation link recovered but no longer current — what the distro is owed waits for the next one");
                 return;
             }
-            if (upWaiters.length) console.log(`[retichat] 🔗 Propagation link recovered from STALE — releasing ${upWaiters.length} waiter(s)`);
-            upWaiters.splice(0).forEach(waiter => waiter.resolve(link));
+            console.log("[retichat] 🔗 Propagation link recovered from STALE");
+            this._sendDistroOutbox(link, "recovered");
         });
 
         link.on("close", () => {
+            // No proof of an upload made on this link can come now: each one
+            // still open is decided lost, and what it carried stays owed
+            // for the next link (lib/distro_upload.js cut(); _uploadOwed).
+            this._distroUploads.cut("the propagation link closed before the propagation node proved it", link);
             if (this._propLink !== link) {
                 // A superseded link: a STALE one replaced by a new attempt
                 // (this function overwrites _propLink), or one disconnect()
@@ -3198,7 +3210,8 @@ const RnsClient = {
      *      request_messages_from_propagation_node: identify, then request);
      *      identify() puts it on the wire before it returns, and the /get
      *      below follows it on the same link;
-     *   2. the copies parked while there was no link (_flushPropagation);
+     *   2. the copies parked while there was no link (_flushPropagation),
+     *      and what is still owed to the distro (_sendDistroOutbox);
      *   3. /get: fetch what the node stores for us;
      *   4. once that has concluded, /distro/pull when this device holds a
      *      distro.
@@ -3213,6 +3226,7 @@ const RnsClient = {
             console.warn(`[retichat] Propagation link identify failed: ${e.message}`);
         }
         this._flushPropagation();
+        this._sendDistroOutbox(link, "established");
         await this._fetchPropagatedMessages();
         if (DistroManager.has) await this._pullDistroMessages();
     },
@@ -4178,18 +4192,24 @@ const RnsClient = {
     },
 
     /**
-     * Propagate the RFed SPEC §17.11 sent-copy of a message this device just
-     * sent as the distro D to `recipientHex`: destination D, source D, signed
-     * with D's key, title and content identical to the original, and
+     * The RFed SPEC §17.11 sent-copy of a message this device just sent as
+     * the distro D to `recipientHex`: destination D, source D, signed with
+     * D's key, title and content identical to the original, and
      *   0xFB FIELD_CUSTOM_TYPE = "rfed.distro.sent"
      *   0xFC FIELD_CUSTOM_DATA = the recipient's address (32 lowercase hex)
      *   0xFD FIELD_CUSTOM_META = this device's own lxmf.delivery address.
-     * It goes PROPAGATED at once, like every distro-addressed message
+     * It goes PROPAGATED, like every distro-addressed message
      * (ContactStore.propagationDelay): RFed intercepts it on lxmf.propagation
      * and fans it out to every registered device of D, this one included —
      * _handleDistroBlob drops that echo by 0xFD. No ticket, so no delivery
      * notification comes back, and no bubble is created here. Mirrors the
      * Android and iOS send paths.
+     *
+     * Packed once, here, and owed to the distro until the propagation node
+     * proves it (_oweDistro, lib/distro_outbox.js). Until 2026-10-03 it
+     * waited in memory for the propagation link and was lost, without a
+     * word, when the node's key was not known yet or the tab stopped or
+     * closed before the link came up, and siblings never showed the message.
      */
     async _sendDistroSentCopy(recipientHex, title, content) {
         const distroHash = DistroManager.lxmfDeliveryHash;
@@ -4199,6 +4219,7 @@ const RnsClient = {
         if (recipientHex === distroHash) return;
         if (!deviceHash) throw new Error("own lxmf.delivery address unavailable for 0xFD");
 
+        const to = recipientHex.toLowerCase();
         const msg = new LXMessage();
         msg.sourceHash = Buffer.from(distroHash, "hex");
         msg.destinationHash = Buffer.from(distroHash, "hex");
@@ -4206,75 +4227,219 @@ const RnsClient = {
         msg.content = content;
         msg.fields = new Map();
         msg.fields.set(LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_SENT_TYPE);
-        msg.fields.set(LXMF.FIELD_CUSTOM_DATA, recipientHex.toLowerCase());
+        msg.fields.set(LXMF.FIELD_CUSTOM_DATA, to);
         msg.fields.set(LXMF.FIELD_CUSTOM_META, deviceHash.toLowerCase());
         // Non-opportunistic: the propagation node reads dest_hash (D) in
         // cleartext from offset 0 — that is how RFed recognises a distro.
         const packed = msg.pack(DistroManager.identity, false);
-        const distroPubKey = DistroManager.pubKey;
-
-        // Wait for the propagation link, never start it: when M's link comes
-        // up is decided by M's own propagation timer, not by its copy. The
-        // link's "established" handler runs _flushPropagation(), which
-        // uploads only copies _propagateMessage parked (waitFor
-        // "propagation") and never a record still "sending", so starting
-        // the link no longer re-propagates M inside its direct window — the
-        // double delivery this rule first guarded against. The link is kept
-        // up by its persistent re-open, the node's announces
-        // (_initPropagation) and page resumes, and by M's own propagation
-        // timer, so the copy rides the next one.
-        const link = await this._whenPropagationLinkUp(recipientHex);
-        const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
-        // Sent once the propagation node has it: its proof, not the
-        // packet's queueing (_uploadForDistro).
-        const how = await this._uploadForDistro(link, recipientHex, propagationPacked,
-            `the sent-copy for ${recipientHex.slice(0,8)} (§17.11)`);
-        console.log(`[distro] 📤 Sent-copy for ${recipientHex.slice(0,8)} propagated to the distro as a ${how}: the propagation node proved it (§17.11)`);
-        Harness.event("distro-sent-copy", { to: recipientHex.slice(0, 12), how });
+        this._oweDistro({
+            id: sentCopyEntryId(Cryptography.fullHash(packed).toString("hex")),
+            kind: "sent", distro: distroHash, packed: Buffer.from(packed).toString("base64"),
+            label: `the sent-copy for ${to.slice(0,8)} (§17.11)`, to,
+        });
     },
 
     /**
-     * Upload `propagationPacked`, a message for the distro (the §17.11
-     * sent-copy, the §17.12 membership message), on the propagation link
-     * `link`, which the caller waited for (_whenPropagationLinkUp, for
-     * `recipientHex`; never started here). Resolves with how it went,
-     * "packet" or "resource", once the propagation node has it: a packet
-     * when the node proves it, a Resource when it is proved. Rejects when it
-     * never will be: the exchange lost the packet (_onPacketsLost), or the
-     * Resource failed. Fire-and-forget all the same: nothing is shown and
-     * nothing is sent again (DESIGN_PRINCIPLES §3). The packet's proof has a
-     * §1 watch (lib/distro_upload.js).
+     * Owe the distro `entry` (lib/distro_outbox.js: a §17.11 sent-copy or a
+     * §17.12 membership message, packed and signed by D). It is written to
+     * the outbox first, before anything can yield, then uploaded at once if
+     * the propagation link is up; otherwise it goes when the link next comes
+     * up (_sendDistroOutbox, from "established" and "recovered"). So a link
+     * that is not up yet, a propagation node whose key is not known yet, or
+     * a tab that stops or closes first no longer loses it. It stays owed
+     * until the propagation node proves it.
      *
-     * Until 2026-10-03 (review of 69ff01e) both callers handed the packet to
-     * link.send and said "propagated" at once, with nothing watching for the
-     * proof (CHECK_THESE_THINGS_FIRST §14), and a link that closed while the
-     * upload was built dropped it in silence.
+     * The link is waited for, never started: when M's link comes up is
+     * decided by M's own propagation timer, not by its copy. The link's
+     * "established" handler runs _flushPropagation(), which uploads only
+     * copies _propagateMessage parked (waitFor "propagation") and never a
+     * record still "sending", so starting the link no longer re-propagates M
+     * inside its direct window — the double delivery this rule first guarded
+     * against. The link is kept up by its persistent re-open, the node's
+     * announces (_initPropagation) and page resumes, and by M's own
+     * propagation timer, so what is owed rides the next one.
      */
-    async _uploadForDistro(link, recipientHex, propagationPacked, label) {
-        // Building the upload (its stamp) yields, and can take seconds: the
-        // link may have closed meanwhile. Nothing has left, so the upload
-        // waits for the link to be up again and goes once, as a DM's parked
-        // copy does (_propagateMessage), never onto a closed link.
-        if (link.status !== Link.ACTIVE) {
-            console.log(`[distro] The propagation link went down while ${label} was built; it goes on the next one`);
-            link = await this._whenPropagationLinkUp(recipientHex);
+    _oweDistro(entry) {
+        if (!DistroOutboxStore.put(entry)) {
+            // Storage refused it (a full localStorage): it goes now if the
+            // link is up, but nothing keeps it past this page. Said, never
+            // silent.
+            console.error(`[distro] ✗ ${entry.label} could not be kept in storage: it is sent only if the propagation link is up while this page is open`);
+            Harness.error(entry.kind === "channel" ? "distro-channel-sync" : "distro-sent-copy",
+                new Error(`${entry.label} could not be kept in storage`));
         }
+        const link = this._propLink;
+        if (link?.status === Link.ACTIVE) {
+            this._uploadOwed(link, entry);
+            return;
+        }
+        console.log(`[distro] ${entry.label} is owed to the distro: it goes when the propagation link is up (§17.11, §17.12)`);
+    },
+
+    /**
+     * The propagation link `link` is up (`trigger`: "established", or
+     * "recovered" from STALE): upload on it, oldest first, what is still
+     * owed to the distro (lib/distro_outbox.js). One already uploading on
+     * this link is left to its proof. One owed to a distro this device no
+     * longer holds is dropped, saying so: it belongs to that distro's
+     * devices, never to another's. The uploads are built one after the
+     * other (a stamp yields), and once the link has gone the rest wait for
+     * the next one, as _flushPropagation's parked copies do. These two link
+     * events and the user's own action are the only triggers: no timer, and
+     * nothing goes again but on one of them, so an upload that was lost
+     * waits for the link's next coming up (DESIGN_PRINCIPLES §3, §5).
+     * Never rejects.
+     */
+    async _sendDistroOutbox(link, trigger) {
+        try {
+            if (!DistroManager.has) return;
+            const distroHash = DistroManager.lxmfDeliveryHash;
+            const owed = DistroOutboxStore.list();
+            if (!owed.length) return;
+            console.log(`[distro] 📤 Propagation link ${trigger}: ${owed.length} upload(s) owed to the distro (§17.11, §17.12)`);
+            for (const entry of owed) {
+                if (entry.distro !== distroHash) {
+                    DistroOutboxStore.settle(entry.id, entry.packed);
+                    console.warn(`[distro] ⚠️ ${entry.label} was owed to ${entry.distro.slice(0,8)}, a distro this device no longer holds — dropped, not sent`);
+                    continue;
+                }
+                if (this._propLink !== link || link.status !== Link.ACTIVE) {
+                    console.log("[distro] ⏳ Propagation link gone mid-flush — what the distro is still owed waits for the next one");
+                    return;
+                }
+                const flight = this._distroOutboxInFlight.get(entry.id);
+                if (flight?.link === link && flight.packed === entry.packed) continue;
+                await this._uploadOwed(link, entry);
+            }
+        } catch (error) {
+            console.warn("[distro] ⚠️ Sending what the distro is owed failed:", error.message);
+        }
+    },
+
+    /**
+     * Upload the owed `entry` on `link`: build its propagation upload (it is
+     * encrypted to D and stamped for the node anew each time; the LXMF
+     * message inside is the one packed when the user acted) and hand it to
+     * _uploadForDistro. Resolves once it has left, or could not leave;
+     * never rejects. Its proof makes it owed no more. If it is not proved,
+     * or never left, it stays owed for the next time the link comes up.
+     * Either outcome is said (_distroOwedOutcome).
+     */
+    async _uploadOwed(link, entry) {
+        const flight = { link, packed: entry.packed };
+        this._distroOutboxInFlight.set(entry.id, flight);
+        const landed = () => {
+            if (this._distroOutboxInFlight.get(entry.id) === flight) this._distroOutboxInFlight.delete(entry.id);
+        };
+        let upload;
+        try {
+            const propagationPacked = await this._buildPropagationPacked(Buffer.from(entry.packed, "base64"), DistroManager.pubKey);
+            // Building it yields: a later action on the same channel may
+            // have replaced it meanwhile. Then only the newest action goes.
+            // (None owed under its id is not that: storage may have refused
+            // it, _oweDistro, and it still goes.)
+            const owed = DistroOutboxStore.get(entry.id);
+            if (owed && owed.packed !== entry.packed) {
+                landed();
+                console.log(`[distro] ${entry.label} was replaced by a later action while it was built: not sent`);
+                return;
+            }
+            upload = this._uploadForDistro(link, propagationPacked, entry.label);
+        } catch (error) {
+            landed();
+            this._distroOwedOutcome(entry, null, error);
+            return;
+        }
+        if (!upload) {
+            // Building the upload (its stamp) yields, and can take seconds:
+            // the link went down meanwhile. Nothing left, so nothing is
+            // decided: it stays owed and goes when the link is next up, as a
+            // DM's parked copy does (_propagateMessage), never onto a closed
+            // link.
+            landed();
+            console.log(`[distro] The propagation link went down while ${entry.label} was built: nothing left, and it goes when the link is next up`);
+            return;
+        }
+        upload.outcome.then(() => {
+            landed();
+            DistroOutboxStore.settle(entry.id, entry.packed);
+            this._distroOwedOutcome(entry, upload.how, null);
+        }, (error) => {
+            landed();
+            this._distroOwedOutcome(entry, upload.how, error);
+        });
+        // A proof after the upload was reported lost (_onPacketsLost: the
+        // node had the packet after all) is the truth all the same: the node
+        // has it, so it is owed no more, and is not sent again.
+        upload.onLateProof = () => {
+            DistroOutboxStore.settle(entry.id, entry.packed);
+            this._distroOwedOutcome(entry, upload.how, null);
+        };
+    },
+
+    /**
+     * Say how the upload of the owed `entry` ended: proved (`error` null,
+     * sent as `how`, "packet" or "resource"), or not (`error`), when it is
+     * still owed and goes when the propagation link is next up. The log
+     * says "propagated" only for a proof (CHECK_THESE_THINGS_FIRST §14), and
+     * the Harness hears each: "distro-channel-sync-sent" or
+     * "distro-sent-copy" for a proof, an error of the entry's kind for an
+     * upload lost or cut (the exchange lost its packet, its link closed, the
+     * connection stopped).
+     */
+    _distroOwedOutcome(entry, how, error) {
+        if (error) {
+            console.warn(`[distro] ⚠️ ${entry.label} was not proved by the propagation node: ${error.message} — still owed: it goes when the propagation link is next up`);
+            Harness.error(entry.kind === "channel" ? "distro-channel-sync" : "distro-sent-copy", error);
+            return;
+        }
+        if (entry.kind === "channel") {
+            console.log(`[distro] 📤 The ${entry.op} of #${entry.name} (at ${entry.at}) propagated to the distro as a ${how}: the propagation node proved it (§17.12)`);
+            Harness.event("distro-channel-sync-sent", { op: entry.op, channel: entry.name, at: entry.at, how });
+        } else {
+            console.log(`[distro] 📤 Sent-copy for ${entry.to.slice(0,8)} propagated to the distro as a ${how}: the propagation node proved it (§17.11)`);
+            Harness.event("distro-sent-copy", { to: entry.to.slice(0, 12), how });
+        }
+    },
+
+    /**
+     * Upload `propagationPacked`, a message owed to the distro
+     * (_uploadOwed), on the propagation link `link`, never started here.
+     * Returns null when `link` is no longer the propagation link or no
+     * longer up: nothing left. Otherwise the upload (lib/distro_upload.js,
+     * `how` "packet" or "resource"), whose `outcome` resolves once the
+     * propagation node has it, a packet when the node proves it and a
+     * Resource when it is proved, and rejects when it never will be: the
+     * exchange lost the packet (_onPacketsLost), the link closed or the
+     * connection stopped first (DistroUploads.cut), or the Resource failed.
+     * The packet's proof has a §1 watch (lib/distro_upload.js).
+     *
+     * Until 2026-10-03 (review of 69ff01e) the distro's uploads were handed
+     * to link.send and said "propagated" at once, with nothing watching for
+     * the proof (CHECK_THESE_THINGS_FIRST §14).
+     */
+    _uploadForDistro(link, propagationPacked, label) {
+        if (this._propLink !== link || link.status !== Link.ACTIVE) return null;
         // Same size rule as every propagation upload (LXMF/LXMRouter.py):
-        // over the MDU it is a Resource, which resolves on its own proof.
+        // over the MDU it is a Resource, which is decided by its own proof
+        // (its progress has its own §1 watch, lib/rns/resource.js).
         if (propagationPacked.length > Link.MDU) {
             console.log(`[distro] 📤 ${label}: ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
-            await link.sendResource(propagationPacked);
-            return "resource";
+            const upload = this._distroUploads.track(label, link, "resource");
+            link.sendResource(propagationPacked).then(
+                () => this._distroUploads.proved(upload),
+                (error) => this._distroUploads.lost(upload, `its Resource failed (${error?.message ?? error})`));
+            return upload;
         }
         // A LINK-type DATA packet, through the link as every link send is.
         const pkt = link.newLinkPacket(Packet.NONE, propagationPacked);
         const raw = pkt.pack();
-        const upload = this._distroUploads.track(label);
+        const upload = this._distroUploads.track(label, link, "packet");
         // Tracked before the packet can go (DESIGN_PRINCIPLES §5: a proof
         // never outruns its entry).
         const proofKey = pkt.packetHash.slice(0, 16).toString("hex");
         this._pendingPacketHashes.set(proofKey, {
-            contactHash: recipientHex,
+            contactHash: DistroManager.lxmfDeliveryHash,
             messageId: proofKey,
             distroUpload: upload,
             onProof: () => this._distroUploads.proved(upload),
@@ -4286,8 +4451,7 @@ const RnsClient = {
             this._distroUploads.left(upload);
             console.log(`[distro] 📤 ${label}: uploaded as a packet; the propagation node's proof says it has it`);
         }
-        await upload.outcome;
-        return "packet";
+        return upload;
     },
 
     /**
@@ -4296,34 +4460,37 @@ const RnsClient = {
      * a change made by applying a sibling's message, the start's
      * re-subscription or a stamp refresh). The action is recorded for rule 5
      * whether or not this device holds a distro, stamped after any record
-     * it holds (ChannelMembership.stampLocal); with a distro it goes to D as
-     * one membership message, fire-and-forget: the list here changed when
+     * it holds (ChannelMembership.stampLocal); with a distro it is owed to D
+     * as one membership message, fire-and-forget: the list here changed when
      * the user acted, whatever becomes of the message.
      */
     _syncChannelMembership(op, ch) {
         const atMs = ChannelMembershipStore.stampLocal(ch.channelHash, op, Date.now());
         if (!DistroManager.has) return;
-        this._sendDistroChannelSync(op, ch.channelName, atMs).catch(error => {
+        try {
+            this._sendDistroChannelSync(op, ch, atMs);
+        } catch (error) {
             console.warn(`[distro] ⚠️ The ${op} of #${ch.channelName} was not sent to the distro (§17.12):`, error.message);
             Harness.error("distro-channel-sync", error);
-        });
+        }
     },
 
     /**
-     * Propagate the RFed SPEC §17.12 membership message C for the user's
-     * `op` ("join" or "leave") of `channelName` at `atMs`: destination D,
-     * source D, signed with D's key, no title, no content, and the fields of
+     * The RFed SPEC §17.12 membership message C for the user's `op` ("join"
+     * or "leave") of the channel `ch` at `atMs`: destination D, source D,
+     * signed with D's key, no title, no content, and the fields of
      * lib/channel_sync.js channelSyncFields (an empty 0x0C, 0xFB
      * "rfed.distro.channel", 0xFC [op, name, at_ms] as a native array, 0xFD
      * this device's own lxmf.delivery address), with no 0xD1: a message to
-     * one's own devices carries no name (DISPLAY_NAMES.md §4.1). Built and
-     * sent as _sendDistroSentCopy is: PROPAGATED at once, on the
-     * propagation link when it is up; RFed fans it out to every device of
-     * D, this one included, and _handleDistroBlob drops that echo by 0xFD.
-     * Resolves once the propagation node has it (_uploadForDistro): then,
-     * not when it is queued, the log and the Harness event say it was sent.
+     * one's own devices carries no name (DISPLAY_NAMES.md §4.1). Owed to the
+     * distro as the §17.11 sent-copy is (_oweDistro): PROPAGATED at once when
+     * the propagation link is up, otherwise when it next comes up, and kept
+     * until the propagation node proves it. It is owed under the channel's
+     * id, so it replaces a C for the same channel still owed: only the
+     * newest action goes. RFed fans it out to every device of D, this one
+     * included, and _handleDistroBlob drops that echo by 0xFD.
      */
-    async _sendDistroChannelSync(op, channelName, atMs) {
+    _sendDistroChannelSync(op, ch, atMs) {
         const distroHash = DistroManager.lxmfDeliveryHash;
         if (!DistroManager.has || !distroHash) return;
         const deviceHash = this.ownHash ?? ownLxmfDestinationHash();
@@ -4334,18 +4501,13 @@ const RnsClient = {
         msg.destinationHash = Buffer.from(distroHash, "hex");
         msg.title = "";
         msg.content = "";
-        msg.fields = channelSyncFields(op, channelName, atMs, deviceHash);
+        msg.fields = channelSyncFields(op, ch.channelName, atMs, deviceHash);
         const packed = msg.pack(DistroManager.identity, false);
-        const distroPubKey = DistroManager.pubKey;
-
-        const link = await this._whenPropagationLinkUp(distroHash);
-        const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
-        // Sent once the propagation node has it: its proof, not the
-        // packet's queueing (_uploadForDistro).
-        const how = await this._uploadForDistro(link, distroHash, propagationPacked,
-            `the ${op} of #${channelName} (§17.12)`);
-        console.log(`[distro] 📤 The ${op} of #${channelName} (at ${atMs}) propagated to the distro as a ${how}: the propagation node proved it (§17.12)`);
-        Harness.event("distro-channel-sync-sent", { op, channel: channelName, at: atMs, how });
+        this._oweDistro({
+            id: channelSyncEntryId(ch.channelHash),
+            kind: "channel", distro: distroHash, packed: Buffer.from(packed).toString("base64"),
+            label: `the ${op} of #${ch.channelName} (§17.12)`, op, name: ch.channelName, at: atMs,
+        });
     },
 
     /**
@@ -5281,21 +5443,6 @@ const RnsClient = {
         return packet;
     },
 
-    /** The propagation link once it is ACTIVE, without starting it (unlike
-     *  _ensurePropagationLink). Used by the §17.11 sent-copy, which must not
-     *  change when the original message is propagated, and the §17.12
-     *  membership message, which is sent the same way. Resolved by the
-     *  link's "established" or "recovered" (STALE -> ACTIVE) handler,
-     *  rejected by disconnect(). */
-    _whenPropagationLinkUp(recipientHex) {
-        if (this._propLink?.status === Link.ACTIVE) return Promise.resolve(this._propLink);
-        if (!this._cfg.propagationNodePubKey || !this._cfg.propagationNodeHash) {
-            return Promise.reject(new Error("Propagation node identity is not ready"));
-        }
-        console.log(`[distro] A copy for ${recipientHex.slice(0,8)} waits for the propagation link (§17.11, §17.12)`);
-        return new Promise((resolve, reject) => this._propLinkUpWaiters.push({ resolve, reject }));
-    },
-
     _ensurePropagationLink() {
         if (this._propLink?.status === Link.ACTIVE) return Promise.resolve(this._propLink);
         if (!this._cfg.propagationNodePubKey || !this._cfg.propagationNodeHash) {
@@ -6172,7 +6319,7 @@ const RnsClient = {
             // device what readers last got from it, but only a value equal to
             // what it would send itself is recorded (ChannelPostNames.learn).
             if (srcHashHex === postingHash) {
-                ChannelPostNamesStore.learn(ch.channelName, postingHash, displayName, postAt, OwnNames.channel, Date.now());
+                ChannelPostNamesStore.learn(ch.channelName, postingHash, displayName, postAt, OwnNames.channel);
             }
 
             // Dedup across reloads: the stored post with this identity
@@ -7211,6 +7358,16 @@ const RnsClient = {
         this._distroRegistrationOwed = null;
         this._registerDistroInFlight = null;
         this._pendingTickets.clear();
+        // The uploads made for the distro that still wait for their proof:
+        // none can come now (the proof's entry goes just below, and the
+        // links close). Each is decided lost, said in the log and the
+        // Harness, and no §1 line follows for a proof nobody waits for any
+        // more; what it carried stays owed, and the next connection sends it
+        // when its propagation link comes up (lib/distro_outbox.js). Until
+        // 2026-10-03 they were left open: the §1 watch fired 5 s later,
+        // saying the proof or the exchange would decide it though neither
+        // could, and nothing ever said they had ended.
+        this._distroUploads.cut("the connection stopped before the propagation node proved it");
         this._pendingPacketHashes.clear();
         for (const tid of this._pendingTimeouts.values()) clearTimeout(tid);
         this._pendingTimeouts.clear();
@@ -7250,7 +7407,6 @@ const RnsClient = {
         this._groupPathsRequested.clear();
         this._groupFallbacks.clear();
         this._propLinkReject?.(new Error("Disconnected before propagation link became active"));
-        this._propLinkUpWaiters.splice(0).forEach(waiter => waiter.reject(new Error("Disconnected before propagation link became active")));
         this._propLinkPromise = null;
         this._propLinkResolve = null;
         this._propLinkReject = null;
@@ -10773,9 +10929,11 @@ window.RetichatTest = {
     // device's not stored here) is stored as outgoing; "distro-channel-sync-
     // sent" {op, channel, at, how} when the propagation node proved a
     // membership message this device uploaded (never at queueing: one that
-    // is lost is Harness error "distro-channel-sync" instead, and one never
-    // proved logs a §1 line at 5 s, _uploadForDistro); "distro-sent-copy"
-    // {to, how}, the same for a §17.11 sent-copy; "distro-channel-sync"
+    // is lost or cut, by the exchange, its link closing or the connection
+    // stopping, is Harness error "distro-channel-sync" instead and stays
+    // owed, and one never proved logs a §1 line at 5 s, _uploadForDistro);
+    // "distro-sent-copy" {to, how}, the same for a §17.11 sent-copy (error
+    // "distro-sent-copy"); "distro-channel-sync"
     // {result: "joined" | "left" | "recorded"
     // | "echo" | "stale" | "dropped", op, channel, at, rule, reason} for each
     // one it received.
@@ -10803,6 +10961,12 @@ window.RetichatTest = {
     },
     /** §17.12 rule 5's record: channel hash → {op, at}. */
     channelMembership() { return JSON.parse(JSON.stringify(ChannelMembershipStore.rows)); },
+    /** What this device still owes the distro, oldest first, each kept until
+     *  the propagation node proves it (lib/distro_outbox.js). */
+    distroOwed() {
+        return DistroOutboxStore.list().map(e => ({ id: e.id, kind: e.kind, distro: e.distro, label: e.label,
+            ...(e.kind === "channel" ? { op: e.op, name: e.name, at: e.at } : { to: e.to }) }));
+    },
 
     // ---- Attachments (test-harnesses/staging/lib/attach.mjs HOOK_CONTRACT) ----
     // client.attachmentsFor(msgId) reads each attachment of a stored message
@@ -10840,6 +11004,7 @@ Harness (headless):
   .channels() / .joinChannel(name) / .leaveChannel(name) — the channel list and the user's join/leave
   .postChannel(name, text) / .channelMessages(name) — a post as the composer sends it, and the stored records
   .channelPoster() / .channelMembership() — the posting hash, and the §17.12 membership record
+  .distroOwed()       — what the distro is still owed (§17.11 copies, §17.12 messages) until proved
   .tab()          — "active" | "inactive" (one active tab per identity)
   .useHere()      — take over from the active tab (reloads this one)
         `);

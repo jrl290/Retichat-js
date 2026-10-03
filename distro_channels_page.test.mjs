@@ -183,8 +183,9 @@ chromiumTest("the real page: a sibling's post is the user's own bubble; a siblin
                 },
                 responseFor: () => Promise.resolve([true, null]),
             });
-            // The propagation link: an upload packet is transmitted and the
-            // node proves it at once (_uploadForDistro waits for the proof).
+            // The propagation link, up: an upload packet is transmitted and
+            // the node proves it at once (what the distro is owed stays owed
+            // until the proof, _uploadOwed).
             const propagationLink = {
                 status: 0x02,
                 newLinkPacket: (context, data) => ({ packetHash: Buffer.alloc(32, window.__uploads.length + 1), pack: () => Buffer.from(data) }),
@@ -199,7 +200,7 @@ chromiumTest("the real page: a sibling's post is the user's own bubble; a siblin
                     return raw;
                 },
             };
-            c._whenPropagationLinkUp = async () => propagationLink;
+            c._propLink = propagationLink;
             c._buildPropagationPacked = async (packed) => packed;
         });
         /** The channels the chat list shows. */
@@ -257,6 +258,7 @@ chromiumTest("the real page: a sibling's post is the user's own bubble; a siblin
             "the leave proved by the propagation node");
         assert.deepEqual(await page.evaluate(() => window.Harness.events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => [e.detail.op, e.detail.how])),
             [["leave", "packet"]]);
+        assert.deepEqual(await page.evaluate(() => window.RetichatTest.distroOwed()), [], "proved: owed no more");
 
         assert.deepEqual([dialogs, pageErrors, elsewhere], [[`Leave #${OTHER}?`], [], []], "the Leave confirmation only; no error; nothing left this machine but esm.sh");
         await context.close();

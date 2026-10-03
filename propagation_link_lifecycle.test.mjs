@@ -31,6 +31,7 @@ import { Buffer } from "node:buffer";
 import Link from "./lib/rns/link.js";
 import Identity from "./lib/rns/identity.js";
 import Destination from "./lib/rns/destination.js";
+import { DistroUploads } from "./lib/distro_upload.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -91,8 +92,12 @@ function makeClient({ distro = true } = {}) {
     const self = {
         _rns: { interfaces: [exchange], registerDestination: () => ({ rns: { registerLink() {}, sendData() {} } }) },
         _cfg: { propagationNodePubKey: node.getPublicKey().toString("hex"), propagationNodeHash: "b".repeat(32) },
-        _propLink: null, _propLinkPromise: null, _propLinkUpWaiters: [], _propagationInitialized: false, _propReopenArmed: false,
+        _propLink: null, _propLinkPromise: null, _propagationInitialized: false, _propReopenArmed: false,
+        _distroUploads: new DistroUploads({ log: { error() {}, warn() {} } }),
         _flushPropagation: () => { order.push("flush"); },
+        // What the distro is still owed (lib/distro_outbox.js) goes with
+        // the parked copies.
+        _sendDistroOutbox: (link, trigger) => { order.push(`owed (${trigger})`); },
         // /get takes its time: the distro pull must wait for it, not for a clock.
         _fetchPropagatedMessages: () => { order.push("fetch"); return new Promise((resolve) => { fetched = resolve; }); },
         _pullDistroMessages: async () => { order.push("distro pull"); return []; },
@@ -116,19 +121,19 @@ test("after establishment: identify, then /get, then /distro/pull, each on the o
     c.self._initPropagation(); // the node's lxmf.propagation announce
     assert.equal(c.links.length, 1);
     await c.establish(c.links[0]);
-    assert.deepEqual(c.order, ["identify", "flush", "fetch"], "identify first; the fetch follows it on the same link");
+    assert.deepEqual(c.order, ["identify", "flush", "owed (established)", "fetch"], "identify first; the fetch follows it on the same link");
     await settle();
-    assert.deepEqual(c.order, ["identify", "flush", "fetch"], "the distro pull waits for the fetch to conclude");
+    assert.deepEqual(c.order, ["identify", "flush", "owed (established)", "fetch"], "the distro pull waits for the fetch to conclude");
     c.finishFetch();
     await settle();
-    assert.deepEqual(c.order, ["identify", "flush", "fetch", "distro pull"]);
+    assert.deepEqual(c.order, ["identify", "flush", "owed (established)", "fetch", "distro pull"]);
 
     const none = makeClient({ distro: false });
     none.self._initPropagation();
     await none.establish(none.links[0]);
     none.finishFetch();
     await settle();
-    assert.deepEqual(none.order, ["identify", "flush", "fetch"], "no distro, no distro pull");
+    assert.deepEqual(none.order, ["identify", "flush", "owed (established)", "fetch"], "no distro, no distro pull");
 });
 
 test("an established propagation link that closes under us re-opens exactly once; a failed attempt waits for an event", async () => {

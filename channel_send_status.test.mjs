@@ -47,6 +47,7 @@ import { channelLxmPack, channelLxmUnpack, channelIdentity, channelComputeStamp 
 import { ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
+import { DistroUploads } from "./lib/distro_upload.js";
 import { app, build, constValue, install, methodBody, memoryStorage, compile } from "./test_app_source.mjs";
 import { linkPair, within } from "./test_link_pair.mjs";
 import { installVirtualTime } from "./test_virtual_time.mjs";
@@ -291,7 +292,8 @@ test("disconnect(): the shipped stop closes rfed.link, which fails the post; rfe
         _rfedOpenedChannelHashes: new Set(), _rfedPullState: new Map(), _rfedStampRefreshed: new Set(),
         _rfedSubscriptionPromises: new Map(), _rfedUnsubscribes: new Map(), _rfedStreamPromises: new Map(), _groupLinks: new Map(),
         _groupLinkPromises: new Map(), _groupPeerReady: new Set(), _groupPeerWaiters: new Map(),
-        _groupPathsRequested: new Set(), _groupFallbacks: new Map(), _propLinkUpWaiters: [], _setStatus() {},
+        _groupPathsRequested: new Set(), _groupFallbacks: new Map(), _setStatus() {},
+        _distroUploads: new DistroUploads(), _distroOutboxInFlight: new Map(),
     });
     const disconnect = compile("disconnect()", { clearInterval() {}, clearTimeout() {}, console: quiet })(c.self);
     const sending = outcome(c.self.sendChannelMessage(CHANNEL, "posted as the tab was taken over"));
