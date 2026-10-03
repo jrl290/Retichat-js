@@ -85,7 +85,8 @@ const SENT = (hash, packed) => entry(sentCopyEntryId(hash), packed, { kind: "sen
 
 test("RFed SPEC §17.12: owe a join (kept), storage fills, a sent-copy and then a leave of that channel are refused; what storage holds no longer holds the join", () => {
     const storage = fullStorage();
-    const box = new DistroOutbox(storage);
+    const lines = [];
+    const box = new DistroOutbox(storage, { log: { error: (line) => lines.push(line) } });
     assert.equal(box.put(entry("channel:aa", "AAAA")), true, "the join is kept");
     storage.on = true;
     assert.equal(box.put(SENT("ff", "BBBBBBBBBBBB")), false, "the sent-copy is refused: this page holds it");
@@ -97,11 +98,15 @@ test("RFed SPEC §17.12: owe a join (kept), storage fills, a sent-copy and then 
     // ([join]); storage refused it, kept the join, and the next page sent
     // the join the user had undone.
     assert.deepEqual(new DistroOutbox(storage).list(), [], "a later page owes neither the join nor what storage refused");
+    // Storage took the smaller write: nothing it holds would go from a
+    // later page, and no such error is said (review of 3411e19, N2).
+    assert.deepEqual(lines, []);
 });
 
 test("storage that refuses writes: what this page settles or drops is taken out of storage too, never left for a later page", () => {
     const storage = fullStorage();
-    const box = new DistroOutbox(storage);
+    const lines = [];
+    const box = new DistroOutbox(storage, { log: { error: (line) => lines.push(line) } });
     const OTHER = "e".repeat(32);
     box.put(entry("channel:aa", "AAAA"));
     box.put(SENT("ff", "BBBB"));
@@ -116,6 +121,7 @@ test("storage that refuses writes: what this page settles or drops is taken out 
     assert.deepEqual(box.dropAllBut(D).map((e) => e.id), ["channel:bb"]);
     assert.deepEqual(box.list().map((e) => e.id), ["sent:ff", "sent:ee"]);
     assert.deepEqual(new DistroOutbox(storage).list().map((e) => e.id), ["sent:ff"]);
+    assert.deepEqual(lines, [], "each smaller write was taken: nothing is said");
 });
 
 test("storage that refuses even a smaller write is said: what it still holds that is owed no more, which a later page would send", () => {

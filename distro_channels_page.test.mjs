@@ -276,7 +276,7 @@ chromiumTest("the real page: a sibling's post is the user's own bubble; a siblin
         await page.evaluate(() => window.RetichatTest.app._forgetDistro());     // the Forget button, confirmed
         assert.equal(await page.evaluate(() => window.RetichatTest.distro().has), false);
         assert.deepEqual(await page.evaluate(() => window.RetichatTest.distroOwed()), [], "dropped when D was forgotten");
-        assert.ok(warnings.some((line) => line.includes(`the leave of #${ELSEWHERE} (§17.12) was owed to ${D.slice(0, 8)}, a distro this device no longer holds — dropped, never sent`)),
+        assert.ok(warnings.some((line) => line.includes(`the leave of #${ELSEWHERE} (§17.12) was owed to ${D.slice(0, 8)}, a distro this device no longer holds — dropped: this device sends it no more (§17.12)`)),
             warnings.join("\n"));
         await page.evaluate((hex) => { window.RetichatTest.adoptDistro(hex).catch(() => {}); }, distroHex);
         assert.equal(await page.evaluate(() => window.RetichatTest.distro().lxmfDeliveryHash), D, "D imported again");

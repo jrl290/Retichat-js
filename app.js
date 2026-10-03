@@ -2148,15 +2148,25 @@ const RnsClient = {
     // membership message) until the propagation node proves each
     // (lib/distro_upload.js, _uploadForDistro).
     _distroUploads: new DistroUploads(),
-    // id → { link, packed }: the entries owed to the distro
-    // (DistroOutboxStore) whose upload is under way, until it is decided
-    // (_uploadOwed), so the same link coming up again ("recovered") does not
-    // send one twice: at most one upload of an entry is in flight on a link
-    // (DESIGN_PRINCIPLES §3, the distro exception). Each attempt removes its
-    // own entry when it ends; one left by a stopped connection names that
-    // connection's link, never the next one's, so disconnect() need not
-    // clear it.
+    // id → { link, packed, upload }: the entries owed to the distro
+    // (DistroOutboxStore) whose upload is under way, from its build until
+    // it is decided (_uploadOwed); `upload` is set once it has left
+    // (lib/distro_upload.js). A flush skips an entry being built for its own
+    // link, and one whose upload has left and is not decided, on any link
+    // (_sendDistroOutbox): at most one upload of an entry is in flight at a
+    // time (DESIGN_PRINCIPLES §3, the distro exception). A build for an
+    // earlier link never leaves (_uploadForDistro), so it holds nothing
+    // back. Each attempt removes its own entry when it ends. One left by a
+    // stopped connection is either an upload that disconnect()'s cut
+    // decides, or a build for a link that is gone, which never leaves and
+    // holds nothing back, so disconnect() need not clear it.
     _distroOutboxInFlight: new Map(),
+    // The newest flush of what is owed to the distro (_sendDistroOutbox),
+    // one per "established" or "recovered" of the propagation link. An
+    // earlier flush still building stops at its next entry once a newer
+    // one began, so what the newer flush uploaded, and saw lost, an earlier
+    // one never uploads again with no link event between.
+    _distroFlush: null,
     _groupLinks: new Map(),
     _groupLinkPromises: new Map(),
     _groupPeerReady: new Set(),
@@ -3139,20 +3149,23 @@ const RnsClient = {
 
         // A STALE link is replaced here without being closed (its own
         // watchdog tears it down, and its "recovered" is ignored once it is
-        // not current, below). The uploads for the distro still waiting on
-        // it are decided now, as its close would decide them: they were not
-        // proved, and what they carried is owed and goes on the new link
-        // when it comes up (DESIGN_PRINCIPLES §3, the distro exception;
-        // RFed SPEC §17.12). A proof that still comes over the old link
-        // settles it all the same (a late proof, lib/distro_upload.js).
-        // Until 2026-10-03 they stayed open, and the new link's
-        // "established" uploaded the same entry while the old upload was
-        // still undecided: two uploads of it at once, two stamps mined, and
-        // two fan-outs when both arrived.
-        const superseded = this._propLink;
-        if (superseded) {
-            this._distroUploads.cut("the propagation link it went on was replaced before the propagation node proved it", superseded);
-        }
+        // not current, below). An upload for the distro still waiting on it
+        // stays open: being replaced is not one of the events that decide
+        // it. James's exception (DESIGN_PRINCIPLES §3, 2026-10-03; RFed SPEC
+        // §17.12 "On the sending device") names those: the packet reported
+        // lost, the link closing, the connection stopping. The node may
+        // still prove it over this link. Its "close" below decides it if no
+        // proof came first, and that fires for a superseded link too. While
+        // it is open, no flush uploads its entry on any link
+        // (_sendDistroOutbox), the new one included. If its close decides it
+        // unproved, the entry is owed and goes on the propagation link's
+        // next "established" or "recovered", never at the close itself.
+        // Retichat-js 3411e19 decided it here and uploaded the entry again
+        // on the new link at once. When the node proved the first upload
+        // after all, the same C was then uploaded twice, two stamps were
+        // mined, and the siblings got two fan-outs, which is the duplicate
+        // the review of a448e98 found (PROBE S1). The only thing 3411e19
+        // added to that duplicate was an error.
         const link = new Link();
         this._propLink = link;
         this._propLinkPromise = new Promise((resolve, reject) => {
@@ -4303,25 +4316,33 @@ const RnsClient = {
     /**
      * The propagation link `link` is up (`trigger`: "established", or
      * "recovered" from STALE): upload on it, oldest first, what is still
-     * owed to the distro (lib/distro_outbox.js). One already uploading on
-     * this link is left to its proof: at most one upload of an entry is in
-     * flight on a link. One owed to a distro this device no longer holds
-     * is dropped, saying so (_dropOwedToOtherDistros; with no distro held,
-     * that is all of it). The uploads are built one after the other (a
-     * stamp yields), and once the link has gone the rest wait for the next
-     * one, as _flushPropagation's parked copies do. These two link events
-     * and the user's own action are the only triggers: no timer
-     * (DESIGN_PRINCIPLES §5). An entry whose earlier upload was not proved
-     * goes again here: the retry DESIGN_PRINCIPLES §3 allows for what a
-     * device owes its distro (James, 2026-10-03; RFed SPEC §17.12 "On the
-     * sending device"), on the link's coming up and on nothing else, and
-     * only the newest action per channel is owed (lib/distro_outbox.js).
-     * The list is read once, and each build yields, so each entry is
-     * checked again before it is built (_stillOwed): one proved, replaced or
-     * owed to a distro given up meanwhile is not built and not sent. Never
-     * rejects.
+     * owed to the distro (lib/distro_outbox.js). One being built for this
+     * link is left to that build, and one whose upload has left and is not
+     * yet decided, on this link or on one it replaced, is left to its proof
+     * or to the event that decides it: at most one upload of an entry is in
+     * flight at a time (_distroOutboxInFlight). One owed to a distro this
+     * device no longer holds is dropped, saying so
+     * (_dropOwedToOtherDistros; with no distro held, that is all of it).
+     * The uploads are built one after the other (a stamp yields), and once
+     * the link has gone the rest wait for the next one, as
+     * _flushPropagation's parked copies do. These two link events and the
+     * user's own action are the only triggers: no timer (DESIGN_PRINCIPLES
+     * §5). An entry whose earlier upload was not proved goes again here:
+     * the retry DESIGN_PRINCIPLES §3 allows for what a device owes its
+     * distro (James, 2026-10-03; RFed SPEC §17.12 "On the sending device"),
+     * on the link's coming up and on nothing else, and only the newest
+     * action per channel is owed (lib/distro_outbox.js). So a flush stops
+     * once a newer one has begun (_distroFlush): the newer flush lists
+     * everything still owed, and an upload it made and saw lost waits for
+     * the next link event, never for an earlier flush still building on
+     * this link. The list is read once, and each build yields, so each
+     * entry is checked again before it is built (_stillOwed): one proved,
+     * replaced or owed to a distro given up meanwhile is not built and not
+     * sent. Never rejects.
      */
     async _sendDistroOutbox(link, trigger) {
+        const flush = {};
+        this._distroFlush = flush;
         try {
             // Until 2026-10-03 (review of a448e98) a flush with no distro
             // held returned here and kept what was owed, which then went if
@@ -4335,6 +4356,17 @@ const RnsClient = {
                     console.log("[distro] ⏳ Propagation link gone mid-flush — what the distro is still owed waits for the next one");
                     return;
                 }
+                if (this._distroFlush !== flush) {
+                    // The link's next event began a flush of its own while
+                    // this one built: it listed all that is still owed, and
+                    // takes it from here. Until 2026-10-03 (review of
+                    // 3411e19, PROBE L) this one went on, and uploaded again
+                    // on the same link, with no link event between, an
+                    // entry whose upload by the newer flush had just been
+                    // reported lost.
+                    console.log(`[distro] A later flush of what the distro is owed took over from this ${trigger} one`);
+                    return;
+                }
                 // Read when the flush began, and every build before this one
                 // yielded (a stamp can take a minute): a later action on the
                 // channel may have replaced it, an upload made meanwhile (the
@@ -4343,7 +4375,7 @@ const RnsClient = {
                 // mined and sent all the same, after the newer action.
                 if (!this._stillOwed(entry)) continue;
                 const flight = this._distroOutboxInFlight.get(entry.id);
-                if (flight?.link === link && flight.packed === entry.packed) continue;
+                if (flight?.packed === entry.packed && (flight.link === link || (flight.upload && !flight.upload.settled))) continue;
                 await this._uploadOwed(link, entry);
             }
         } catch (error) {
@@ -4398,6 +4430,9 @@ const RnsClient = {
             console.log(`[distro] The propagation link went down while ${entry.label} was built: nothing left, and it goes when the link is next up`);
             return;
         }
+        // It left: until it is decided, no flush uploads this entry again,
+        // on this link or on one that replaces it (_sendDistroOutbox).
+        flight.upload = upload;
         upload.outcome.then(() => {
             landed();
             DistroOutboxStore.settle(entry.id, entry.packed);
@@ -4437,11 +4472,24 @@ const RnsClient = {
      * it ever sent under another distro. Runs on every change of the
      * distro held, and once at load (DistroManager.onChange, after
      * RnsClient), and before each flush (_sendDistroOutbox).
+     *
+     * The line says what is true: this device sends it no more. One whose
+     * upload has already left and is not decided cannot be taken back, and
+     * the line says that too, because the node may prove that upload and
+     * fan it out, and the proof is then said as any proof is
+     * (_distroOwedOutcome). Until 2026-10-03 (review of 3411e19, PROBE G)
+     * every line said "never sent", and for such an entry the log then
+     * said it had propagated.
      */
     _dropOwedToOtherDistros() {
         const held = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
         for (const entry of DistroOutboxStore.dropAllBut(held)) {
-            console.warn(`[distro] ⚠️ ${entry.label} was owed to ${entry.distro.slice(0,8)}, a distro this device no longer holds — dropped, never sent (§17.12)`);
+            const flight = this._distroOutboxInFlight.get(entry.id);
+            const onTheWire = flight?.packed === entry.packed && !!flight.upload && !flight.upload.settled;
+            console.warn(`[distro] ⚠️ ${entry.label} was owed to ${entry.distro.slice(0,8)}, a distro this device no longer holds — dropped: this device sends it no more`
+                + (onTheWire
+                    ? "; one upload of it has already left on the propagation link and cannot be taken back: if the propagation node proves it, the distro's devices get it (§17.12)"
+                    : " (§17.12)"));
         }
     },
 
@@ -4451,9 +4499,10 @@ const RnsClient = {
      * says "propagated" only for a proof (CHECK_THESE_THINGS_FIRST §14), and
      * the Harness hears each: "distro-channel-sync-sent" or
      * "distro-sent-copy" for a proof, an error of the entry's kind for an
-     * upload lost or cut (the exchange lost its packet, its link closed or
-     * was replaced, the connection stopped) while the entry is still owed,
-     * when it goes again on the propagation link's next coming up. One
+     * upload lost or cut (the exchange lost its packet, its link closed, the
+     * connection stopped; a link replaced while STALE decides nothing until
+     * its own close) while the entry is still owed, when it goes again on
+     * the propagation link's next coming up. One
      * whose entry is owed no more by then (another upload of it was proved,
      * a later action replaced it, or its distro was given up) failed no
      * one: a log line says so, and neither "still owed" nor an error.
@@ -11014,8 +11063,9 @@ window.RetichatTest = {
     // device's not stored here) is stored as outgoing; "distro-channel-sync-
     // sent" {op, channel, at, how} when the propagation node proved a
     // membership message this device uploaded (never at queueing: one that
-    // is lost or cut, by the exchange, its link closing or being replaced or
-    // the connection stopping, is Harness error "distro-channel-sync"
+    // is lost or cut, by the exchange, its link closing (a link replaced
+    // while STALE, at its own close) or the connection stopping, is Harness
+    // error "distro-channel-sync"
     // instead while what it carried is still owed, and goes again when the
     // propagation link next comes up; one whose message was proved, replaced
     // or dropped meanwhile raises nothing, _distroOwedOutcome; and one never

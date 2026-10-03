@@ -1710,7 +1710,8 @@ test("the page drops what is owed to a distro it gives up on every change of the
     // generate, import and forget (lib/distro.js _notify).
     assert.match(app, /\nDistroManager\.onChange\(\(\) => RnsClient\._dropOwedToOtherDistros\(\)\);\n/);
     assert.ok(app.indexOf("\nDistroManager.onChange(") > app.indexOf("\nconst RnsClient = {"), "after RnsClient is defined");
-    assert.match(methodBody("async _sendDistroOutbox(link, trigger)"), /^\s*try \{[^]*?this\._dropOwedToOtherDistros\(\);\s*const owed = DistroOutboxStore\.list\(\);/,
+    assert.match(methodBody("async _sendDistroOutbox(link, trigger)"),
+        /^\s*const flush = \{\};\s*this\._distroFlush = flush;\s*try \{[^]*?this\._dropOwedToOtherDistros\(\);\s*const owed = DistroOutboxStore\.list\(\);/,
         "and before each flush lists what is owed");
 });
 
@@ -1723,7 +1724,7 @@ test("RFed SPEC §17.12: a join owed with the link down, D given up (said), D im
     assert.equal(a.owed().length, 1);
     changeDistro(a, null);
     assert.deepEqual(a.owed(), [], "dropped when D was given up");
-    assert.deepEqual(a.logged, [["warn", `[distro] ⚠️ the join of #${CH} (§17.12) was owed to ${lxmfHash(distro).slice(0, 8)}, a distro this device no longer holds — dropped, never sent (§17.12)`]]);
+    assert.deepEqual(a.logged, [["warn", `[distro] ⚠️ the join of #${CH} (§17.12) was owed to ${lxmfHash(distro).slice(0, 8)}, a distro this device no longer holds — dropped: this device sends it no more (§17.12)`]]);
     assert.equal(device(distro, { me: a.me, storage: a.storage, linkUp: false }).owed().length, 0, "not in storage either");
     clock.now += 60_000;
     await a.self.leaveChannel(CH);           // with no distro: recorded, no C
@@ -1758,7 +1759,8 @@ test("D replaced by another distro and then taken again with no link up in betwe
  * _establishPropagationLink, over links the test drives: `attempt()` makes
  * one as the page does (it replaces a STALE one), PENDING until `up(link)`
  * delivers its "established" (whose handler sends what is owed, as
- * _onPropagationLinkEstablished does); `close(link)` delivers its "close".
+ * _onPropagationLinkEstablished does); `close(link)` delivers its "close",
+ * `recover(link)` its "recovered" (a STALE link heard from again).
  */
 function shippedLinks(d) {
     class TestLink {
@@ -1788,51 +1790,194 @@ function shippedLinks(d) {
         attempt: () => { establishLink(); return d.self._propLink; },
         up: async (link) => { link.status = TestLink.ACTIVE; link.emit("established"); await settle(); },
         close: async (link) => { link.status = TestLink.CLOSED; link.emit("close"); await settle(); },
+        recover: async (link) => { link.status = TestLink.ACTIVE; link.emit("recovered"); await settle(); },
     };
 }
 
-test("a STALE propagation link replaced by a new one decides the upload still waiting on it: C goes again on the new link only once that one is decided, and one sibling applies it once", async (t) => {
+test("a STALE propagation link replaced by a new one decides nothing: the new link does not upload C again while the first upload is open, and the node's proof of it over the old link settles it; one upload, one stamp, one fan-out", async (t) => {
     fakeClock(t);
     const distro = Identity.create();
     const a = device(distro, { linkUp: false, proofs: "manual" });
     const b = device(distro);
+    let builds = 0;
+    a.self._buildPropagationPacked = async (packed) => { builds++; return packed; };
     const links = shippedLinks(a);
     const first = links.attempt();
     await links.up(first);
     await a.self.joinChannel(CH);
     await settle();
     assert.deepEqual(first.sent.length, 1, "uploaded on the link that is up");
-    // Its proof's entry (the two uploads are one packing here, so the
-    // second's would take its key).
     const firstProof = a.self._pendingPacketHashes.get(a.proofKeys[0]);
     first.status = 0x03;                  // STALE: nothing heard for staleTime
     const second = links.attempt();       // a DM's propagation (_ensurePropagationLink) replaces it
     assert.notEqual(second, first);
     await settle();
-    // Review of a448e98 (PROBE S1): the upload on the replaced link stayed
-    // open, and the new link's "established" uploaded the join again while
-    // it was: two uploads of one C at once.
-    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "the propagation link it went on was replaced before the propagation node proved it"]]);
-    assert.ok(a.logged.some(([level, line]) => level === "warn" && line.includes("still owed: it goes when the propagation link is next up")));
-    assert.equal(a.owed().length, 1, "not proved, so still owed");
+    // Being replaced is none of the events of DESIGN_PRINCIPLES §3's
+    // exception (packet lost, link closed, connection stopped): nothing is
+    // decided, said or raised. Review of 3411e19: the replacement decided
+    // the upload lost, and the new link uploaded C again.
+    assert.deepEqual(errorsOf(a), []);
+    assert.deepEqual(a.logged, []);
+    assert.equal(a.owed().length, 1, "owed until the node proves it");
     await links.up(second);
-    assert.deepEqual([first.sent.length, second.sent.length], [1, 1], "uploaded again on the new link (DESIGN_PRINCIPLES §3, the distro exception)");
-    assert.equal(a.prove(a.proofKeys[1]), true);
-    await settle();
-    assert.deepEqual(a.owed(), []);
-    // The old link's watchdog tears it down: there is nothing left on it to
-    // decide, and nothing more is said.
-    await links.close(first);
-    assert.equal(errorsOf(a).length, 1);
-    // The node had the first upload after all: its proof comes late, over
-    // the old link.
+    assert.deepEqual([first.sent.length, second.sent.length, builds], [1, 0, 1],
+        "not uploaded again, nor a stamp mined, while the first upload is open (PROBE S1)");
+    // The node had the first upload: its proof comes over the old link.
     firstProof.onProof(firstProof.messageId);
     await settle();
-    assert.deepEqual([a.uploads.length, a.owed().length], [2, 0]);
-    assert.deepEqual(a.sentEvents(), [["join", CH], ["join", CH]], "each proof said, the late one too");
+    assert.deepEqual(a.owed(), []);
+    assert.deepEqual(a.sentEvents(), [["join", CH]], "said once");
+    // The old link's watchdog tears it down: nothing is left on it to decide.
+    await links.close(first);
+    await links.recover(second);
+    assert.deepEqual([a.uploads.length, errorsOf(a)], [1, []]);
     for (const upload of a.uploads) fanOut(distro, upload, [b]);
     await settle();
-    assert.deepEqual(b.syncEvents(), ["joined"], "applied once");
+    assert.deepEqual(b.syncEvents(), ["joined"]);
+    assert.equal(b.events.filter((e) => e.kind === "distro-dup").length, 0, "one fan-out, no repeat");
+});
+
+test("a replaced link that closes before the node proves its upload decides it then (said, still owed), and C goes on the propagation link's next 'established' or 'recovered', never at the close", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { linkUp: false, proofs: "manual" });
+    const links = shippedLinks(a);
+    const first = links.attempt();
+    await links.up(first);
+    await a.self.joinChannel(CH);
+    await settle();
+    first.status = 0x03;
+    const second = links.attempt();
+    await links.up(second);
+    assert.equal(second.sent.length, 0, "held back while the first upload is open");
+    await links.close(first);             // its watchdog's teardown, with no proof
+    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "the propagation link closed before the propagation node proved it"]]);
+    assert.ok(a.logged.some(([level, line]) => level === "warn" && line.includes("still owed: it goes when the propagation link is next up")));
+    assert.deepEqual([second.sent.length, a.owed().length], [0, 1], "not at the close: the close is the failure, not the link coming up");
+    await links.recover(second);          // the new link heard from the node again after a STALE spell
+    assert.deepEqual(carried(a), [`join ${CH}`, `join ${CH}`]);
+    assert.equal(second.sent.length, 1);
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+    assert.deepEqual(a.sentEvents(), [["join", CH]]);
+});
+
+test("an upload decided in the same task as the next flush (the cut, then the flush) holds nothing back: decided is not in flight", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    await a.self.joinChannel(CH);
+    await settle();
+    const old = a.self._propLink;
+    a.self._propLink = a.makeLink("link2");
+    a.self._propLinks.push(a.self._propLink);
+    // No microtask between the two: the upload is decided, its in-flight
+    // entry not yet removed.
+    a.self._distroUploads.cut("the propagation link closed before the propagation node proved it", old);
+    const flush = a.self._sendDistroOutbox(a.self._propLink, "established");
+    await flush;
+    await settle();
+    assert.deepEqual(carried(a), [`join ${CH}`, `join ${CH}`]);
+    assert.equal(a.self._propLinks[1].sent.length, 1);
+});
+
+test("a build for a link that has closed holds nothing back: the next link builds and sends the entry, and the old build sends nothing", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const hold = holdFirstBuild(a);
+    await a.self.joinChannel(CH);         // its build for link1 is held
+    a.closeLink();
+    await a.establish();                  // link2, while link1's build is still under way
+    await settle();
+    assert.deepEqual(hold.built, [`join ${CH}`, `join ${CH}`]);
+    assert.deepEqual([a.self._propLinks[0].sent.length, a.self._propLinks[1].sent.length], [0, 1]);
+    hold.release();
+    await settle();
+    assert.deepEqual([a.self._propLinks[0].sent.length, a.self._propLinks[1].sent.length], [0, 1], "nothing onto the closed link, nor twice onto the new one");
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+});
+
+test("two flushes on one link: what the newer one uploaded and saw lost, the earlier one does not upload again; it goes on the link's next event", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { linkUp: false, proofs: "manual" });
+    await a.self.joinChannel(CH);
+    await a.self.joinChannel("public.other");
+    const hold = holdFirstBuild(a);
+    const flush = a.establish();          // "established": lists [CH, public.other]; CH's stamp is mined
+    await settle();
+    const link = a.self._propLink;
+    await a.self._sendDistroOutbox(link, "recovered");   // the same link, STALE and heard from again
+    assert.deepEqual(carried(a), ["join public.other"], "CH is being built for this link already");
+    a.self._onPacketsLost({ packetHashes: [a.proofKeys[0]], reason: "the exchange failed" });
+    await settle();
+    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "its packet was lost (the exchange failed)"]]);
+    hold.release();                       // no link event after the loss
+    await flush;
+    await settle();
+    // Review of 3411e19 (PROBE L): the "established" flush went on to
+    // public.other, found it owed with nothing in flight, and uploaded it
+    // again on the same link with no link event after its loss.
+    assert.deepEqual(carried(a), ["join public.other", `join ${CH}`], "the earlier flush ends the build it had begun, then stops");
+    assert.deepEqual(hold.built, [`join ${CH}`, "join public.other"], "no stamp mined for public.other again");
+    assert.equal(a.self._propLinks.length, 1);
+    await a.self._sendDistroOutbox(link, "recovered");   // the link's next event
+    assert.deepEqual(carried(a), ["join public.other", `join ${CH}`, "join public.other"], "CH, still in flight, is left to its proof");
+    a.prove(a.proofKeys[1]);
+    a.prove(a.proofKeys[2]);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+});
+
+test("D given up while C's upload is on the wire: the line says the upload cannot be taken back, and the node's proof of it is said; one being built is not sent, and its line says only that it goes no more", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    await a.self.joinChannel(CH);
+    await settle();
+    assert.equal(a.uploads.length, 1, "on the wire");
+    changeDistro(a, null);
+    // Review of 3411e19 (PROBE G): the line said "dropped, never sent", and
+    // the node's proof then said it had propagated.
+    assert.deepEqual(a.logged, [["warn", `[distro] ⚠️ the join of #${CH} (§17.12) was owed to ${lxmfHash(distro).slice(0, 8)}, a distro this device no longer holds — dropped: this device sends it no more; `
+        + "one upload of it has already left on the propagation link and cannot be taken back: if the propagation node proves it, the distro's devices get it (§17.12)"]]);
+    assert.deepEqual(a.owed(), []);
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.sentEvents(), [["join", CH]]);
+
+    const c = device(distro, { proofs: "manual" });
+    const hold = holdFirstBuild(c);
+    await c.self.joinChannel(CH);
+    changeDistro(c, null);                // while its stamp is mined
+    assert.deepEqual(c.logged, [["warn", `[distro] ⚠️ the join of #${CH} (§17.12) was owed to ${lxmfHash(distro).slice(0, 8)}, a distro this device no longer holds — dropped: this device sends it no more (§17.12)`]]);
+    hold.release();
+    await settle();
+    assert.deepEqual([c.uploads.length, c.owed().length], [0, 0]);
+
+    // A leave made while the link is STALE, owed and not uploaded, with the
+    // join it replaced still on the wire: that upload is not the leave's.
+    const f = device(distro, { proofs: "manual" });
+    await f.self.joinChannel(CH);
+    await settle();
+    f.self._propLink.status = 0x03;
+    await f.self.leaveChannel(CH);
+    await settle();
+    assert.deepEqual(carried(f), [`join ${CH}`]);
+    changeDistro(f, null);
+    assert.deepEqual(f.logged, [["warn", `[distro] ⚠️ the leave of #${CH} (§17.12) was owed to ${lxmfHash(distro).slice(0, 8)}, a distro this device no longer holds — dropped: this device sends it no more (§17.12)`]]);
+
+    // One whose upload was decided in this same task is not on the wire.
+    const e = device(distro, { proofs: "manual" });
+    await e.self.joinChannel(CH);
+    await settle();
+    e.self._distroUploads.cut("the propagation link closed before the propagation node proved it", e.self._propLink);
+    changeDistro(e, null);
+    assert.ok(e.logged.some(([, line]) => line.endsWith("dropped: this device sends it no more (§17.12)")), JSON.stringify(e.logged));
 });
 
 test("an upload cut after a later action replaced its C, or after its distro was given up, is not said to be owed and raises no error", async (t) => {
