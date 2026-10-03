@@ -53,7 +53,7 @@ import {
 } from "./lib/channel_sync.js";
 import { DistroUploads } from "./lib/distro_upload.js";
 import { DistroOutbox, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
-import { build, compile, install, methodBody, memoryStorage } from "./test_app_source.mjs";
+import { app, build, compile, install, methodBody, memoryStorage } from "./test_app_source.mjs";
 
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
 const quiet = { log() {}, warn() {}, error() {} };
@@ -230,6 +230,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         "async _sendDistroOutbox(link, trigger)",
         "async _uploadOwed(link, entry)",
         "_stillOwed(entry)",
+        "_dropOwedToOtherDistros()",
         "_distroOwedOutcome(entry, how, error)",
         "_uploadForDistro(link, propagationPacked, label)",
         "_handleDistroBlob(distroHash, blob)",
@@ -262,6 +263,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
     return {
         label, me, hash: lxmfHash(me), self, env, storage, ChannelStore, ChannelMsgStore, DistroManager, hold,
         uploads, requests, published, events, ui, contacts, logged, timers, proofKeys, prove, establish, closeLink,
+        makeLink: propagationLink,
         /** What this device still owes the distro (lib/distro_outbox.js). */
         owed: () => env.DistroOutboxStore.list().map((e) => (e.kind === "channel" ? [e.kind, e.op, e.name, e.at] : [e.kind, e.to])),
         sentEvents: () => events.filter((e) => e.kind === "distro-channel-sync-sent").map((e) => [e.detail.op, e.detail.channel]),
@@ -396,6 +398,54 @@ test("readChannelSync: no marker for other types and other shapes; an unusable 0
     unusable(["join", "public.x", 1.5], "a fractional at_ms");
     unusable(["join", "public.x", null], "a nil at_ms");
     assert.equal(readChannelSync(payload(new Map([[0xFB, DISTRO_CHANNEL_TYPE]]))).problem, "it carries no 0xFC");
+});
+
+/** A C payload whose at_ms is the 64-bit `value` (a BigInt) written as
+ *  `type`: 0xd3 (int 64, as the web writes it) or 0xcf (uint 64, as rmpv and
+ *  umsgpack write it). msgpackr writes the placeholder as int 64. */
+function payloadAt(value, type) {
+    const placeholder = 0x7fff_ffff_ffff_ffffn;
+    const fields = new Map([[0xFB, DISTRO_CHANNEL_TYPE], [0xFC, ["join", "public.tea", placeholder]], [0xFD, "cd".repeat(16)]]);
+    const b = Buffer.from(MsgPack.pack([1.5, Buffer.alloc(0), Buffer.alloc(0), fields]));
+    const at = b.indexOf(Buffer.from("d37fffffffffffffff", "hex"));
+    assert.notEqual(at, -1);
+    b[at] = type;
+    b.writeBigUInt64BE(value, at + 1);
+    return b;
+}
+
+test("readChannelSync: at_ms is an integer from 0 to 2^53 − 1 in any integer encoding; from 2^53 up it is no at_ms (§17.12 rule 4)", () => {
+    const INT64 = 0xd3, UINT64 = 0xcf;
+    const atMs = (value, type) => readChannelSync(payloadAt(value, type));
+    // The same value from the web (int 64) and from a phone (uint 64) is one action.
+    assert.deepEqual(atMs(1_790_000_000_123n, INT64), atMs(1_790_000_000_123n, UINT64));
+    assert.equal(atMs(1_790_000_000_123n, UINT64).sync.atMs, 1_790_000_000_123, "uint 64, as rmpv writes it");
+    assert.equal(atMs(2n ** 53n - 1n, UINT64).sync.atMs, 2 ** 53 - 1, "2^53 − 1 as uint 64");
+    assert.equal(atMs(2n ** 53n - 1n, INT64).sync.atMs, 2 ** 53 - 1, "2^53 − 1 as int 64");
+    // Review of a448e98: these were read, rounded (2^53 + 1 as 2^53), and
+    // applied, where the phones keep them exact; a join at 2^53 + 1 and a
+    // leave at 2^53 were then ordered one way here and the other there.
+    for (const [value, type, why] of [[2n ** 53n, UINT64, "2^53 as uint 64"], [2n ** 53n + 1n, UINT64, "2^53 + 1 as uint 64"],
+        [2n ** 53n, INT64, "2^53 as int 64"], [2n ** 53n + 1n, INT64, "2^53 + 1 as int 64"], [2n ** 64n - 1n, UINT64, "2^64 − 1"],
+        [2n ** 64n - 1n, INT64, "−1 as int 64"]]) {
+        const r = atMs(value, type);
+        assert.deepEqual([r.sync, r.problem], [null, "its at_ms is not an integer from 0 to 2^53 − 1"], why);
+    }
+});
+
+test("rule 4: a C whose at_ms is above 2^53 − 1 is dropped, whatever its encoding, and never applied", (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const b = device(distro);
+    const typed = (at) => new Map([[0x0C, Buffer.alloc(0)], [0xFB, DISTRO_CHANNEL_TYPE], [0xFC, ["join", "public.tea", at]], [0xFD, "cc".repeat(16)]]);
+    let ts = Date.now();
+    assert.deepEqual(fanOut(distro, craftC(distro, { fields: typed(2n ** 53n + 1n), timestampMs: ++ts }), [b]), [false]);
+    assert.deepEqual(fanOut(distro, craftC(distro, { fields: typed(2n ** 63n + 5n), timestampMs: ++ts }), [b]), [false], "uint 64");
+    assert.deepEqual(b.channels(), []);
+    assert.equal(b.record("public.tea"), null, "nothing recorded for rule 5 either");
+    assert.deepEqual(b.events.filter((e) => e.kind === "distro-channel-sync").map((e) => e.detail.rule), [4, 4]);
+    assert.deepEqual(fanOut(distro, craftC(distro, { fields: typed(2n ** 53n - 1n), timestampMs: ++ts }), [b]), [true]);
+    assert.deepEqual(b.channels(), ["public.tea"], "2^53 − 1 is applied");
 });
 
 test("joinNameAccepted: exactly the names the New Channel form joins", () => {
@@ -1630,12 +1680,192 @@ test("what is owed to a distro this device no longer holds is dropped, saying so
     assert.equal(a.uploads[0].subarray(0, 16).toString("hex"), lxmfHash(d2));
     assert.deepEqual(a.owed(), []);
     assert.ok(a.logged.some(([level, line]) => level === "warn" && line.includes(`owed to ${lxmfHash(d1).slice(0, 8)}, a distro this device no longer holds`)));
-    // With no distro held at all, nothing goes and nothing is dropped.
+    // With no distro held at all, nothing goes, and what was owed is
+    // dropped, saying so. Review of a448e98: it was kept, and went if D was
+    // imported again.
     const b = device(d1, { linkUp: false });
     await b.self.joinChannel(CH);
     b.hold(null);
     await b.establish();
-    assert.deepEqual([b.uploads.length, b.owed().length], [0, 1]);
+    assert.deepEqual([b.uploads.length, b.owed().length], [0, 0]);
+    assert.ok(b.logged.some(([level, line]) => level === "warn" && line.includes(`the join of #${CH} (§17.12) was owed to ${lxmfHash(d1).slice(0, 8)}`)));
+    b.hold(d1);
+    await b.establish();
+    assert.equal(b.uploads.length, 0, "D held again: nothing goes");
+});
+
+/** The Harness errors `d` raised, [where, message]. */
+const errorsOf = (d) => d.events.filter((e) => e.kind === "error").map((e) => [e.detail.where, e.detail.message]);
+
+/** `d` gives up its distro or takes `identity` instead: DistroManager's
+ *  change, then its onChange listener, as the page registers it (pinned
+ *  below and in distro_channels_page.test.mjs). */
+function changeDistro(d, identity) {
+    d.hold(identity);
+    d.self._dropOwedToOtherDistros();
+}
+
+test("the page drops what is owed to a distro it gives up on every change of the distro held, and once at load", () => {
+    // DistroManager.onChange runs its listener at once and on every
+    // generate, import and forget (lib/distro.js _notify).
+    assert.match(app, /\nDistroManager\.onChange\(\(\) => RnsClient\._dropOwedToOtherDistros\(\)\);\n/);
+    assert.ok(app.indexOf("\nDistroManager.onChange(") > app.indexOf("\nconst RnsClient = {"), "after RnsClient is defined");
+    assert.match(methodBody("async _sendDistroOutbox(link, trigger)"), /^\s*try \{[^]*?this\._dropOwedToOtherDistros\(\);\s*const owed = DistroOutboxStore\.list\(\);/,
+        "and before each flush lists what is owed");
+});
+
+test("RFed SPEC §17.12: a join owed with the link down, D given up (said), D imported again and the link up: nothing goes, and the sibling never joins a channel the user left", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { linkUp: false });
+    const b = device(distro);
+    await a.self.joinChannel(CH);
+    assert.equal(a.owed().length, 1);
+    changeDistro(a, null);
+    assert.deepEqual(a.owed(), [], "dropped when D was given up");
+    assert.deepEqual(a.logged, [["warn", `[distro] ⚠️ the join of #${CH} (§17.12) was owed to ${lxmfHash(distro).slice(0, 8)}, a distro this device no longer holds — dropped, never sent (§17.12)`]]);
+    assert.equal(device(distro, { me: a.me, storage: a.storage, linkUp: false }).owed().length, 0, "not in storage either");
+    clock.now += 60_000;
+    await a.self.leaveChannel(CH);           // with no distro: recorded, no C
+    changeDistro(a, distro);                 // D imported again
+    await a.establish();
+    await settle();
+    // Review of a448e98: the join was kept while no distro was held and
+    // went now; the sibling joined a channel this device had left.
+    assert.equal(a.uploads.length, 0);
+    for (const upload of a.uploads) fanOut(distro, upload, [b]);
+    assert.deepEqual([a.channels(), b.channels()], [[], []]);
+});
+
+test("D replaced by another distro and then taken again with no link up in between: what was owed to D is dropped at the first change and never sent", async (t) => {
+    fakeClock(t);
+    const d1 = Identity.create();
+    const d2 = Identity.create();
+    const a = device(d1, { linkUp: false });
+    await a.self.joinChannel(CH);
+    await a.self._sendDistroSentCopy("0123456789abcdef0123456789abcdef", "", "sent as D1");
+    changeDistro(a, d2);
+    assert.deepEqual(a.owed(), []);
+    assert.equal(a.logged.filter(([level, line]) => level === "warn" && line.includes("a distro this device no longer holds — dropped")).length, 2,
+        "one line for each, the sent-copy too");
+    changeDistro(a, d1);
+    await a.establish();
+    assert.equal(a.uploads.length, 0, "nothing for D1, nor for D2");
+});
+
+/**
+ * `d`'s propagation link lifecycle run by the shipped
+ * _establishPropagationLink, over links the test drives: `attempt()` makes
+ * one as the page does (it replaces a STALE one), PENDING until `up(link)`
+ * delivers its "established" (whose handler sends what is owed, as
+ * _onPropagationLinkEstablished does); `close(link)` delivers its "close".
+ */
+function shippedLinks(d) {
+    class TestLink {
+        static PENDING = 0x00;
+        static ACTIVE = 0x02;
+        static STALE = 0x03;
+        static CLOSED = 0x04;
+        constructor() {
+            Object.assign(this, d.makeLink(`link${d.self._propLinks.length + 1}`));
+            this.status = TestLink.PENDING;
+            this.listeners = new Map();
+            d.self._propLinks.push(this);
+        }
+        on(event, fn) { this.listeners.set(event, [...(this.listeners.get(event) ?? []), fn]); }
+        emit(event) { for (const fn of this.listeners.get(event) ?? []) fn(); }
+        establish() {}
+    }
+    Object.assign(d.self, {
+        _cfg: { ...d.self._cfg, propagationNodePubKey: Identity.create().getPublicKey().toString("hex"), propagationNodeHash: "b".repeat(32) },
+        _rns: { registerDestination: () => ({}) },
+        _propLinkPromise: null,
+        _onPropagationLinkEstablished: (link) => d.self._sendDistroOutbox(link, "established"),
+        _onPropagationLinkClosed() {},
+    });
+    const establishLink = compile("_establishPropagationLink()", { Identity, Buffer, Destination, Link: TestLink, console: quiet })(d.self);
+    return {
+        attempt: () => { establishLink(); return d.self._propLink; },
+        up: async (link) => { link.status = TestLink.ACTIVE; link.emit("established"); await settle(); },
+        close: async (link) => { link.status = TestLink.CLOSED; link.emit("close"); await settle(); },
+    };
+}
+
+test("a STALE propagation link replaced by a new one decides the upload still waiting on it: C goes again on the new link only once that one is decided, and one sibling applies it once", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { linkUp: false, proofs: "manual" });
+    const b = device(distro);
+    const links = shippedLinks(a);
+    const first = links.attempt();
+    await links.up(first);
+    await a.self.joinChannel(CH);
+    await settle();
+    assert.deepEqual(first.sent.length, 1, "uploaded on the link that is up");
+    // Its proof's entry (the two uploads are one packing here, so the
+    // second's would take its key).
+    const firstProof = a.self._pendingPacketHashes.get(a.proofKeys[0]);
+    first.status = 0x03;                  // STALE: nothing heard for staleTime
+    const second = links.attempt();       // a DM's propagation (_ensurePropagationLink) replaces it
+    assert.notEqual(second, first);
+    await settle();
+    // Review of a448e98 (PROBE S1): the upload on the replaced link stayed
+    // open, and the new link's "established" uploaded the join again while
+    // it was: two uploads of one C at once.
+    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "the propagation link it went on was replaced before the propagation node proved it"]]);
+    assert.ok(a.logged.some(([level, line]) => level === "warn" && line.includes("still owed: it goes when the propagation link is next up")));
+    assert.equal(a.owed().length, 1, "not proved, so still owed");
+    await links.up(second);
+    assert.deepEqual([first.sent.length, second.sent.length], [1, 1], "uploaded again on the new link (DESIGN_PRINCIPLES §3, the distro exception)");
+    assert.equal(a.prove(a.proofKeys[1]), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+    // The old link's watchdog tears it down: there is nothing left on it to
+    // decide, and nothing more is said.
+    await links.close(first);
+    assert.equal(errorsOf(a).length, 1);
+    // The node had the first upload after all: its proof comes late, over
+    // the old link.
+    firstProof.onProof(firstProof.messageId);
+    await settle();
+    assert.deepEqual([a.uploads.length, a.owed().length], [2, 0]);
+    assert.deepEqual(a.sentEvents(), [["join", CH], ["join", CH]], "each proof said, the late one too");
+    for (const upload of a.uploads) fanOut(distro, upload, [b]);
+    await settle();
+    assert.deepEqual(b.syncEvents(), ["joined"], "applied once");
+});
+
+test("an upload cut after a later action replaced its C, or after its distro was given up, is not said to be owed and raises no error", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    await a.self.joinChannel(CH);
+    await settle();
+    clock.now += 10;
+    await a.self.leaveChannel(CH);        // replaces the join, which is in flight
+    await settle();
+    assert.deepEqual(carried(a), [`join ${CH}`, `leave ${CH}`]);
+    a.closeLink();
+    await settle();
+    // Review of a448e98 (PROBE S2): the join's cut said "still owed: it
+    // goes when the propagation link is next up" and raised the error too,
+    // though nothing was owed for it.
+    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "the propagation link closed before the propagation node proved it"]], "the leave's alone");
+    const stillOwed = a.logged.filter(([, line]) => line.includes("still owed"));
+    assert.equal(stillOwed.length, 1);
+    assert.match(stillOwed[0][1], /the leave of/);
+    await a.establish();
+    assert.deepEqual(carried(a), [`join ${CH}`, `leave ${CH}`, `leave ${CH}`]);
+
+    // The distro given up while C's upload waits for its proof.
+    const c = device(distro, { proofs: "manual" });
+    await c.self.joinChannel(CH);
+    await settle();
+    changeDistro(c, null);
+    c.closeLink();
+    await settle();
+    assert.deepEqual(errorsOf(c), []);
+    assert.equal(c.logged.filter(([, line]) => line.includes("still owed")).length, 0);
 });
 
 test("the §17.11 sent-copy is owed the same way: made with no link up, it goes when the link comes up and is owed until proved", async (t) => {

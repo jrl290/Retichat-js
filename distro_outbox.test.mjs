@@ -65,6 +65,89 @@ test("storage that refuses a write: this page holds what is owed, the refused en
     assert.deepEqual(box.list(), []);
 });
 
+/** Storage that refuses a write of the outbox larger than what it holds once
+ *  `on` is set, as a full localStorage does (app.js sSet drops it without a
+ *  word); a smaller write is taken. With `frozen` set it refuses every write. */
+function fullStorage() {
+    const real = memoryStorage();
+    const s = {
+        on: false, frozen: false, real,
+        get: real.sGet,
+        set: (k, v) => {
+            if (s.frozen) return;
+            if (s.on && JSON.stringify(v).length > (real.data.get(k)?.length ?? 0)) return;
+            real.sSet(k, v);
+        },
+    };
+    return s;
+}
+const SENT = (hash, packed) => entry(sentCopyEntryId(hash), packed, { kind: "sent", to: "0".repeat(32) });
+
+test("RFed SPEC §17.12: owe a join (kept), storage fills, a sent-copy and then a leave of that channel are refused; what storage holds no longer holds the join", () => {
+    const storage = fullStorage();
+    const box = new DistroOutbox(storage);
+    assert.equal(box.put(entry("channel:aa", "AAAA")), true, "the join is kept");
+    storage.on = true;
+    assert.equal(box.put(SENT("ff", "BBBBBBBBBBBB")), false, "the sent-copy is refused: this page holds it");
+    assert.equal(box.put(entry("channel:aa", "CCCCCCCC", { op: "leave", at: 2 })), false, "the leave is refused too");
+    assert.deepEqual(box.list().map((e) => [e.id, e.packed]), [["sent:ff", "BBBBBBBBBBBB"], ["channel:aa", "CCCCCCCC"]],
+        "this page owes the sent-copy and the leave");
+    // Review of a448e98: the write after the second refusal was what this
+    // page held, less the join ([sent-copy]), larger than what storage held
+    // ([join]); storage refused it, kept the join, and the next page sent
+    // the join the user had undone.
+    assert.deepEqual(new DistroOutbox(storage).list(), [], "a later page owes neither the join nor what storage refused");
+});
+
+test("storage that refuses writes: what this page settles or drops is taken out of storage too, never left for a later page", () => {
+    const storage = fullStorage();
+    const box = new DistroOutbox(storage);
+    const OTHER = "e".repeat(32);
+    box.put(entry("channel:aa", "AAAA"));
+    box.put(SENT("ff", "BBBB"));
+    box.put(entry("channel:bb", "DDDD", { distro: OTHER }));
+    storage.on = true;
+    assert.equal(box.put(SENT("ee", "EEEEEEEEEEEEEEEEEEEE")), false);
+    // The join is proved: the write of what this page now owes is larger
+    // than what storage holds, and refused; storage still drops the join.
+    assert.equal(box.settle("channel:aa", "AAAA"), true);
+    assert.deepEqual(new DistroOutbox(storage).list().map((e) => e.id), ["sent:ff", "channel:bb"], "a later page never uploads the proved join again");
+    // The distro OTHER was given up: what was owed to it leaves storage too.
+    assert.deepEqual(box.dropAllBut(D).map((e) => e.id), ["channel:bb"]);
+    assert.deepEqual(box.list().map((e) => e.id), ["sent:ff", "sent:ee"]);
+    assert.deepEqual(new DistroOutbox(storage).list().map((e) => e.id), ["sent:ff"]);
+});
+
+test("storage that refuses even a smaller write is said: what it still holds that is owed no more, which a later page would send", () => {
+    const storage = fullStorage();
+    const lines = [];
+    const box = new DistroOutbox(storage, { log: { error: (line) => lines.push(line) } });
+    box.put(entry("channel:aa", "AAAA"));
+    storage.frozen = true;
+    assert.equal(box.put(entry("channel:aa", "CCCC", { op: "leave", at: 2, label: "the leave of #aa" })), false);
+    assert.deepEqual(box.list().map((e) => e.packed), ["CCCC"], "this page holds the leave");
+    assert.deepEqual(lines.length, 1);
+    assert.match(lines[0], /refuses even a smaller write: it still holds the join of #channel:aa, owed no more, which a later page would send/);
+    // A write storage takes again makes it the outbox again, the join gone.
+    storage.frozen = false;
+    assert.equal(box.settle("channel:aa", "CCCC"), true);
+    assert.deepEqual(new DistroOutbox(storage).list(), []);
+    assert.equal(lines.length, 1, "nothing more said once storage takes the write");
+});
+
+test("dropAllBut: every entry owed to another distro, or all of them when none is held, is dropped and returned", () => {
+    const { storage, box } = outbox();
+    const OTHER = "e".repeat(32);
+    box.put(entry("channel:aa", "AAAA"));
+    box.put(entry("channel:bb", "BBBB", { distro: OTHER }));
+    box.put(SENT("ff", "CCCC"));
+    assert.deepEqual(box.dropAllBut(D).map((e) => e.id), ["channel:bb"]);
+    assert.deepEqual(new DistroOutbox({ get: storage.sGet, set: storage.sSet }).list().map((e) => e.id), ["channel:aa", "sent:ff"], "in storage");
+    assert.deepEqual(box.dropAllBut(D), [], "nothing more to drop");
+    assert.deepEqual(box.dropAllBut(null).map((e) => e.id), ["channel:aa", "sent:ff"], "no distro held: nothing is owed");
+    assert.deepEqual(box.list(), []);
+});
+
 test("a later entry under the same id replaces the one owed, and goes to the end", () => {
     const { box } = outbox();
     box.put(entry("channel:aa", "AAAA"));

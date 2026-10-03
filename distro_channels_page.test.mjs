@@ -10,7 +10,10 @@
  *   - a join made on another device puts the channel in the chat list, and
  *     a leave made there takes the open channel away and closes its chat;
  *   - the Leave button sends the user's leave to the distro as one
- *     membership message, and a post made here is signed as D.
+ *     membership message, and a post made here is signed as D;
+ *   - a leave owed while the propagation link is down is dropped, saying
+ *     so, when the user forgets D with the Forget button, and is not sent
+ *     when D is imported again and the link comes up.
  * rfed is played at the page's own seams: rfed.link and the propagation
  * link are stand-ins that keep what the page sends, and rfed's fan-out goes
  * through _handleChannelPacket and _handleDistroBlob, the handlers every
@@ -124,7 +127,7 @@ function siblingC(distro, op, name, atMs) {
     return Buffer.concat([packed.subarray(0, 16), distro.encrypt(packed.subarray(16))]).toString("hex");
 }
 
-chromiumTest("the real page: a sibling's post is the user's own bubble; a sibling's join and leave change the list and close the open chat; Leave and a post go out as the distro", async (t) => {
+chromiumTest("the real page: a sibling's post is the user's own bubble; a sibling's join and leave change the list and close the open chat; Leave and a post go out as the distro; what is owed to a forgotten distro is dropped", async (t) => {
     const browser = await launchChromium(t);
     if (!browser) return;
     const served = await servePageAndExchange();
@@ -260,7 +263,28 @@ chromiumTest("the real page: a sibling's post is the user's own bubble; a siblin
             [["leave", "packet"]]);
         assert.deepEqual(await page.evaluate(() => window.RetichatTest.distroOwed()), [], "proved: owed no more");
 
-        assert.deepEqual([dialogs, pageErrors, elsewhere], [[`Leave #${OTHER}?`], [], []], "the Leave confirmation only; no error; nothing left this machine but esm.sh");
+        // 6. RFed SPEC §17.12: what is owed to D when the user forgets D is
+        //    dropped then, saying so, and never sent if D comes back
+        //    (DistroManager.onChange). Review of a448e98: it was kept, and
+        //    went when D was imported again.
+        const warnings = [];
+        page.on("console", (m) => { if (m.type() === "warning") warnings.push(m.text()); });
+        await page.evaluate(() => { const c = window.RetichatTest.client; window.__link = c._propLink; c._propLink = null; });
+        await page.evaluate((ch) => window.RetichatTest.client.leaveChannel(ch), ELSEWHERE);
+        assert.deepEqual(await page.evaluate(() => window.RetichatTest.distroOwed().map((e) => [e.op, e.name])), [["leave", ELSEWHERE]],
+            "owed while the propagation link is down");
+        await page.evaluate(() => window.RetichatTest.app._forgetDistro());     // the Forget button, confirmed
+        assert.equal(await page.evaluate(() => window.RetichatTest.distro().has), false);
+        assert.deepEqual(await page.evaluate(() => window.RetichatTest.distroOwed()), [], "dropped when D was forgotten");
+        assert.ok(warnings.some((line) => line.includes(`the leave of #${ELSEWHERE} (§17.12) was owed to ${D.slice(0, 8)}, a distro this device no longer holds — dropped, never sent`)),
+            warnings.join("\n"));
+        await page.evaluate((hex) => { window.RetichatTest.adoptDistro(hex).catch(() => {}); }, distroHex);
+        assert.equal(await page.evaluate(() => window.RetichatTest.distro().lxmfDeliveryHash), D, "D imported again");
+        await page.evaluate(async () => { const c = window.RetichatTest.client; c._propLink = window.__link; await c._sendDistroOutbox(c._propLink, "established"); });
+        assert.equal(await page.evaluate(() => window.__uploads.length), 1, "nothing goes but step 5's leave");
+
+        assert.deepEqual([dialogs.map((d) => d.split("?")[0]), pageErrors, elsewhere],
+            [[`Leave #${OTHER}`, "Forget the current distro identity"], [], []], "the two confirmations only; no error; nothing left this machine but esm.sh");
         await context.close();
     } finally {
         await browser.close();

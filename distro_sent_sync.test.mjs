@@ -179,7 +179,7 @@ function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
     };
     install(self, env, [
         "async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
-        "async _uploadOwed(link, entry)", "_stillOwed(entry)", "_distroOwedOutcome(entry, how, error)", "_uploadForDistro(link, propagationPacked, label)",
+        "async _uploadOwed(link, entry)", "_stillOwed(entry)", "_dropOwedToOtherDistros()", "_distroOwedOutcome(entry, how, error)", "_uploadForDistro(link, propagationPacked, label)",
     ]);
     return {
         run: async (to, content) => { await self._sendDistroSentCopy(to, "", content); await tick(); },
