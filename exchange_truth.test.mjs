@@ -727,8 +727,9 @@ function makeChannelClient(iface) {
     const { sGet, sSet } = memoryStorage();
     const ChannelMsgStore = new Function("sGet", "sSet", "addInOrder", `return ${extractObject("ChannelMsgStore")};`)(sGet, sSet, addInOrder);
     const channel = { channelName: "general", channelHash: "c".repeat(32) };
+    const me = Identity.create();
     const env = {
-        ChannelMsgStore, IdMgr: { has: true, hash: "a".repeat(32) },
+        ChannelMsgStore, IdMgr: { has: true, id: me, hash: me.hash.toString("hex") }, DistroManager: { has: false }, Destination,
         ChannelStore: { get: (name) => (name === channel.channelName ? channel : null), touch() {} },
         console: { log() {}, warn() {}, error() {} },
     };
@@ -739,7 +740,8 @@ function makeChannelClient(iface) {
         _onMsg: [(event, name) => notified.push({ kind: event?.kind, name })],
         _ensureChannelSubscribed: async (ch) => { subscribing.push(ch); throw new Error("sent on (test stops here)"); },
     };
-    for (const signature of ["async sendChannelMessage(channelName, content)", "_exchangeIsDown()", "_setChannelPostStatus(channelName, msgId, status)"]) {
+    for (const signature of ["async sendChannelMessage(channelName, content)", "_exchangeIsDown()", "_setChannelPostStatus(channelName, msgId, status)",
+        "sendingIdentity()"]) {
         self[methodName(signature)] = compile(signature, env)(self);
     }
     return { self, channel, ChannelMsgStore, subscribing, notified };

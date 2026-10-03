@@ -162,15 +162,16 @@ test("§4.2 channel rule: first post, change, new sender, 24 h, clear once", () 
     const H = 3_600_000;
     let t = 1_000 * H;
     const post = (name) => {
-        const state = posts.decide("public.x", name, t);
-        posts.recordIncluded("public.x", state, t);
+        const state = posts.decide("public.x", "me", name, t);
+        posts.recordIncluded("public.x", "me", state, t);
         return state.state;
     };
     assert.equal(post("Alice"), "name", "first post");
     t += H;
     assert.equal(post("Alice"), "absent");
     assert.equal(posts.noteSender("public.x", "me", "me", t), false, "own echo is not a new sender");
-    assert.equal(posts.noteSender("public.x", "b0b", "me", t + 1), true);
+    assert.equal(posts.noteSender("public.x", "d1st", ["me", "d1st"], t), false, "nor is the distro this device posts as");
+    assert.equal(posts.noteSender("public.x", "b0b", ["me", "d1st"], t + 1), true);
     t += H;
     assert.equal(post("Alice"), "name", "a new sender posted since the last inclusion");
     assert.equal(posts.noteSender("public.x", "b0b", "me", t + 1), false, "seen before");
@@ -184,8 +185,8 @@ test("§4.2 channel rule: first post, change, new sender, 24 h, clear once", () 
     assert.equal(post(null), "clear", "unset after a real name: clear once");
     t += H;
     assert.equal(post(null), "absent");
-    assert.equal(new ChannelPostNames(storage).decide("public.x", null, t).state, "absent", "persisted");
-    assert.equal(new ChannelPostNames(storage).decide("public.y", null, t).state, "absent", "never named: nothing");
+    assert.equal(new ChannelPostNames(storage).decide("public.x", "me", null, t).state, "absent", "persisted");
+    assert.equal(new ChannelPostNames(storage).decide("public.y", "me", null, t).state, "absent", "never named: nothing");
 });
 
 test("§5.2 accepting a 0xD1", () => {

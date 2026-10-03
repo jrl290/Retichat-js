@@ -119,6 +119,7 @@ function client({ subscribe = async () => null, pair = {} } = {}) {
         _ensureRfedLink: async (aspects) => { linksAsked.push(aspects.join(".")); return a; },
     };
     install(self, env, [
+        "sendingIdentity()",
         "async sendChannelMessage(channelName, content)",
         "_setChannelPostStatus(channelName, msgId, status)",
         "_handleChannelPacket(packetData)",
@@ -288,7 +289,7 @@ test("disconnect(): the shipped stop closes rfed.link, which fails the post; rfe
         _annTimer: null, _unhookPageLifecycle() {}, _rfedReopenArmed: new Set(), _pendingTickets: new Map(),
         _rfedLinkPromises: new Map(), _rfedServiceReady: new Set(["link"]), _rfedServiceWaiters: new Map(),
         _rfedOpenedChannelHashes: new Set(), _rfedPullState: new Map(), _rfedStampRefreshed: new Set(),
-        _rfedSubscriptionPromises: new Map(), _rfedStreamPromises: new Map(), _groupLinks: new Map(),
+        _rfedSubscriptionPromises: new Map(), _rfedUnsubscribes: new Map(), _rfedStreamPromises: new Map(), _groupLinks: new Map(),
         _groupLinkPromises: new Map(), _groupPeerReady: new Set(), _groupPeerWaiters: new Map(),
         _groupPathsRequested: new Set(), _groupFallbacks: new Map(), _propLinkUpWaiters: [], _setStatus() {},
     });

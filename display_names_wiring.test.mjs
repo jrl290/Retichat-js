@@ -840,8 +840,11 @@ function makeChannelReceiver(me) {
     const env = {
         Buffer, DistroManager: { has: false }, Harness, console: quiet, channelLxmUnpack, ContactStore,
         ChannelStore: { getByHash: () => ({ channelName: CHANNEL }), touch() {} },
-        ChannelMsgStore: { add: (c, m) => posts.push(m) },
-        ownLxmfDestinationHash: () => lxmfHash(me), sentTimeMs,
+        ChannelMsgStore: {
+            add: (c, m) => posts.push(m),
+            held: (c, src, ts) => posts.find((m) => m.srcHash === src && m.timestamp === ts) ?? null,
+        },
+        ownLxmfDestinationHash: () => lxmfHash(me), sentTimeMs, OwnNames: { channel: null },
         ...stores,
     };
     const self = { _channelPublishes: new ChannelPublishes(), _onMsg: [] };
@@ -886,8 +889,8 @@ test("§4.2 own posts carry the Channel Display Name by the channel rule, record
     const sent = [];
     const records = [];
     const env = {
-        IdMgr: { has: true, id: me }, Destination, Link, Buffer, MsgPack, console: quiet, channelLxmPack, channelComputeStamp,
-        ChannelMsgStore: { add: (c, m) => { records.push(m); return { id: String(records.length), ...m }; }, updateStatus: () => ({}) },
+        IdMgr: { has: true, id: me }, DistroManager: { has: false }, Destination, Link, Buffer, MsgPack, console: quiet, channelLxmPack, channelComputeStamp,
+        ChannelMsgStore: { add: (c, m) => { records.push(m); return { id: String(records.length), ...m }; }, updateStatus: () => ({}), held: () => null },
         ChannelStore: { get: () => ({ channelName: CHANNEL, stampCost: null }), touch() {} },
         ChannelPostNamesStore: posts, OwnNames: { channel: "Pseud", message: "Not this one" },
         rfedRequestTimeoutMs: () => 10_000, CHANNEL_PUBLISH_PATH,
@@ -911,6 +914,7 @@ test("§4.2 own posts carry the Channel Display Name by the channel rule, record
         }),
     };
     self._setChannelPostStatus = compile("_setChannelPostStatus(channelName, msgId, status)", env)(self);
+    self.sendingIdentity = compile("sendingIdentity()", env)(self);
     const post = compile("async sendChannelMessage(channelName, content)", env)(self);
     const nameOf = (wire) => channelLxmUnpack(CHANNEL, wire).displayName;
     await post(CHANNEL, "first");

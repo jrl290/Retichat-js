@@ -57,6 +57,7 @@ import {
     migrateOwnDisplayName,
 } from "./lib/display_name.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
+import { ChannelMembership, channelSyncDisposition, channelSyncFields } from "./lib/channel_sync.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
 import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.js";
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
@@ -524,6 +525,9 @@ const nameStorage = { get: sGet, set: sSet };
 const NameLedgerStore = new NameLedger(nameStorage);
 const ChannelPostNamesStore = new ChannelPostNames(nameStorage);
 const ChannelSenderNamesStore = new ChannelSenderNames(nameStorage);
+// RFed SPEC §17.12 rule 5: per channel hash, the last membership action this
+// device made or applied (lib/channel_sync.js), kept after a leave.
+const ChannelMembershipStore = new ChannelMembership(nameStorage);
 
 // =========================================================================
 //  IDENTITY MANAGER
@@ -2026,11 +2030,33 @@ ChannelStore.init();
 // =========================================================================
 const ChannelMsgStore = {
     get(channelName) { return sGet("cmsg_"+channelName) ?? []; },
+    /**
+     * The stored post whose identity is (srcHash, timestamp), or null
+     * (RFed-spec/Channel.md "Deduplication"). A post's identity is its
+     * source's lxmf.delivery hash and its LXMF timestamp in ms, which every
+     * post record keeps as `srcHash` and `timestamp`: a received one stores
+     * the time its poster sent it (sentTimeMs), this client's own the
+     * timestamp it packed (sendChannelMessage). System lines have neither.
+     */
+    held(channelName, srcHash, timestamp) {
+        if (!srcHash || !Number.isFinite(timestamp)) return null;
+        return this.get(channelName).find(m => (m.dir === "in" || m.dir === "out")
+            && m.srcHash === srcHash && m.timestamp === timestamp) ?? null;
+    },
     /** As MsgStore.add: in conversation order (a post carries its post
      *  time), so history pulled late sits under its own day; returns the
-     *  stored record. */
+     *  stored record. A post whose identity is already held is not stored
+     *  again: the held record is returned, unchanged. That holds across
+     *  reloads, which the in-memory echo set (_chanSeenIds) does not: until
+     *  2026-10-03 rfed's echo of an own post, pulled after a reload, was
+     *  stored a second time as an incoming post. */
     add(channelName, msg) {
         const msgs = this.get(channelName);
+        if ((msg.dir === "in" || msg.dir === "out") && msg.srcHash && Number.isFinite(msg.timestamp)) {
+            const held = msgs.find(m => (m.dir === "in" || m.dir === "out")
+                && m.srcHash === msg.srcHash && m.timestamp === msg.timestamp);
+            if (held) return held;
+        }
         const stored = { id: Date.now().toString(36)+Math.random().toString(36).slice(2,8), timestamp: Date.now(), ...msg };
         addInOrder(msgs, stored, 500);
         sSet("cmsg_"+channelName, msgs);
@@ -2102,6 +2128,11 @@ const RnsClient = {
     _rfedPullState: new Map(),
     _rfedStampRefreshed: new Set(),
     _rfedSubscriptionPromises: new Map(),
+    // channelHash → the /channel/unsubscribe of a channel being left, until
+    // rfed answers it: a subscription to that channel waits for it, so a
+    // join right after a leave (the user's, or a sibling's, §17.12) is never
+    // overtaken by the leave it follows (DESIGN_PRINCIPLES §5).
+    _rfedUnsubscribes: new Map(),
     _rfedStreamPromises: new Map(),
     // This device's channel posts until rfed's answer to each publish, or
     // its echo of the post, decides it (lib/channel_publish.js).
@@ -4197,6 +4228,148 @@ const RnsClient = {
         dispatched("packet");
     },
 
+    /**
+     * RFed SPEC §17.12, "Who sends it": the user's own join of a channel not
+     * in the list, or leave of one that is (joinChannel, leaveChannel; never
+     * a change made by applying a sibling's message, the start's
+     * re-subscription or a stamp refresh). The action is recorded for rule 5
+     * whether or not this device holds a distro, stamped after any record
+     * it holds (ChannelMembership.stampLocal); with a distro it goes to D as
+     * one membership message, fire-and-forget: the list here changed when
+     * the user acted, whatever becomes of the message.
+     */
+    _syncChannelMembership(op, ch) {
+        const atMs = ChannelMembershipStore.stampLocal(ch.channelHash, op, Date.now());
+        if (!DistroManager.has) return;
+        this._sendDistroChannelSync(op, ch.channelName, atMs).catch(error => {
+            console.warn(`[distro] ⚠️ The ${op} of #${ch.channelName} was not sent to the distro (§17.12):`, error.message);
+            Harness.error("distro-channel-sync", error);
+        });
+    },
+
+    /**
+     * Propagate the RFed SPEC §17.12 membership message C for the user's
+     * `op` ("join" or "leave") of `channelName` at `atMs`: destination D,
+     * source D, signed with D's key, no title, no content, and the fields of
+     * lib/channel_sync.js channelSyncFields (an empty 0x0C, 0xFB
+     * "rfed.distro.channel", 0xFC [op, name, at_ms] as a native array, 0xFD
+     * this device's own lxmf.delivery address), with no 0xD1: a message to
+     * one's own devices carries no name (DISPLAY_NAMES.md §4.1). Built and
+     * sent as _sendDistroSentCopy is: PROPAGATED at once, on the
+     * propagation link when it is up; RFed fans it out to every device of
+     * D, this one included, and _handleDistroBlob drops that echo by 0xFD.
+     */
+    async _sendDistroChannelSync(op, channelName, atMs) {
+        const distroHash = DistroManager.lxmfDeliveryHash;
+        if (!DistroManager.has || !distroHash) return;
+        const deviceHash = this.ownHash ?? ownLxmfDestinationHash();
+        if (!deviceHash) throw new Error("own lxmf.delivery address unavailable for 0xFD");
+
+        const msg = new LXMessage();
+        msg.sourceHash = Buffer.from(distroHash, "hex");
+        msg.destinationHash = Buffer.from(distroHash, "hex");
+        msg.title = "";
+        msg.content = "";
+        msg.fields = channelSyncFields(op, channelName, atMs, deviceHash);
+        const packed = msg.pack(DistroManager.identity, false);
+        const distroPubKey = DistroManager.pubKey;
+
+        const link = await this._whenPropagationLinkUp(distroHash);
+        const propagationPacked = await this._buildPropagationPacked(packed, distroPubKey);
+        const dispatched = (how) => {
+            console.log(`[distro] 📤 The ${op} of #${channelName} (at ${atMs}) propagated to the distro as a ${how} (§17.12)`);
+            Harness.event("distro-channel-sync-sent", { op, channel: channelName, at: atMs, how });
+        };
+        if (propagationPacked.length > Link.MDU) {
+            await link.sendResource(propagationPacked);
+            dispatched("resource");
+            return;
+        }
+        link.send(propagationPacked);
+        dispatched("packet");
+    },
+
+    /**
+     * A membership message C unwrapped from the distro (§17.12 "Receiving"):
+     * `marker` is LXMF.distroChannelSyncFromPayload's; `facts` holds
+     * `fromDistro` and `signedByDistro`, rules 1 and 2's facts. Rules 1-5
+     * (lib/channel_sync.js channelSyncDisposition), then rule 6
+     * (_applyDistroChannelSync). Returns true when C is held (applied, this
+     * device's own echo, or stale: each recorded as seen), false when it is
+     * dropped (rules 1, 2 and 4, each with a log line).
+     */
+    _handleDistroChannelSync(marker, facts) {
+        const disposition = channelSyncDisposition(marker, {
+            fromDistro: facts.fromDistro, signedByDistro: facts.signedByDistro,
+            ownDeviceHex: this.ownHash ?? ownLxmfDestinationHash(),
+            channelHashOf: (name) => channelIdentity(name).hash.toString("hex"),
+            recordOf: (channelHash) => ChannelMembershipStore.get(channelHash),
+        });
+        const { verdict } = disposition;
+        const name = marker.sync?.name ?? "?";
+        if (verdict === "drop") {
+            console.warn(`[distro] ⚠️ Channel membership message for #${name} from device ${marker.byHex.slice(0,12) || "?"} dropped: ${disposition.reason} (§17.12 rule ${disposition.rule})`);
+            Harness.event("distro-channel-sync", { result: "dropped", rule: disposition.rule, reason: disposition.reason });
+            return false;
+        }
+        if (verdict === "echo") {
+            console.log(`[distro] ↩︎ own channel ${marker.sync?.op ?? "membership"} echo for #${name} — dropped (§17.12 rule 3)`);
+            Harness.event("distro-channel-sync", { result: "echo", op: marker.sync?.op ?? null, channel: name });
+            return true;
+        }
+        if (verdict === "stale") {
+            const r = disposition.recorded;
+            console.log(`[distro] ↩︎ channel ${disposition.op} of #${name} at ${disposition.atMs} is older than the ${r.op} at ${r.at} held here — dropped (§17.12 rule 5)`);
+            Harness.event("distro-channel-sync", { result: "stale", op: disposition.op, channel: name, at: disposition.atMs });
+            return true;
+        }
+        this._applyDistroChannelSync(disposition, marker.byHex);
+        return true;
+    },
+
+    /**
+     * §17.12 rule 6: apply a sibling's join or leave on this device, with
+     * this device's own key and its own configured RFed node, as the user's
+     * own join or leave here would, then record it. No membership message
+     * is sent (nothing loops), and nothing asks the user anything: the
+     * channel list simply changes.
+     *   join of a channel not in the list: stored, then subscribed: at once
+     *     when this connection has already subscribed its stored channels
+     *     (_initChannels), else by that subscription when the RFed link is
+     *     ready (never by a retry, DESIGN_PRINCIPLES §3, §5). Not opened:
+     *     its posts wait at RFed until the user opens it, as for any stored
+     *     channel;
+     *   leave of a channel in the list: _leaveChannelHere;
+     *   otherwise nothing but the record.
+     */
+    _applyDistroChannelSync(change, byHex) {
+        const { op, name, atMs, channelHash } = change;
+        const held = ChannelStore.getByHash(channelHash);
+        let applied = "recorded";
+        if (op === "join" && !held) {
+            if (!this._cfg.rfedNodeHash) {
+                // Not this device's to join without a node; the record still
+                // orders a later message.
+                console.warn(`[distro] ⚠️ Channel join of #${name} from device ${byHex.slice(0,12)}: no RFed node configured here — recorded, not joined`);
+            } else {
+                const ch = ChannelStore.join(name, this._cfg.rfedNodeHash);
+                applied = "joined";
+                if (this._channelsResubscribed) {
+                    this._ensureChannelSubscribed(ch).then(
+                        (stampCost) => ChannelStore.setStampCost(ch.channelName, stampCost),
+                        (e) => console.warn(`[distro] ⚠️ Subscribing to #${name}, joined on another device, failed:`, e.message),
+                    );
+                }
+            }
+        } else if (op === "leave" && held) {
+            this._leaveChannelHere(held, true);
+            applied = "left";
+        }
+        ChannelMembershipStore.record(channelHash, op, atMs);
+        console.log(`[distro] 📡 Channel ${op} of #${name} at ${atMs} from device ${byHex.slice(0,12) || "?"}: ${applied} (§17.12)`);
+        Harness.event("distro-channel-sync", { result: applied, op, channel: name, at: atMs });
+    },
+
     /** Core packet send: packs, sends, tracks proof, calls back. */
     _sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError) {
         const peerId = Identity.fromPublicKey(Buffer.from(publicKeyHex, "hex"));
@@ -5051,7 +5224,8 @@ const RnsClient = {
 
     /** The propagation link once it is ACTIVE, without starting it (unlike
      *  _ensurePropagationLink). Used by the §17.11 sent-copy, which must not
-     *  change when the original message is propagated. Resolved by the
+     *  change when the original message is propagated, and the §17.12
+     *  membership message, which is sent the same way. Resolved by the
      *  link's "established" or "recovered" (STALE -> ACTIVE) handler,
      *  rejected by disconnect(). */
     _whenPropagationLinkUp(recipientHex) {
@@ -5059,7 +5233,7 @@ const RnsClient = {
         if (!this._cfg.propagationNodePubKey || !this._cfg.propagationNodeHash) {
             return Promise.reject(new Error("Propagation node identity is not ready"));
         }
-        console.log(`[distro] Sent-copy for ${recipientHex.slice(0,8)} waits for the propagation link (§17.11)`);
+        console.log(`[distro] A copy for ${recipientHex.slice(0,8)} waits for the propagation link (§17.11, §17.12)`);
         return new Promise((resolve, reject) => this._propLinkUpWaiters.push({ resolve, reject }));
     },
 
@@ -5897,6 +6071,20 @@ const RnsClient = {
 
             const { sourceHash, tsMs, content, senderPubKey, displayName } = result;
             const srcHashHex = sourceHash.toString("hex");
+            // The post's identity is (source, timestamp) (RFed-spec/Channel.md
+            // "Deduplication"); a record keeps the time the poster sent it.
+            const postAt = sentTimeMs(tsMs / 1000);
+
+            // RFed-spec/Channel.md "Distro holders": a post is the user's own
+            // when its source is this device's lxmf.delivery hash or that of
+            // the distro this device holds now, whichever of the user's
+            // devices sent it. The posting identity is the one this device
+            // signs its own posts with (sendChannelMessage): the distro when
+            // it holds one, otherwise the device.
+            const deviceHash = ownLxmfDestinationHash();
+            const distroHash = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
+            const own = srcHashHex === deviceHash || (distroHash !== null && srcHashHex === distroHash);
+            const postingHash = distroHash ?? deviceHash;
 
             // Dedup: track by (senderHash, tsMs) — per spec security requirements.
             // Server-echo of own sent messages and multi-subscriber fanout produce
@@ -5919,15 +6107,41 @@ const RnsClient = {
                 this._chanSeenIds = new Set(arr.slice(-1000));
             }
 
+            // DISPLAY_NAMES.md §4.2 "Learning from the channel": a post from
+            // the current posting identity (the echo of this device's own
+            // post, or one a sibling signed with the same distro) tells this
+            // device what readers last got from it, but only a value equal to
+            // what it would send itself is recorded (ChannelPostNames.learn).
+            if (srcHashHex === postingHash) {
+                ChannelPostNamesStore.learn(ch.channelName, postingHash, displayName, postAt, OwnNames.channel);
+            }
+
+            // Dedup across reloads: the stored post with this identity
+            // (ChannelMsgStore.held), the user's own included, so rfed's echo
+            // of an own post, live or pulled later, is dropped against it. An
+            // own post RFed hands back is one RFed holds, so it is "sent"
+            // (Channel.md "Own posts"): through its publish when this tab
+            // still tracks it (lib/channel_publish.js), else at once (a
+            // reload while it was "sending").
+            const held = ChannelMsgStore.held(ch.channelName, srcHashHex, postAt);
+            if (held) {
+                if (held.dir === "out" && !this._channelPublishes.echoed(dedupKey) && held.status !== "sent") {
+                    this._setChannelPostStatus(ch.channelName, held.id, "sent");
+                }
+                console.log(`[retichat] 📡 Channel dedup: already stored ${srcHashHex.slice(0,8)} ts=${tsMs}`);
+                return true; // already held
+            }
+
             // Register sender identity from the RTID prelude. The key is
             // bound to srcHashHex (checked in channelLxmUnpack), so it may
             // fill a contact's missing key; one already held is never
             // replaced from a channel post.
-            // This device's own posts (fetched history, echoes) never make it
-            // a contact of itself (audit L4).
+            // The user's own posts (fetched history, echoes, a sibling
+            // device's post as the distro) never make a contact of this
+            // device or of the distro (audit L4).
             // A poster the user has not added gets a hidden row, never a
             // listed contact (audit L4).
-            if (senderPubKey && srcHashHex !== ownLxmfDestinationHash()) {
+            if (senderPubKey && !own) {
                 const contact = ContactStore.keep(srcHashHex);
                 if (contact && !contact.publicKey) {
                     contact.publicKey = Buffer.from(senderPubKey).toString("hex");
@@ -5942,16 +6156,31 @@ const RnsClient = {
             // counts (§5.2 order), so history pulled late cannot undo it.
             ChannelSenderNamesStore.apply(ch.channelName, srcHashHex, displayName, tsMs);
             // §4.2 rule 2: a sender not seen here before means our next post
-            // carries our Channel Display Name again.
-            ChannelPostNamesStore.noteSender(ch.channelName, srcHashHex, ownLxmfDestinationHash(), Date.now());
+            // carries our Channel Display Name again. The user's own posting
+            // identities are never such a sender.
+            if (!own) ChannelPostNamesStore.noteSender(ch.channelName, srcHashHex, [deviceHash, distroHash], Date.now());
 
             // Insert message. The sender is stored as a hash and labelled at
             // render (channelSenderLabel), so a name that arrives later
-            // relabels earlier posts.
-            ChannelMsgStore.add(ch.channelName, {
-                dir: "in", content, status: "delivered",
-                srcHash: srcHashHex, timestamp: sentTimeMs(tsMs / 1000),
-            });
+            // relabels earlier posts. The user's own post (a sibling device's,
+            // or this device's own that is not stored here) is outgoing: the
+            // user's bubble under no label, "sent" since RFed holds it, never
+            // "delivered" (a channel post has no per-reader confirmation), as
+            // a §17.11 sent copy is stored (Channel.md "Own posts"). The web
+            // posts no notifications; nothing here would.
+            if (own) {
+                ChannelMsgStore.add(ch.channelName, {
+                    dir: "out", content, status: "sent",
+                    srcHash: srcHashHex, timestamp: postAt,
+                });
+                Harness.event("channel-own-post", { channel: ch.channelName, src: srcHashHex.slice(0, 12), ts: tsMs,
+                    via: srcHashHex === distroHash ? "distro" : "device" });
+            } else {
+                ChannelMsgStore.add(ch.channelName, {
+                    dir: "in", content, status: "delivered",
+                    srcHash: srcHashHex, timestamp: postAt,
+                });
+            }
             ChannelStore.touch(ch.channelName);
 
             this._onMsg.forEach(fn => fn({kind: "channel-receive"}, ch.channelName));
@@ -5982,7 +6211,11 @@ const RnsClient = {
         const key = channel.channelHash;
         const existing = this._rfedSubscriptionPromises.get(key);
         if (existing) return existing;
-        const subscription = this._subscribeChannel(channel.channelName, channel.rfedNodeHash)
+        // A leave of this channel still in flight goes first (it never
+        // rejects: _leaveChannelHere logs its failure).
+        const leaving = this._rfedUnsubscribes.get(key);
+        const subscribe = () => this._subscribeChannel(channel.channelName, channel.rfedNodeHash);
+        const subscription = (leaving ? leaving.then(subscribe) : subscribe())
             .then(stampCost => {
                 this._rfedStampRefreshed.add(key);
                 return stampCost;
@@ -6335,10 +6568,21 @@ const RnsClient = {
             const found = payload.attachments;
             const unreadable = found.skipped || payload.fieldsUnreadable;
 
+            // RFed SPEC §17.12: a channel membership message from another
+            // device of this distro (handled below, after the §17.11 copy).
+            const channelSync = LXMF.distroChannelSyncFromPayload(payloadBytes);
+
             // Idempotency: the same blob is delivered more than once (see
             // DistroSeen). Drop repeats before they reach the store, or the
-            // conversation fills with duplicates of every message.
-            const dedupKey = `${srcHashHex}:${ts}`;
+            // conversation fills with duplicates of every message. A
+            // membership message is told apart by its LXMF message hash too
+            // (dest | src | the signed payload): every one has source D and no
+            // content, so two that two of the user's devices send in the same
+            // millisecond would otherwise be one, and the devices would end
+            // in different states (§17.12 rule 5).
+            const dedupKey = channelSync
+                ? `${srcHashHex}:${ts}:${Cryptography.fullHash(Buffer.concat([destHash, srcHash, LXMessage.signedPayload(payloadBytes)])).toString("hex").slice(0, 16)}`
+                : `${srcHashHex}:${ts}`;
             if (DistroSeen.check(dedupKey)) {
                 Harness.event("distro-dup", { src: srcHashHex.slice(0, 12), ts });
                 console.log(`[distro] ↩︎ duplicate, ignoring (${srcHashHex.slice(0,12)} ts=${ts})`);
@@ -6347,6 +6591,18 @@ const RnsClient = {
             // Nothing kept: un-record it, so a later copy is not answered
             // "already held" (see above), and tell the caller.
             const dropped = () => { DistroSeen.forget(dedupKey); return false; };
+            // Whether the message is signed by D's key, not just addressed
+            // from D: anyone can encrypt to D's announced public key and claim
+            // source D. LXMF signs dest | src | payload | SHA-256(dest | src |
+            // payload) over the four-element payload; a fifth element (a
+            // stamp) is appended after signing, so it is left out here as
+            // LXMessage.unpack_from_bytes leaves it out (LXMessage.signedPayload,
+            // from the received bytes). §17.11 rule 2 and §17.12 rule 2.
+            const signedByDistro = () => {
+                const hashedPart = Buffer.concat([destHash, srcHash, LXMessage.signedPayload(payloadBytes)]);
+                const signature = decrypted.slice(16, 80);
+                return DistroManager.identity.validate(signature, Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)]));
+            };
 
             // RFed SPEC §17.11 sent-message sync: another device of this
             // distro sent a message as the distro and propagated a copy here.
@@ -6366,16 +6622,8 @@ const RnsClient = {
                     return dropped();
                 }
                 // Rule 2, signature. Stored as "me", so the source must really
-                // be the distro's key, not just its address: anyone can
-                // encrypt to D's announced public key and claim source D.
-                // LXMF signs dest | src | payload | SHA-256(dest | src | payload)
-                // over the four-element payload; a fifth element (a stamp) is
-                // appended after signing, so it is left out here as
-                // LXMessage.unpack_from_bytes leaves it out
-                // (LXMessage.signedPayload, from the received bytes).
-                const hashedPart = Buffer.concat([destHash, srcHash, LXMessage.signedPayload(payloadBytes)]);
-                const signature = decrypted.slice(16, 80);
-                if (!DistroManager.identity.validate(signature, Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)]))) {
+                // be the distro's key, not just its address (signedByDistro).
+                if (!signedByDistro()) {
                     console.warn(`[distro] ⚠️ Sent-copy for ${sentCopy.toHex?.slice(0,12) ?? "?"} fails the distro signature — dropped (§17.11 rule 2)`);
                     return dropped();
                 }
@@ -6423,6 +6671,17 @@ const RnsClient = {
                 Harness.event("distro-sent-sync", { to: recipientHex.slice(0, 12), by: sentCopy.byHex.slice(0, 12) });
                 this._onMsg.forEach(fn => fn(stored, recipientHex));
                 return true;
+            }
+
+            // RFed SPEC §17.12 membership sync: another device of this distro
+            // joined or left a channel. Read before the delivery-notification
+            // test below, which C also passes: it carries an empty 0x0C and no
+            // content so that clients older than §17.12 drop it.
+            if (channelSync) {
+                return this._handleDistroChannelSync(channelSync, {
+                    fromDistro: srcHashHex === myLxmfHash,
+                    signedByDistro: srcHashHex === myLxmfHash && signedByDistro(),
+                }) ? true : dropped();
             }
 
             // Delivery notifications now arrive here too. Since we send as the
@@ -6611,7 +6870,9 @@ const RnsClient = {
         }
     },
 
-    /** Join a channel: persist + subscribe (queues if pub key unknown). */
+    /** The user's join of a channel: persist + subscribe (queues if pub key
+     *  unknown). A channel not in the list is the user's own change, which
+     *  goes to the distro's other devices (RFed SPEC §17.12). */
     async joinChannel(channelName) {
         if (!this._cfg.rfedNodeHash) throw new Error("No RFed node configured");
         const existing = ChannelStore.get(channelName);
@@ -6624,6 +6885,9 @@ const RnsClient = {
         }
 
         const ch = ChannelStore.join(channelName, this._cfg.rfedNodeHash);
+        // §17.12: recorded (rule 5) and sent to the other devices of the
+        // distro, if this device holds one, once per change.
+        this._syncChannelMembership("join", ch);
         ChannelMsgStore.add(channelName, {
             dir: "system", content: `You joined #${channelName}`,
             status: "delivered",
@@ -6650,22 +6914,55 @@ const RnsClient = {
         return ch;
     },
 
+    /** The user's leave of a channel: it is gone from this device at once,
+     *  then unsubscribed; the change goes to the distro's other devices
+     *  (RFed SPEC §17.12). Resolves once rfed has answered the
+     *  unsubscribe (a failure is logged, as it always was). */
     async leaveChannel(channelName) {
         const ch = ChannelStore.get(channelName);
         if (!ch) return;
+        const left = this._leaveChannelHere(ch);
+        this._syncChannelMembership("leave", ch);
+        await left;
+    },
 
-        try { await this._unsubscribeChannel(channelName, ch.rfedNodeHash); } catch(e) {
-            console.warn(`[retichat] 📡 Unsubscribe failed:`, e.message);
-        }
-
-        this._rfedOpenedChannelHashes.delete(ch.channelHash);
-        this._rfedStreamPromises.delete(ch.channelHash);
-        await this._configureChannelStream();
+    /**
+     * Leave `ch` on this device, by the user's action or a sibling's
+     * (§17.12 rule 6): its posts, its names and its entry go now, so the
+     * list is what the user last chose whatever rfed answers, and no later
+     * join finds it still listed; then /channel/unsubscribe with the device
+     * key, after any subscription still in flight for it, and the stream's
+     * filter set without it. Until 2026-10-03 the subscription stayed
+     * memoised after a leave, so joining the channel again in the same
+     * connection never subscribed. Resolves when both are done; never
+     * rejects (each failure is logged). Sends no membership message.
+     * `synced` says the leave is a sibling's (§17.12 rule 6).
+     */
+    _leaveChannelHere(ch, synced = false) {
+        const { channelName, channelHash: key } = ch;
+        const subscribing = this._rfedSubscriptionPromises.get(key);
+        this._rfedSubscriptionPromises.delete(key);
+        this._rfedStampRefreshed.delete(key);
+        this._rfedOpenedChannelHashes.delete(key);
+        this._rfedStreamPromises.delete(key);
         ChannelMsgStore.remove(channelName);
         ChannelSenderNamesStore.forget(channelName);
         ChannelPostNamesStore.forget(channelName);
         ChannelStore.leave(channelName);
-        this._onMsg.forEach(fn => fn({kind: "channel-left"}, channelName));
+        // `synced`: a sibling's leave, which closes the channel if it is open
+        // here (App._wire); the user's own leave closes it itself.
+        this._onMsg.forEach(fn => fn({kind: "channel-left", synced}, channelName));
+
+        const unsubscribe = () => this._unsubscribeChannel(channelName, ch.rfedNodeHash);
+        const unsubscribed = (subscribing ? subscribing.then(unsubscribe, unsubscribe) : unsubscribe())
+            .catch(e => console.warn(`[retichat] 📡 Unsubscribe failed:`, e.message));
+        this._rfedUnsubscribes.set(key, unsubscribed);
+        unsubscribed.then(() => {
+            if (this._rfedUnsubscribes.get(key) === unsubscribed) this._rfedUnsubscribes.delete(key);
+        });
+        const stream = this._configureChannelStream()
+            .catch(e => console.warn(`[retichat] 📡 Channel stream reconfiguration after leaving #${channelName} failed:`, e.message));
+        return Promise.all([unsubscribed, stream]);
     },
 
     /** Send a message to a channel: the `/channel/publish` request on
@@ -6675,12 +6972,31 @@ const RnsClient = {
     async sendChannelMessage(channelName, content) {
         if (!IdMgr.has) throw new Error("No identity");
 
+        // RFed-spec/Channel.md "Distro holders" (James, 2026-10-03): a post
+        // is signed by the posting identity, the distro when this device
+        // holds one (as a DM is, sendingIdentity), otherwise the device. Its
+        // source, the key in its prelude and its signature are that
+        // identity's, so readers see one sender for all of the user's
+        // devices, at the address the user gives contacts. Subscribing,
+        // the stream, pulls and the link's identify stay the device's.
+        // Decided once, here: the record, the echo key, the packing and the
+        // name state all take this one.
+        const poster = this.sendingIdentity();
+        const posterHash = Destination.hash(poster.identity, "lxmf", "delivery").toString("hex");
+        // The post's identity is (source, timestamp) (Channel.md
+        // "Deduplication"): its record keeps the timestamp it is packed
+        // with, so rfed's echo of it, live or pulled after a reload, is
+        // dropped against it. One already held here would make two posts
+        // one; the next free millisecond is this one's.
+        let postedAt = Date.now();
+        while (ChannelMsgStore.held(channelName, posterHash, postedAt)) postedAt++;
+
         // D3: a post with the exchange down fails now and is never sent
         // (see sendMessage).
         if (this._exchangeIsDown()) {
             const failed = ChannelMsgStore.add(channelName, {
                 dir: "out", content, status: "failed",
-                srcHash: IdMgr.hash,
+                srcHash: posterHash, timestamp: postedAt,
             });
             ChannelStore.touch(channelName);
             console.warn(`[retichat] ✗ Post to #${channelName} not sent: the exchange is down`);
@@ -6691,7 +7007,7 @@ const RnsClient = {
         // Add outgoing message optimistically
         const outMsg = ChannelMsgStore.add(channelName, {
             dir: "out", content, status: "sending",
-            srcHash: IdMgr.hash,
+            srcHash: posterHash, timestamp: postedAt,
         });
         ChannelStore.touch(channelName);
         this._onMsg.forEach(fn => fn({kind: "channel-send-pending"}, channelName));
@@ -6711,9 +7027,11 @@ const RnsClient = {
             // Pack the channel message, carrying the Channel Display Name
             // when the channel rule says so (DISPLAY_NAMES.md §4.2). It
             // never falls back to the Message Display Name.
+            // The rule's state is kept per posting identity (§4.2): readers
+            // have never had a name from a distro this device just took up.
             const nameDecidedAt = Date.now();
-            const postName = ChannelPostNamesStore.decide(channelName, OwnNames.channel, nameDecidedAt);
-            const { wire, tsMs } = channelLxmPack(channelName, IdMgr.id, content, postName);
+            const postName = ChannelPostNamesStore.decide(channelName, posterHash, OwnNames.channel, nameDecidedAt);
+            const { wire, tsMs } = channelLxmPack(channelName, poster.identity, content, postName, postedAt);
 
             // Compute PoW stamp (only if server requires one). The publish
             // is a request, which goes whatever its size (a packet, or a
@@ -6732,8 +7050,7 @@ const RnsClient = {
             const payloadBytes = finalPayload.length;
 
             if (!this._chanSeenIds) this._chanSeenIds = new Set();
-            const ownSourceHash = Destination.hash(IdMgr.id, "lxmf", "delivery").toString("hex");
-            const echoKey = `${ownSourceHash}:${tsMs}`;
+            const echoKey = `${posterHash}:${tsMs}`;
             this._chanSeenIds.add(echoKey);
 
             // On rfed.link, as every other request to rfed (_rfedRequest):
@@ -6750,7 +7067,7 @@ const RnsClient = {
                     if (lostKey) this._pendingPacketHashes.delete(lostKey);
                     // RFed has the post, so what it carried is recorded for
                     // the channel rule (§4.2).
-                    ChannelPostNamesStore.recordIncluded(channelName, postName, nameDecidedAt);
+                    ChannelPostNamesStore.recordIncluded(channelName, posterHash, postName, nameDecidedAt);
                     this._setChannelPostStatus(channelName, outMsg.id, "sent");
                     console.log(`[retichat] 📡 Channel message accepted by RFed on #${channelName} (${via}`
                         + `${post.leftAt === null ? "" : `, ${Date.now() - post.leftAt} ms after rfed held it`}; ${payloadBytes}B, stamp=${!!stamp})`
@@ -6855,6 +7172,7 @@ const RnsClient = {
         this._rfedPullState.clear();
         this._rfedStampRefreshed.clear();
         this._rfedSubscriptionPromises.clear();
+        this._rfedUnsubscribes.clear();
         this._rfedStreamPromises.clear();
         // A channel post still waiting for rfed's answer fails as its
         // rfed.link closes above (the request's own failure), and stays
@@ -7177,6 +7495,9 @@ const App = {
 
         if (!IdMgr.load()) { this.state.view = "onboarding"; this.render(); return; }
         GroupStore.migrateOwnMemberHash();
+        // DISPLAY_NAMES.md §4.2 per posting identity: what this client
+        // included in its channel posts before 2026-10-03 was this device's.
+        ChannelPostNamesStore.adoptLegacy(ownLxmfDestinationHash());
         // Once, now that the groups hold this device's delivery hash: the
         // members of groups already held pass the privacy filter, as on the
         // phones (ContactStore.allowHeldGroupMembers), but this device's own
@@ -10216,6 +10537,18 @@ const App = {
                 return;
             }
 
+            // A channel left on another device of the distro (RFed SPEC
+            // §17.12): it is gone here too, so its chat closes if it is the
+            // one open, as the user's own leave closes it (the Leave button).
+            if (msg.kind === "channel-left" && msg.synced) {
+                if (inActiveChat) {
+                    this.state.activeHash = null;
+                    document.body.classList.remove("narrow-chat-open");
+                    this.render();
+                }
+                return;
+            }
+
             // A channel pull started or completed: only the open channel's
             // "Load earlier messages" control follows. The posts it brings each
             // come with their own event (channel-receive), below, so this one
@@ -10376,6 +10709,39 @@ window.RetichatTest = {
     registerDistro() { return RnsClient._registerDistro(); },
     pullDistro() { return RnsClient._pullDistroMessages(); },
 
+    // ---- Channels and the distro (RFed SPEC §17.12) ----
+    // Harness events: "channel-own-post" {channel, src, ts, via: "distro" |
+    // "device"} when a post of the user's own (a sibling's, or this
+    // device's not stored here) is stored as outgoing; "distro-channel-sync-
+    // sent" {op, channel, at, how} when this device sent a membership
+    // message; "distro-channel-sync" {result: "joined" | "left" | "recorded"
+    // | "echo" | "stale" | "dropped", op, channel, at, rule, reason} for each
+    // one it received.
+    /** The channels this device holds. */
+    channels() {
+        return ChannelStore.getAll().map(c => ({ channelName: c.channelName, channelHash: c.channelHash, isSubscribed: c.isSubscribed }));
+    },
+    /** The user's join and leave, as the New Channel form and the Leave
+     *  button make them: a distro holder's goes to its other devices. */
+    joinChannel(name) { return RnsClient.joinChannel(name).then(c => ({ channelName: c.channelName, channelHash: c.channelHash })); },
+    leaveChannel(name) { return RnsClient.leaveChannel(name).then(() => true); },
+    /** A post, as the composer sends it; resolves once rfed has it. */
+    postChannel(name, text) {
+        return RnsClient.sendChannelMessage(name, text).then(m => ({ id: m.id, srcHash: m.srcHash, timestamp: m.timestamp }));
+    },
+    /** A channel's stored records, oldest first. */
+    channelMessages(name) {
+        return ChannelMsgStore.get(name).map(m => ({ id: m.id, dir: m.dir, content: m.content, status: m.status, srcHash: m.srcHash ?? null, timestamp: m.timestamp }));
+    },
+    /** The lxmf.delivery hash this device signs its channel posts with: the
+     *  distro's when it holds one, otherwise its own. */
+    channelPoster() {
+        const poster = RnsClient.sendingIdentity();
+        return poster.identity ? Destination.hash(poster.identity, "lxmf", "delivery").toString("hex") : null;
+    },
+    /** §17.12 rule 5's record: channel hash → {op, at}. */
+    channelMembership() { return JSON.parse(JSON.stringify(ChannelMembershipStore.rows)); },
+
     // ---- Attachments (test-harnesses/staging/lib/attach.mjs HOOK_CONTRACT) ----
     // client.attachmentsFor(msgId) reads each attachment of a stored message
     // back from the attachment store: [{name, size, sha256, mime, field}].
@@ -10409,6 +10775,9 @@ Harness (headless):
   .privacyFilter([on]) — read, or turn on/off, the privacy filter (off unless turned on)
   .distro()       — distro identity state
   .generateDistro() / .adoptDistro(privHex) / .pullDistro()
+  .channels() / .joinChannel(name) / .leaveChannel(name) — the channel list and the user's join/leave
+  .postChannel(name, text) / .channelMessages(name) — a post as the composer sends it, and the stored records
+  .channelPoster() / .channelMembership() — the posting hash, and the §17.12 membership record
   .tab()          — "active" | "inactive" (one active tab per identity)
   .useHere()      — take over from the active tab (reloads this one)
         `);

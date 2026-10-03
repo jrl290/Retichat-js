@@ -733,7 +733,7 @@ test("disconnect resets the propagation link, its re-open and initialization", (
         _annTimer: null, _monTimer: null,
         _pendingTickets: new Map(), _rfedLinks: new Map(), _rfedLinkPromises: new Map(),
         _rfedServiceReady: new Set(), _rfedServiceWaiters: new Map(), _rfedOpenedChannelHashes: new Set(),
-        _rfedPullState: new Map(), _rfedStampRefreshed: new Set(), _rfedSubscriptionPromises: new Map(),
+        _rfedPullState: new Map(), _rfedStampRefreshed: new Set(), _rfedSubscriptionPromises: new Map(), _rfedUnsubscribes: new Map(),
         _rfedStreamPromises: new Map(), _channelPublishes: new ChannelPublishes(),
         _groupLinks: new Map(), _groupLinkPromises: new Map(), _groupPeerReady: new Set(),
         _groupPeerWaiters: new Map(), _groupPathsRequested: new Set(), _groupFallbacks: new Map(),
