@@ -336,13 +336,38 @@ function withoutComments(source) {
     return out;
 }
 
-test("_sendDistroOutbox runs when the propagation link comes up and at no other time: 'established' and the current link's 'recovered' are its only callers", async () => {
+/**
+ * The body of the listener `source` registers with `link.on("<event>", () => {`,
+ * which must be there exactly once.
+ */
+function linkListener(source, event) {
+    const opener = `link.on("${event}", () => {`;
+    const start = source.indexOf(opener);
+    assert.notEqual(start, -1, `no ${opener}`);
+    assert.equal(source.indexOf(opener, start + 1), -1, `a second ${opener}`);
+    let depth = 0;
+    for (let i = start + opener.length - 1; i < source.length; i++) {
+        if (source[i] === "{") depth++;
+        else if (source[i] === "}" && --depth === 0) return source.slice(start + opener.length, i);
+    }
+    throw new Error(`could not brace-match ${opener}`);
+}
+
+test("_sendDistroOutbox runs when the propagation link comes up and at no other time: 'established' and the current link's 'recovered' are its only callers, directly or through the 'established' work", async () => {
     // Each call is one coming-up (_propComingUps) and lets every upload whose
     // failure was recorded before it go again, so a third caller would send
     // an upload again on the strength of its own failure (James, 2026-10-03;
     // DESIGN_PRINCIPLES §3, what a device owes its distro). Review of 74fbbcd
     // (RV2b): the test above checks only that the two calls are there, and a
-    // third, on page resume, passed every test.
+    // third, on page resume, passed every test. Review of 9d45faa (RW2):
+    // counting the flush's own name let a caller in one step away, through
+    // _onPropagationLinkEstablished, which runs the flush every time; a
+    // propagation announce that re-ran it while the link was up passed every
+    // test. So the 'established' work is pinned as the flush is, the two
+    // calls must sit in the listeners of the link they belong to, and only
+    // the Link fires those two events. What this cannot see is a call that
+    // never writes these names whole: one assembled at run time
+    // ("_send" + "DistroOutbox") or found by reflection.
     const code = withoutComments(app);
     // Only the comments are gone: what is left still parses, and keeps the
     // code's strings.
@@ -352,17 +377,41 @@ test("_sendDistroOutbox runs when the propagation link comes up and at no other 
     assert.match(code, /"it goes when the propagation link is next up \(DESIGN_PRINCIPLES §3, the distro exception\)"/);
     assert.match(code, /\n {4}async _sendDistroOutbox\(link, trigger\) \{/);
     assert.equal(code.match(/_sendDistroOutbox/g).length, 3, "the method and its two calls: nothing else names it");
+    assert.match(code, /\n {4}async _onPropagationLinkEstablished\(link\) \{/);
+    assert.equal(code.match(/_onPropagationLinkEstablished/g).length, 2,
+        "the 'established' work and its one call, from the link's \"established\": nothing else names it, as it runs the flush");
     assert.equal(extractMethod(code, "async _onPropagationLinkEstablished(link)").match(/_sendDistroOutbox/g)?.length, 1);
-    assert.equal(extractMethod(code, "_establishPropagationLink()").match(/_sendDistroOutbox/g)?.length, 1);
-    // Nor does any other script of the page.
+    const establish = extractMethod(code, "_establishPropagationLink()");
+    assert.match(establish, /\n {8}const link = new Link\(\);\n/, "the listeners are the new link's own");
+    assert.equal(establish.match(/_sendDistroOutbox/g)?.length, 1);
+    assert.equal(linkListener(establish, "established").match(/this\._onPropagationLinkEstablished\(link\);/g)?.length, 1,
+        "the 'established' work runs from the link's \"established\" listener");
+    assert.equal(linkListener(establish, "recovered").match(/this\._sendDistroOutbox\(link, "recovered"\);/g)?.length, 1,
+        "the flush runs from the link's \"recovered\" listener");
+    // Only the Link fires "established" and "recovered" (lib/rns/link.js):
+    // once its handshake completes, as initiator or as responder, and when a
+    // STALE link hears from its peer (_recoverIfStale). The page fires no
+    // event of a link to run those listeners again, nor reaches into them.
+    const fired = [...code.matchAll(/\.\s*emit\s*(\?\.)?\s*\(\s*([^,)]*)/g)].map((m) => m[2].trim());
+    assert.equal(fired.length, code.match(/\.\s*emit\b/g).length, "every .emit in app.js is called, with its event named");
+    assert.ok(fired.length > 0 && fired.every((name) => /^"[\w-]+"$/.test(name) && !["\"established\"", "\"recovered\""].includes(name)),
+        `app.js fires only named events other than a link's coming up: ${fired.join(", ")}`);
+    assert.doesNotMatch(code, /eventListenersMap/);
     const lib = new URL("./lib/", import.meta.url);
     const scripts = (await readdir(lib, { recursive: true })).filter((f) => f.endsWith(".js"));
     assert.ok(scripts.includes("distro_upload.js") && scripts.includes("rns/link.js"));
     for (const file of scripts) {
-        assert.doesNotMatch(withoutComments(await readFile(new URL(file, lib), "utf8")), /_sendDistroOutbox|_propComingUps/, `lib/${file}`);
+        const source = withoutComments(await readFile(new URL(file, lib), "utf8"));
+        // Nor does any other script of the page name the flush or the work.
+        assert.doesNotMatch(source, /_sendDistroOutbox|_propComingUps|_onPropagationLinkEstablished/, `lib/${file}`);
+        const comingUp = { established: source.match(/\bemit\(\s*["']established["']/g)?.length ?? 0,
+                           recovered: source.match(/\bemit\(\s*["']recovered["']/g)?.length ?? 0 };
+        assert.deepEqual(comingUp, file === "rns/link.js" ? { established: 2, recovered: 1 } : { established: 0, recovered: 0 },
+            `lib/${file} fires a link's coming up only where the Link comes up`);
     }
     for (const page of ["index.html", "debug.html", "debug-standalone.html"]) {
-        assert.doesNotMatch(await readFile(new URL(`./${page}`, import.meta.url), "utf8"), /_sendDistroOutbox|_propComingUps/, page);
+        assert.doesNotMatch(await readFile(new URL(`./${page}`, import.meta.url), "utf8"),
+            /_sendDistroOutbox|_propComingUps|_onPropagationLinkEstablished/, page);
     }
 });
 
@@ -387,7 +436,8 @@ function makePropagationLink() {
         _propLinkPromise: null,
         _distroUploads: new DistroUploads({ log: { error() {}, warn() {} } }),
         _sendDistroOutbox: (link, trigger) => { flushes.push([trigger, link]); },
-        _onPropagationLinkEstablished() {},
+        // The 'established' work runs the flush (_onPropagationLinkEstablished).
+        _onPropagationLinkEstablished: (link) => { flushes.push(["established", link]); },
         _onPropagationLinkClosed() {},
     };
     new Function("Identity", "Buffer", "Destination", "Link", "self", establish.replaceAll("this.", "self."))(
@@ -432,6 +482,27 @@ test("what the distro is owed goes when a STALE propagation link recovers", asyn
         await afterLinkEvents();
     });
     assert.deepEqual(flushes, [["recovered", link]], "sent on the recovery, not left for a re-establishment that may never come");
+});
+
+test("the propagation link's 'established' runs the 'established' work once, and its recovery only the flush; making the link runs neither", async () => {
+    // Review of 9d45faa (RW2): the 'established' work runs the flush, so it
+    // runs on the link's establishment and nothing else.
+    const { self, flushes } = makePropagationLink();
+    const link = self._propLink;
+    assert.deepEqual(flushes, [], "nothing runs until the link comes up");
+    await hushed(async () => {
+        link.status = Link.ACTIVE;
+        link.emit("established");
+        await afterLinkEvents();
+    });
+    assert.deepEqual(flushes, [["established", link]]);
+    await hushed(async () => {
+        link.status = Link.STALE;
+        link.staleSince = Date.now();
+        link.onPacket({ context: Packet.KEEPALIVE, data: Buffer.from([0xFE]) });
+        await afterLinkEvents();
+    });
+    assert.deepEqual(flushes, [["established", link], ["recovered", link]]);
 });
 
 test("the propagation link's close decides the uploads made on it lost, and only those; a superseded link's too", async () => {

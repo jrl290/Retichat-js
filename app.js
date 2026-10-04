@@ -3269,6 +3269,13 @@ const RnsClient = {
      *      distro.
      * Until 2026-09-30 these ran on fixed 1 s, 5 s and 7 s timers ("to let
      * the link settle").
+     *
+     * It runs from the link's "established" listener and nothing else: step
+     * 2's flush counts a coming-up, and run at any other time it would send
+     * a failed upload again on its own failure (_sendDistroOutbox; DESIGN_
+     * PRINCIPLES §3, what a device owes its distro). Code that wants one of
+     * these steps calls that step. distro_sent_sync.test.mjs fails if
+     * anything else names this method.
      */
     async _onPropagationLinkEstablished(link) {
         this._propReopenArmed = true;
@@ -4351,8 +4358,13 @@ const RnsClient = {
      * (_propComingUps): this flush's value is `comingUp`. So this is called
      * when the link comes up and never otherwise: any other caller would let
      * a failed upload go again on its own failure. Those two handlers are its
-     * only callers, and distro_sent_sync.test.mjs fails if anything else in
-     * the page names it.
+     * only callers: "recovered" calls it, and "established" through
+     * _onPropagationLinkEstablished, which runs it every time and so is
+     * called from that listener alone. Only the Link fires those two events.
+     * distro_sent_sync.test.mjs fails if anything else in the page names
+     * either method, if either call leaves its listener, or if anything but
+     * the Link fires "established" or "recovered" (review of 9d45faa, RW2: an
+     * announce that re-ran the 'established' work passed every test).
      *
      * An entry is uploaded only when no attempt of it is open and its last
      * failure, if any, came before this coming-up:
