@@ -2164,6 +2164,64 @@ for (const [kind, make, what] of [
     }
 }
 
+// The same rule for an upload an earlier flush made: its failure is recorded
+// at the coming-up current when it is decided, not at the coming-up of the
+// flush that uploaded it. Review of 74fbbcd (RV1): recorded at the uploading
+// flush's coming-up, it passed every test, and a later flush on the same
+// link uploaded it again at once on its own failure, the round-3 blocking
+// bug for uploads a flush made.
+for (const [kind, make, what] of [
+    ["a join", (a) => a.self.joinChannel(CH), `join ${CH}`],
+    ["a §17.11 sent-copy", (a) => a.self._sendDistroSentCopy(R1, "", "sent as the distro"), "sent-copy"],
+]) {
+    for (const earlier of ["established", "recovered"]) {
+        test(`${kind} uploaded by an earlier flush ("${earlier}") and reported lost while a later flush on the same link builds an earlier entry is not uploaded by that later flush: it goes once on the next coming-up`, async (t) => {
+            fakeClock(t);
+            const distro = Identity.create();
+            const a = device(distro, { linkUp: earlier === "recovered", proofs: "manual" });
+            // Y, then X, owed while no link is up (none yet, or one STALE).
+            if (earlier === "recovered") a.self._propLink.status = 0x03;
+            await a.self.joinChannel("public.yyy");
+            await make(a);
+            await settle();
+            assert.deepEqual(carried(a), []);
+            let link = a.self._propLink;
+            if (earlier === "recovered") {
+                link.status = 0x02;
+                await a.self._sendDistroOutbox(link, "recovered");
+            } else {
+                link = await a.establish();
+            }
+            await settle();
+            assert.deepEqual(carried(a), ["join public.yyy", what], "the earlier flush uploads Y and X");
+            a.self._onPacketsLost({ packetHashes: [a.proofKeys[0]], reason: "the exchange failed" });   // Y lost
+            await settle();
+            const hold = holdFirstBuild(a);
+            // The link, STALE, is heard from again: the flush lists [Y, X];
+            // Y's stamp is mined, X is in flight.
+            const flush = a.self._sendDistroOutbox(link, "recovered");
+            await settle();
+            assert.deepEqual(hold.built, ["join public.yyy"]);
+            // X, the earlier flush's upload, is reported lost now.
+            a.self._onPacketsLost({ packetHashes: [a.proofKeys[1]], reason: "the exchange failed again" });
+            await settle();
+            assert.ok(a.logged.some(([, line]) => line.includes("(the exchange failed again) — still owed: it goes when the propagation link is next up")));
+            hold.release();
+            await flush;
+            await settle();
+            assert.deepEqual(carried(a), ["join public.yyy", what, "join public.yyy"], "Y goes; X does not");
+            assert.deepEqual(hold.built, ["join public.yyy"], "no stamp mined for X");
+            await a.self._sendDistroOutbox(link, "recovered");    // the next coming-up
+            await settle();
+            assert.deepEqual(carried(a), ["join public.yyy", what, "join public.yyy", what], "X goes once; Y, in flight, is left to its proof");
+            a.prove(a.proofKeys[2]);
+            a.prove(a.proofKeys[3]);
+            await settle();
+            assert.deepEqual(a.owed(), []);
+        });
+    }
+}
+
 test("the proof of an earlier action on a channel does not clear the failure of the later one: a flush under way still leaves the later one for the next coming-up", async (t) => {
     const clock = fakeClock(t);
     const distro = Identity.create();

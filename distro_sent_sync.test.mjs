@@ -15,7 +15,8 @@
  * Run: node --test distro_sent_sync.test.mjs
  */
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { Buffer } from "node:buffer";
 import MsgPack from "./lib/rns/msgpack.js";
@@ -263,6 +264,106 @@ test("the copy waits for the propagation link and never starts it: the link's ow
         /this\._flushPropagation\(\);\s*this\._sendDistroOutbox\(link, "established"\);/);
     // "recovered" (STALE -> ACTIVE), on the current link only: makePropagationLink below.
     assert.match(extractMethod(app, "_establishPropagationLink()"), /this\._sendDistroOutbox\(link, "recovered"\)/);
+});
+
+/**
+ * `source` with its comments taken out and nothing else: strings, template
+ * literals and regular expression literals are kept as they are, so what is
+ * left is what the code says, not what its comments say about it. A "/"
+ * begins a regular expression where an expression may begin (after an
+ * operator, a bracket or a keyword), as a JavaScript parser decides it.
+ */
+function withoutComments(source) {
+    const n = source.length;
+    let i = 0, out = "", last = "", word = "";
+    const regexMayFollow = () => /[\w$]/.test(last)
+        ? /^(?:return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/.test(word)
+        : last === "" || "(,=:[!&|?{};+-*%<>~^}".includes(last);
+    const literal = (start) => { out += source.slice(start, i); last = "\""; word = ""; };
+    const string = (quote) => {
+        const start = i++;
+        while (i < n && source[i] !== quote) i += source[i] === "\\" ? 2 : 1;
+        i++;
+        literal(start);
+    };
+    const regex = () => {
+        const start = i++;
+        let inClass = false;
+        for (; source[i] !== "/" || inClass; i++) {
+            if (i >= n || source[i] === "\n") throw new Error(`an unterminated regular expression at ${start}`);
+            if (source[i] === "\\") i++;
+            else if (source[i] === "[") inClass = true;
+            else if (source[i] === "]") inClass = false;
+        }
+        i++;
+        while (/[a-z]/.test(source[i] ?? "")) i++;
+        literal(start);
+    };
+    const template = () => {
+        out += source[i++];
+        while (i < n && source[i] !== "`") {
+            if (source[i] === "\\") { out += source.slice(i, i + 2); i += 2; }
+            else if (source[i] === "$" && source[i + 1] === "{") { out += "${"; i += 2; last = "{"; word = ""; code(true); out += "}"; i++; }
+            else out += source[i++];
+        }
+        out += "`"; i++;
+        last = "\""; word = "";
+    };
+    const code = (inPlaceholder) => {
+        let depth = 0;
+        while (i < n) {
+            const c = source[i], next = source[i + 1];
+            if (c === "/" && next === "/") { while (i < n && source[i] !== "\n") i++; }
+            else if (c === "/" && next === "*") {
+                const end = source.indexOf("*/", i + 2);
+                if (end === -1) throw new Error(`an unterminated comment at ${i}`);
+                out += " ";
+                i = end + 2;
+            }
+            else if (c === "'" || c === "\"") string(c);
+            else if (c === "`") template();
+            else if (c === "/" && regexMayFollow()) regex();
+            else {
+                if (inPlaceholder && c === "{") depth++;
+                if (inPlaceholder && c === "}") { if (depth === 0) return; depth--; }
+                out += c;
+                i++;
+                if (!/\s/.test(c)) { word = /[\w$]/.test(c) ? (/[\w$]/.test(last) ? word + c : c) : ""; last = c; }
+            }
+        }
+    };
+    code(false);
+    return out;
+}
+
+test("_sendDistroOutbox runs when the propagation link comes up and at no other time: 'established' and the current link's 'recovered' are its only callers", async () => {
+    // Each call is one coming-up (_propComingUps) and lets every upload whose
+    // failure was recorded before it go again, so a third caller would send
+    // an upload again on the strength of its own failure (James, 2026-10-03;
+    // DESIGN_PRINCIPLES §3, what a device owes its distro). Review of 74fbbcd
+    // (RV2b): the test above checks only that the two calls are there, and a
+    // third, on page resume, passed every test.
+    const code = withoutComments(app);
+    // Only the comments are gone: what is left still parses, and keeps the
+    // code's strings.
+    const check = spawnSync(process.execPath, ["--input-type=module", "--check"], { input: code, encoding: "utf8" });
+    assert.equal(check.status, 0, `app.js without its comments does not parse: ${check.stderr}`);
+    assert.doesNotMatch(code, /NEVER REMOVE/);
+    assert.match(code, /"it goes when the propagation link is next up \(DESIGN_PRINCIPLES §3, the distro exception\)"/);
+    assert.match(code, /\n {4}async _sendDistroOutbox\(link, trigger\) \{/);
+    assert.equal(code.match(/_sendDistroOutbox/g).length, 3, "the method and its two calls: nothing else names it");
+    assert.equal(extractMethod(code, "async _onPropagationLinkEstablished(link)").match(/_sendDistroOutbox/g)?.length, 1);
+    assert.equal(extractMethod(code, "_establishPropagationLink()").match(/_sendDistroOutbox/g)?.length, 1);
+    // Nor does any other script of the page.
+    const lib = new URL("./lib/", import.meta.url);
+    const scripts = (await readdir(lib, { recursive: true })).filter((f) => f.endsWith(".js"));
+    assert.ok(scripts.includes("distro_upload.js") && scripts.includes("rns/link.js"));
+    for (const file of scripts) {
+        assert.doesNotMatch(withoutComments(await readFile(new URL(file, lib), "utf8")), /_sendDistroOutbox|_propComingUps/, `lib/${file}`);
+    }
+    for (const page of ["index.html", "debug.html", "debug-standalone.html"]) {
+        assert.doesNotMatch(await readFile(new URL(`./${page}`, import.meta.url), "utf8"), /_sendDistroOutbox|_propComingUps/, page);
+    }
 });
 
 // Link events are delivered on a later macrotask (utils/events.js defers every

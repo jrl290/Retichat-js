@@ -4334,11 +4334,14 @@ const RnsClient = {
 
     /**
      * The propagation link `link` has come up (`trigger`: "established", or
-     * "recovered" from STALE, James's two events of 2026-10-03; its only
-     * callers, pinned by distro_sent_sync.test.mjs): upload on it, oldest
-     * first, what is still owed to the distro (lib/distro_outbox.js). Each
-     * call is one coming-up, and counts it (_propComingUps): this flush's
-     * value is `comingUp`.
+     * "recovered" from STALE, James's two events of 2026-10-03): upload on
+     * it, oldest first, what is still owed to the distro
+     * (lib/distro_outbox.js). Each call is one coming-up, and counts it
+     * (_propComingUps): this flush's value is `comingUp`. So this is called
+     * when the link comes up and never otherwise: any other caller would let
+     * a failed upload go again on its own failure. Those two handlers are its
+     * only callers, and distro_sent_sync.test.mjs fails if anything else in
+     * the page names it.
      *
      * An entry is uploaded only when no attempt of it is open and its last
      * failure, if any, came before this coming-up:
@@ -4461,6 +4464,10 @@ const RnsClient = {
         // A failure is recorded when it is decided, with the coming-up it
         // was decided at (_distroUnproved): a flush begun after it, in the
         // same task (a close, then a new link's "established"), takes it.
+        // That is the coming-up current then, never the one of the flush
+        // that made this upload (`comingUp`): a later flush, under way on
+        // the same link when the failure is decided, must leave it for the
+        // next coming-up (review of 74fbbcd, RV1).
         const unproved = () => this._distroUnproved.set(entry.id, { packed: entry.packed, at: this._propComingUps });
         // Proved: its record goes, and only its own (a later action on the
         // channel, under the same id, keeps the record of its failure).
