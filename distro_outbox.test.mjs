@@ -117,8 +117,9 @@ test("storage that refuses writes: what this page settles or drops is taken out 
     // than what storage holds, and refused; storage still drops the join.
     assert.equal(box.settle("channel:aa", "AAAA"), true);
     assert.deepEqual(new DistroOutbox(storage).list().map((e) => e.id), ["sent:ff", "channel:bb"], "a later page never uploads the proved join again");
-    // The distro OTHER was given up: what was owed to it leaves storage too.
-    assert.deepEqual(box.dropAllBut(D).map((e) => e.id), ["channel:bb"]);
+    // The distro OTHER was given up: the membership message owed to it
+    // leaves storage too.
+    assert.deepEqual(box.dropMembershipNotFor(D).map((e) => e.id), ["channel:bb"]);
     assert.deepEqual(box.list().map((e) => e.id), ["sent:ff", "sent:ee"]);
     assert.deepEqual(new DistroOutbox(storage).list().map((e) => e.id), ["sent:ff"]);
     assert.deepEqual(lines, [], "each smaller write was taken: nothing is said");
@@ -141,17 +142,32 @@ test("storage that refuses even a smaller write is said: what it still holds tha
     assert.equal(lines.length, 1, "nothing more said once storage takes the write");
 });
 
-test("dropAllBut: every entry owed to another distro, or all of them when none is held, is dropped and returned", () => {
+test("dropMembershipNotFor: every membership message owed to another distro, or all of them when none is held, is dropped and returned; sent-copies are kept, to whatever distro they are owed", () => {
+    // James, 2026-10-03: a sent-copy is already packed and signed as the
+    // distro, and is still owed to it after the device gives it up. Until
+    // then (dropAllBut, Retichat-js 3411e19 and 145ca2f) it was dropped too.
     const { storage, box } = outbox();
     const OTHER = "e".repeat(32);
     box.put(entry("channel:aa", "AAAA"));
     box.put(entry("channel:bb", "BBBB", { distro: OTHER }));
     box.put(SENT("ff", "CCCC"));
-    assert.deepEqual(box.dropAllBut(D).map((e) => e.id), ["channel:bb"]);
-    assert.deepEqual(new DistroOutbox({ get: storage.sGet, set: storage.sSet }).list().map((e) => e.id), ["channel:aa", "sent:ff"], "in storage");
-    assert.deepEqual(box.dropAllBut(D), [], "nothing more to drop");
-    assert.deepEqual(box.dropAllBut(null).map((e) => e.id), ["channel:aa", "sent:ff"], "no distro held: nothing is owed");
-    assert.deepEqual(box.list(), []);
+    box.put(entry(sentCopyEntryId("ee"), "DDDD", { kind: "sent", to: "0".repeat(32), distro: OTHER }));
+    assert.deepEqual(box.dropMembershipNotFor(D).map((e) => e.id), ["channel:bb"]);
+    assert.deepEqual(new DistroOutbox({ get: storage.sGet, set: storage.sSet }).list().map((e) => e.id), ["channel:aa", "sent:ff", "sent:ee"], "in storage");
+    assert.deepEqual(box.dropMembershipNotFor(D), [], "nothing more to drop");
+    assert.deepEqual(box.dropMembershipNotFor(null).map((e) => e.id), ["channel:aa"], "no distro held: no membership message is owed");
+    assert.deepEqual(box.list().map((e) => [e.id, e.distro]), [["sent:ff", D], ["sent:ee", OTHER]], "each sent-copy still owed to its own distro");
+});
+
+test("an entry may carry its distro's public key, 128 lowercase hex; one without it (written before 2026-10-03) is still an entry", () => {
+    const { box } = outbox();
+    const KEY = "ab".repeat(64);
+    box.put(SENT("ff", "CCCC"));
+    box.put({ ...SENT("ee", "DDDD"), distroKey: KEY });
+    assert.deepEqual(box.list().map((e) => [e.id, e.distroKey ?? null]), [["sent:ff", null], ["sent:ee", KEY]]);
+    for (const bad of ["AB".repeat(64), "ab".repeat(32), 7, null]) {
+        assert.throws(() => box.put({ ...SENT("dd", "EEEE"), distroKey: bad }), /not an entry the distro can be owed/, String(bad));
+    }
 });
 
 test("a later entry under the same id replaces the one owed, and goes to the end", () => {

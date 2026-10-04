@@ -149,6 +149,8 @@ function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
         ownHash: deviceHash,
         _propLink: linkUp ? link : null,
         _distroOutboxInFlight: new Map(),
+        _propComingUps: 0,
+        _distroUnproved: new Map(),
         _ensurePropagationLink: async () => { throw new Error("the copy must not start the propagation link"); },
         _establishPropagationLink: () => { throw new Error("the copy must not start the propagation link"); },
         // Identity passthrough so the test can read the LXMF bytes back.
@@ -179,7 +181,8 @@ function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
     };
     install(self, env, [
         "async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
-        "async _uploadOwed(link, entry)", "_stillOwed(entry)", "_dropOwedToOtherDistros()", "_distroOwedOutcome(entry, how, error)", "_uploadForDistro(link, propagationPacked, label)",
+        "_distroAttemptOpen(entry, link)", "_unprovedSince(entry, comingUp)", "async _uploadOwed(link, entry, comingUp = null)", "_stillOwed(entry)",
+        "_dropMembershipOwedToOtherDistros()", "_distroOwedOutcome(entry, how, error, goesNow = false)", "_uploadForDistro(link, propagationPacked, label)",
     ]);
     return {
         run: async (to, content) => { await self._sendDistroSentCopy(to, "", content); await tick(); },
@@ -250,7 +253,7 @@ test("the copy waits for the propagation link and never starts it: the link's ow
     // (Starting it once meant a flush that re-propagated M inside its direct
     // window; _flushPropagation now uploads only parked copies.)
     for (const sig of ["async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
-        "async _uploadOwed(link, entry)", "_uploadForDistro(link, propagationPacked, label)"]) {
+        "async _uploadOwed(link, entry, comingUp = null)", "_uploadForDistro(link, propagationPacked, label)"]) {
         assert.doesNotMatch(extractMethod(app, sig), /_ensurePropagationLink|_establishPropagationLink/, sig);
     }
     assert.match(extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)"), /this\._oweDistro\(\{/);
