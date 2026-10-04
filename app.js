@@ -3733,7 +3733,13 @@ const RnsClient = {
      * Dispatch a stored outgoing DM: the direct attempt, the §17.11
      * sent-copy, the propagation fallback and the 30 s ceiling. Runs once
      * per user message — from sendMessage once initialized, or from
-     * _dispatchQueued for one queued before that.
+     * _dispatchQueued for one queued before that. Sending as the distro, it
+     * owes the distro a new sent-copy, uploaded at once while the
+     * propagation link is up and reading no failure record (_oweDistro). So
+     * it has those two callers alone, each for a DM the user sent:
+     * distro_sent_sync.test.mjs fails if anything else names it, or if
+     * anything new reaches them (verifier of b6c7f7f, R12: the window's
+     * "online" dispatching every failed DM again passed every test).
      */
     _dispatchMessage(contact, outMsg) {
         const content = outMsg.content;
@@ -4332,7 +4338,11 @@ const RnsClient = {
      * already owed: it uploads at once, reading no failure record
      * (_uploadOwed). distro_sent_sync.test.mjs fails if anything else names
      * it (verifier of 2683ea4, RX3: owing every entry again on an announce
-     * was caught only because another test's stand-in has no outbox).
+     * was caught only because another test's stand-in has no outbox), or if
+     * anything new reaches its two callers: they begin only with the user's
+     * own send, join or leave (a click or key of theirs, or the test
+     * harness acting as them) and with a DM the user sent before the
+     * exchange first registered (verifier of b6c7f7f, R12 to R14).
      */
     _oweDistro(entry) {
         // The message this one replaces (an earlier join or leave of the
@@ -4495,9 +4505,16 @@ const RnsClient = {
      * on a replaced link's decision, below. Called without a coming-up it
      * reads no failure record, so any other caller would send an upload
      * again on its own failure. distro_sent_sync.test.mjs fails if anything
-     * else names it, or reaches one of the three by a new path (verifier of
-     * 2683ea4, RX1: an announce that uploaded every owed entry through it
-     * passed every test).
+     * else names it or the upload it makes (_uploadForDistro), or reaches
+     * one of the three by a new path, up to where each begins: the
+     * propagation link's coming-up; the user's own send, join or leave, and
+     * a DM the user sent before the exchange first registered; and the
+     * Link's close and the exchange's loss report (verifier of 2683ea4,
+     * RX1: an announce that uploaded every owed entry through it passed
+     * every test; verifier of b6c7f7f: that pin stopped at a DM's dispatch
+     * and the user's join and leave, and the window's "online" dispatching
+     * every failed DM again, or re-uploading every owed entry through a
+     * bound alias of _uploadForDistro, passed every test).
      */
     async _uploadOwed(link, entry, comingUp = null) {
         const flight = { link, packed: entry.packed };
@@ -4734,6 +4751,12 @@ const RnsClient = {
      * Until 2026-10-03 (review of 69ff01e) the distro's uploads were handed
      * to link.send and said "propagated" at once, with nothing watching for
      * the proof (CHECK_THESE_THINGS_FIRST §14).
+     *
+     * Its one caller is _uploadOwed, which reads the failure record when a
+     * coming-up asks it to: distro_sent_sync.test.mjs fails if anything
+     * else names it (verifier of b6c7f7f, R17: a bound alias of it,
+     * uploading every owed entry on the window's "online", passed every
+     * test).
      */
     _uploadForDistro(link, propagationPacked, label) {
         if (this._propLink !== link || link.status !== Link.ACTIVE) return null;

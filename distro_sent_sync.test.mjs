@@ -272,14 +272,19 @@ test("the copy waits for the propagation link and never starts it: the link's ow
  * left is what the code says, not what its comments say about it. A "/"
  * begins a regular expression where an expression may begin (after an
  * operator, a bracket or a keyword), as a JavaScript parser decides it.
+ * With `blank`, what those literals hold is spaces instead (their newlines
+ * kept, a template's ${…} code kept), so code without comments keeps its
+ * length and only its shape is left: its names and its brackets, and no
+ * bracket of a string among them (members, below).
  */
-function withoutComments(source) {
+function withoutComments(source, blank = false) {
     const n = source.length;
     let i = 0, out = "", last = "", word = "";
     const regexMayFollow = () => /[\w$]/.test(last)
         ? /^(?:return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/.test(word)
         : last === "" || "(,=:[!&|?{};+-*%<>~^}".includes(last);
-    const literal = (start) => { out += source.slice(start, i); last = "\""; word = ""; };
+    const text = (said) => blank ? said.replace(/[^\n]/g, " ") : said;
+    const literal = (start) => { out += text(source.slice(start, i)); last = "\""; word = ""; };
     const string = (quote) => {
         const start = i++;
         while (i < n && source[i] !== quote) i += source[i] === "\\" ? 2 : 1;
@@ -300,13 +305,13 @@ function withoutComments(source) {
         literal(start);
     };
     const template = () => {
-        out += source[i++];
+        out += text(source[i++]);
         while (i < n && source[i] !== "`") {
-            if (source[i] === "\\") { out += source.slice(i, i + 2); i += 2; }
+            if (source[i] === "\\") { out += text(source.slice(i, i + 2)); i += 2; }
             else if (source[i] === "$" && source[i + 1] === "{") { out += "${"; i += 2; last = "{"; word = ""; code(true); out += "}"; i++; }
-            else out += source[i++];
+            else out += text(source[i++]);
         }
-        out += "`"; i++;
+        out += text("`"); i++;
         last = "\""; word = "";
     };
     const code = (inPlaceholder) => {
@@ -418,7 +423,66 @@ test("_sendDistroOutbox runs when the propagation link comes up and at no other 
 /** How many times the global `pattern` matches `source`. */
 const count = (source, pattern) => source.match(pattern)?.length ?? 0;
 
-test("the per-entry upload (_uploadOwed) has today's three callers and no other, and nothing new reaches them: the coming-up pass, the user's own action (_oweDistro), and the third ruling's send on a replaced link's close or loss report", async () => {
+/**
+ * The top-level statements of `code` (its comments out) and the members of
+ * each top-level object and class, as { name, start, end }: a declaration
+ * is named by what it declares, any other statement as "statement: " and
+ * the first name it says ("statement: import", "statement: console.log"),
+ * and a member, at four spaces in, as "Object.member". A member runs to the
+ * next one, or to its object's end. Brackets are counted in the code's
+ * shape (withoutComments with `blank`), so none of a string counts.
+ */
+function members(code) {
+    const shape = withoutComments(code, true);
+    assert.equal(shape.length, code.length, "the code's shape is the code, place for place");
+    const spans = [];
+    let depth = 0, top = null, member = null, at = 0;
+    const end = (span, where) => { if (span) { span.end = where; spans.push(span); } return null; };
+    for (const line of shape.split("\n")) {
+        const said = code.slice(at, at + line.length);
+        if (depth === 0 && /^\S/.test(line)) {
+            member = end(member, at);
+            end(top, at);
+            const name = said.match(/^(?:export\s+(?:default\s+)?)?(?:(?:const|let|var)\s+|window\.|(?:async\s+)?function\s*\*?\s*|class\s+)([\w$]+)/)?.[1]
+                ?? `statement: ${said.match(/^[\w$.]+/)?.[0] ?? said.trim()}`;
+            const holds = /^(?:(?:export\s+)?(?:const|let|var)\s+[\w$]+|window\.[\w$]+)\s*=\s*\{$|^(?:export\s+(?:default\s+)?)?class\s/.test(said.trimEnd());
+            top = { name, start: at, end: code.length, holds };
+        } else if (depth === 1 && top?.holds && /^ {4}[\w$*]/.test(line)) {
+            const name = said.match(/^ {4}(?:(?:async|get|set|static)\s+)*\*?([\w$]+)\s*[(:=]/)?.[1];
+            if (name) { end(member, at); member = { name: `${top.name}.${name}`, start: at, end: code.length }; }
+        }
+        for (let i = 0; i < line.length; i++) {
+            if (line[i] === "{") depth++;
+            else if (line[i] === "}" && --depth === 0) member = end(member, at + i + 1);
+        }
+        at += line.length + 1;
+    }
+    end(member, code.length);
+    end(top, code.length);
+    return spans;
+}
+
+/**
+ * Where each occurrence of `what` sits in `code` (its comments out): the
+ * member around it, or the top-level statement (members, above). A name
+ * (a string) is matched whole, in the code and in its strings alike, so a
+ * computed call (this["name"]), a bound alias or a destructured one names
+ * it too; a pattern is matched as it is.
+ */
+function sites(code, what, spans = members(code)) {
+    const pattern = typeof what === "string" ? new RegExp(`(?<![\\w$])${what.replaceAll("$", "\\$")}(?![\\w$])`, "g") : what;
+    return [...code.matchAll(pattern)].map((m) =>
+        spans.filter((s) => s.start <= m.index && m.index < s.end).sort((a, b) => b.start - a.start)[0]?.name ?? "?");
+}
+
+/** The text of the one member or top-level statement of `spans` called `name`. */
+function memberText(code, spans, name) {
+    const found = spans.filter((s) => s.name === name);
+    assert.equal(found.length, 1, `one ${name}`);
+    return code.slice(found[0].start, found[0].end);
+}
+
+test("the per-entry upload (_uploadOwed) has today's three callers and no other, and the upload it makes (_uploadForDistro) that one: the coming-up pass, the user's own action (_oweDistro), and the third ruling's send on a replaced link's close or loss report, decided only where it is decided today", async () => {
     // _uploadOwed reads an entry's failure record only when a coming-up
     // pass calls it (`comingUp`). Called without one, it uploads at once
     // whatever the record says, which is right for its two other callers
@@ -440,9 +504,11 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     //     packed in that same call, by _sendDistroSentCopy (from a DM's
     //     dispatch; "a DM's dispatch sends the copy once" pins where) and
     //     by _sendDistroChannelSync (from _syncChannelMembership, from the
-    //     user's joinChannel and leaveChannel). Above those, each call is a
-    //     new action of the user's that packs a new message, never the
-    //     bytes of an upload already made;
+    //     user's joinChannel and leaveChannel); everything above those, up
+    //     to the user's own click or key, by the test below (the verifier
+    //     of b6c7f7f, R12 to R14: this pin stopped at those three, and the
+    //     window's "online" dispatching every failed DM again, or leaving
+    //     and joining every channel again, passed every test);
     //   - the third ruling's send: where it goes is set only when its
     //     upload is decided with a newer propagation link up, and an upload
     //     is decided only by DistroUploads.lost, which the page calls for
@@ -451,6 +517,23 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     //     link's own close and for disconnect(). The page closes a
     //     propagation link only in disconnect(), once it has let go of it;
     //     only the Link fires its "close", and only the exchange its "lost".
+    //     Every place the page and lib/ say close or lost (and lib/ a
+    //     link's coming-up or recovery) is pinned, and the page fires one
+    //     event of its own, so a new close, loss report or coming-up is
+    //     caught however it is written (an optional call such as
+    //     link.close?.(), which the list of closes alone missed, an alias,
+    //     a computed link["emit"](…)). Below the page, each is
+    //     reached only from today's places: DistroUploads.cut from the page
+    //     alone, a Link's close from its own five, and the exchange's loss
+    //     report from its own four (the verifier of b6c7f7f, R6 to R8: a
+    //     cut by the §1 watch, a STALE Link firing its close and the
+    //     exchange reporting its queue lost on going down were each caught
+    //     by another suite alone);
+    //   - the upload itself: _uploadForDistro, called by _uploadOwed alone
+    //     (the verifier of b6c7f7f, R15 to R17: a bound alias of it, run
+    //     over every owed entry on the window's "online", skipped
+    //     _uploadOwed and its failure record and passed every test; on an
+    //     announce, it and a direct call were caught by other suites alone).
     // A Resource's own failure reaches the third ruling's send too, as the
     // code stands, and neither ruling names it (the verifier of 2683ea4,
     // question 1 for James). It is pinned here as it is, so that no other
@@ -458,10 +541,12 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     // writes these names whole, as for the test above.
     const code = withoutComments(app);
     const method = (signature) => extractMethod(code, signature);
+    const spans = members(code);
 
     // The per-entry upload, and its three calls.
     assert.match(code, /\n {4}async _uploadOwed\(link, entry, comingUp = null\) \{/);
     assert.equal(count(code, /_uploadOwed/g), 4, "the method and its three calls: nothing else names it");
+    assert.deepEqual(sites(code, "_uploadOwed", spans), ["RnsClient._oweDistro", "RnsClient._sendDistroOutbox", "RnsClient._uploadOwed", "RnsClient._uploadOwed"]);
     const pass = method("async _sendDistroOutbox(link, trigger)");
     assert.equal(count(pass, /_uploadOwed/g), 1);
     assert.match(pass, /if \(this\._unprovedSince\(entry, comingUp\)\) \{\s*console\.log\([^\n]*\);\s*continue;\s*\}\s*await this\._uploadOwed\(link, entry, comingUp\);/,
@@ -474,6 +559,10 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     assert.equal(count(upload, /_uploadOwed/g), 1, "the third ruling's send, and no other");
     assert.match(upload, /\}, \(error\) => \{\s*landed\(\);\s*if \(goesOn && goesOn === this\._propLink && goesOn\.status === Link\.ACTIVE\s*&& this\._stillOwed\(entry\) && !this\._distroAttemptOpen\(entry, goesOn\)\) \{\s*this\._distroOwedOutcome\(entry, upload\.how, error, true\);\s*this\._uploadOwed\(goesOn, entry\);\s*return;\s*\}/,
         "the third ruling's send: on its upload's failure, to the newer link only while that is still the propagation link and up");
+    // The upload itself: _uploadOwed hands it to _uploadForDistro, and nothing else does.
+    assert.deepEqual(sites(code, "_uploadForDistro", spans), ["RnsClient._uploadOwed", "RnsClient._uploadForDistro"],
+        "_uploadForDistro: made, and called by _uploadOwed alone, which reads the failure record");
+    assert.equal(count(upload, /\bupload = this\._uploadForDistro\(link, propagationPacked, entry\.label\);/g), 1);
 
     // Where it goes is set only when this upload is decided, with a newer link up.
     assert.match(upload, /let goesOn = null;\s*const decided = \(\) => \{\s*unproved\(\);\s*const newer = this\._propLink;\s*if \(newer && upload\.link !== newer\) goesOn = newer;\s*\};\s*upload\.onLost = decided;\s*if \(upload\.settled === "lost"\) decided\(\);\s*upload\.outcome\.then\(/);
@@ -516,18 +605,49 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
         "today's closes: a group link, a refused rfed.link, disconnect()'s rfed.links, group links and the propagation link it let go of, and a group. "
         + "A close of a propagation link decides the uploads on it, and a newer link up sends them at once (the third ruling): only its own close may");
     assert.doesNotMatch(code, /_linkClosed/, "the page never runs a link's close for it");
+    // And every place the page says close or lost, or fires an event, so that a close of a link or a loss report
+    // is new here however it is written: an optional call (link.close?.()), an alias, a computed name. Names are
+    // read in the code (shape: its strings blanked), and the event names whole in its strings, so a log line that
+    // says "emit" or "closed" is not one.
+    const shape = withoutComments(code, true);
+    assert.deepEqual(sites(shape, "close", spans), ["GroupStore.close", "RnsClient._markGroupPeerReady",
+        "RnsClient._closeRefusedRfedLink", "RnsClient.disconnect", "RnsClient.disconnect", "RnsClient.disconnect", "App._quitGroup",
+        "App._renderSettingsModal", "App._renderSettingsModal", "App._renderIdentityModal", "App._renderIdentityModal"],
+        "close in the page's code: the closes above, a group's close, and two dialogs' own close");
+    assert.deepEqual(sites(code, /(["'`])(?:close|lost)\1/g, spans), ["RnsClient._followExchange", "RnsClient._establishPropagationLink",
+        "RnsClient._onPropagationLinkClosed", "RnsClient._uploadOwed", "RnsClient._ensureGroupLink", "RnsClient._ensureRfedLink", "RnsClient._onRfedLinkClosed"],
+        "\"close\" and \"lost\": the links' close listeners, the loss report's listener, two re-drives' reasons and an upload's state");
+    assert.deepEqual([...sites(shape, "emit", spans), ...sites(code, /(["'`])emit\1/g, spans)], ["RnsClient._ingestPropagatedBlob"],
+        "the page fires one event of its own, so no link's coming-up, close or loss report, however it is written (link[\"emit\"](…) too)");
     const fired = [...code.matchAll(/\.\s*emit\s*(\?\.)?\s*\(\s*([^,)]*)/g)].map((m) => m[2].trim());
     assert.ok(fired.every((name) => !["\"close\"", "\"lost\""].includes(name)), `app.js fires no link's close and no loss report: ${fired.join(", ")}`);
     const lib = new URL("./lib/", import.meta.url);
     const scripts = (await readdir(lib, { recursive: true })).filter((f) => f.endsWith(".js"));
     assert.ok(scripts.includes("distro_upload.js") && scripts.includes("rns/link.js") && scripts.includes("rns/interfaces/post_interface.js"));
-    const named = /_uploadOwed|_oweDistro|_sendDistroSentCopy|_sendDistroChannelSync|_syncChannelMembership|_onPacketsLost|_distroUploads|goesOn/;
+    const named = /_uploadOwed|_uploadForDistro|_oweDistro|_sendDistroSentCopy|_sendDistroChannelSync|_syncChannelMembership|_onPacketsLost|_distroUploads|goesOn/;
+    const closesAndLosses = {};
     for (const file of scripts) {
         const source = withoutComments(await readFile(new URL(file, lib), "utf8"));
         assert.doesNotMatch(source, named, `lib/${file}`);
         assert.equal(count(source, /\bemit\s*\(\s*["'`]lost["'`]/g), file === "rns/interfaces/post_interface.js" ? 1 : 0,
             `lib/${file}: only the exchange reports packets lost`);
+        const fileSpans = members(source);
+        const said = [...sites(withoutComments(source, true), "close", fileSpans), ...sites(source, /(["'`])(?:close|lost|established|recovered)\1/g, fileSpans)];
+        if (said.length) closesAndLosses[file] = said;
     }
+    assert.deepEqual(closesAndLosses, {
+        "distro_upload.js": ["DistroUploads.proved", "DistroUploads.lost"],
+        "rns/interfaces/direct_sockets_interface.js": ["DirectSocketsInterface._cleanup"],
+        "rns/interfaces/post_interface.js": ["PostInterface._lose"],
+        "rns/interfaces/tcp_client_interface.js": ["TCPClientInterface.connect"],
+        "rns/interfaces/websocket_client_interface.js": ["WebsocketClientInterface.connectInBrowser", "WebsocketClientInterface.connectInNodeJs"],
+        "rns/link.js": ["Link.close", "Link.validateProof", "Link._recoverIfStale", "Link._linkClosed", "Link.onLinkRequestRtt"],
+        "rns/lxmf/lxmf_router.js": ["LXMRouter.constructor"],
+        "rns/reticulum.js": ["Reticulum.addInterface"],
+    }, "lib/ says close, lost, established and recovered only where it does today: a socket's close and the close events of the sockets "
+        + "it reads, the Link's own close(), and the close, coming-up and recovery it fires, the exchange's loss report and Reticulum's "
+        + "listener of it, the LXMF router's listener of a link's coming-up, and an upload's state. So no script under lib/ closes a link, "
+        + "or fires a link's close or coming-up or a loss report anew, however it is written");
     const linkSource = withoutComments(await readFile(new URL("rns/link.js", lib), "utf8"));
     assert.equal(count(linkSource, /\bemit\s*\(\s*["'`]close["'`]/g), 1, "a Link fires its close once in its code");
     assert.match(extractMethod(linkSource, "_linkClosed()"), /\bthis\.emit\("close"\);/, "a Link fires its close when it closes, and only then");
@@ -536,6 +656,14 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     assert.match(extractMethod(uploads, "lost(upload, why)"), /upload\.reject\(new Error\(why\)\);\s*upload\.onLost\?\.\(\);/);
     assert.equal(count(uploads, /\blost\s*\(/g), 2, "lost(): itself, and cut()'s call");
     assert.match(extractMethod(uploads, "cut(why, link = null)"), /if \(this\.lost\(upload, why\)\) cut\+\+;/);
+    assert.equal(count(uploads, /\bcut\s*\(/g), 1, "cut(): itself, called by the page alone (the link's close and disconnect())");
+    assert.deepEqual(sites(linkSource, "_linkClosed"), ["Link.onPacket", "Link._linkClosed", "Link._startEstablishmentWatchdog", "Link.requestLost", "Link._watchdogStep", "Link.close"],
+        "a Link closes on its peer's LINKCLOSE, its establishment's timeout, its link request lost, its STALE grace run out and its own close(), and nowhere else");
+    const exchange = withoutComments(await readFile(new URL("rns/interfaces/post_interface.js", lib), "utf8"));
+    const exchangeSpans = members(exchange);
+    assert.deepEqual(sites(exchange, "_lose", exchangeSpans), ["PostInterface.block", "PostInterface.sendData", "PostInterface._runExchange", "PostInterface._runExchange", "PostInterface._lose"],
+        "the exchange reports packets lost when it is refused, when one is sent while it is down, and when an exchange fails or a check abandons it, and nowhere else");
+    assert.match(memberText(exchange, exchangeSpans, "PostInterface._lose"), /this\.emit\('lost', \{ packetHashes, reason, abandoned \}\);/);
     for (const page of ["index.html", "debug.html", "debug-standalone.html"]) {
         assert.doesNotMatch(await readFile(new URL(`./${page}`, import.meta.url), "utf8"), named, page);
     }
@@ -558,6 +686,153 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     assert.equal(count(code, /_syncChannelMembership/g), 3, "the user's join and leave");
     assert.equal(count(method("async joinChannel(channelName)"), /this\._syncChannelMembership\("join", ch\);/g), 1);
     assert.equal(count(method("async leaveChannel(channelName)"), /this\._syncChannelMembership\("leave", ch\);/g), 1);
+});
+
+test("what reaches the user's own action (_oweDistro) begins with the user and nothing else: a DM from the composer, a join from the channel form, a leave from the channel's Leave button, the test harness's send, join and leave, and a DM sent before the exchange first registered", async () => {
+    // _oweDistro uploads at once while the propagation link is up and reads
+    // no failure record, which is right only for a message the user's own
+    // action has just packed (the test above pins its two callers, each
+    // owing the message it has just packed). The verifier of b6c7f7f (R12
+    // to R14, R5): that pin stopped at a DM's dispatch, joinChannel and
+    // leaveChannel, so the window's "online" dispatching every failed DM
+    // again (by name, or through a bound alias of _dispatchMessage), or
+    // leaving and joining every channel again, passed every test, and so did
+    // debug.html naming _dispatchMessage. Each would owe the distro a new
+    // message on the strength of a failure alone, with the user doing
+    // nothing. So everything above those two callers is pinned here, every
+    // place each name is written, up to where it begins:
+    //   - a DM: the composer's send button and Enter key, in the DM, group
+    //     and channel views (App.sendMessage sends what the composer holds,
+    //     and a DM only to the open chat's contact), the harness's send, and
+    //     _dispatchQueued, which sends once each DM the user sent before the
+    //     exchange first registered after a connect: only sendMessage queues
+    //     a DM for it ("init"), and only disconnect() makes it wait again;
+    //   - a join: the channel form's Join button and Enter key, and the
+    //     harness's joinChannel;
+    //   - a leave: the channel's Leave button, once confirmed, and the
+    //     harness's leaveChannel.
+    // The harness (window.RetichatTest) is the staging tests' hand on the
+    // page, acting as the user: nothing in the page calls it, no script
+    // under lib/ reaches the page's objects, and the pages reach none of
+    // this (debug.html reads the harness's events, identity, distro and
+    // ready, and nothing else). The page clicks none of its own controls
+    // but the attachment picker's hidden file input, and fires no DOM
+    // event; h() makes each on… property a listener of that event. And the
+    // bytes an upload sends come only from what is owed: the one outbox,
+    // the attempts in flight and the failure records, each read where it is
+    // read today, the outbox's storage key named by lib/distro_outbox.js
+    // alone. What this cannot see is a name assembled at run time or found
+    // by reflection, as for the tests above.
+    const code = withoutComments(app);
+    const spans = members(code);
+    const at = (what) => sites(code, what, spans);
+    const member = (name) => memberText(code, spans, name);
+
+    // Every place each name is written, in the code or in a string.
+    const places = {
+        _sendDistroSentCopy: ["RnsClient._dispatchMessage", "RnsClient._sendDistroSentCopy"],
+        _sendDistroChannelSync: ["RnsClient._syncChannelMembership", "RnsClient._sendDistroChannelSync"],
+        _dispatchMessage: ["RnsClient.sendMessage", "RnsClient._dispatchMessage", "RnsClient._dispatchQueued"],
+        sendMessage: ["RnsClient.sendMessage", "App._buildDmChatView", "App._buildGroupChatView", "App._buildChannelChatView",
+            "App._composerKeydown", "App.sendMessage", "App.sendMessage", "RetichatTest.send"],
+        _composerKeydown: ["App._buildDmChatView", "App._buildGroupChatView", "App._buildChannelChatView", "App._composerKeydown"],
+        _dispatchQueued: ["RnsClient._dispatchQueued", "RnsClient._onExchangeRegistered"],
+        _onExchangeRegistered: ["RnsClient._followExchange", "RnsClient._onExchangeRegistered"],
+        _followExchange: ["RnsClient._followExchange", "RnsClient.connect"],
+        _syncChannelMembership: ["RnsClient._syncChannelMembership", "RnsClient.joinChannel", "RnsClient.leaveChannel"],
+        joinChannel: ["RnsClient.joinChannel", "App._renderChannelForm", "RetichatTest.joinChannel", "RetichatTest.joinChannel", "RetichatTest.help"],
+        leaveChannel: ["RnsClient.leaveChannel", "App._renderChannelInfoModal", "RetichatTest.leaveChannel", "RetichatTest.leaveChannel", "RetichatTest.help"],
+        doJoin: ["App._renderChannelForm", "App._renderChannelForm", "App._renderChannelForm"],
+        RetichatTest: ["RetichatTest", "RetichatTest.help", "statement: console.log", "statement: console.log"],
+        DistroOutboxStore: ["DistroOutboxStore", "RnsClient._oweDistro", "RnsClient._oweDistro", "RnsClient._sendDistroOutbox",
+            "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._stillOwed",
+            "RnsClient._dropMembershipOwedToOtherDistros", "RetichatTest.distroOwed"],
+        DistroOutbox: ["statement: import", "DistroOutboxStore"],
+        _distroOutboxInFlight: ["RnsClient._distroOutboxInFlight", "RnsClient._distroAttemptOpen", "RnsClient._uploadOwed",
+            "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._dropMembershipOwedToOtherDistros"],
+        _distroUnproved: ["RnsClient._distroUnproved", "RnsClient._oweDistro", "RnsClient._unprovedSince", "RnsClient._uploadOwed",
+            "RnsClient._uploadOwed", "RnsClient._dropMembershipOwedToOtherDistros"],
+    };
+    for (const [name, where] of Object.entries(places)) assert.deepEqual(at(name), where, `${name}: written where it is today, and nowhere else`);
+
+    // A DM: the composer's Enter key and send button in each chat view, the harness's send, and App.sendMessage's
+    // one call, with what the composer holds, to the open chat's contact.
+    for (const view of ["App._buildDmChatView", "App._buildGroupChatView", "App._buildChannelChatView"]) {
+        const built = member(view);
+        assert.match(built, /h\("textarea", \{\s*id: "composer-input",(?:\s*\w+: [^\n]*,)*?\s*onKeydown: \(e\) => this\._composerKeydown\(e\),/, `${view}: the composer's keys`);
+        assert.match(built, /h\("button", \{\s*className: "btn-send",(?:\s*disabled: !c\.publicKey,)?\s*onClick: \(\) => this\.sendMessage\(\),\s*\}/, `${view}: the send button's click`);
+    }
+    assert.match(member("App._composerKeydown"), /^ {4}_composerKeydown\(e\) \{\s*if \(!enterSends\(e, [^\n]*\)\) return;\s*e\.preventDefault\(\);\s*this\.sendMessage\(\);\s*\},\s*$/,
+        "Enter, as lib/message_text.js enterSends decides it, and nothing else");
+    const composer = member("App.sendMessage");
+    assert.match(composer, /const ta = document\.getElementById\("composer-input"\);[\s\S]*const content = ta\.value\.trim\(\);/);
+    assert.match(composer, /const c = ContactStore\.get\(this\.state\.activeHash\);[\s\S]*RnsClient\.sendMessage\(c, content, attachments\);/);
+    assert.match(member("RetichatTest.send"), /const stored = RnsClient\.sendMessage\(contact, content \|\| 'E2E test ' \+ Date\.now\(\)\);/);
+    assert.equal(count(member("RnsClient.sendMessage"), /this\._dispatchMessage\(contact, outMsg\);/g), 1);
+
+    // A DM the user sent before the exchange first registered after a connect: sent once, at that registration.
+    assert.match(member("RnsClient._onExchangeRegistered"), /if \(!this\._initialized\) \{\s*this\._initialized = true;\s*this\._dispatchQueued\(\);\s*\}/);
+    assert.match(member("RnsClient._followExchange"), /iface\.on\("registered", \(\) => \{\s*if \(current\(\)\) this\._onExchangeRegistered\(\);\s*\}\);/);
+    assert.match(member("RnsClient.connect"), /\n {8}this\._followExchange\(iface\);\n/, "the exchange connect() makes, once");
+    const initialized = /\b_initialized\s*(?::|=(?!=))\s*(\w+)/g;
+    assert.deepEqual(at(initialized), ["RnsClient._initialized", "RnsClient._onExchangeRegistered", "RnsClient.disconnect"],
+        "_initialized: set where it is today, and nowhere else");
+    assert.deepEqual([...code.matchAll(initialized)].map((m) => m[1]), ["false", "true", "false"],
+        "set at the first registration, and made to wait again by disconnect() alone");
+    assert.deepEqual(at(/(["'`])init\1/g), ["RnsClient.sendMessage", "RnsClient._dispatchQueued", "RnsClient.sendGroupMessage"],
+        "a DM waits for the registration only as sendMessage queues it (a group message has no copy)");
+    assert.match(member("RnsClient.sendMessage"), /if \(!this\._initialized\) \{\s*const queued = MsgStore\.add\(contact\.destHash, \{\s*dir: "out", content, status: "queued", waitFor: "init",/);
+    assert.match(member("RnsClient._dispatchQueued"), /MsgStore\.update\(contact\.destHash, msg\.id, \{ waitFor: null \}\);\s*this\._dispatchMessage\(contact, msg\);/,
+        "a queued DM waits no more before it goes, so it goes once");
+
+    // A join: the channel form's Join button and Enter key. A leave: the channel's Leave button, once confirmed.
+    // And the harness's join and leave, one call each; no member of the harness calls its send.
+    const form = member("App._renderChannelForm");
+    assert.match(form, /const doJoin = \(\) => \{\s*if \(!inp\) return;\s*const v = validateChannelName\(inp\.value, mode\(\)\);\s*if \(!v\.ok\) \{ refresh\(\); return; \}\s*RnsClient\.joinChannel\(v\.name\)\.then\(/);
+    assert.match(form, /onKeydown: \(e\) => \{ if \(e\.key === "Enter"\) doJoin\(\); \},/);
+    assert.match(form, /joinBtn = h\("button", \{ className: "btn btn-primary btn-block", onClick: doJoin,/);
+    assert.match(member("App._renderChannelInfoModal"), /onClick: \(\) => \{\s*if \(!confirm\(`Leave #\$\{ch\.channelName\}\?`\)\) return;\s*RnsClient\.leaveChannel\(ch\.channelName\)\.then\(/);
+    assert.match(member("RetichatTest.joinChannel"), /^ {4}joinChannel\(name\) \{ return RnsClient\.joinChannel\(name\)\.then\(/);
+    assert.match(member("RetichatTest.leaveChannel"), /^ {4}leaveChannel\(name\) \{ return RnsClient\.leaveChannel\(name\)\.then\(\(\) => true\); \},/);
+    assert.deepEqual(at("send").filter((where) => where.startsWith("RetichatTest")), ["RetichatTest.help", "RetichatTest.help", "RetichatTest.send"],
+        "the harness's send, and its help's two words for it");
+
+    // The page clicks none of its own controls but the attachment picker's file input, and fires no DOM event;
+    // h() makes each on… property its element's listener of that event.
+    assert.deepEqual(at(/\.\s*click\s*\(/g), ["App._pickAttachments"], "the page clicks the attachment picker's file input, and nothing else");
+    assert.doesNotMatch(code, /\bdispatchEvent\b|\brequestSubmit\b|\bnew\s+(?:Keyboard|Mouse|Pointer|Submit|Input|Focus|UI|Custom)?Event\s*\(/);
+    const h = member("h");
+    assert.match(h, /else if \(k\.startsWith\("on"\) && typeof v === "function"\) el\.addEventListener\(k\.slice\(2\)\.toLowerCase\(\), v\);\n/);
+    assert.equal(count(h, /addEventListener/g), 1, "and no other listener");
+    assert.doesNotMatch(code, /distro_outbox_v1/, "the outbox's storage is read through DistroOutboxStore alone");
+
+    // Nor does a script under lib/ or a page: lib/ reaches no object of the page, index.html loads app.js and
+    // nothing else, debug-standalone.html not even that (its console has its own stack), and debug.html reads the
+    // harness alone.
+    const named = /_sendDistroSentCopy|_sendDistroChannelSync|_dispatchMessage|_dispatchQueued|_onExchangeRegistered|_followExchange|_composerKeydown|\bsendMessage\b|\bjoinChannel\b|\bleaveChannel\b|_syncChannelMembership|DistroOutboxStore|_distroOutboxInFlight|_distroUnproved/;
+    const lib = new URL("./lib/", import.meta.url);
+    const scripts = (await readdir(lib, { recursive: true })).filter((f) => f.endsWith(".js"));
+    assert.ok(scripts.includes("distro_outbox.js") && scripts.includes("message_text.js"));
+    for (const file of scripts) {
+        const source = withoutComments(await readFile(new URL(file, lib), "utf8"));
+        assert.doesNotMatch(source, named, `lib/${file}`);
+        assert.doesNotMatch(source, /\b(?:RetichatTest|Debug|RnsClient|App)\b/, `lib/${file} reaches no object of the page`);
+        assert.equal(count(source, /distro_outbox_v1/g), file === "distro_outbox.js" ? 1 : 0, `lib/${file}: the outbox's storage key is lib/distro_outbox.js's`);
+    }
+    const page = (name) => readFile(new URL(`./${name}`, import.meta.url), "utf8");
+    const [index, debug, standalone] = await Promise.all(["index.html", "debug.html", "debug-standalone.html"].map(page));
+    for (const [name, html] of [["index.html", index], ["debug.html", debug], ["debug-standalone.html", standalone]]) {
+        assert.doesNotMatch(html, named, name);
+        assert.doesNotMatch(html, /distro_outbox_v1/, name);
+    }
+    assert.deepEqual(index.match(/<script\b[^>]*>/g), ["<script type=\"importmap\">", "<script type=\"module\" src=\"app.js\">"], "index.html: the import map and app.js");
+    assert.doesNotMatch(standalone, /app\.js|RetichatTest/, "debug-standalone.html loads no app.js");
+    assert.deepEqual(debug.match(/<script\b[^>]*>/g), ["<script type=\"importmap\">", "<script>", "<script type=\"module\" src=\"app.js\">", "<script type=\"module\">"]);
+    const opened = debug.lastIndexOf("<script type=\"module\">");
+    const reader = withoutComments(debug.slice(opened + "<script type=\"module\">".length, debug.indexOf("</script>", opened)));
+    assert.deepEqual([...reader.matchAll(/\bT\s*\.\s*([\w$]+)/g)].map((m) => m[1]), ["events", "identity", "distro", "ready"], "debug.html reads the harness");
+    assert.deepEqual([count(reader, /\bT\b/g), count(reader, /\bDebug\b/g), count(reader, /\bRetichatTest\b/g)], [6, 3, 3],
+        "and holds it as T, which it shows the console as window.Debug, and nowhere else");
 });
 
 // Link events are delivered on a later macrotask (utils/events.js defers every
