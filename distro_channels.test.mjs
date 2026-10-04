@@ -1959,13 +1959,14 @@ test("a STALE propagation link replaced by a new one decides nothing: the new li
 });
 
 // James, 2026-10-03: a STALE link replaced by a new one decides nothing.
-// When the old link's own close, or the exchange's report that the upload's
-// packet was lost, then finds the upload not proved and a newer propagation
-// link is up, that is the event: the entry goes once on the newer link at
-// once. With no newer link up, it waits for the next coming-up. A failure
-// of that upload follows the rule for any other: it waits for the next
-// coming-up. Retichat-js 145ca2f waited for the next coming-up in both
-// cases, which could be hours away while the newer link stayed up.
+// When the old link's own close then finds the upload not proved and a newer
+// propagation link is up, that close is the event: the entry goes once on the
+// newer link at once. The exchange's report that the upload's packet was
+// lost counts the same as that close (James, 2026-10-04). With no newer link
+// up, it waits for the next coming-up. A failure of that upload follows the
+// rule for any other: it waits for the next coming-up. Retichat-js 145ca2f
+// waited for the next coming-up in both cases, which could be hours away
+// while the newer link stayed up.
 
 for (const decides of ["close", "loss"]) {
     test(`a replaced link's ${decides === "close" ? "close" : "loss report"} that finds its upload not proved, with the newer link up, is the event: C goes once on the newer link at once; that upload's own failure waits for the next coming-up`, async (t) => {
@@ -2506,8 +2507,9 @@ for (const [kind, makeOlder, makeNewer] of [
             hold.release();
             for (let i = 0; i < 4; i++) await settle();
             // A sent-copy still owed whose upload is decided lost while the
-            // newer link is up goes once on that link at once (James,
-            // 2026-10-03, R3); a join the leave replaced goes no more.
+            // newer link is up goes once on that link at once (R3: the old
+            // link's close, James, 2026-10-03; the exchange's loss report,
+            // James, 2026-10-04); a join the leave replaced goes no more.
             const r3 = !sameChannel && when !== "proved after";
             assert.deepEqual(n.went().slice(4), r3 ? ["older", "Y"] : ["Y"], "Y goes; the newer is not uploaded again by this flush");
             assert.deepEqual(hold.built, r3 ? ["join public.yyy", "sent-copy"] : ["join public.yyy"], "and no stamp is mined for it");

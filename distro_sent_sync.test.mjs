@@ -415,6 +415,151 @@ test("_sendDistroOutbox runs when the propagation link comes up and at no other 
     }
 });
 
+/** How many times the global `pattern` matches `source`. */
+const count = (source, pattern) => source.match(pattern)?.length ?? 0;
+
+test("the per-entry upload (_uploadOwed) has today's three callers and no other, and nothing new reaches them: the coming-up pass, the user's own action (_oweDistro), and the third ruling's send on a replaced link's close or loss report", async () => {
+    // _uploadOwed reads an entry's failure record only when a coming-up
+    // pass calls it (`comingUp`). Called without one, it uploads at once
+    // whatever the record says, which is right for its two other callers
+    // alone: the user's own action, whose message is packed in that action
+    // and so was never uploaded before; and the third ruling's send
+    // (DESIGN_PRINCIPLES §3, what a device owes its distro): an upload on a
+    // STALE link that a newer link replaced, decided not proved by that
+    // link's own close (James, 2026-10-03) or by the exchange's report that
+    // its packet was lost (James, 2026-10-04) while the newer link is up,
+    // goes once on the newer link at once. Any other caller, or another way
+    // to reach one of these three, would send an upload again on the
+    // strength of its own failure alone. Verifier of 2683ea4 (RX1): the
+    // test above pinned the pass's callers but not this one's, and an
+    // lxmf.propagation announce that uploaded every owed entry through it
+    // passed every test. So the three calls are pinned where they sit, and
+    // so is everything that reaches each one:
+    //   - the pass: its callers, by the test above;
+    //   - the user's own action: _oweDistro, called only with a message
+    //     packed in that same call, by _sendDistroSentCopy (from a DM's
+    //     dispatch; "a DM's dispatch sends the copy once" pins where) and
+    //     by _sendDistroChannelSync (from _syncChannelMembership, from the
+    //     user's joinChannel and leaveChannel). Above those, each call is a
+    //     new action of the user's that packs a new message, never the
+    //     bytes of an upload already made;
+    //   - the third ruling's send: where it goes is set only when its
+    //     upload is decided with a newer propagation link up, and an upload
+    //     is decided only by DistroUploads.lost, which the page calls for
+    //     the exchange's loss report, a Resource's failure and a packet
+    //     that never left, and by DistroUploads.cut, for the propagation
+    //     link's own close and for disconnect(). The page closes a
+    //     propagation link only in disconnect(), once it has let go of it;
+    //     only the Link fires its "close", and only the exchange its "lost".
+    // A Resource's own failure reaches the third ruling's send too, as the
+    // code stands, and neither ruling names it (the verifier of 2683ea4,
+    // question 1 for James). It is pinned here as it is, so that no other
+    // path joins it unnoticed. What this cannot see is a call that never
+    // writes these names whole, as for the test above.
+    const code = withoutComments(app);
+    const method = (signature) => extractMethod(code, signature);
+
+    // The per-entry upload, and its three calls.
+    assert.match(code, /\n {4}async _uploadOwed\(link, entry, comingUp = null\) \{/);
+    assert.equal(count(code, /_uploadOwed/g), 4, "the method and its three calls: nothing else names it");
+    const pass = method("async _sendDistroOutbox(link, trigger)");
+    assert.equal(count(pass, /_uploadOwed/g), 1);
+    assert.match(pass, /if \(this\._unprovedSince\(entry, comingUp\)\) \{\s*console\.log\([^\n]*\);\s*continue;\s*\}\s*await this\._uploadOwed\(link, entry, comingUp\);/,
+        "the coming-up pass leaves what failed since its coming-up, and hands that coming-up on, so the record is read again once the upload is built");
+    const owe = method("_oweDistro(entry)");
+    assert.equal(count(owe, /_uploadOwed/g), 1);
+    assert.match(owe, /const link = this\._propLink;\s*if \(link\?\.status === Link\.ACTIVE\) \{\s*this\._uploadOwed\(link, entry\);\s*return;\s*\}/,
+        "the user's own action goes at once while the propagation link is up");
+    const upload = method("async _uploadOwed(link, entry, comingUp = null)");
+    assert.equal(count(upload, /_uploadOwed/g), 1, "the third ruling's send, and no other");
+    assert.match(upload, /\}, \(error\) => \{\s*landed\(\);\s*if \(goesOn && goesOn === this\._propLink && goesOn\.status === Link\.ACTIVE\s*&& this\._stillOwed\(entry\) && !this\._distroAttemptOpen\(entry, goesOn\)\) \{\s*this\._distroOwedOutcome\(entry, upload\.how, error, true\);\s*this\._uploadOwed\(goesOn, entry\);\s*return;\s*\}/,
+        "the third ruling's send: on its upload's failure, to the newer link only while that is still the propagation link and up");
+
+    // Where it goes is set only when this upload is decided, with a newer link up.
+    assert.match(upload, /let goesOn = null;\s*const decided = \(\) => \{\s*unproved\(\);\s*const newer = this\._propLink;\s*if \(newer && upload\.link !== newer\) goesOn = newer;\s*\};\s*upload\.onLost = decided;\s*if \(upload\.settled === "lost"\) decided\(\);\s*upload\.outcome\.then\(/);
+    assert.equal(count(code, /\bgoesOn\b/g), 7, "goesOn: declared, set by the decision, read by the send");
+    assert.equal(count(upload, /\bgoesOn\s*=(?!=)/g), 2, "set to null, then only by the decision");
+    assert.equal(count(code, /\bdecided\b/g), 3, "the decision: made, given to the upload, and run for an upload decided before it left");
+    assert.equal(count(code, /\bonLost\b/g), 1, "the page gives an upload its onLost once, and calls it nowhere");
+
+    // An upload is decided by DistroUploads.lost and .cut, at today's five places.
+    assert.equal(count(code, /_distroUploads/g), 11, "the field and its ten calls: no alias");
+    assert.deepEqual(code.match(/\.\s*(?:lost|cut)\s*\(/g), [".cut(", ".lost(", ".lost(", ".lost(", ".cut("],
+        "nothing else in the page is told .lost or .cut");
+    assert.match(method("_onPacketsLost({ packetHashes, reason })"),
+        /if \(pending\?\.distroUpload\) \{\s*this\._distroUploads\.lost\(pending\.distroUpload, `its packet was lost \(\$\{reason\}\)`\);\s*continue;\s*\}/,
+        "the exchange's loss report (James, 2026-10-04)");
+    assert.equal(count(code, /\bdistroUpload\b/g), 3, "the loss report knows an upload by the entry _uploadForDistro makes for its proof, and by nothing else");
+    assert.equal(count(code, /_onPacketsLost/g), 2, "the loss report's handler and its one call");
+    assert.match(method("_followExchange(iface)"), /iface\.on\("lost", \(lost\) => \{\s*if \(current\(\)\) this\._onPacketsLost\(lost\);\s*\}\);/,
+        "the loss report is the exchange's \"lost\"");
+    const forDistro = method("_uploadForDistro(link, propagationPacked, label)");
+    assert.equal(count(forDistro, /_distroUploads\.lost\(/g), 2);
+    assert.match(forDistro, /link\.sendResource\(propagationPacked\)\.then\(\s*\(\) => this\._distroUploads\.proved\(upload\),\s*\(error\) => this\._distroUploads\.lost\(upload, `its Resource failed/,
+        "a Resource's own failure (no ruling names it yet)");
+    assert.match(forDistro, /^\s*if \(this\._propLink !== link \|\| link\.status !== Link\.ACTIVE\) return null;/);
+    assert.match(forDistro, /if \(link\._transmit\(raw\) === null\) \{\s*this\._pendingPacketHashes\.delete\(proofKey\);\s*this\._distroUploads\.lost\(upload, "the propagation link closed before the upload"\);/,
+        "a packet that never left, on the link checked to be the propagation link in the same task: no newer link is up");
+    const establish = method("_establishPropagationLink()");
+    assert.equal(count(linkListener(establish, "close"), /this\._distroUploads\.cut\("the propagation link closed before the propagation node proved it", link\);/g), 1,
+        "the propagation link's own close (James, 2026-10-03)");
+    const disconnect = method("disconnect()");
+    assert.equal(count(disconnect, /this\._distroUploads\.cut\("the connection stopped before the propagation node proved it"\);/g), 1, "disconnect()");
+    assert.match(disconnect, /const propLink = this\._propLink;\s*this\._propLink = null;\s*try \{ propLink\?\.close\(\); \} catch\(e\) \{\}/,
+        "disconnect() lets go of the propagation link before it closes it");
+    assert.doesNotMatch(disconnect, /\bawait\b|\.then\(/,
+        "and in its cut's own task, so no decision's outcome finds a newer link that is the propagation link");
+
+    // Nothing else closes a propagation link, or fires a link's close or a loss report.
+    assert.deepEqual([...code.matchAll(/([\w$]+(?:\.[\w$]+)*)\s*(?:\?\.|\.)\s*close\s*\(/g)].map((m) => m[1]),
+        ["existing.link", "link", "link", "entry.link", "propLink", "GroupStore"],
+        "today's closes: a group link, a refused rfed.link, disconnect()'s rfed.links, group links and the propagation link it let go of, and a group. "
+        + "A close of a propagation link decides the uploads on it, and a newer link up sends them at once (the third ruling): only its own close may");
+    assert.doesNotMatch(code, /_linkClosed/, "the page never runs a link's close for it");
+    const fired = [...code.matchAll(/\.\s*emit\s*(\?\.)?\s*\(\s*([^,)]*)/g)].map((m) => m[2].trim());
+    assert.ok(fired.every((name) => !["\"close\"", "\"lost\""].includes(name)), `app.js fires no link's close and no loss report: ${fired.join(", ")}`);
+    const lib = new URL("./lib/", import.meta.url);
+    const scripts = (await readdir(lib, { recursive: true })).filter((f) => f.endsWith(".js"));
+    assert.ok(scripts.includes("distro_upload.js") && scripts.includes("rns/link.js") && scripts.includes("rns/interfaces/post_interface.js"));
+    const named = /_uploadOwed|_oweDistro|_sendDistroSentCopy|_sendDistroChannelSync|_syncChannelMembership|_onPacketsLost|_distroUploads|goesOn/;
+    for (const file of scripts) {
+        const source = withoutComments(await readFile(new URL(file, lib), "utf8"));
+        assert.doesNotMatch(source, named, `lib/${file}`);
+        assert.equal(count(source, /\bemit\s*\(\s*["'`]lost["'`]/g), file === "rns/interfaces/post_interface.js" ? 1 : 0,
+            `lib/${file}: only the exchange reports packets lost`);
+    }
+    const linkSource = withoutComments(await readFile(new URL("rns/link.js", lib), "utf8"));
+    assert.equal(count(linkSource, /\bemit\s*\(\s*["'`]close["'`]/g), 1, "a Link fires its close once in its code");
+    assert.match(extractMethod(linkSource, "_linkClosed()"), /\bthis\.emit\("close"\);/, "a Link fires its close when it closes, and only then");
+    const uploads = withoutComments(await readFile(new URL("distro_upload.js", lib), "utf8"));
+    assert.equal(count(uploads, /\bonLost\b/g), 2, "an upload's onLost: made empty, and told only by lost()");
+    assert.match(extractMethod(uploads, "lost(upload, why)"), /upload\.reject\(new Error\(why\)\);\s*upload\.onLost\?\.\(\);/);
+    assert.equal(count(uploads, /\blost\s*\(/g), 2, "lost(): itself, and cut()'s call");
+    assert.match(extractMethod(uploads, "cut(why, link = null)"), /if \(this\.lost\(upload, why\)\) cut\+\+;/);
+    for (const page of ["index.html", "debug.html", "debug-standalone.html"]) {
+        assert.doesNotMatch(await readFile(new URL(`./${page}`, import.meta.url), "utf8"), named, page);
+    }
+
+    // The user's own action: _oweDistro owes a message packed in that same call, from the user's join, leave or DM.
+    assert.equal(count(code, /_oweDistro/g), 3, "the method and its two calls");
+    for (const signature of ["async _sendDistroSentCopy(recipientHex, title, content)", "_sendDistroChannelSync(op, ch, atMs)"]) {
+        const body = method(signature);
+        assert.equal(count(body, /_oweDistro/g), 1, signature);
+        assert.match(body, /const msg = new LXMessage\(\);[\s\S]*const packed = msg\.pack\(DistroManager\.identity, false\);\s*this\._oweDistro\(\{[^}]*\bpacked: Buffer\.from\(packed\)\.toString\("base64"\),/,
+            `${signature} owes the message it has just packed`);
+    }
+    assert.equal(count(code, /_sendDistroSentCopy/g), 2, "made in a DM's dispatch alone");
+    assert.equal(count(method("_dispatchMessage(contact, outMsg)"), /_sendDistroSentCopy/g), 1);
+    assert.equal(count(code, /_sendDistroChannelSync/g), 2, "made for the user's own join or leave alone");
+    const membership = method("_syncChannelMembership(op, ch)");
+    assert.match(membership, /const atMs = ChannelMembershipStore\.stampLocal\(ch\.channelHash, op, Date\.now\(\)\);[\s\S]*this\._sendDistroChannelSync\(op, ch, atMs\);/,
+        "each action stamped after any before it on the channel, so its message is a new one");
+    assert.equal(count(membership, /_sendDistroChannelSync/g), 1);
+    assert.equal(count(code, /_syncChannelMembership/g), 3, "the user's join and leave");
+    assert.equal(count(method("async joinChannel(channelName)"), /this\._syncChannelMembership\("join", ch\);/g), 1);
+    assert.equal(count(method("async leaveChannel(channelName)"), /this\._syncChannelMembership\("leave", ch\);/g), 1);
+});
+
 // Link events are delivered on a later macrotask (utils/events.js defers every
 // listener with setTimeout 0). A timer queued after the event has fired runs
 // after its listeners, so awaiting one observes their effects deterministically.

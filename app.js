@@ -3172,11 +3172,12 @@ const RnsClient = {
         // proof over it settles the entry, with one upload, one stamp and
         // one fan-out. While it is open, no flush uploads its entry on any
         // link, the new one included (_distroAttemptOpen). If the old link's
-        // own "close" below (it fires for a superseded link too), or the
-        // exchange's report that its packet was lost, then finds it not
-        // proved while a newer propagation link is up, that is the event:
-        // the entry goes once on the newer link at once (_uploadOwed). With
-        // no newer link up, it waits for the next coming-up. Retichat-js
+        // own "close" below (it fires for a superseded link too) then finds
+        // it not proved while a newer propagation link is up, that close is
+        // the event: the entry goes once on the newer link at once
+        // (_uploadOwed). The exchange's report that its packet was lost
+        // counts the same as that close (James, 2026-10-04). With no newer
+        // link up, it waits for the next coming-up. Retichat-js
         // 3411e19 counted the replacement as the upload's failure and
         // uploaded the entry on the new link at once; when the node proved
         // the first upload over the old link after all, one C went twice,
@@ -4325,6 +4326,13 @@ const RnsClient = {
      * against. The link is kept up by its persistent re-open, the node's
      * announces (_initPropagation) and page resumes, and by M's own
      * propagation timer, so what is owed rides the next one.
+     *
+     * It is the user's own action, and is called only with a message packed
+     * in that action (_sendDistroSentCopy, _sendDistroChannelSync), never one
+     * already owed: it uploads at once, reading no failure record
+     * (_uploadOwed). distro_sent_sync.test.mjs fails if anything else names
+     * it (verifier of 2683ea4, RX3: owing every entry again on an announce
+     * was caught only because another test's stand-in has no outbox).
      */
     _oweDistro(entry) {
         // The message this one replaces (an earlier join or leave of the
@@ -4473,11 +4481,23 @@ const RnsClient = {
      * DESIGN_PRINCIPLES §3's decided exception for what a device owes its
      * distro (James, 2026-10-03; RFed SPEC §17.12). One exception, also
      * James's: an upload on a STALE link that a newer propagation link
-     * replaced, decided by the old link's own close or the exchange's
-     * report that its packet was lost while the newer link is up, goes once
-     * on the newer link at once: that close is the event (the newer link's
-     * own coming-up passed while it was open). A failure of that upload is
-     * like any other. Each outcome is said (_distroOwedOutcome).
+     * replaced, decided not proved by the old link's own close while the
+     * newer link is up, goes once on the newer link at once: that close is
+     * the event (James, 2026-10-03; the newer link's own coming-up passed
+     * while it was open). The exchange's report that its packet was lost
+     * counts the same as that close (James, 2026-10-04). A Resource's own
+     * failure is decided the same way as the code stands, and no ruling
+     * names it yet (verifier of 2683ea4). A failure of that upload is like
+     * any other. Each outcome is said (_distroOwedOutcome).
+     *
+     * Its callers are today's three and no other: the coming-up pass
+     * (_sendDistroOutbox), the user's own action (_oweDistro) and that send
+     * on a replaced link's decision, below. Called without a coming-up it
+     * reads no failure record, so any other caller would send an upload
+     * again on its own failure. distro_sent_sync.test.mjs fails if anything
+     * else names it, or reaches one of the three by a new path (verifier of
+     * 2683ea4, RX1: an announce that uploaded every owed entry through it
+     * passed every test).
      */
     async _uploadOwed(link, entry, comingUp = null) {
         const flight = { link, packed: entry.packed };
@@ -4559,14 +4579,17 @@ const RnsClient = {
         // on this link or on one that replaces it (_distroAttemptOpen).
         flight.upload = upload;
         // Told in the task of the event that decides it (the exchange's
-        // loss report, a link's close, disconnect()), before anything else
-        // runs: its failure is recorded then, and so is the newer
-        // propagation link that had replaced its link while STALE, if any.
-        // If that link is up and still the propagation link once the
+        // loss report, a link's close, a Resource's failure, disconnect()),
+        // before anything else runs: its failure is recorded then, and so is
+        // the newer propagation link that had replaced its link while STALE,
+        // if any. If that link is up and still the propagation link once the
         // decision's task is done (disconnect() lets go of it), this
-        // decision is the event, and the entry goes once on it (James,
-        // 2026-10-03). On the current link, or with no newer link up, it
-        // waits for the next coming-up.
+        // decision is the event, and the entry goes once on it: the old
+        // link's close (James, 2026-10-03), and the exchange's report that
+        // its packet was lost, which counts the same as that close (James,
+        // 2026-10-04). A Resource's failure is taken the same way, which no
+        // ruling names yet. On the current link, or with no newer link up,
+        // it waits for the next coming-up.
         let goesOn = null;
         const decided = () => {
             unproved();
