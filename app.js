@@ -63,7 +63,7 @@ import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.j
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
@@ -2167,16 +2167,22 @@ const RnsClient = {
     // flush of what the distro is owed, which takes the new value
     // (_sendDistroOutbox).
     _propComingUps: 0,
-    // id → { packed, at }: the owed entries whose last upload (or its build)
-    // was decided not proved, and the value of _propComingUps when it was.
-    // A flush taken at value G uploads such an entry only if `at` < G: a
-    // failure waits for the next coming-up, even when a flush is already
-    // running on the link that is up (James, 2026-10-03; DESIGN_PRINCIPLES
-    // §3, what a device owes its distro). Until then a flush under way
-    // uploaded at once an entry whose upload, made outside that flush (the
-    // user's own, or one on a replaced link), was decided while the flush
-    // built an earlier entry: a retry on the failure alone.
-    _distroUnproved: new Map(),
+    // The messages owed whose last upload (or its build) was decided not
+    // proved, each with the value of _propComingUps when it was
+    // (lib/distro_outbox.js UnprovedUploads). A flush taken at value G
+    // uploads such a message only if its record is below G: a failure
+    // waits for the next coming-up, even when a flush is already running
+    // on the link that is up (James, 2026-10-03; DESIGN_PRINCIPLES §3, what
+    // a device owes its distro). Until then a flush under way uploaded at
+    // once an entry whose upload, made outside that flush (the user's own,
+    // or one on a replaced link), was decided while the flush built an
+    // earlier entry: a retry on the failure alone. A record is one
+    // message's, never its channel's: a join's upload decided after the
+    // leave that replaced it was reported lost must not take the leave's
+    // record (review of 367b266, VR4-OW). Only a message owed has one
+    // (_uploadOwed, _oweDistro, _dropMembershipOwedToOtherDistros), and it
+    // lives in this page's memory alone.
+    _distroUnproved: new UnprovedUploads(),
     _groupLinks: new Map(),
     _groupLinkPromises: new Map(),
     _groupPeerReady: new Set(),
@@ -4314,6 +4320,11 @@ const RnsClient = {
      * propagation timer, so what is owed rides the next one.
      */
     _oweDistro(entry) {
+        // The message this one replaces (an earlier join or leave of the
+        // channel) is owed no more: its failure record, if any, goes with
+        // it, and only its own (_distroUnproved).
+        const replaced = DistroOutboxStore.get(entry.id);
+        if (replaced && replaced.packed !== entry.packed) this._distroUnproved.forget(replaced);
         if (!DistroOutboxStore.put(entry)) {
             // Storage refused it (a full localStorage): this page holds it,
             // and it goes when the propagation link is up while the page is
@@ -4425,14 +4436,15 @@ const RnsClient = {
     },
 
     /**
-     * Whether the last upload of the owed `entry` (its build included) was
-     * decided not proved at coming-up `comingUp` of the propagation link or
-     * later (_distroUnproved): a flush taken at `comingUp` does not upload
-     * it, and the next coming-up does.
+     * Whether the last upload of the owed message `entry` (its build
+     * included) was decided not proved at coming-up `comingUp` of the
+     * propagation link or later (_distroUnproved): a flush taken at
+     * `comingUp` does not upload it, and the next coming-up does. Only that
+     * message's own record is read, never that of another action under
+     * the same id.
      */
     _unprovedSince(entry, comingUp) {
-        const unproved = this._distroUnproved.get(entry.id);
-        return unproved?.packed === entry.packed && unproved.at >= comingUp;
+        return this._distroUnproved.since(entry, comingUp);
     },
 
     /**
@@ -4467,13 +4479,19 @@ const RnsClient = {
         // That is the coming-up current then, never the one of the flush
         // that made this upload (`comingUp`): a later flush, under way on
         // the same link when the failure is decided, must leave it for the
-        // next coming-up (review of 74fbbcd, RV1).
-        const unproved = () => this._distroUnproved.set(entry.id, { packed: entry.packed, at: this._propComingUps });
-        // Proved: its record goes, and only its own (a later action on the
-        // channel, under the same id, keeps the record of its failure).
-        const proved = () => {
-            if (this._distroUnproved.get(entry.id)?.packed === entry.packed) this._distroUnproved.delete(entry.id);
+        // next coming-up (review of 74fbbcd, RV1). It is this message's
+        // record, and only while this message is the one owed under its
+        // id: a decision about it never replaces or clears the record of
+        // another action on the channel. Review of 367b266 (VR4-OW): the
+        // record was the channel's, so a join's upload, open on a replaced
+        // link and decided after the upload of the leave that replaced it
+        // was reported lost, replaced the leave's record, and a flush under
+        // way uploaded the leave again at once on its own failure.
+        const unproved = () => {
+            if (DistroOutboxStore.get(entry.id)?.packed === entry.packed) this._distroUnproved.record(entry, this._propComingUps);
         };
+        // Proved (late, too): owed no more, its record goes, and only its own.
+        const proved = () => this._distroUnproved.forget(entry);
         // The distro the entry was made for: a sent-copy is still owed to it
         // after this device gives it up (James, 2026-10-03), and is never
         // encrypted to another. An entry kept before entries carried the
@@ -4617,7 +4635,7 @@ const RnsClient = {
     _dropMembershipOwedToOtherDistros() {
         const held = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
         for (const entry of DistroOutboxStore.dropMembershipNotFor(held)) {
-            if (this._distroUnproved.get(entry.id)?.packed === entry.packed) this._distroUnproved.delete(entry.id);
+            this._distroUnproved.forget(entry);
             const flight = this._distroOutboxInFlight.get(entry.id);
             const onTheWire = flight?.packed === entry.packed && !!flight.upload && !flight.upload.settled;
             console.warn(`[distro] ⚠️ ${entry.label} was owed to ${entry.distro.slice(0,8)}, a distro this device no longer holds — dropped: this device sends it no more`

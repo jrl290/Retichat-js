@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DistroOutbox, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { memoryStorage } from "./test_app_source.mjs";
 
 const D = "d".repeat(32);
@@ -199,4 +199,28 @@ test("what is stored and is not an entry is ignored, and a malformed entry is re
         entry("channel:x", "QUJD", { label: 7 })]) {
         assert.throws(() => box.put(bad), /not an entry the distro can be owed/);
     }
+});
+
+test("UnprovedUploads: a failure record is one message's (its id and its bytes); recording, reading or forgetting one never touches another's, the same channel's included", () => {
+    // Review of 367b266 (verifier probe VR4-OW): the record was kept per
+    // id, so the join's failure, decided after the leave's, replaced the
+    // leave's record (app.js _uploadOwed; distro_channels.test.mjs).
+    const unproved = new UnprovedUploads();
+    const join = entry("channel:aa", "AAAA");
+    const leave = entry("channel:aa", "CCCC", { op: "leave", at: 2 });
+    const other = entry("channel:bb", "AAAA");
+    assert.deepEqual([unproved.at(leave), unproved.since(leave, 0), unproved.size], [undefined, false, 0]);
+    unproved.record(leave, 3);
+    unproved.record(join, 4);              // the older action's, decided later
+    unproved.record(other, 1);             // the same bytes under another id
+    assert.deepEqual([unproved.at(join), unproved.at(leave), unproved.at(other), unproved.size], [4, 3, 1, 3]);
+    assert.deepEqual([3, 4].map((comingUp) => unproved.since(leave, comingUp)), [true, false], "a flush taken at 3 leaves the leave; one taken at 4 sends it");
+    unproved.record(leave, 5);             // the same message decided again, later
+    assert.equal(unproved.at(leave), 5);
+    unproved.forget(join);                 // the join proved, late
+    assert.deepEqual([unproved.at(join), unproved.at(leave), unproved.at(other), unproved.size], [undefined, 5, 1, 2]);
+    unproved.forget(join);                 // nothing left of it to forget
+    unproved.forget(leave);
+    unproved.forget(other);
+    assert.equal(unproved.size, 0);
 });

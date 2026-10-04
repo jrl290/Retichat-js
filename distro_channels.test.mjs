@@ -52,7 +52,7 @@ import {
     readChannelSync, supersedes,
 } from "./lib/channel_sync.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { app, build, compile, install, methodBody, memoryStorage } from "./test_app_source.mjs";
 
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
@@ -197,7 +197,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         openChannel: async () => {},
         // Every propagation link this device had, oldest first; _propLink
         // is the current one.
-        _propLinks: [], _propLink: null, _distroOutboxInFlight: new Map(), _propComingUps: 0, _distroUnproved: new Map(),
+        _propLinks: [], _propLink: null, _distroOutboxInFlight: new Map(), _propComingUps: 0, _distroUnproved: new UnprovedUploads(),
         _buildPropagationPacked: async (packed) => packed,
         _exchangeIsDown: () => false,
         _ensureChannelStreamConfigured: async () => {},
@@ -2407,6 +2407,242 @@ test("a replaced link's close while the newer link's 'established' flush builds 
     await settle();
     assert.deepEqual(a.owed(), []);
     assert.deepEqual(a.sentEvents().map(([, name]) => name).sort(), [CH, "public.yyy"].sort());
+});
+
+// A failure record belongs to one message (lib/distro_outbox.js
+// UnprovedUploads): a decision about one message never replaces or clears
+// another's record. Review of 367b266 (verifier probe VR4-OW): the record
+// was kept per channel id and written whatever it held. When the upload of
+// an older action, open on a replaced link, was decided after the upload of
+// the newer action on the same channel had been reported lost, the older
+// one's record replaced the newer one's; the flush under way, building an
+// earlier entry, then found no record of the newer message and uploaded it
+// again at once, on its own failure alone, after the log had said it would
+// wait for the next coming-up.
+
+/** Names for the messages `d` owes, and what each upload of `d` carried by
+ *  those names. */
+function messageNames(d) {
+    const names = new Map();
+    const of = (packed) => names.get(Buffer.from(packed).toString("base64")) ?? "?";
+    return {
+        /** The entry owed last (the newest), named `name`; returned. */
+        name(name) {
+            const entry = d.env.DistroOutboxStore.list().at(-1);
+            names.set(entry.packed, name);
+            return entry;
+        },
+        of,
+        went: () => d.uploads.map(of),
+    };
+}
+
+const R2 = "fedcba9876543210fedcba9876543210";
+
+for (const [kind, makeOlder, makeNewer] of [
+    ["a join, then a leave of the same channel", (a) => a.self.joinChannel(CH), (a) => a.self.leaveChannel(CH)],
+    ["a §17.11 sent-copy, then another", (a) => a.self._sendDistroSentCopy(R1, "", "the first"), (a) => a.self._sendDistroSentCopy(R2, "", "the second")],
+]) {
+    const sameChannel = kind.startsWith("a join");
+    for (const [when, before, after] of [
+        ["closed after", null, "close"],
+        ["reported lost after", null, "lost"],
+        ["closed before", "close", null],
+        ["proved after", null, "proved"],
+        ["reported lost before and proved late after", "lost", "proved"],
+    ]) {
+        test(`${kind}: the older one's upload, open on a replaced link, ${when} the newer one's upload is reported lost while a flush that lists the newer builds an earlier entry: that flush does not upload the newer, which goes once on the next coming-up`, async (t) => {
+            const clock = fakeClock(t);
+            const distro = Identity.create();
+            const a = device(distro, { linkUp: false, proofs: "manual" });
+            const n = messageNames(a);
+            const unproved = a.self._distroUnproved;
+            const links = shippedLinks(a);
+            const first = links.attempt();
+            await links.up(first);                                // coming-up 1
+            await a.self.joinChannel("public.yyy");               // Y, on the first link (key 0)
+            await settle();
+            n.name("Y");
+            a.self._onPacketsLost({ packetHashes: [a.proofKeys[0]], reason: "the exchange failed" });
+            await settle();
+            await makeOlder(a);                                    // on the first link (key 1); its proof does not come
+            await settle();
+            const older = n.name("older");
+            // The node's proof of that upload, taken now: the test's builds
+            // are the bytes themselves, so a later upload of the same
+            // message has the same proof key.
+            const olderProof = a.self._pendingPacketHashes.get(a.proofKeys[1]);
+            first.status = 0x03;                                   // STALE
+            const second = links.attempt();                        // replaced, which decides nothing
+            await links.up(second);                                // coming-up 2: Y goes (key 2); the older is open, left to its link
+            assert.deepEqual(n.went(), ["Y", "older", "Y"]);
+            a.self._onPacketsLost({ packetHashes: [a.proofKeys[2]], reason: "the exchange failed" });
+            await settle();
+            clock.now += 10;
+            await makeNewer(a);                                    // at once, on the second link (key 3)
+            await settle();
+            const newer = n.name("newer");
+            assert.deepEqual(n.went(), ["Y", "older", "Y", "newer"]);
+            assert.equal(a.owed().length, sameChannel ? 2 : 3, sameChannel ? "the leave replaced the join" : "both sent-copies are owed");
+            const hold = holdFirstBuild(a);
+            await links.recover(second);                           // coming-up 3: lists Y first, and mines Y's stamp
+            assert.deepEqual(hold.built, ["join public.yyy"]);
+            const decideOlder = async (how) => {
+                if (how === "close") await links.close(first);    // its watchdog's teardown
+                else if (how === "lost") {
+                    a.self._onPacketsLost({ packetHashes: [a.proofKeys[1]], reason: "the exchange failed for the older" });
+                    await settle();
+                } else {
+                    olderProof.onProof(olderProof.messageId);       // over the first link, which kept its grace
+                    await settle();
+                }
+            };
+            if (before) await decideOlder(before);
+            a.self._onPacketsLost({ packetHashes: [a.proofKeys[3]], reason: "the exchange failed for the newer" });
+            await settle();
+            if (after) await decideOlder(after);
+            assert.ok(a.logged.some(([level, line]) => level === "warn"
+                && line.includes("(the exchange failed for the newer) — still owed: it goes when the propagation link is next up")), JSON.stringify(a.logged));
+            hold.release();
+            for (let i = 0; i < 4; i++) await settle();
+            // A sent-copy still owed whose upload is decided lost while the
+            // newer link is up goes once on that link at once (James,
+            // 2026-10-03, R3); a join the leave replaced goes no more.
+            const r3 = !sameChannel && when !== "proved after";
+            assert.deepEqual(n.went().slice(4), r3 ? ["older", "Y"] : ["Y"], "Y goes; the newer is not uploaded again by this flush");
+            assert.deepEqual(hold.built, r3 ? ["join public.yyy", "sent-copy"] : ["join public.yyy"], "and no stamp is mined for it");
+            assert.equal(unproved.at(newer), 3, "the newer one's failure, at coming-up 3, is its own record");
+            if (sameChannel) assert.equal(unproved.at(older), undefined, "the join, owed no more, keeps no record");
+            await links.recover(second);                           // coming-up 4
+            assert.deepEqual(n.went().slice(r3 ? 6 : 5), ["newer"], "the newer goes once, on the next coming-up");
+            for (const key of a.proofKeys.slice(4)) assert.equal(a.prove(key), true);
+            await settle();
+            assert.deepEqual(a.owed(), []);
+            assert.equal(unproved.size, 0, "no record is kept for a message owed no more");
+        });
+    }
+}
+
+test("an older action's build that throws after the newer action's upload on the same channel was reported lost changes nothing for the newer: the flush under way that lists it does not upload it, and it goes once on the next coming-up", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const n = messageNames(a);
+    const unproved = a.self._distroUnproved;
+    const link = a.self._propLink;
+    link.status = 0x03;                       // STALE: what is made now is owed, not uploaded
+    await a.self.joinChannel(CH);
+    const join = n.name("join");
+    await a.self.joinChannel("public.yyy");
+    n.name("Y");
+    // Build 0 (the join's, in the first flush) and build 2 (Y's, in the
+    // second) are held; any other finishes at once.
+    const builds = [];
+    a.self._buildPropagationPacked = (packed) => {
+        const build = { packed };
+        builds.push(build);
+        if (builds.length !== 1 && builds.length !== 3) return Promise.resolve(packed);
+        return new Promise((resolve, reject) => Object.assign(build, { resolve: () => resolve(packed), reject }));
+    };
+    const built = () => builds.map((b) => n.of(b.packed));
+    link.status = 0x02;
+    const flush1 = a.self._sendDistroOutbox(link, "recovered");     // coming-up 1: lists [join, Y]; the join's build is held
+    await settle();
+    clock.now += 10;
+    await a.self.leaveChannel(CH);           // replaces the join, and goes at once (key 0)
+    await settle();
+    const leave = n.name("leave");
+    assert.deepEqual(n.went(), ["leave"]);
+    const flush2 = a.self._sendDistroOutbox(link, "recovered");     // coming-up 2: lists [Y, leave]; Y's build is held
+    await settle();
+    assert.deepEqual(built(), ["join", "leave", "Y"]);
+    a.self._onPacketsLost({ packetHashes: [a.proofKeys[0]], reason: "the exchange failed" });   // the leave's upload, lost
+    await settle();
+    builds[0].reject(new Error("the join's build threw"));         // the join's, decided after it
+    await settle();
+    builds[2].resolve();
+    await flush1;
+    await flush2;
+    await settle();
+    // Review of 367b266 (VR4-OW, through the build's failure): the join's
+    // record replaced the leave's, and flush 2 uploaded the leave again.
+    assert.deepEqual(n.went(), ["leave", "Y"], "the flush under way does not upload the leave again");
+    assert.deepEqual(built(), ["join", "leave", "Y"], "nor mines a stamp for it");
+    assert.deepEqual([unproved.at(join), unproved.at(leave)], [undefined, 2], "the join, owed no more, keeps no record; the leave keeps its own");
+    await a.self._sendDistroOutbox(link, "recovered");             // coming-up 3
+    await settle();
+    assert.deepEqual(n.went(), ["leave", "Y", "leave"], "it goes once on the next coming-up");
+    for (const key of a.proofKeys.slice(1)) assert.equal(a.prove(key), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+    assert.equal(unproved.size, 0);
+});
+
+test("D given up while a flush builds an earlier entry: the drop takes only the records of the membership messages it drops; a sent-copy reported lost meanwhile is not uploaded by that flush, and goes once, to D, on the next coming-up", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const n = messageNames(a);
+    const unproved = a.self._distroUnproved;
+    const link = a.self._propLink;
+    await a.self.joinChannel("public.yyy");                         // Y (key 0)
+    await settle();
+    const y = n.name("Y");
+    a.self._onPacketsLost({ packetHashes: [a.proofKeys[0]], reason: "the exchange failed" });
+    await settle();
+    await a.self._sendDistroSentCopy(R1, "", "sent as D");          // S, at once (key 1)
+    await settle();
+    const s = n.name("S");
+    const hold = holdFirstBuild(a);
+    const flush = a.self._sendDistroOutbox(link, "recovered");      // coming-up 1: lists [Y, S]; Y's build is held
+    await settle();
+    assert.deepEqual(hold.built, ["join public.yyy"]);
+    a.self._onPacketsLost({ packetHashes: [a.proofKeys[1]], reason: "the exchange failed for S" });
+    await settle();
+    assert.deepEqual([unproved.at(y), unproved.at(s)], [0, 1]);
+    changeDistro(a, null);                    // D forgotten: Y, a membership message, is dropped; S stays owed
+    assert.deepEqual([unproved.at(y), unproved.at(s)], [undefined, 1], "Y's record goes with Y, and S keeps its own");
+    hold.release();
+    await flush;
+    await settle();
+    assert.deepEqual(n.went(), ["Y", "S"], "Y, dropped, is not sent; S is not uploaded again by this flush");
+    assert.deepEqual(hold.built, ["join public.yyy"], "no stamp is mined for S");
+    await a.self._sendDistroOutbox(link, "recovered");              // coming-up 2
+    await settle();
+    assert.deepEqual(n.went(), ["Y", "S", "S"], "S goes once, on the next coming-up");
+    assert.equal(a.uploads.at(-1).subarray(0, 16).toString("hex"), lxmfHash(distro), "to D, the distro it was made for");
+    assert.equal(a.prove(a.proofKeys[2]), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+    assert.equal(unproved.size, 0);
+});
+
+test("a message's failure record goes when the message is owed no more: a failed join replaced by a leave leaves no record behind, and the leave's failure is its own record", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const n = messageNames(a);
+    const unproved = a.self._distroUnproved;
+    await a.self.joinChannel(CH);                                    // key 0
+    await settle();
+    const join = n.name("join");
+    a.self._onPacketsLost({ packetHashes: [a.proofKeys[0]], reason: "the exchange failed" });
+    await settle();
+    assert.deepEqual([unproved.at(join), unproved.size], [0, 1]);
+    clock.now += 10;
+    await a.self.leaveChannel(CH);                                   // replaces the join; at once (key 1)
+    await settle();
+    const leave = n.name("leave");
+    assert.deepEqual([unproved.at(join), unproved.size], [undefined, 0], "the join's record goes with the join");
+    a.self._onPacketsLost({ packetHashes: [a.proofKeys[1]], reason: "the exchange failed again" });
+    await settle();
+    assert.deepEqual([unproved.at(leave), unproved.size], [0, 1]);
+    await a.self._sendDistroOutbox(a.self._propLink, "recovered");  // coming-up 1
+    await settle();
+    assert.deepEqual(n.went(), ["join", "leave", "leave"]);
+    assert.equal(a.prove(a.proofKeys[2]), true);
+    await settle();
+    assert.deepEqual([a.owed(), unproved.size], [[], 0]);
 });
 
 test("a failure decided in the same task as the next coming-up, before it, is taken by that coming-up's flush", async (t) => {

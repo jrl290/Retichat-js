@@ -30,7 +30,7 @@ import Packet from "./lib/rns/packet.js";
 import { decodePayload as decodeDisplayName } from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { install, memoryStorage } from "./test_app_source.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -151,7 +151,7 @@ function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
         _propLink: linkUp ? link : null,
         _distroOutboxInFlight: new Map(),
         _propComingUps: 0,
-        _distroUnproved: new Map(),
+        _distroUnproved: new UnprovedUploads(),
         _ensurePropagationLink: async () => { throw new Error("the copy must not start the propagation link"); },
         _establishPropagationLink: () => { throw new Error("the copy must not start the propagation link"); },
         // Identity passthrough so the test can read the LXMF bytes back.
