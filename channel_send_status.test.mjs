@@ -124,7 +124,7 @@ function client({ subscribe = async () => null, pair = {} } = {}) {
         "async sendChannelMessage(channelName, content)",
         "_setChannelPostStatus(channelName, msgId, status)",
         "_handleChannelPacket(packetData)",
-        "_onPacketsLost({ packetHashes, reason })",
+        "_onPacketsLost({ packetHashes, reason, unsent = [] })",
         "_onRfedLinkPush(link, requestId, pathHash, data)",
     ]);
     // _ensureRfedLink's own wiring of rfed.link: the node's pushes.

@@ -2182,7 +2182,12 @@ const RnsClient = {
     // leave that replaced it was reported lost must not take the leave's
     // record (review of 367b266, VR4-OW). Only a message owed has one
     // (_uploadOwed, _oweDistro, _dropMembershipOwedToOtherDistros), and it
-    // lives in this page's memory alone.
+    // lives in this page's memory alone. The same object holds, apart from
+    // the failures, the messages whose last upload never left the device
+    // (James, 2026-10-06): nothing was sent, so that is no failure, it has
+    // no coming-up, and it goes at the next coming-up like a message not yet
+    // uploaded, and when the exchange is back (_sendDistroNeverLeft). Its
+    // forget() ends both.
     _distroUnproved: new UnprovedUploads(),
     _groupLinks: new Map(),
     _groupLinkPromises: new Map(),
@@ -2448,6 +2453,16 @@ const RnsClient = {
         // connection's first "up" is not one: that is initialization, which
         // the registration and the announces drive (§5).
         //
+        // That return is also the event that sends what is owed to the
+        // distro and never left the device while the exchange was down
+        // (_sendDistroNeverLeft; James, 2026-10-06, DESIGN_PRINCIPLES §3,
+        // what a device owes its distro): nothing was sent, so it was no
+        // failure, and a short outage leaves the propagation link up, so no
+        // coming-up follows to send it. It is the interface's own up-edge,
+        // not the window's "online", which says only that the browser has a
+        // network: that makes the interface check (PostInterface.check), and
+        // the "up" it then emits, if the exchange answers, is this.
+        //
         // Neither moves the status once this connection's exchange is found
         // blocked by the page's policy (exchangeBlocked, _exchangeIsBlocked):
         // it stays "blocked". The interface's events are heard on a later
@@ -2464,7 +2479,10 @@ const RnsClient = {
             const back = wasUp && wentDown;
             wasUp = true;
             wentDown = false;
-            if (back) this._onPageResume("exchange back");
+            if (back) {
+                this._onPageResume("exchange back");
+                this._sendDistroNeverLeft("exchange back");
+            }
         });
         iface.on("down", () => {
             if (!current() || this.exchangeBlocked) return;
@@ -4165,15 +4183,27 @@ const RnsClient = {
      * taken the batch after all, outranks that failure
      * (lib/channel_publish.js). Link keepalives, proofs and other requests
      * are left to the link protocol.
+     *
+     * `unsent` is the part of `packetHashes` the exchange says went into no
+     * request (PostInterface "lost": refused while it was down or blocked,
+     * or still queued when an exchange failed). Only an upload for the
+     * distro reads it: nothing of it was sent, so it is no loss and no
+     * failure (James, 2026-10-06, DESIGN_PRINCIPLES §3, what a device owes
+     * its distro). A DM, a channel post and the rest are lost as ever.
      */
-    _onPacketsLost({ packetHashes, reason }) {
+    _onPacketsLost({ packetHashes, reason, unsent = [] }) {
         for (const packetHash of packetHashes) {
             const pending = this._pendingPacketHashes.get(packetHash.slice(0, 32));
             if (pending?.distroUpload) {
                 // An upload for the distro (_uploadForDistro): it will never
-                // be proved, and its sender says so. A proof that still
+                // be proved, and its sender says so. One the exchange never
+                // sent is said so (DistroUploads.neverLeft: no failure; it
+                // goes when the exchange is back, _sendDistroNeverLeft, or at
+                // the next coming-up); one lost after it left is a loss, and
+                // waits for the next coming-up alone. A proof that still
                 // arrives is logged, and changes nothing.
-                this._distroUploads.lost(pending.distroUpload, `its packet was lost (${reason})`);
+                if (unsent.includes(packetHash)) this._distroUploads.neverLeft(pending.distroUpload, `its packet never left: ${reason}`);
+                else this._distroUploads.lost(pending.distroUpload, `its packet was lost (${reason})`);
                 continue;
             }
             if (pending?.channelPost) {
@@ -4415,7 +4445,11 @@ const RnsClient = {
      *     is already running on the link that is up.
      * That second upload of an unproved entry is the retry §3 allows for
      * these two messages alone, on the link's coming up and nothing else,
-     * and only the newest action per channel is owed. A membership message
+     * and only the newest action per channel is owed. An entry whose last
+     * upload never left the device (the exchange could not carry its packet:
+     * _onPacketsLost) has no failure record, so it goes here like one never
+     * uploaded; the exchange's return sends it too (_sendDistroNeverLeft;
+     * James, 2026-10-06). A membership message
      * owed to a distro this device no longer holds is dropped, saying so
      * (_dropMembershipOwedToOtherDistros); a sent-copy stays owed to the
      * distro it was made for. The uploads are built one after the other (a
@@ -4469,6 +4503,53 @@ const RnsClient = {
     },
 
     /**
+     * The exchange is back (`trigger`: "exchange back", from _followExchange:
+     * its "up" after a "down", the web's interface up-edge): upload on the
+     * propagation link, if it is up, what is owed to the distro and never
+     * left the device, because the exchange could not carry its packet (it
+     * refused it while down, or it was still queued when an exchange failed:
+     * _onPacketsLost, DistroUploads.neverLeft; _distroUnproved holds which
+     * messages). Nothing was sent, so it was no failure and waits for no
+     * coming-up. A short outage leaves the propagation link up, so none would
+     * follow (James, 2026-10-06, DESIGN_PRINCIPLES §3, what a device owes its
+     * distro; on staging an Android phone's upload waited 35 s for an
+     * unrelated close). It is an event like the others: no timer, and only
+     * _followExchange calls it (distro_sent_sync.test.mjs pins that).
+     *
+     * It is not a coming-up and counts none (_propComingUps), so no failure
+     * is released by it: it sends only what is recorded as never left, and a
+     * loss after the packet left still waits for the next coming-up. With the
+     * propagation link not up (down, STALE, or coming up) there is nothing to
+     * do: its coming-up sends these with everything else owed
+     * (_sendDistroOutbox: a never-left message has no failure record). Each is
+     * checked again when its turn comes, as a flush's are (a build yields): a
+     * flush at a coming-up that began meanwhile may have uploaded it, or
+     * another return begun before this one ended it (_uploadOwed ends the
+     * record when an upload of the message begins), so none goes twice, and
+     * one with an attempt open is left to it (_distroAttemptOpen). Never
+     * rejects.
+     */
+    async _sendDistroNeverLeft(trigger) {
+        const link = this._propLink;
+        if (!this._rns || !ActiveTab.held || link?.status !== Link.ACTIVE) return;
+        try {
+            const owed = DistroOutboxStore.list().filter((entry) => this._distroUnproved.neverLeft(entry));
+            if (!owed.length) return;
+            console.log(`[distro] 📤 The exchange is back (${trigger}): ${owed.length} upload(s) that never left the device go now (§17.11, §17.12)`);
+            for (const entry of owed) {
+                if (this._propLink !== link || link.status !== Link.ACTIVE) {
+                    console.log("[distro] ⏳ Propagation link gone mid-flush — what never left the device waits for the next coming-up or the exchange's next return");
+                    return;
+                }
+                if (!this._distroUnproved.neverLeft(entry) || !this._stillOwed(entry) || this._distroAttemptOpen(entry, link)) continue;
+                await this._uploadOwed(link, entry);
+            }
+        } catch (error) {
+            console.warn("[distro] ⚠️ Sending what never left the device failed:", error.message);
+        }
+    },
+
+    /**
      * Whether an attempt at the owed `entry` is open for a flush on `link`:
      * being built for `link`, or uploaded on any link and not yet decided
      * (_distroOutboxInFlight). A build for another link never leaves
@@ -4514,25 +4595,36 @@ const RnsClient = {
      * names it yet (verifier of 2683ea4). A failure of that upload is like
      * any other. Each outcome is said (_distroOwedOutcome).
      *
-     * Its callers are today's three and no other: the coming-up pass
-     * (_sendDistroOutbox), the user's own action (_oweDistro) and that send
-     * on a replaced link's decision, below. Called without a coming-up it
-     * reads no failure record, so any other caller would send an upload
-     * again on its own failure. distro_sent_sync.test.mjs fails if anything
+     * Its callers are today's four and no other: the coming-up pass
+     * (_sendDistroOutbox), the user's own action (_oweDistro), that send on
+     * a replaced link's decision, below, and the exchange's return, which
+     * sends what never left the device (_sendDistroNeverLeft; James,
+     * 2026-10-06: nothing was sent, so no failure is retried). Called without
+     * a coming-up it reads no failure record, so any other caller would send
+     * an upload again on its own failure; the return's reads none because it
+     * sends only an entry whose last upload never left, and an upload made
+     * after a failure was made only on an event that let that failure go.
+     * distro_sent_sync.test.mjs fails if anything
      * else names it or the upload it makes (_uploadForDistro), or reaches
-     * one of the three by a new path, up to where each begins: the
+     * one of the four by a new path, up to where each begins: the
      * propagation link's coming-up; the user's own send, join or leave, and
-     * a DM the user sent before the exchange first registered; and the
-     * Link's close and the exchange's loss report (verifier of 2683ea4,
-     * RX1: an announce that uploaded every owed entry through it passed
-     * every test; verifier of b6c7f7f: that pin stopped at a DM's dispatch
-     * and the user's join and leave, and the window's "online" dispatching
-     * every failed DM again, or re-uploading every owed entry through a
-     * bound alias of _uploadForDistro, passed every test).
+     * a DM the user sent before the exchange first registered; the Link's
+     * close and the exchange's loss report; and the exchange's own "up"
+     * after a "down", the one place _sendDistroNeverLeft is called from
+     * (verifier of 2683ea4, RX1: an announce that uploaded every owed entry
+     * through it passed every test; verifier of b6c7f7f: that pin stopped at
+     * a DM's dispatch and the user's join and leave, and the window's
+     * "online" dispatching every failed DM again, or re-uploading every owed
+     * entry through a bound alias of _uploadForDistro, passed every test).
      */
     async _uploadOwed(link, entry, comingUp = null) {
         const flight = { link, packed: entry.packed };
         this._distroOutboxInFlight.set(entry.id, flight);
+        // An upload of this message begins, so that its last one never left
+        // the device decides nothing from now on (James, 2026-10-06): what
+        // this one comes to is what is recorded then, a failure's record, its
+        // proof, or the never-left record again.
+        this._distroUnproved.clearNeverLeft(entry);
         const landed = () => {
             if (this._distroOutboxInFlight.get(entry.id) === flight) this._distroOutboxInFlight.delete(entry.id);
         };
@@ -4552,6 +4644,15 @@ const RnsClient = {
         // way uploaded the leave again at once on its own failure.
         const unproved = () => {
             if (DistroOutboxStore.get(entry.id)?.packed === entry.packed) this._distroUnproved.record(entry, this._propComingUps);
+        };
+        // Never left the device (the exchange's report, in `unsent`, that its
+        // packet went into no request: _onPacketsLost, DistroUploads.neverLeft):
+        // nothing was sent, so this is no failure and records no coming-up. The
+        // exchange's return (_sendDistroNeverLeft) or the next coming-up sends
+        // it, and the record only says which message that is, while it is the
+        // one owed under its id, as a failure's does. James, 2026-10-06.
+        const neverLeft = () => {
+            if (DistroOutboxStore.get(entry.id)?.packed === entry.packed) this._distroUnproved.recordNeverLeft(entry);
         };
         // Proved (late, too): owed no more, its record goes, and only its own.
         const proved = () => this._distroUnproved.forget(entry);
@@ -4609,6 +4710,10 @@ const RnsClient = {
         // It left: until it is decided, no flush uploads this entry again,
         // on this link or on one that replaces it (_distroAttemptOpen).
         flight.upload = upload;
+        // Not a loss, if the exchange says nothing of it was sent: told in the
+        // task of that report, as the decision below is, and it takes no part
+        // in it, so nothing goes on a newer link at once for it (goesOn).
+        upload.onNeverLeft = neverLeft;
         // Told in the task of the event that decides it (the exchange's
         // loss report, a link's close, a Resource's failure, disconnect()),
         // before anything else runs: its failure is recorded then, and so is
@@ -4639,6 +4744,10 @@ const RnsClient = {
             this._distroOwedOutcome(entry, upload.how, null);
         }, (error) => {
             landed();
+            if (upload.settled === "never-left") {
+                this._distroOwedNeverLeft(entry, error);
+                return;
+            }
             if (goesOn && goesOn === this._propLink && goesOn.status === Link.ACTIVE
                 && this._stillOwed(entry) && !this._distroAttemptOpen(entry, goesOn)) {
                 this._distroOwedOutcome(entry, upload.how, error, true);
@@ -4748,6 +4857,26 @@ const RnsClient = {
             console.log(`[distro] 📤 Sent-copy for ${entry.to.slice(0,8)} propagated to the distro as a ${how}: the propagation node proved it (§17.11)`);
             Harness.event("distro-sent-copy", { to: entry.to.slice(0, 12), how });
         }
+    },
+
+    /**
+     * Say that the upload of the owed `entry` never left the device
+     * (DistroUploads.neverLeft; `error` says why): nothing was sent, so this
+     * is no failure. The log says so, as a line and not a warning, and the
+     * Harness hears no error: a staging stage counts those, and none is due.
+     * The entry stays owed, and goes when the exchange is back
+     * (_sendDistroNeverLeft) or at the propagation link's next coming-up,
+     * whichever is first (James, 2026-10-06, DESIGN_PRINCIPLES §3, what a
+     * device owes its distro). One owed no more by now (proved by another
+     * upload, replaced by a later action, or dropped with its distro) says
+     * that instead, as _distroOwedOutcome does.
+     */
+    _distroOwedNeverLeft(entry, error) {
+        if (!this._stillOwed(entry)) {
+            console.log(`[distro] ${entry.label} never left the device (${error.message}), and it is owed no more (proved by another upload, replaced by a later action, or dropped with its distro): nothing goes again`);
+            return;
+        }
+        console.log(`[distro] ⏳ ${entry.label} never left the device (${error.message}): nothing was sent, so it is no failure — it goes when the exchange is back, or when the propagation link next comes up, whichever is first (DESIGN_PRINCIPLES §3, the distro exception)`);
     },
 
     /**

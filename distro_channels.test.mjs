@@ -81,9 +81,9 @@ const linkPacket = (data) => ({ packetHash: Cryptography.fullHash(Buffer.from(da
 
 /** _onPacketsLost, whose parameter is destructured, compiled by hand. */
 function installPacketsLost(self, env) {
-    const body = methodBody("_onPacketsLost({ packetHashes, reason })").replaceAll("this.", "self.");
+    const body = methodBody("_onPacketsLost({ packetHashes, reason, unsent = [] })").replaceAll("this.", "self.");
     const names = Object.keys(env);
-    const f = new Function(...names, "self", "arg", `const { packetHashes, reason } = arg; ${body}`);
+    const f = new Function(...names, "self", "arg", `const { packetHashes, reason, unsent = [] } = arg; ${body}`);
     self._onPacketsLost = (arg) => f(...names.map((n) => env[n]), self, arg);
 }
 
@@ -95,7 +95,12 @@ function installPacketsLost(self, env) {
  * propagation link is up from the start unless `linkUp` is false;
  * `establish()` brings a new one up (its "established" handler's
  * _sendDistroOutbox), `closeLink()` takes the current one down (its "close"
- * handler's cut). A page reload is a second device() on the same `me` and
+ * handler's cut). The exchange is up unless `exchange.down` says it is: a
+ * packet sent while it is down is refused, and the exchange says at once
+ * that nothing of it was sent (PostInterface.sendData: "lost", `unsent`),
+ * heard on a later task as the interface's events are; `exchangeBack()` is
+ * its return, as _followExchange's "up" after a "down" runs it (James,
+ * 2026-10-06). A page reload is a second device() on the same `me` and
  * `storage`.
  */
 function device(distro, { label = "device", ownName = null, resubscribed = true, holdUnsubscribe = false, proofs = "auto",
@@ -129,7 +134,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         Buffer, Destination, Cryptography, MsgPack, LXMessage, LXMF, Link: { MDU: 100_000, ACTIVE: 0x02, CLOSED: 0x04 },
         Packet: { NONE: 0x00 }, console: log,
         IdMgr: { has: true, id: me, hash: me.hash.toString("hex") },
-        DistroManager, DistroSeen, Harness,
+        DistroManager, DistroSeen, Harness, ActiveTab: { held: true },
         ContactStore: { keep: (h) => { contacts.add(h); return { publicKey: null }; }, _save() {}, touch() {}, acceptMessageName() {} },
         MsgStore: { add: () => assert.fail("no direct message here"), get: () => [] },
         ChannelStore, ChannelMsgStore,
@@ -142,6 +147,8 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         rfedRequestTimeoutMs: () => 10_000,
     };
     const uploads = [];     // the LXMF packing of each C this device propagated
+    const exchange = { down: false };
+    const refused = [];     // what the exchange refused while it was down: nothing of it was sent
     const requests = [];    // [path, payload] to rfed, in the order sent
     const published = [];   // each post's /channel/publish payload: channel_hash | blob
     const held = [];
@@ -155,6 +162,12 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         newLinkPacket: (context, data) => linkPacket(data),
         _transmit(raw) {
             if (this.status === 0x04) return null;
+            if (exchange.down) {
+                const hash = Cryptography.fullHash(Buffer.from(raw)).toString("hex");
+                refused.push(Buffer.from(raw));
+                setTimeout(() => self._onPacketsLost({ packetHashes: [hash], reason: "the exchange is down", unsent: [hash] }), 0);
+                return raw;
+            }
             this.sent.push(Buffer.from(raw));
             uploads.push(Buffer.from(raw));
             const key = Cryptography.fullHash(Buffer.from(raw)).subarray(0, 16).toString("hex");
@@ -197,6 +210,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         openChannel: async () => {},
         // Every propagation link this device had, oldest first; _propLink
         // is the current one.
+        _rns: { interfaces: [] },
         _propLinks: [], _propLink: null, _distroOutboxInFlight: new Map(), _propComingUps: 0, _distroUnproved: new UnprovedUploads(),
         _buildPropagationPacked: async (packed) => packed,
         _exchangeIsDown: () => false,
@@ -234,6 +248,8 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         "_stillOwed(entry)",
         "_dropMembershipOwedToOtherDistros()",
         "_distroOwedOutcome(entry, how, error, goesNow = false)",
+        "async _sendDistroNeverLeft(trigger)",
+        "_distroOwedNeverLeft(entry, error)",
         "_uploadForDistro(link, propagationPacked, label)",
         "_handleDistroBlob(distroHash, blob)",
         "_handleDistroChannelSync(marker, facts)",
@@ -258,6 +274,11 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         self._distroUploads.cut("the propagation link closed before the propagation node proved it", link);
         return link;
     };
+    /** The exchange answers again, as _followExchange's "up" after a "down" runs it: what never left the device goes. */
+    const exchangeBack = async () => {
+        exchange.down = false;
+        await self._sendDistroNeverLeft("exchange back");
+    };
     if (linkUp) {
         self._propLink = propagationLink("link1");
         self._propLinks.push(self._propLink);
@@ -265,6 +286,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
     return {
         label, me, hash: lxmfHash(me), self, env, storage, ChannelStore, ChannelMsgStore, DistroManager, hold,
         uploads, requests, published, events, ui, contacts, logged, timers, proofKeys, prove, establish, closeLink,
+        exchange, refused, exchangeBack,
         makeLink: propagationLink,
         /** What this device still owes the distro (lib/distro_outbox.js). */
         owed: () => env.DistroOutboxStore.list().map((e) => (e.kind === "channel" ? [e.kind, e.op, e.name, e.at] : [e.kind, e.to])),
@@ -2743,6 +2765,392 @@ test("an upload cut after a later action replaced its C, or after its distro was
     await settle();
     assert.deepEqual(errorsOf(c), []);
     assert.equal(c.logged.filter(([, line]) => line.includes("still owed")).length, 0);
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+//  An upload that never left the device (James, 2026-10-06; DESIGN_PRINCIPLES
+//  §3, what a device owes its distro): no interface could carry it, so
+//  nothing was sent and it is no failure. It goes when the exchange is back,
+//  an event like the others, as well as at the next coming-up; a loss after
+//  the packet left still waits for the next coming-up. On staging a short
+//  network drop left an Android phone's propagation link up, so no coming-up
+//  followed and the owed upload waited 35 s for an unrelated close.
+//  exchange_truth.test.mjs runs it over the real PostInterface.
+// ═════════════════════════════════════════════════════════════════════════
+
+/** The one entry `d` owes, as the outbox holds it. */
+const theEntry = (d) => {
+    const owed = d.env.DistroOutboxStore.list();
+    assert.equal(owed.length, 1, "one message owed");
+    return owed[0];
+};
+
+test("C whose packet never left because the exchange was down is no failure: nothing is sent, said or counted, and it goes when the exchange is back, once, the same message", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    const entry = theEntry(a);
+    assert.deepEqual([a.uploads.length, a.refused.length], [0, 1], "the exchange refused its packet: nothing was sent");
+    assert.deepEqual(a.events.filter((e) => e.kind === "error"), [], "no failure, so none is reported to the Harness");
+    assert.deepEqual(a.logged, [], "and none is warned or errored in the log");
+    assert.deepEqual(a.sentEvents(), [], "nor said sent");
+    assert.deepEqual(a.owed(), [["channel", "join", "public.tea", clock.now]], "still owed");
+    assert.equal(a.self._distroUnproved.neverLeft(entry), true, "recorded as never left");
+    assert.deepEqual([a.self._distroUnproved.size, a.self._distroUnproved.since(entry, 0)], [0, false], "and with no coming-up: no failure holds it back");
+    assert.equal(a.self._distroOutboxInFlight.size, 0, "no attempt is open on it");
+    assert.deepEqual(a.timers.filter((timer) => !timer.cleared), [], "no §1 watch is left running for a packet nobody sent");
+
+    // Nothing but the exchange's return sends it: no timer does (the §1 watch is the only one this page arms, and it is cleared).
+    a.fireTimers();
+    await settle();
+    assert.equal(a.uploads.length, 0, "not on a clock");
+
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1, "the exchange is back: it goes");
+    assert.deepEqual(a.uploads[0], Buffer.from(entry.packed, "base64"), "the LXMF message packed when the user acted, not a new one");
+    assert.equal(a.self._distroUnproved.neverLeft(entry), false, "an upload of it has begun: the record has done its work");
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.sentEvents(), [["join", "public.tea"]]);
+    assert.deepEqual(a.owed(), [], "proved: owed no more");
+    assert.equal(a.self._distroUnproved.neverLeftSize, 0);
+
+    // The next return sends nothing: it is proved.
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1);
+});
+
+test("C lost after its packet left (reported lost, none of it unsent) does not go when the exchange is back: it waits for the link's next coming-up, as before", async (t) => {
+    const clock = fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.equal(a.uploads.length, 1, "it left");
+    const hash = Cryptography.fullHash(a.uploads[0]).toString("hex");
+    a.self._onPacketsLost({ packetHashes: [hash], reason: "the exchange failed", unsent: [] });
+    await settle();
+    const entry = theEntry(a);
+    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "its packet was lost (the exchange failed)"]], "a loss is a failure, and is reported");
+    assert.equal(a.self._distroUnproved.neverLeft(entry), false, "not a packet that never left");
+    assert.equal(a.self._distroUnproved.at(entry), a.self._propComingUps, "its failure is recorded at the coming-up it was decided at");
+
+    const comingUps = a.self._propComingUps;
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1, "the exchange's return is no coming-up: a failure is not retried on it");
+    assert.deepEqual(a.owed(), [["channel", "join", "public.tea", clock.now]], "still owed");
+    assert.equal(a.self._propComingUps, comingUps, "and it counted none");
+
+    await a.establish();
+    assert.equal(a.uploads.length, 2, "the next coming-up sends it");
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+});
+
+test("a loss reported with part of the batch unsent is told apart packet by packet: the one that left waits for the next coming-up, the one that never did goes at the return", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const R = "0123456789abcdef0123456789abcdef";
+    await a.self.joinChannel("public.tea");
+    await a.self._sendDistroSentCopy(R, "", "behind the failed batch");
+    await settle();
+    assert.equal(a.uploads.length, 2);
+    const [joinHash, copyHash] = a.uploads.map((u) => Cryptography.fullHash(u).toString("hex"));
+    // One exchange failed: the join was in its batch, the sent-copy still queued behind it (PostInterface "lost": packetHashes, unsent).
+    a.self._onPacketsLost({ packetHashes: [joinHash, copyHash], reason: "Failed to fetch", unsent: [copyHash] });
+    await settle();
+    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "its packet was lost (Failed to fetch)"]], "only the one that left is a failure");
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 3, "the sent-copy goes, once");
+    assert.deepEqual(MsgPack.unpack(a.uploads[2].subarray(96))[3].get(0xFB), LXMF.DISTRO_SENT_TYPE);
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.owed(), [["channel", "join", "public.tea", a.owed()[0][3]]], "the join still waits");
+    await a.establish();
+    assert.equal(a.uploads.length, 4, "the join goes on the next coming-up");
+});
+
+test("a never-left C goes at the next coming-up too, whichever comes first, and the exchange's return after that sends nothing more", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.equal(a.uploads.length, 0);
+    // The propagation link comes up while the exchange still looks down to nobody (the exchange is back, the link first): a flush sends it.
+    a.exchange.down = false;
+    const link = await a.establish();
+    await settle();
+    assert.equal(link.sent.length, 1, "it went at the coming-up: a never-left message has no failure to wait out");
+    assert.equal(a.self._distroUnproved.neverLeftSize, 0);
+    // The return, while that upload is in flight, sends nothing: one upload of a message at a time, and its record is ended.
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1, "no double send");
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+});
+
+test("a never-left C that goes at a coming-up and is then lost after it left is a failure like any: the exchange's return does not send it again, the next coming-up does", async (t) => {
+    // The record of a message that never left ends when an upload of it begins (_uploadOwed); left standing, the return
+    // would send on the strength of a failure alone, which §3 allows only at a coming-up.
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    const entry = theEntry(a);
+    assert.equal(a.self._distroUnproved.neverLeft(entry), true);
+    a.exchange.down = false;
+    await a.establish();                          // a new link: the coming-up sends it
+    await settle();
+    assert.equal(a.uploads.length, 1);
+    assert.equal(a.self._distroUnproved.neverLeft(entry), false, "an upload of it has begun");
+    a.self._onPacketsLost({ packetHashes: [Cryptography.fullHash(a.uploads[0]).toString("hex")], reason: "the exchange failed", unsent: [] });
+    await settle();
+    assert.deepEqual(errorsOf(a), [["distro-channel-sync", "its packet was lost (the exchange failed)"]], "it left, and was lost: a failure");
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1, "no retry on a failure at the exchange's return");
+    await a.establish();
+    await settle();
+    assert.equal(a.uploads.length, 2, "the next coming-up sends it");
+});
+
+test("two returns in a row, the second while the first's upload is being built, send one upload", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    let releaseBuild;
+    const building = new Promise((resolve) => { releaseBuild = resolve; });
+    let builds = 0;
+    a.self._buildPropagationPacked = async (packed) => { builds++; await building; return packed; };
+    const first = a.exchangeBack();
+    await settle();
+    const second = a.exchangeBack();
+    await settle();
+    assert.equal(builds, 1, "the second return finds the first's upload being built, and its record ended");
+    releaseBuild();
+    await Promise.all([first, second]);
+    await settle();
+    assert.equal(a.uploads.length, 1, "one upload, one stamp");
+});
+
+test("a flush at a coming-up already running does not send twice what the exchange's return sends: the return's upload is in flight when the flush reaches it", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual", linkUp: false });
+    const R = "0123456789abcdef0123456789abcdef";
+    // Two messages owed with no link up: a join (never attempted) and a sent-copy.
+    await a.self.joinChannel("public.tea");
+    await a.self._sendDistroSentCopy(R, "", "second");
+    assert.equal(a.owed().length, 2);
+    // The link comes up while the exchange is down: the flush builds the join first (held), the sent-copy waits its turn.
+    let releaseJoin;
+    const joinBuilding = new Promise((resolve) => { releaseJoin = resolve; });
+    a.self._buildPropagationPacked = async (packed) => {
+        if (Buffer.from(packed).subarray(0, 16).equals(Buffer.from(lxmfHash(distro), "hex")) && !a.self._joinBuilt) {
+            a.self._joinBuilt = true;
+            await joinBuilding;
+        }
+        return packed;
+    };
+    a.exchange.down = true;
+    const flush = a.establish();
+    await settle();
+    // The sent-copy was never attempted by the flush yet. Record that its last upload never left (an earlier upload of it did not), then the exchange returns.
+    const copy = a.env.DistroOutboxStore.list().find((e) => e.kind === "sent");
+    a.self._distroUnproved.recordNeverLeft(copy);
+    a.exchange.down = false;
+    a.self._buildPropagationPacked = async (packed) => packed;
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1, "the return uploaded the sent-copy: one upload so far");
+    releaseJoin();
+    await flush;
+    await settle();
+    assert.equal(a.uploads.length, 2, "the flush sent the join, and found the sent-copy in flight: no second upload of it");
+});
+
+test("a never-left C replaced by a later action is not sent: only the newer message goes at the return, and the old record is gone", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.ChannelStore.join("public.tea", RFED);
+    a.exchange.down = true;
+    await a.self.leaveChannel("public.tea");
+    await settle();
+    const leave = theEntry(a);
+    assert.equal(a.self._distroUnproved.neverLeft(leave), true);
+    await a.self.joinChannel("public.tea");
+    await settle();
+    const join = theEntry(a);
+    assert.notEqual(join.packed, leave.packed);
+    assert.equal(a.self._distroUnproved.neverLeft(leave), false, "the replaced message's record went with it");
+    assert.equal(a.self._distroUnproved.neverLeft(join), true);
+    assert.equal(a.self._distroUnproved.neverLeftSize, 1);
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1);
+    assert.deepEqual(a.uploads[0], Buffer.from(join.packed, "base64"), "the newest action, and the replaced leave never");
+    assert.deepEqual(a.owed(), [["channel", "join", "public.tea", join.at]]);
+});
+
+test("a never-left C owed to a distro this device gives up is dropped, said, and never sent at the return", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.equal(a.self._distroUnproved.neverLeftSize, 1);
+    a.hold(null);
+    a.self._dropMembershipOwedToOtherDistros();
+    assert.deepEqual(a.owed(), [], "dropped with its distro");
+    assert.equal(a.self._distroUnproved.neverLeftSize, 0, "and its record with it");
+    a.hold(distro);
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 0, "nothing goes, though the distro is held again");
+});
+
+test("the exchange's return with the propagation link not up sends nothing, and the link's coming-up sends what never left: a link coming up, closed or STALE is none of this event's", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    const stale = a.self._propLink;
+    stale.status = 0x03;                        // STALE: not ACTIVE
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 0, "a STALE link carries nothing: its recovery, a coming-up, sends it");
+    stale.status = 0x02;
+    a.exchange.down = true;
+    a.closeLink();                              // closed: no link at all
+    a.exchange.down = false;
+    await a.exchangeBack();
+    await settle();
+    assert.deepEqual([a.uploads.length, a.self._distroUnproved.neverLeftSize], [0, 1], "no link, nothing built, and the record stands");
+    assert.deepEqual(a.logged, [], "and nothing is warned: with no link up the return has nothing to try");
+    await a.establish();
+    await settle();
+    assert.equal(a.uploads.length, 1, "the new link's coming-up sends it");
+    assert.equal(a.self._distroUnproved.neverLeftSize, 0);
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.owed(), []);
+});
+
+test("a STALE link's recovery sends what never left, as it sends everything owed (a coming-up), and the exchange's return before it did not", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    const link = a.self._propLink;
+    link.status = 0x03;
+    await a.exchangeBack();
+    assert.equal(a.uploads.length, 0);
+    link.status = 0x02;
+    await a.self._sendDistroOutbox(link, "recovered");
+    await settle();
+    assert.equal(a.uploads.length, 1);
+});
+
+test("a tab that does not hold the identity sends nothing at the exchange's return", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    a.env.ActiveTab.held = false;
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 0);
+    a.env.ActiveTab.held = true;
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1, "the tab that holds it does");
+});
+
+test("the §17.11 sent-copy that never left goes at the return the same way, to its own distro", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const R = "0123456789abcdef0123456789abcdef";
+    a.exchange.down = true;
+    await a.self._sendDistroSentCopy(R, "", "sent into a dead exchange");
+    await settle();
+    assert.deepEqual([a.uploads.length, a.refused.length, errorsOf(a)], [0, 1, []]);
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1);
+    const [, , content, fields] = MsgPack.unpack(a.uploads[0].subarray(96));
+    assert.deepEqual([Buffer.from(content).toString(), fields.get(0xFC)], ["sent into a dead exchange", R]);
+    assert.equal(a.prove(), true);
+    await settle();
+    assert.deepEqual(a.events.filter((e) => e.kind === "distro-sent-copy").map((e) => e.detail), [{ to: R.slice(0, 12), how: "packet" }]);
+    assert.deepEqual(a.owed(), []);
+});
+
+test("an exchange that is still down at the return refuses the upload again: nothing is sent, nothing fails, nothing loops, and the next return sends it", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    // The return's event is heard, but the exchange went down again before the flush's packet was sent.
+    await a.self._sendDistroNeverLeft("exchange back");
+    await settle();
+    assert.deepEqual([a.uploads.length, a.refused.length], [0, 2], "refused again, once: no loop");
+    assert.deepEqual([errorsOf(a), a.logged], [[], []]);
+    assert.equal(a.self._distroUnproved.neverLeftSize, 1, "recorded again: still no failure");
+    await settle();
+    assert.deepEqual([a.uploads.length, a.refused.length], [0, 2], "and nothing else follows on its own");
+    await a.exchangeBack();
+    await settle();
+    assert.equal(a.uploads.length, 1);
+});
+
+test("the exchange's return arms no timer, and a never-left upload decided at all arms none: the only timer is the §1 watch of an upload that left", async (t) => {
+    fakeClock(t);
+    const distro = Identity.create();
+    const a = device(distro, { proofs: "manual" });
+    const armed = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const realSetInterval = globalThis.setInterval;
+    globalThis.setTimeout = (fn, ms, ...rest) => { if (ms) armed.push(["setTimeout", ms]); return realSetTimeout(fn, ms, ...rest); };
+    globalThis.setInterval = (fn, ms, ...rest) => { armed.push(["setInterval", ms]); return realSetInterval(fn, ms, ...rest); };
+    t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.setInterval = realSetInterval; });
+    a.exchange.down = true;
+    await a.self.joinChannel("public.tea");
+    await settle();
+    assert.deepEqual(armed, [], "refused, reported never left, recorded, said: no timer anywhere");
+    assert.deepEqual(a.timers.map((timer) => timer.cleared), [true], "the §1 watch the upload began with was cleared when it was decided");
+    await a.exchangeBack();
+    await settle();
+    assert.deepEqual(armed, [], "the return: no timer anywhere");
+    assert.deepEqual(a.timers.map((timer) => [timer.ms, timer.cleared]), [[5_001, true], [5_001, false]], "the one upload that left has its own §1 watch, and nothing else is armed");
 });
 
 test("the §17.11 sent-copy is owed the same way: made with no link up, it goes when the link comes up and is owed until proved", async (t) => {

@@ -395,7 +395,7 @@ test("a down or up the interface emitted before it was found blocked, heard afte
         const iface = new EventEmitter();
         iface.block = () => {};
         const self = { _rns: { interfaces: [iface] }, _status: "connecting", _connType: "exchange", _onStatus: [], exchangeBlocked: null,
-            _onExchangeRegistered() {}, _onPacketsLost() {}, _onPageResume() {} };
+            _onExchangeRegistered() {}, _onPacketsLost() {}, _onPageResume() {}, _sendDistroNeverLeft() {} };
         self._setStatus = compile("_setStatus(s, type)", { Harness })(self);
         self._exchangeIsBlocked = compile("_exchangeIsBlocked(iface, exchangeUrl, reason, found)", { Harness, console: { warn() {} } })(self);
         compile("_followExchange(iface)", {})(self)(iface);

@@ -482,12 +482,15 @@ function memberText(code, spans, name) {
     return code.slice(found[0].start, found[0].end);
 }
 
-test("the per-entry upload (_uploadOwed) has today's three callers and no other, and the upload it makes (_uploadForDistro) that one: the coming-up pass, the user's own action (_oweDistro), and the third ruling's send on a replaced link's close or loss report, decided only where it is decided today", async () => {
+test("the per-entry upload (_uploadOwed) has today's four callers and no other, and the upload it makes (_uploadForDistro) that one: the coming-up pass, the user's own action (_oweDistro), the third ruling's send on a replaced link's close or loss report, decided only where it is decided today, and the exchange's return for what never left the device (_sendDistroNeverLeft)", async () => {
     // _uploadOwed reads an entry's failure record only when a coming-up
     // pass calls it (`comingUp`). Called without one, it uploads at once
-    // whatever the record says, which is right for its two other callers
+    // whatever the record says, which is right for its three other callers
     // alone: the user's own action, whose message is packed in that action
-    // and so was never uploaded before; and the third ruling's send
+    // and so was never uploaded before; the exchange's return, which sends
+    // only a message whose last upload never left the device, nothing of it
+    // sent and so no failure to hold it back (James, 2026-10-06; below);
+    // and the third ruling's send
     // (DESIGN_PRINCIPLES §3, what a device owes its distro): an upload on a
     // STALE link that a newer link replaced, decided not proved by that
     // link's own close (James, 2026-10-03) or by the exchange's report that
@@ -509,6 +512,16 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     //     of b6c7f7f, R12 to R14: this pin stopped at those three, and the
     //     window's "online" dispatching every failed DM again, or leaving
     //     and joining every channel again, passed every test);
+    //   - the exchange's return: _sendDistroNeverLeft, named in its own
+    //     definition and in one call, in the "back" branch of
+    //     _followExchange's "up" listener, which runs only for an "up" that
+    //     follows a "down" (the page_resume and exchange_truth suites); it
+    //     sends only a message _distroUnproved records as never left, and
+    //     that record is made only for an upload the exchange reported
+    //     `unsent`, which only DistroUploads.neverLeft decides, from
+    //     _onPacketsLost alone; an upload begun for the message ends the
+    //     record (_uploadOwed), so a loss after the packet left is a failure
+    //     again and waits for the next coming-up. It arms no timer;
     //   - the third ruling's send: where it goes is set only when its
     //     upload is decided with a newer propagation link up, and an upload
     //     is decided only by DistroUploads.lost, which the page calls for
@@ -545,8 +558,8 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
 
     // The per-entry upload, and its three calls.
     assert.match(code, /\n {4}async _uploadOwed\(link, entry, comingUp = null\) \{/);
-    assert.equal(count(code, /_uploadOwed/g), 4, "the method and its three calls: nothing else names it");
-    assert.deepEqual(sites(code, "_uploadOwed", spans), ["RnsClient._oweDistro", "RnsClient._sendDistroOutbox", "RnsClient._uploadOwed", "RnsClient._uploadOwed"]);
+    assert.equal(count(code, /_uploadOwed/g), 5, "the method and its four calls: nothing else names it");
+    assert.deepEqual(sites(code, "_uploadOwed", spans), ["RnsClient._oweDistro", "RnsClient._sendDistroOutbox", "RnsClient._sendDistroNeverLeft", "RnsClient._uploadOwed", "RnsClient._uploadOwed"]);
     const pass = method("async _sendDistroOutbox(link, trigger)");
     assert.equal(count(pass, /_uploadOwed/g), 1);
     assert.match(pass, /if \(this\._unprovedSince\(entry, comingUp\)\) \{\s*console\.log\([^\n]*\);\s*continue;\s*\}\s*await this\._uploadOwed\(link, entry, comingUp\);/,
@@ -555,10 +568,28 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     assert.equal(count(owe, /_uploadOwed/g), 1);
     assert.match(owe, /const link = this\._propLink;\s*if \(link\?\.status === Link\.ACTIVE\) \{\s*this\._uploadOwed\(link, entry\);\s*return;\s*\}/,
         "the user's own action goes at once while the propagation link is up");
+    // The exchange's return (James, 2026-10-06): an upload that never left the device is no failure, and goes when the
+    // exchange is back, as well as at the next coming-up. It sends only what is recorded never left, still owed, with no
+    // attempt open, on the propagation link while that is up; it is not a coming-up (it never names the pass, the failure
+    // record or the count), and it arms no timer.
+    const never = method("async _sendDistroNeverLeft(trigger)");
+    assert.equal(count(never, /_uploadOwed/g), 1);
+    assert.match(never, /^\s*const link = this\._propLink;\s*if \(!this\._rns \|\| !ActiveTab\.held \|\| link\?\.status !== Link\.ACTIVE\) return;/,
+        "only the tab holding the identity, and only on the propagation link while it is up: a link coming up sends these itself");
+    assert.match(never, /const owed = DistroOutboxStore\.list\(\)\.filter\(\(entry\) => this\._distroUnproved\.neverLeft\(entry\)\);/,
+        "what never left, and nothing else owed");
+    assert.match(never, /if \(this\._propLink !== link \|\| link\.status !== Link\.ACTIVE\) \{[^}]*return;\s*\}\s*if \(!this\._distroUnproved\.neverLeft\(entry\) \|\| !this\._stillOwed\(entry\) \|\| this\._distroAttemptOpen\(entry, link\)\) continue;\s*await this\._uploadOwed\(link, entry\);/,
+        "each checked again when its turn comes, and never one with an attempt open: no double send");
+    assert.doesNotMatch(never, /setTimeout|setInterval|setImmediate|requestAnimationFrame|requestIdleCallback/, "an event, never a clock (DESIGN_PRINCIPLES §5)");
+    assert.doesNotMatch(never, /_propComingUps|_unprovedSince|_distroUnproved\.(?:record|forget|clearNeverLeft|recordNeverLeft)\(|_sendDistroOutbox/,
+        "not a coming-up: it counts none, releases no failure record and runs no pass");
+    assert.equal(count(code, /_sendDistroNeverLeft/g), 2, "the method and its one call: nothing else names it");
+    assert.match(method("_followExchange(iface)"), /if \(back\) \{\s*this\._onPageResume\("exchange back"\);\s*this\._sendDistroNeverLeft\("exchange back"\);\s*\}/,
+        "the exchange's return, the interface's own up-edge after a down, and no page event");
     const upload = method("async _uploadOwed(link, entry, comingUp = null)");
     assert.equal(count(upload, /_uploadOwed/g), 1, "the third ruling's send, and no other");
-    assert.match(upload, /\}, \(error\) => \{\s*landed\(\);\s*if \(goesOn && goesOn === this\._propLink && goesOn\.status === Link\.ACTIVE\s*&& this\._stillOwed\(entry\) && !this\._distroAttemptOpen\(entry, goesOn\)\) \{\s*this\._distroOwedOutcome\(entry, upload\.how, error, true\);\s*this\._uploadOwed\(goesOn, entry\);\s*return;\s*\}/,
-        "the third ruling's send: on its upload's failure, to the newer link only while that is still the propagation link and up");
+    assert.match(upload, /\}, \(error\) => \{\s*landed\(\);\s*if \(upload\.settled === "never-left"\) \{\s*this\._distroOwedNeverLeft\(entry, error\);\s*return;\s*\}\s*if \(goesOn && goesOn === this\._propLink && goesOn\.status === Link\.ACTIVE\s*&& this\._stillOwed\(entry\) && !this\._distroAttemptOpen\(entry, goesOn\)\) \{\s*this\._distroOwedOutcome\(entry, upload\.how, error, true\);\s*this\._uploadOwed\(goesOn, entry\);\s*return;\s*\}/,
+        "the third ruling's send: on its upload's failure, never one that never left the device (said as no failure, James, 2026-10-06), to the newer link only while that is still the propagation link and up");
     // The upload itself: _uploadOwed hands it to _uploadForDistro, and nothing else does.
     assert.deepEqual(sites(code, "_uploadForDistro", spans), ["RnsClient._uploadOwed", "RnsClient._uploadForDistro"],
         "_uploadForDistro: made, and called by _uploadOwed alone, which reads the failure record");
@@ -570,15 +601,29 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     assert.equal(count(upload, /\bgoesOn\s*=(?!=)/g), 2, "set to null, then only by the decision");
     assert.equal(count(code, /\bdecided\b/g), 3, "the decision: made, given to the upload, and run for an upload decided before it left");
     assert.equal(count(code, /\bonLost\b/g), 1, "the page gives an upload its onLost once, and calls it nowhere");
+    // An upload is decided never left (James, 2026-10-06) only by DistroUploads.neverLeft, which the page calls for a packet
+    // the exchange reports `unsent`; its record is made only by the owner's onNeverLeft, which takes no part in goesOn, and
+    // ended by an upload begun for the message and by forget().
+    assert.equal(count(code, /\bonNeverLeft\b/g), 1, "the page gives an upload its onNeverLeft once, and calls it nowhere");
+    assert.equal(count(upload, /upload\.onNeverLeft = neverLeft;/g), 1);
+    assert.equal(count(code, /\.\s*neverLeft\s*\(/g), 3, "neverLeft: the upload's decision, and two reads of the record (the return's list and its check)");
+    assert.equal(count(code, /_distroUploads\.neverLeft\(/g), 1, "decided in one place");
+    assert.equal(count(code, /_distroUnproved\.recordNeverLeft\(/g), 1, "the record is made in one place: the upload's onNeverLeft");
+    assert.equal(count(code, /_distroUnproved\.clearNeverLeft\(/g), 1, "and ended when an upload of the message begins");
+    assert.match(upload, /^\s*const flight = \{ link, packed: entry\.packed \};\s*this\._distroOutboxInFlight\.set\(entry\.id, flight\);\s*this\._distroUnproved\.clearNeverLeft\(entry\);/,
+        "ended as the attempt begins, whatever it comes to");
+    assert.match(upload, /const neverLeft = \(\) => \{\s*if \(DistroOutboxStore\.get\(entry\.id\)\?\.packed === entry\.packed\) this\._distroUnproved\.recordNeverLeft\(entry\);\s*\};/,
+        "recorded while this message is the one owed under its id, with no coming-up: a never-left upload is no failure");
+    assert.equal(count(upload, /_distroOwedNeverLeft\(/g), 1, "a never-left upload is said as no failure, in one place, and takes no part in the third ruling's send");
 
     // An upload is decided by DistroUploads.lost and .cut, at today's five places.
-    assert.equal(count(code, /_distroUploads/g), 11, "the field and its ten calls: no alias");
+    assert.equal(count(code, /_distroUploads/g), 12, "the field and its eleven calls: no alias");
     assert.deepEqual(code.match(/\.\s*(?:lost|cut)\s*\(/g), [".cut(", ".lost(", ".lost(", ".lost(", ".cut("],
         "nothing else in the page is told .lost or .cut");
-    assert.match(method("_onPacketsLost({ packetHashes, reason })"),
-        /if \(pending\?\.distroUpload\) \{\s*this\._distroUploads\.lost\(pending\.distroUpload, `its packet was lost \(\$\{reason\}\)`\);\s*continue;\s*\}/,
-        "the exchange's loss report (James, 2026-10-04)");
-    assert.equal(count(code, /\bdistroUpload\b/g), 3, "the loss report knows an upload by the entry _uploadForDistro makes for its proof, and by nothing else");
+    assert.match(method("_onPacketsLost({ packetHashes, reason, unsent = [] })"),
+        /if \(pending\?\.distroUpload\) \{\s*if \(unsent\.includes\(packetHash\)\) this\._distroUploads\.neverLeft\(pending\.distroUpload, `its packet never left: \$\{reason\}`\);\s*else this\._distroUploads\.lost\(pending\.distroUpload, `its packet was lost \(\$\{reason\}\)`\);\s*continue;\s*\}/,
+        "the exchange's loss report (James, 2026-10-04), and its report that the packet never left, which is no loss (James, 2026-10-06)");
+    assert.equal(count(code, /\bdistroUpload\b/g), 4, "the loss report knows an upload by the entry _uploadForDistro makes for its proof, and by nothing else");
     assert.equal(count(code, /_onPacketsLost/g), 2, "the loss report's handler and its one call");
     assert.match(method("_followExchange(iface)"), /iface\.on\("lost", \(lost\) => \{\s*if \(current\(\)\) this\._onPacketsLost\(lost\);\s*\}\);/,
         "the loss report is the exchange's \"lost\"");
@@ -653,6 +698,9 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     assert.match(extractMethod(linkSource, "_linkClosed()"), /\bthis\.emit\("close"\);/, "a Link fires its close when it closes, and only then");
     const uploads = withoutComments(await readFile(new URL("distro_upload.js", lib), "utf8"));
     assert.equal(count(uploads, /\bonLost\b/g), 2, "an upload's onLost: made empty, and told only by lost()");
+    assert.equal(count(uploads, /\bonNeverLeft\b/g), 2, "an upload's onNeverLeft: made empty, and told only by neverLeft()");
+    assert.match(extractMethod(uploads, "neverLeft(upload, why)"), /upload\.reject\(new Error\(why\)\);\s*upload\.onNeverLeft\?\.\(\);/);
+    assert.equal(count(uploads, /\bneverLeft\s*\(/g), 1, "neverLeft(): itself, and no call in lib/: the page decides it, from the exchange's report");
     assert.match(extractMethod(uploads, "lost(upload, why)"), /upload\.reject\(new Error\(why\)\);\s*upload\.onLost\?\.\(\);/);
     assert.equal(count(uploads, /\blost\s*\(/g), 2, "lost(): itself, and cut()'s call");
     assert.match(extractMethod(uploads, "cut(why, link = null)"), /if \(this\.lost\(upload, why\)\) cut\+\+;/);
@@ -758,13 +806,15 @@ test("what reaches the user's own action (_oweDistro) begins with the user and n
         doJoin: ["App._renderChannelForm", "App._renderChannelForm", "App._renderChannelForm"],
         RetichatTest: ["RetichatTest", "RetichatTest.help", "statement: console.log", "statement: console.log"],
         DistroOutboxStore: ["DistroOutboxStore", "RnsClient._oweDistro", "RnsClient._oweDistro", "RnsClient._sendDistroOutbox",
-            "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._stillOwed",
-            "RnsClient._dropMembershipOwedToOtherDistros", "RetichatTest.distroOwed"],
+            "RnsClient._sendDistroNeverLeft", "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._uploadOwed",
+            "RnsClient._uploadOwed", "RnsClient._stillOwed", "RnsClient._dropMembershipOwedToOtherDistros", "RetichatTest.distroOwed"],
         DistroOutbox: ["statement: import", "DistroOutboxStore"],
         _distroOutboxInFlight: ["RnsClient._distroOutboxInFlight", "RnsClient._distroAttemptOpen", "RnsClient._uploadOwed",
             "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._dropMembershipOwedToOtherDistros"],
-        _distroUnproved: ["RnsClient._distroUnproved", "RnsClient._oweDistro", "RnsClient._unprovedSince", "RnsClient._uploadOwed",
-            "RnsClient._uploadOwed", "RnsClient._dropMembershipOwedToOtherDistros"],
+        _distroUnproved: ["RnsClient._distroUnproved", "RnsClient._oweDistro", "RnsClient._sendDistroNeverLeft", "RnsClient._sendDistroNeverLeft",
+            "RnsClient._unprovedSince", "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._uploadOwed",
+            "RnsClient._dropMembershipOwedToOtherDistros"],
+        _sendDistroNeverLeft: ["RnsClient._followExchange", "RnsClient._sendDistroNeverLeft"],
     };
     for (const [name, where] of Object.entries(places)) assert.deepEqual(at(name), where, `${name}: written where it is today, and nowhere else`);
 
@@ -822,7 +872,7 @@ test("what reaches the user's own action (_oweDistro) begins with the user and n
     // Nor does a script under lib/ or a page: lib/ reaches no object of the page, index.html loads app.js and
     // nothing else, debug-standalone.html not even that (its console has its own stack), and debug.html reads the
     // harness alone.
-    const named = /_sendDistroSentCopy|_sendDistroChannelSync|_dispatchMessage|_dispatchQueued|_onExchangeRegistered|_followExchange|_composerKeydown|\bsendMessage\b|\bjoinChannel\b|\bleaveChannel\b|_syncChannelMembership|DistroOutboxStore|_distroOutboxInFlight|_distroUnproved/;
+    const named = /_sendDistroSentCopy|_sendDistroChannelSync|_dispatchMessage|_dispatchQueued|_onExchangeRegistered|_followExchange|_composerKeydown|\bsendMessage\b|\bjoinChannel\b|\bleaveChannel\b|_syncChannelMembership|DistroOutboxStore|_distroOutboxInFlight|_distroUnproved|_sendDistroNeverLeft/;
     const lib = new URL("./lib/", import.meta.url);
     const scripts = (await readdir(lib, { recursive: true })).filter((f) => f.endsWith(".js"));
     assert.ok(scripts.includes("distro_outbox.js") && scripts.includes("message_text.js"));
