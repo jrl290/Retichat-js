@@ -700,6 +700,37 @@ test("a status counts only from the group's creator, whose signature shows it: n
     }
 });
 
+test("a status whose signature is not validated counts for nothing, and nothing in it is held: the creator's key not held here (unverifiable), the creator forged, before and from the switch; once the creator's key is held the same status counts", async () => {
+    const [a, b, mallory] = [1, 2, 3].map(() => Identity.create());
+    const [A, B] = [a, b].map(lxmfHash);
+    for (const switched of [false, true]) {
+        const when = switched ? "from the switch" : "before the switch";
+        // Group G joined by the user, the creator's key NOT held: the status cannot be verified, so it is not the creator's to be believed.
+        const r = groupClient({ switched });
+        const creator = Identity.create(), C = lxmfHash(creator);
+        r.GroupStore.addPending(G, "G", C, [C, A, B, r.own]);
+        r.GroupStore.accept(G);
+        assert.equal(r.ContactStore.get(C)?.publicKey ?? null, null, `${when}: the creator's key is not held`);
+        // A keyed element and a keyless one: each would count (or be held) arriving directly.
+        const elements = [control(a, creator, "accept", { groupId: G }), control(b, creator, "accept", { key: false, groupId: G })];
+        const nothing = (label) => assert.deepEqual([r.proofs.length, r.status(G, A), r.status(G, B), r.held(), r.notices(G), r.ContactStore.get(A)?.publicKey ?? null],
+            [0, "invited", "invited", [], [], null], `${when}: ${label}: unproved, nothing counted, nothing held, no key remembered`);
+        await r.receive(status(creator, r.me, elements, { switched, timestamp: 1 }));
+        nothing("the creator's key not held");
+        assert.equal(r.events.some((e) => e.kind === "group-status-received"), false, `${when}: no element was read`);
+        // The creator's name under mallory's signature, with the creator's key now held: forged.
+        r.know(creator);
+        await r.receive(status(creator, r.me, elements, { switched, signer: mallory, timestamp: 2 }));
+        nothing("forged under the creator's key");
+        assert.equal(r.events.some((e) => e.kind === "group-status-received"), false, `${when}: no element was read`);
+        // The creator's own, now that its key is held: counts, as any status does.
+        await r.receive(status(creator, r.me, elements, { switched, timestamp: 3 }));
+        assert.deepEqual([r.proofs.length, r.status(G, A)], [1, "accepted"], `${when}: validated: counts`);
+        assert.deepEqual([r.status(G, B), r.held()], switched ? ["invited", [[B, "accept"]]] : ["accepted", []],
+            `${when}: its keyless element is unverifiable: held from the switch, counted before it, as arriving directly`);
+    }
+});
+
 test("a status counts only in a group the user has accepted: a pending group's, a group not held and one the user left are dropped unproved, and nothing is applied", async () => {
     const a = Identity.create(), creator = Identity.create();
     const A = lxmfHash(a);
