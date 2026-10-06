@@ -316,6 +316,7 @@ test("check() aborts a hung exchange, loses its batch and exchanges at once", as
     assert.deepEqual(seen.lost()[0].packetHashes, [a.hash]);
     assert.equal(seen.lost()[0].abandoned, true,
         "as abandoned: the node may have taken it, so a link attempt keeps waiting for its LRPROOF (Link.requestLost)");
+    assert.deepEqual(seen.lost()[0].unsent, [], "and so none of it is said never to have been sent: it was in a request");
     assert.deepEqual(fresh.body.packets, [], "the abandoned packet is not re-sent");
 
     fresh.respond(200, {});
@@ -355,13 +356,16 @@ test("a failed exchange loses its batch and the queue behind it, and a down inte
     await eventually(() => seen.lost().length === 1, "lost");
     assert.deepEqual(seen.lost()[0].packetHashes, [a.hash, b.hash]);
     assert.equal(seen.lost()[0].abandoned, false, "a failed exchange's report is not an abandoned one");
+    assert.deepEqual(seen.lost()[0].unsent, [b.hash],
+        "what was queued behind the batch went into no request, so nothing of it was sent; the batch itself may have reached the node");
     assert.equal(seen.kinds().indexOf("down") < seen.kinds().indexOf("lost"), true, "down, then what it lost");
 
     const requestsBefore = node.requests.length;
     const c = rawPacket(0xc3);
     iface.sendData(c.raw);
     await eventually(() => seen.lost().length === 2, "lost at once");
-    assert.deepEqual(seen.lost()[1], { packetHashes: [c.hash], reason: "the exchange is down", abandoned: false });
+    assert.deepEqual(seen.lost()[1], { packetHashes: [c.hash], reason: "the exchange is down", abandoned: false, unsent: [c.hash] },
+        "refused while down: nothing of it was sent");
     assert.equal(node.requests.length, requestsBefore, "nothing is sent for it");
 
     // The next attempt re-sends none of them (a re-send is a retry, §3).
@@ -518,13 +522,47 @@ test("block(): an exchange the page's policy blocks is never asked again, and wh
         const a = rawPacket(0xa1);
         iface.sendData(a.raw);
         await eventually(() => seen.lost().length === 1, "lost at once");
-        assert.deepEqual(seen.lost()[0], { packetHashes: [a.hash], reason: REASON, abandoned: false }, `${label}: lost at once, saying why`);
+        assert.deepEqual(seen.lost()[0], { packetHashes: [a.hash], reason: REASON, abandoned: false, unsent: [a.hash] },
+            `${label}: lost at once, saying why, and nothing of it was sent`);
         iface.check("online");
         iface.check("visible");
         await tick(); await tick();
         assert.equal(node.requests.length, 1, `${label}: nothing is asked of it again, a check included`);
         assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0);
     }
+});
+
+test("what was still queued when a registration fails, or when the page's policy blocks the exchange, went into no request: it is reported unsent", async (t) => {
+    // James, 2026-10-06 (DESIGN_PRINCIPLES §3, what a device owes its
+    // distro): the sender of an upload for the distro whose packet is in
+    // `unsent` may say that nothing was sent, which is no failure.
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+
+    // A registration that fails takes the packets queued behind it: none was sent.
+    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", "ab".repeat(16));
+    const seen = record(iface);
+    t.after(() => iface.disconnect());
+    iface.connect();
+    const registering = await node.pending("register");
+    const queued = rawPacket(0xd4);
+    iface.sendData(queued.raw);
+    registering.fail();
+    await eventually(() => seen.lost().length === 1, "lost");
+    assert.deepEqual(seen.lost()[0], { packetHashes: [queued.hash], reason: "Failed to fetch", abandoned: false, unsent: [queued.hash] });
+    assert.equal(node.count("exchange"), 0, "and no request ever carried it");
+    iface.disconnect();
+
+    // block() drops what is queued, and none of it was sent either; the exchange in flight carries nothing.
+    const blocked = await upInterface(t, fakeNode(t), clock);
+    blocked.iface.check("online");
+    const queuedAtBlock = rawPacket(0xe5);
+    blocked.iface.sendData(queuedAtBlock.raw);
+    blocked.iface.block("the exchange URL is blocked by this page's Content-Security-Policy");
+    await eventually(() => blocked.seen.lost().length === 1, "lost at once");
+    assert.deepEqual(blocked.seen.lost()[0].packetHashes, [queuedAtBlock.hash]);
+    assert.deepEqual(blocked.seen.lost()[0].unsent, [queuedAtBlock.hash]);
 });
 
 // ── A DM whose packet is lost (app.js) ─────────────────────────────────────

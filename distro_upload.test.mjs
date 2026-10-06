@@ -126,3 +126,70 @@ test("a proof after a loss tells the upload's owner once, so what it carried is 
     u.proved(proved);
     assert.equal(told, 1, "a proof of one proved already is no late proof");
 });
+
+// James, 2026-10-06 (DESIGN_PRINCIPLES §3, what a device owes its distro): an
+// upload that never left the device, because no interface could carry it, is
+// not a failure: nothing was sent. The exchange says so in the `unsent` part
+// of its "lost" (lib/rns/interfaces/post_interface.js), and the page decides
+// the upload with neverLeft() (app.js _onPacketsLost).
+
+test("an upload that never left is decided never-left, not lost: its owner hears onNeverLeft and not onLost, once, and the §1 watch stops", async () => {
+    const { u, timers, logged, fire } = uploads();
+    const upload = u.track("the join of #x", "link1");
+    let neverLeft = 0;
+    let lost = 0;
+    upload.onNeverLeft = () => neverLeft++;
+    upload.onLost = () => lost++;
+    u.left(upload);
+    assert.equal(u.neverLeft(upload, "its packet never left: the exchange is down"), true);
+    assert.equal(upload.settled, "never-left", "which is how a reader tells it from a loss");
+    assert.deepEqual(await outcome(upload), ["lost", "its packet never left: the exchange is down"], "outcome rejects, as for a loss");
+    assert.deepEqual([neverLeft, lost], [1, 0], "told of the one decision, and not of a loss");
+    assert.equal(timers[0].cleared, true, "no proof is awaited for what was never sent");
+    fire();
+    assert.deepEqual(logged, [], "so no §1 line follows");
+    assert.equal(u.neverLeft(upload, "again"), false, "decided once");
+    assert.equal(u.lost(upload, "late"), false, "and no loss decides it after");
+    assert.equal(u.cut("the connection stopped before the propagation node proved it"), 0, "cut() has nothing open to decide");
+    assert.deepEqual([neverLeft, lost], [1, 0]);
+});
+
+test("neverLeft() decides only an upload not decided: a proof or a loss before it stands", async () => {
+    const { u } = uploads();
+    const proved = u.track("the join of #a", "link1");
+    u.left(proved);
+    u.proved(proved);
+    assert.equal(u.neverLeft(proved, "its packet never left"), false);
+    assert.equal(proved.settled, "proved");
+    const lost = u.track("the join of #b", "link1");
+    u.left(lost);
+    u.lost(lost, "its packet was lost (the exchange failed)");
+    assert.equal(u.neverLeft(lost, "its packet never left"), false);
+    assert.equal(lost.settled, "lost", "a loss after the packet left is not turned into a never-left");
+    assert.deepEqual(await outcome(lost), ["lost", "its packet was lost (the exchange failed)"]);
+});
+
+test("a proof after a never-left is a late proof: logged, it decides nothing, and it tells the owner once", () => {
+    const { u, logged } = uploads();
+    const upload = u.track("the sent-copy for 01234567", "link1");
+    let told = 0;
+    upload.onLateProof = () => told++;
+    u.left(upload);
+    u.neverLeft(upload, "its packet never left: the exchange is down");
+    assert.equal(u.proved(upload), false);
+    assert.equal(u.proved(upload), false);
+    assert.equal(told, 1);
+    assert.deepEqual(logged, [
+        ["warn", "[distro] the sent-copy for 01234567 was proved after all, after it was reported never to have left"],
+        ["warn", "[distro] the sent-copy for 01234567 was proved after all, after it was reported never to have left"],
+    ]);
+});
+
+test("an upload never left before it was handed to the exchange starts no watch", async () => {
+    const { u, timers } = uploads();
+    const upload = u.track("the leave of #y", "link1");
+    u.neverLeft(upload, "its packet never left");
+    u.left(upload);
+    assert.deepEqual(timers, [], "a settled upload is not watched");
+    assert.equal(upload.settled, "never-left");
+});

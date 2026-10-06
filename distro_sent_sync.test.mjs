@@ -663,7 +663,20 @@ test("the per-entry upload (_uploadOwed) has today's three callers and no other,
     const exchangeSpans = members(exchange);
     assert.deepEqual(sites(exchange, "_lose", exchangeSpans), ["PostInterface.block", "PostInterface.sendData", "PostInterface._runExchange", "PostInterface._runExchange", "PostInterface._lose"],
         "the exchange reports packets lost when it is refused, when one is sent while it is down, and when an exchange fails or a check abandons it, and nowhere else");
-    assert.match(memberText(exchange, exchangeSpans, "PostInterface._lose"), /this\.emit\('lost', \{ packetHashes, reason, abandoned \}\);/);
+    assert.match(memberText(exchange, exchangeSpans, "PostInterface._lose"), /this\.emit\('lost', \{ packetHashes: hashes\(packets\), reason, abandoned, unsent: hashes\(unsent\) \}\);/);
+    // James, 2026-10-06 (DESIGN_PRINCIPLES §3, what a device owes its distro): an upload whose packet the exchange says
+    // went into no request is no failure, and goes at the exchange's return. A packet of a batch an exchange carried, or
+    // gave up on, may have reached the node, and a loss after that waits for the next coming-up. So `unsent` is only what a
+    // down or blocked exchange refused and what was still in the queue (spliced out of it by block() and by a failed exchange,
+    // and never the batch in flight): this is where a batch could be passed as unsent, and none is.
+    assert.deepEqual([...exchange.matchAll(/this\._lose\(([^;]*)\);/g)].map((m) => m[1].replace(/\s+/g, " ")), [
+        "queued, reason, { unsent: queued }",
+        "[data], this._blocked ?? 'the exchange is down', { unsent: [data] }",
+        "batch.packets, `exchange abandoned by a check`, { abandoned: true }",
+        "[...batch.packets, ...queued], err.message, { unsent: queued }",
+    ], "what the exchange reports lost, and the part of it that was never sent");
+    assert.equal(count(exchange, /const queued = this\._outboundQueue\.splice\(0\);/g), 2, "the queue, in block() and in a failed exchange, and nothing else");
+    assert.equal(count(exchange, /\bunsent\b/g), 6, "`unsent`: _lose's parameter, the emit's key and argument, and the three callers' one each");
     for (const page of ["index.html", "debug.html", "debug-standalone.html"]) {
         assert.doesNotMatch(await readFile(new URL(`./${page}`, import.meta.url), "utf8"), named, page);
     }
