@@ -13,6 +13,11 @@
  *   Progress: 0.10 + 0.90 x the Resource's fraction while SENDING, only up
  *   (LXMF/LXMessage.py __update_transfer_progress, LXMF-rust 4125139).
  *
+ *   Location: a photo goes without where it was taken (James, 2026-10-05):
+ *   each attachment is withoutLocation's (lib/photo_metadata.js) in
+ *   RnsClient.sendMessage, before anything is kept, and the composer holds
+ *   a picked file the same way. photo_metadata.test.mjs has the formats.
+ *
  *   Outcome: a moving transfer is never failed by the 30 s send ceiling: the
  *   Resource's own end decides, and a silence of more than 5 s is a logged §1
  *   violation (DESIGN_PRINCIPLES §1, bulk transfers), which the Resource
@@ -41,7 +46,9 @@ import {
 } from "./lib/attachment_limits.js";
 import { SendTransfers, transferProgress, propagationFailure, PROGRESS_START } from "./lib/send_progress.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
-import { build, compile, constValue, install, memoryStorage, methodBody } from "./test_app_source.mjs";
+import { app, build, compile, constValue, install, memoryStorage, methodBody } from "./test_app_source.mjs";
+import { withoutLocation } from "./lib/photo_metadata.js";
+import { TAG, exifOf, gpsJpeg, numberOf, readTiff, sentinelsIn } from "./test_photos.mjs";
 
 const quiet = { log() {}, warn() {}, error() {} };
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
@@ -103,7 +110,7 @@ test("the propagation node's announced limits are read from its announce ([3] pe
 // ── the send path ───────────────────────────────────────────────────────────
 
 /** A web client's DM send path over the real stores and attachment store. */
-function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = null, initialized = true } = {}) {
+function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = null, initialized = true, strip = withoutLocation } = {}) {
     const me = Identity.create();
     const storage = memoryStorage();
     const MsgStore = build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness: { recordInbound() {} }, Date });
@@ -113,6 +120,7 @@ function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = nul
     const env = {
         MsgStore, Attachments, attachmentKey, Cryptography, Identity, Buffer, Destination, LXMessage, LXMRouter, Link, Packet,
         FIELD_FILE_ATTACHMENTS, mimeForName, formatSize, attachmentRefusal, estimatePackedSize, propagationFailure, console: quiet,
+        withoutLocation: strip,
         applyDisplayName: DN.applyToFields, crypto: globalThis.crypto, Harness: { error() {} },
         ContactStore: { allow() {}, touch() {}, setReachable() {}, propagationDelay: (h) => (contacts.get(h)?.isDistro ? 0 : 5), getAll: () => [...contacts.values()] },
         GroupStore: { getAll: () => [] }, GroupMsgStore: { get: () => [] },
@@ -194,13 +202,111 @@ test("an attachment's MIME type is ours, from its name: never the browser's gues
     const app = { state: { activeHash: null }, _pendingAttachments: pending, _renderComposerTray() {}, _composerNotice() {} };
     install(app, {
         LXMRouter, MAX_ATTACHMENTS, formatSize, ContactStore: { get: () => null }, RnsClient: { attachmentRefusal: () => null },
-        document: { getElementById: () => null },
+        document: { getElementById: () => null }, withoutLocation,
     }, ["async _addAttachments(chatId, files)"]);
     const picked = { name: "page.html", size: 4, type: "text/html", arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
     await app._addAttachments("d".repeat(32), [picked]);
     const [entry] = pending.get("d".repeat(32));
     assert.deepEqual(Object.keys(entry).sort(), ["bytes", "name"], "the file's own type is not carried");
     assert.deepEqual([...entry.bytes], [1, 2, 3, 4]);
+});
+
+test("a picked photo is held as it will leave, without where it was taken; one that cannot be made safe is not held, with why", async () => {
+    const chat = "d".repeat(32);
+    const picker = (strip) => {
+        const self = { state: { activeHash: chat }, _pendingAttachments: new Map(), notices: [], _renderComposerTray() {} };
+        self._composerNotice = (text) => self.notices.push(text);
+        return install(self, {
+            LXMRouter, MAX_ATTACHMENTS, formatSize, ContactStore: { get: () => null }, RnsClient: { attachmentRefusal: () => null },
+            document: { getElementById: () => null }, withoutLocation: strip,
+        }, ["async _addAttachments(chatId, files)"]);
+    };
+    const photo = gpsJpeg();
+    const picked = { name: "IMG_0004.jpg", size: photo.length, arrayBuffer: async () => Uint8Array.from(photo).buffer };
+
+    const p = picker(withoutLocation);
+    await p._addAttachments(chat, [picked]);
+    const [held] = p._pendingAttachments.get(chat);
+    assert.ok(Buffer.from(held.bytes).equals(Buffer.from(withoutLocation(photo))), "held as it will leave: the tray and the limits are of what goes");
+    assert.deepEqual(sentinelsIn(held.bytes), []);
+    assert.deepEqual(p.notices, [""]);
+
+    const refusing = picker(() => null);
+    await refusing._addAttachments(chat, [picked]);
+    assert.equal(refusing._pendingAttachments.has(chat), false, "not held");
+    assert.deepEqual(refusing.notices, ["IMG_0004.jpg: where it was taken could not be removed from it, so it is not sent."]);
+});
+
+test("a photo leaves without where it was taken: the packed field, the bubble's copy, a queued send and the propagated copy carry withoutLocation's bytes", async () => {
+    // James, 2026-10-05: no photo leaves with GPS location, whatever its
+    // format (photo_metadata.test.mjs has the formats).
+    const s = sender();
+    const peer = Identity.create();
+    const c = contactOf(peer);
+    s.contacts.set(c.destHash, c);
+    const photo = { name: "IMG_0002.jpg", bytes: gpsJpeg() };
+    const doc = file("notes.pdf", 1000, 8);
+    assert.notDeepEqual(sentinelsIn(photo.bytes), [], "as picked, it says where it was taken");
+    const cleaned = Buffer.from(withoutLocation(photo.bytes));
+    assert.ok(cleaned.length < photo.bytes.length);
+
+    const rec = s.self.sendMessage(c, "", [photo, doc]);
+    const [sent] = s.direct;
+    const field = fieldsOf(sent.packed).get(FIELD_FILE_ATTACHMENTS);
+    const left = Buffer.from(field[0][1]);
+    assert.ok(left.equals(cleaned), "the photo that leaves is withoutLocation's");
+    assert.deepEqual(sentinelsIn(left), [], "no GPS, XMP or IPTC in it");
+    assert.equal(numberOf(readTiff(exifOf(left)).ifd0.get(TAG.Orientation), true), 6, "and it is upright, as picked");
+    assert.ok(Buffer.from(field[1][1]).equals(doc.bytes), "a file that is no photo goes as picked");
+    assert.deepEqual(rec.attachments.map(({ size, sha256 }) => ({ size, sha256 })), [
+        { size: cleaned.length, sha256: Cryptography.fullHash(cleaned).toString("hex") },
+        { size: 1000, sha256: Cryptography.fullHash(doc.bytes).toString("hex") },
+    ], "the bubble's record is of the bytes that left");
+    await settle();
+    assert.ok(Buffer.from(await s.Attachments.get(rec.attachments[0].key)).equals(cleaned), "the store holds them");
+    await s.self._propagateMessage(c, s.MsgStore.get(c.destHash)[0]);
+    assert.ok(s.resources[0].subarray(Link.MDU + 1).equals(sent.packed), "the propagated copy is the same message");
+
+    // Sent before initialization: queued with the same bytes, sent from them.
+    const q = sender({ initialized: false });
+    q.contacts.set(c.destHash, c);
+    const queued = q.self.sendMessage(c, "", [photo]);
+    assert.equal(queued.status, "queued");
+    await settle();
+    assert.ok(Buffer.from(await q.Attachments.get(queued.attachments[0].key)).equals(cleaned), "a queued send keeps the cleaned bytes");
+});
+
+test("a photo withoutLocation cannot make safe is refused before anything is stored, with why", () => {
+    const s = sender({ strip: () => null });
+    const peer = Identity.create();
+    const c = contactOf(peer);
+    s.contacts.set(c.destHash, c);
+    assert.throws(() => s.self.sendMessage(c, "look", [{ name: "IMG_0003.jpg", bytes: gpsJpeg() }]),
+        /^Error: IMG_0003\.jpg: where it was taken could not be removed from it, so it is not sent\.$/);
+    assert.deepEqual(s.MsgStore.get(c.destHash), [], "nothing stored");
+    assert.equal(s.direct.length, 0, "nothing sent");
+});
+
+test("every attachment passes withoutLocation in RnsClient.sendMessage, before its limits and before anything is kept; a picked file as it is read", () => {
+    const body = methodBody("sendMessage(contact, content, attachments = [])");
+    const at = body.indexOf("const bytes = withoutLocation(a.bytes);");
+    assert.ok(at > 0, "each attachment's bytes are withoutLocation's");
+    assert.match(body, /if \(attachments\.length\) attachments = attachments\.map\(\(a\) => \{\s*const bytes = withoutLocation\(a\.bytes\);\s*if \(!bytes\) throw new Error\(/);
+    assert.ok(at < body.indexOf("this.attachmentRefusal("), "before the limits");
+    for (const keep of ["MsgStore.add(", "this._keepAttachments("]) assert.ok(at < body.indexOf(keep), `before ${keep}`);
+    assert.match(app, /^import \{ withoutLocation \} from "\.\/lib\/photo_metadata\.js";$/m);
+    // Every outgoing attachment field is built from the store (_attachmentFieldNow,
+    // _attachmentField), and the one place an outgoing message's attachments
+    // are kept is this method's.
+    assert.equal((app.match(/_keepAttachments\(MsgStore, contact\.destHash,/g) || []).length, 1);
+    assert.deepEqual(app.match(/fields\.set\(FIELD_FILE_ATTACHMENTS, [^;]*;/g), [
+        "fields.set(FIELD_FILE_ATTACHMENTS, field);",                                   // _propagateMessage: field = await this._attachmentField(record)
+        "fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));",        // _sendPacket
+    ]);
+    assert.match(methodBody("async _propagateMessage(contact, outMsg)"), /field = await this\._attachmentField\(record\);/);
+    // The composer holds a picked file as it will leave (the one place a picked file is read).
+    assert.match(methodBody("async _addAttachments(chatId, files)"), /const bytes = withoutLocation\(new Uint8Array\(await file\.arrayBuffer\(\)\)\);\s*if \(!bytes\) \{/);
+    assert.equal((app.match(/\.arrayBuffer\(\)/g) || []).length, 1);
 });
 
 test("its propagated copy is the same message, attachments and hash, even read back from the store", async () => {

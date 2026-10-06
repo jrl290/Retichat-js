@@ -65,6 +65,7 @@ import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js
 import { DistroUploads } from "./lib/distro_upload.js";
 import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
+import { withoutLocation } from "./lib/photo_metadata.js";
 import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
@@ -3668,9 +3669,22 @@ const RnsClient = {
      * its limits (attachmentRefusal) throws before anything is stored. Their
      * bytes go to the attachment store with the record, so the bubble shows
      * them and the propagated copy carries the same field.
+     *
+     * A photo leaves without where it was taken (James, 2026-10-05): each
+     * attachment's bytes are withoutLocation's (lib/photo_metadata.js: a
+     * JPEG, PNG or WebP without its GPS, XMP and IPTC, nothing re-encoded),
+     * here, before the limits are checked and anything is kept, so the
+     * bubble, a queued send, the direct send and the propagated copy all
+     * carry those bytes and no others. One it cannot make safe throws: it
+     * is not sent as picked.
      */
     sendMessage(contact, content, attachments = []) {
         if (!contact.publicKey) throw new Error("No public key for this contact yet.");
+        if (attachments.length) attachments = attachments.map((a) => {
+            const bytes = withoutLocation(a.bytes);
+            if (!bytes) throw new Error(`${a.name}: where it was taken could not be removed from it, so it is not sent.`);
+            return bytes === a.bytes ? a : { ...a, bytes };
+        });
         const refusal = attachments.length ? this.attachmentRefusal(contact, content, attachments) : null;
         if (refusal) throw new Error(refusal);
 
@@ -9235,7 +9249,14 @@ const App = {
                 continue;
             }
             try {
-                const bytes = new Uint8Array(await file.arrayBuffer());
+                // Held as it will leave, without where it was taken (James,
+                // 2026-10-05), so the tray and the limits are of what goes:
+                // RnsClient.sendMessage does the same to all it sends.
+                const bytes = withoutLocation(new Uint8Array(await file.arrayBuffer()));
+                if (!bytes) {
+                    notices.push(`${file.name}: where it was taken could not be removed from it, so it is not sent.`);
+                    continue;
+                }
                 // No type from the browser (file.type): the record's MIME
                 // type is ours, from the name (RnsClient.sendMessage).
                 pending.push({ name: file.name || "attachment.bin", bytes });
