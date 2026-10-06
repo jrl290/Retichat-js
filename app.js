@@ -58,7 +58,8 @@ import {
 } from "./lib/display_name.js";
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { ChannelMembership, channelSyncDisposition, channelSyncFields } from "./lib/channel_sync.js";
-import { applyGroupFields } from "./lib/retichat_field.js";
+import { applyGroupFields, GROUP_ENTRIES_IN_RETICHAT_FIELD } from "./lib/retichat_field.js";
+import { senderKeyEntry, statusChangeVerdict, packedMessage, packedHeld } from "./lib/group_status.js";
 import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.js";
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
@@ -620,6 +621,15 @@ function ownLxmfDestinationHash() {
  *     client transmit for someone: only for a group the user has joined
  *     (active), and only from a member that accepted it (`sourceStatus`
  *     "accepted").
+ *   - status (RFed-spec Group.md, "Member statuses and keys", James
+ *     2026-10-06): the creator's answer to the user's accept, carrying the
+ *     other members' own accepts and leaves. Only from the group's creator
+ *     (`sourceIsCreator`: the invite's authenticated source, which
+ *     GroupStore keeps with the group), only for a group the user has
+ *     joined (active), and only when its signature shows the creator sent
+ *     it (`proven`; the creator's key is held, as every member's is when the
+ *     user accepts). Whether the creator has left decides nothing: it is a
+ *     carrier, every element is checked on its own (_takeGroupStatuses).
  *   - Any other action (relay_done, an action this client does not know):
  *     only from a source the group trusts (groupTrustsSource: a current
  *     member of a group the user has joined).
@@ -634,12 +644,18 @@ function ownLxmfDestinationHash() {
  *     it, an invite included. A plain message is still kept, as a DM with
  *     an invalid signature is, and speaks only for its source
  *     (PrivacyFilter.groupMember).
- *   - "unknown" (no key for the source here yet): an invite is taken (the
- *     inviter's key travels in one of the invite's own messages, and the
- *     filter decides by source, as on the phones). An accept or a leave
- *     passes this rule, but does not count yet: the handler holds it until
- *     the source's key is held, checks the signature then, and counts it
- *     only if it verifies (_holdGroupStatusChange). A pending group's
+ *   - "unknown" (no key for the source here yet, and none carried that
+ *     binds: an accept or leave carries its sender's own key, and
+ *     LXMessage.fromBytes checks it under that key when none is held, so a
+ *     message that carries one is "validated" or "invalid", never
+ *     "unknown"): an invite is taken (the inviter's key travels in one of
+ *     the invite's own messages, and the filter decides by source, as on
+ *     the phones). An accept or a leave passes this rule and is counted
+ *     until the switch (GROUP_ENTRIES_IN_RETICHAT_FIELD, around 2026-10-26),
+ *     as the phones count it (statusChangeVerdict; James, 2026-10-06); from
+ *     the switch the handler holds it until the source's key is held,
+ *     checks the signature then, and counts it only if it verifies
+ *     (_holdGroupStatusChange). A pending group's
  *     members' keys arrive one per invite message (each client sends one
  *     per member, sendGroupInvites, iOS GroupChatManager.sendInvites), and
  *     a member's accept can come first, both fetched from the propagation
@@ -669,9 +685,13 @@ function ownLxmfDestinationHash() {
  *   (GroupStore.isClosed)
  * @param {"validated"|"unknown"|"invalid"|null} signature  the message's
  *   signature check (LXMessage.signatureState); null when not checked yet
+ * @param {boolean} sourceIsCreator  the packet's source is the group's
+ *   creator, the invite's source (GroupStore: `creator`); asked of a
+ *   `status` only. False for a group whose creator is not recorded (one held
+ *   before 2026-10-06).
  * The source is the LXMF source of the packet, never GROUP_SENDER.
  */
-function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sourceStatus, namesOther, groupClosed, signature = null) {
+function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sourceStatus, namesOther, groupClosed, signature = null, sourceIsCreator = false) {
     const forged = signature === "invalid";
     const proven = signature === "validated" || signature === null;
     if (groupAction === "invite") return sourceAllowed && !groupClosed && !forged;
@@ -681,6 +701,7 @@ function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sour
     if (groupAction === "accept" || groupAction === "leave") {
         return (sourceStatus === "invited" || sourceStatus === "accepted") && !namesOther && !forged;
     }
+    if (groupAction === "status") return groupStatus === "active" && sourceIsCreator === true && proven;
     return groupTrustsSource(groupStatus, sourceStatus) && proven;
 }
 
@@ -1411,9 +1432,18 @@ OutboundTickets.init();
 //  never back from left (updateMember). The groups the user declined or left
 //  are recorded (close, isClosed), so an invite to one is ignored
 //  (shouldProcessGroupMessage) and the user is never offered it again.
+//
+//  The creator (James, 2026-10-06, RFed-spec Group.md "Member statuses and
+//  keys"): a group records who started it, the invite's authenticated source
+//  (addPending) or this device (create), because a `status` counts only from
+//  it and only the creator answers an accept with one. Groups held before
+//  that day have no creator recorded and take no part: they answer no accept
+//  and count no status. The creator also keeps, per group and member, the
+//  packed LXMF message of the newest accept or leave that counted (keepStatus,
+//  statusMessages), persisted beside the groups and gone with the group.
 // =========================================================================
 const GroupStore = {
-    _groups: new Map(),  // groupId → { groupId, groupName, groupStatus, members: Map<memberHash, status>, lastActivity }
+    _groups: new Map(),  // groupId → { groupId, groupName, groupStatus, members: Map<memberHash, status>, lastActivity, creator }
     _listeners: [],
     // groupId → "rejected" | "left": the groups the user declined or left,
     // oldest first. Bounded: past CLOSED_LIMIT the oldest is forgotten, and
@@ -1437,6 +1467,16 @@ const GroupStore = {
     HELD_LIMIT: 128,
     HELD_PER_MEMBER: 4,
     HELD_PAYLOAD_LIMIT: 2048,
+    // The creator's copies (keepStatus): groupId → Map<memberHash, {action,
+    // packed}>, the newest accept or leave that counted for each member,
+    // `packed` the whole received LXMF message in base64 (destination,
+    // source, signature, payload: lib/group_status.js packedMessage).
+    // Persisted as rows under groups_statuses_v1. A copy over
+    // STATUS_PACKED_LIMIT is not kept: that is HELD_PAYLOAD_LIMIT plus the 96
+    // bytes before the payload (lib/group_status.js STATUS_PACKED_LIMIT, which
+    // a test pins this to), and no genuine accept or leave comes near it.
+    _statuses: new Map(),
+    STATUS_PACKED_LIMIT: 2144,
 
     init() {
         const data = sGet("groups_v1");
@@ -1452,6 +1492,7 @@ const GroupStore = {
                     groupStatus: g.groupStatus || "active",
                     members,
                     lastActivity: g.lastActivity || 0,
+                    creator: typeof g.creator === "string" && /^[0-9a-f]{32}$/.test(g.creator) ? g.creator : null,
                 });
             }
         }
@@ -1468,6 +1509,62 @@ const GroupStore = {
                 && (e.action === "accept" || e.action === "leave")
                 && text(e.dest) && text(e.signature) && text(e.payload)).slice(0, this.HELD_LIMIT);
         }
+        const kept = sGet("groups_statuses_v1");
+        if (Array.isArray(kept)) {
+            for (const e of kept) {
+                const g = e && typeof e.groupId === "string" ? this._groups.get(e.groupId) : null;
+                if (!g || !g.members.has(e.member) || (e.action !== "accept" && e.action !== "leave") || typeof e.packed !== "string") continue;
+                if (Buffer.from(e.packed, "base64").length > this.STATUS_PACKED_LIMIT) continue;
+                if (!this._statuses.has(e.groupId)) this._statuses.set(e.groupId, new Map());
+                this._statuses.get(e.groupId).set(e.member, { action: e.action, packed: e.packed });
+            }
+        }
+    },
+
+    /** Keep `packed` (a Buffer: the accept or leave exactly as it was
+     *  received, lib/group_status.js packedMessage) as member `member`'s copy
+     *  for the creator's answer (RnsClient.sendGroupStatus): the newest accept
+     *  or leave of that member that counted, one per member, replaced by the
+     *  next that counts. Called for each that counts, by the three paths that
+     *  count one (RnsClient._applyGroupStatusChange), before the member's
+     *  status moves. A leave is final here as everywhere: nothing replaces
+     *  it, and nothing is kept for a member that left. Returns null when
+     *  kept, else why not (the group is not held, the sender is on no list,
+     *  it left, or the copy is over STATUS_PACKED_LIMIT). */
+    keepStatus(groupId, member, action, packed) {
+        const g = this._groups.get(groupId);
+        if (!g) return "the group is not held here";
+        if (action !== "accept" && action !== "leave") return "it is neither an accept nor a leave";
+        const status = g.members.get(member);
+        if (status === undefined) return "its sender is on no list";
+        if (status === "left") return "its sender left, for good";
+        if (!(packed instanceof Uint8Array) || packed.length === 0) return "there is no packed message";
+        if (packed.length > this.STATUS_PACKED_LIMIT) return `it is over ${this.STATUS_PACKED_LIMIT} bytes, which no accept or leave is`;
+        const rows = this._statuses.get(groupId) ?? new Map();
+        if (rows.get(member)?.action === "leave") return "a leave is kept: nothing replaces it";
+        rows.set(member, { action, packed: Buffer.from(packed).toString("base64") });
+        this._statuses.set(groupId, rows);
+        this._saveStatuses();
+        return null;
+    },
+
+    /** The creator's copies for group `groupId`: [{ member, action, packed
+     *  (a Buffer) }], by member hash, ascending: one per member that has
+     *  answered. A member that has not is absent: still invited. */
+    statusMessages(groupId) {
+        const rows = this._statuses.get(groupId);
+        if (!rows) return [];
+        return [...rows.entries()]
+            .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+            .map(([member, row]) => ({ member, action: row.action, packed: Buffer.from(row.packed, "base64") }));
+    },
+
+    _saveStatuses() {
+        const rows = [];
+        for (const [groupId, members] of this._statuses) {
+            for (const [member, row] of members) rows.push({ groupId, member, action: row.action, packed: row.packed });
+        }
+        sSet("groups_statuses_v1", rows);
     },
 
     /** Hold `entry` (an accept or leave whose source's key is not here
@@ -1507,7 +1604,7 @@ const GroupStore = {
         for (const h of memberHashes) {
             if (h !== ownHash) members.set(h, "invited");
         }
-        const group = { groupId, groupName, groupStatus: "active", members, lastActivity: Date.now() };
+        const group = { groupId, groupName, groupStatus: "active", members, lastActivity: Date.now(), creator: ownHash };
         this._groups.set(groupId, group);
         this._save();
         this._notify();
@@ -1519,7 +1616,10 @@ const GroupStore = {
      *  For a group already held it changes nothing and returns that group:
      *  the list is fixed (James, 2026-10-01). Until then a second invite
      *  merged its list in and marked its sender accepted, so anyone the
-     *  filter let invite could add members, or bring back one that left. */
+     *  filter let invite could add members, or bring back one that left.
+     *  The invite's source is the group's creator (James, 2026-10-06): the
+     *  one source a `status` counts from, recorded once, with the group, and
+     *  never changed by a later invite. */
     addPending(groupId, groupName, senderHash, memberHashes) {
         const existing = this._groups.get(groupId);
         if (existing) return existing;
@@ -1529,7 +1629,7 @@ const GroupStore = {
         }
         members.set(senderHash, "accepted");
         members.set(ownLxmfDestinationHash(), "invited");
-        const group = { groupId, groupName, groupStatus: "pending", members, lastActivity: Date.now() };
+        const group = { groupId, groupName, groupStatus: "pending", members, lastActivity: Date.now(), creator: senderHash };
         this._groups.set(groupId, group);
         this._save();
         this._notify();
@@ -1560,12 +1660,14 @@ const GroupStore = {
         return true;
     },
 
-    /** Remove a group entirely, with the accepts and leaves held for it. */
+    /** Remove a group entirely, with the accepts and leaves held for it and
+     *  the creator's copies of its members' (keepStatus). */
     remove(groupId) {
         this._groups.delete(groupId);
         const held = this._held.length;
         this._held = this._held.filter(e => e.groupId !== groupId);
         if (this._held.length !== held) sSet("groups_held_v1", this._held);
+        if (this._statuses.delete(groupId)) this._saveStatuses();
         this._save();
         this._notify();
     },
@@ -1638,6 +1740,7 @@ const GroupStore = {
                 groupStatus: g.groupStatus,
                 members: [...g.members.entries()].map(([hash, status]) => ({ hash, status })),
                 lastActivity: g.lastActivity,
+                creator: g.creator ?? null,
             });
         }
         sSet("groups_v1", arr);
@@ -1769,9 +1872,14 @@ const PrivacyFilter = {
         const held = GroupStore.get(groupId);
         const groupStatus = held ? held.groupStatus : null;
         const sourceStatus = GroupStore.memberStatus(groupId, src);
+        // The invite's source, kept with the group (GroupStore): a `status`
+        // counts only from it. A group whose creator is not recorded has
+        // none, so nothing is the creator's for it.
+        const sourceIsCreator = !!held && typeof held.creator === "string" && held.creator === src;
         return { sourceAllowed: this.allows(src), groupStatus, sourceStatus,
             closed: GroupStore.isClosed(groupId),
-            trusted: groupTrustsSource(groupStatus, sourceStatus) };
+            trusted: groupTrustsSource(groupStatus, sourceStatus),
+            sourceIsCreator };
     },
 
     /** The group rule (shouldProcessGroupMessage: iOS groupMessagePolicy
@@ -1784,7 +1892,7 @@ const PrivacyFilter = {
     groupAccepts(group, src, signature = null) {
         const s = this._groupStanding(group.groupId, src);
         const named = group.groupSender ? String(group.groupSender).toLowerCase() : src;
-        return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, s.groupStatus, s.sourceStatus, named !== src, s.closed, signature);
+        return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, s.groupStatus, s.sourceStatus, named !== src, s.closed, signature, s.sourceIsCreator);
     },
 
     /** Whom a group message the rule kept is from: its GROUP_SENDER
@@ -5240,6 +5348,15 @@ const RnsClient = {
         if (this._groupSeenIds.size > 2000) {
             this._groupSeenIds = new Set([...this._groupSeenIds].slice(-1000));
         }
+        // An accept or leave carries its sender's own key (RFed-spec Group.md,
+        // "Member statuses and keys"; LXMessage.fromBytes bound it, and
+        // checked the signature under it when no key was held). It is
+        // remembered as an invite chunk's key is, before anything below looks
+        // for the key: an accept or leave of this member's held for it is
+        // decided by it, next.
+        if ((groupAction === "accept" || groupAction === "leave") && lxmfMsg.senderKey) {
+            this._rememberGroupMemberKeys(new Map([[srcHash, Buffer.from(lxmfMsg.senderKey).toString("base64")]]));
+        }
         // A message its source signed (validated) shows that source's key is
         // here, however it came (a channel post's prelude, a contact added
         // with its key): an accept or leave of that source's held for the
@@ -5301,15 +5418,29 @@ const RnsClient = {
                 if (!group) return;
                 // The source's own accept or leave (the rule took it only
                 // from a member on the list that has not left, naming nobody
-                // else, and not forged). It counts only once its signature
-                // shows the member sent it: from a source whose key is not
-                // here yet it is held until the key is, then checked
-                // (_holdGroupStatusChange).
-                if (signature !== "validated") {
-                    this._holdGroupStatusChange(lxmfMsg, groupId, srcHash, groupAction);
-                    return;
+                // else, and not forged). Verified, it counts. From a source
+                // whose key is neither held nor carried it is unverifiable:
+                // it counts until the switch, as the phones count it, and
+                // from then on is held until the key is here, then checked
+                // (_takeGroupStatusChange, _holdGroupStatusChange).
+                const counted = this._takeGroupStatusChange(lxmfMsg, groupId, srcHash, groupAction, lxmfMsg);
+                // The creator answers every accept that counted and carries
+                // its sender's own key with one status (RFed-spec Group.md):
+                // never one that carries none, so a client from before this
+                // change is not sent an action it does not know. Once per
+                // accept received, and never again.
+                if (counted && groupAction === "accept" && lxmfMsg.senderKey) {
+                    this.sendGroupStatus(groupId, srcHash).catch(e => console.warn("Group status send failed:", e.message));
                 }
-                this._applyGroupStatusChange(groupId, srcHash, groupAction, lxmfMsg);
+                break;
+            }
+            case "status": {
+                // The creator's answer to the user's accept (the rule took it
+                // only from the group's creator, for a group the user has
+                // joined, signed by it): each element is a member's own
+                // accept or leave, checked on its own.
+                if (!group) return;
+                this._takeGroupStatuses(group, groupInfo.statuses);
                 break;
             }
             case "relay_req": {
@@ -5376,15 +5507,119 @@ const RnsClient = {
      *  another hash (GROUP_SENDER) from an allowed source made that hash a
      *  member, allowlisted. The open chat is told with `event`: the message
      *  itself when it is counted as it arrives, as before, or a "group-status"
-     *  event when a held one is. Returns whether anything changed. */
-    _applyGroupStatusChange(groupId, src, action, event = null) {
+     *  event when a held one or an element of a `status` is. Returns whether
+     *  anything changed.
+     *
+     *  Every accept or leave that counts comes through here (arriving, held
+     *  and decided later, or an element of a `status`), so this is where the
+     *  creator keeps its copy (James, 2026-10-06): `packed`, the message
+     *  exactly as received (lib/group_status.js packedMessage), is kept as
+     *  the member's newest (GroupStore.keepStatus) when this device created
+     *  the group, before the member's status moves, so a repeated accept,
+     *  which changes nothing, is the newest too. */
+    _applyGroupStatusChange(groupId, src, action, event = null, packed = null) {
         const group = GroupStore.get(groupId);
         if (!group) return false;
+        if (packed && group.creator === (this.ownHash ?? ownLxmfDestinationHash())) {
+            const refused = GroupStore.keepStatus(groupId, src, action, packed);
+            if (refused) console.log(`[retichat] 👥 No copy kept of the ${action} of ${src.slice(0,12)} for group ${groupId.slice(0,8)}: ${refused}`);
+        }
         if (!GroupStore.updateMember(groupId, src, action === "leave" ? "left" : "accepted")) return false;
         if (action === "accept" && group.groupStatus === "active" && src !== (this.ownHash ?? ownLxmfDestinationHash())) ContactStore.allow(src);
         GroupMsgStore.addSystem(groupId, action === "leave" ? "left the group" : "joined the group", src);
         this._onMsg.forEach(fn => fn(event ?? { kind: "group-status", groupId }, groupId));
         return true;
+    },
+
+    /** An accept or leave of member `src` that passed the group rule (a
+     *  listed member that has not left, about itself, not forged), decided by
+     *  its signature (lib/group_status.js statusChangeVerdict): verified, it
+     *  counts; unverifiable (no key held, none carried that binds), it counts
+     *  until the switch (GROUP_ENTRIES_IN_RETICHAT_FIELD, around 2026-10-26),
+     *  as the phones count it, and from the switch is held until its sender's
+     *  key is here (_holdGroupStatusChange). James, 2026-10-06. The one place
+     *  that decides it, for the message arriving directly and for each
+     *  element of a `status` (_takeGroupStatusElement), so the two cannot
+     *  differ. `event` is what the open chat is told on a count
+     *  (_applyGroupStatusChange). Returns whether it counted. */
+    _takeGroupStatusChange(lxmfMsg, groupId, src, action, event = null) {
+        const verdict = statusChangeVerdict(lxmfMsg.signatureState ?? "invalid", GROUP_ENTRIES_IN_RETICHAT_FIELD);
+        if (verdict === "hold") {
+            this._holdGroupStatusChange(lxmfMsg, groupId, src, action);
+            return false;
+        }
+        if (verdict === "ignore") return false;
+        this._applyGroupStatusChange(groupId, src, action, event, packedMessage(lxmfMsg));
+        return true;
+    },
+
+    /** A `status` the group rule took (PrivacyFilter.groupAccepts: only from
+     *  the group's creator, for a group the user has joined, signed by it):
+     *  the creator's answer to the user's accept, `statuses` its
+     *  GROUP_STATUSES, the members' own accepts and leaves as the creator
+     *  received them (RFed-spec Group.md, "Receiving a status"). Each element
+     *  is checked on its own, as if it had arrived directly
+     *  (_takeGroupStatusElement), and one that fails is skipped, so the
+     *  creator can only pass on what the members signed. An element that
+     *  passes counts under the rules of the message arriving directly, so
+     *  order does not matter and a leave stays final. An honest creator sends
+     *  at most one element for each member but the two it leaves out (itself
+     *  and the recipient), so no more than the member list's length are read:
+     *  each costs a signature check. Returns {counted, held, skipped}. */
+    _takeGroupStatuses(group, statuses) {
+        const groupId = group.groupId;
+        const ownHash = this.ownHash ?? ownLxmfDestinationHash();
+        const elements = Array.isArray(statuses) ? statuses : [];
+        const read = elements.slice(0, group.members.size);
+        const tally = { counted: 0, held: 0, skipped: elements.length - read.length };
+        read.forEach((element, index) => {
+            const result = this._takeGroupStatusElement(groupId, element, ownHash);
+            if (result === "counted") tally.counted++;
+            else if (result === "held") tally.held++;
+            else {
+                tally.skipped++;
+                console.log(`[retichat] 👥 Skipped element ${index} of the status for group ${groupId.slice(0,8)}: ${result}`);
+            }
+        });
+        console.log(`[retichat] 👥 Status for group ${groupId.slice(0,8)}: ${elements.length} element(s), ${tally.counted} counted, ${tally.held} held, ${tally.skipped} skipped`);
+        Harness.event("group-status-received", { group: groupId.slice(0, 8), elements: elements.length, ...tally });
+        return tally;
+    },
+
+    /** One element of a `status`, checked as if it had arrived directly: it
+     *  must be a packed LXMF message (destination, source, signature,
+     *  payload) that unpacks, about this group (`groupId`), an accept or a
+     *  leave, from a source that is a member listed for the group and has
+     *  not left, naming nobody else, and not about this device. Its
+     *  signature is checked as any message's is (LXMessage.fromBytes: under a
+     *  key held here, or the one it carries once bound), and the group rule
+     *  and the verdict are those of the message arriving directly
+     *  (PrivacyFilter.groupAccepts, _takeGroupStatusChange). Its destination
+     *  is the creator, not this device: it is the member's own statement to
+     *  the creator, and is not asked. Returns "counted", "held" (unverifiable
+     *  from the switch), or why it was skipped. */
+    _takeGroupStatusElement(groupId, element, ownHash) {
+        if (!(element instanceof Uint8Array)) return "not a bin";
+        if (element.length <= 96 || element.length > GroupStore.STATUS_PACKED_LIMIT) return `${element.length} bytes is not the size of an accept or leave`;
+        const bytes = Buffer.from(element);
+        const message = LXMessage.fromBytes(bytes.subarray(16), bytes.subarray(0, 16));
+        if (!message) return "not an LXMF message";
+        const info = LXMessage.extractGroupFields(message.fields);
+        if (!info) return "no group id";
+        if (info.groupId !== groupId) return "about another group";
+        const action = info.groupAction;
+        if (action !== "accept" && action !== "leave") return `the action is ${action || "none"}, not an accept or a leave`;
+        const src = message.sourceHash.toString("hex");
+        if (src === ownHash) return "about this device";
+        const signature = message.signatureState ?? "invalid";
+        if (!PrivacyFilter.groupAccepts(info, src, signature)) {
+            return signature === "invalid" ? "its signature does not verify: it is not its source's"
+                : "its source is not a member listed for the group that has not left, or it names another";
+        }
+        // The key it carries is remembered as the one an accept arriving
+        // directly brings (_handleGroupMessage).
+        if (message.senderKey) this._rememberGroupMemberKeys(new Map([[src, Buffer.from(message.senderKey).toString("base64")]]));
+        return this._takeGroupStatusChange(message, groupId, src, action) ? "counted" : "held";
     },
 
     /** An accept or leave from member `src` whose signature could not be
@@ -5436,7 +5671,7 @@ const RnsClient = {
                 continue;
             }
             console.log(`[retichat] 👥 Held ${entry.action} for group ${entry.groupId.slice(0,8)} from ${entry.src.slice(0,12)} verifies: counted`);
-            this._applyGroupStatusChange(entry.groupId, entry.src, entry.action);
+            this._applyGroupStatusChange(entry.groupId, entry.src, entry.action, null, packedHeld(entry));
         }
     },
 
@@ -5518,7 +5753,23 @@ const RnsClient = {
         ));
     },
 
-    /** Send accept to all group members. */
+    /** The user's own GROUP_MEMBER_KEYS entry (RFed-spec Group.md, "The
+     *  sender's key", James 2026-10-06): `hash:base64-public-key`, the form an
+     *  invite chunk uses (_groupMemberKeys). Every accept and every leave (a
+     *  decline is a leave) carries exactly this one entry, in the old field
+     *  0xA8 until the switch like every group entry
+     *  (GROUP_ENTRIES_IN_RETICHAT_FIELD, applyGroupFields). Read from the
+     *  identity, not the router, so a leave sent with no connection carries
+     *  it too. */
+    _ownGroupMemberKey() {
+        const ownHash = ownLxmfDestinationHash();
+        const publicKey = IdMgr.pubKey;
+        if (!ownHash || !publicKey || !/^[0-9a-f]{128}$/i.test(publicKey)) throw new Error("This device's own key is not available");
+        return senderKeyEntry(ownHash, publicKey);
+    },
+
+    /** Send accept to all group members, carrying the user's own key
+     *  (_ownGroupMemberKey). */
     async sendGroupAccept(groupId) {
         const group = GroupStore.get(groupId);
         if (!group) return;
@@ -5529,7 +5780,41 @@ const RnsClient = {
             groupId,
             groupAction: "accept",
             groupSender: ownHash,
+            groupMemberKey: this._ownGroupMemberKey(),
         });
+    },
+
+    /** The creator's answer to an accept (RFed-spec Group.md, "The creator's
+     *  answer: status", James 2026-10-06): one `status` to member
+     *  `memberHash` alone, whose accept just counted and carried its own key.
+     *  GROUP_ID, GROUP_ACTION "status", GROUP_SENDER this device, and
+     *  GROUP_STATUSES: the copy this device keeps of each other listed
+     *  member's newest accept or leave that counted (GroupStore.keepStatus),
+     *  exactly as it was received, neither this device's nor the recipient's,
+     *  by member hash. A member that has not answered is absent: still
+     *  invited. An empty array is a valid answer (nobody else has).
+     *  Sent as every group envelope is (_fanoutGroupEnvelope: directly, one
+     *  propagated copy as the fallback; a Resource when it is too large for
+     *  a packet), once per accept received and never again: nothing here
+     *  retries. The key is carried in the Retichat field only, even before
+     *  the switch (applyGroupFields). Only the creator answers: any other
+     *  device returns null, and a creator who left holds no group. */
+    async sendGroupStatus(groupId, memberHash) {
+        const group = GroupStore.get(groupId);
+        const ownHash = this.ownHash ?? ownLxmfDestinationHash();
+        if (!group || !ownHash || group.creator !== ownHash) return null;
+        const statuses = GroupStore.statusMessages(groupId)
+            .filter(copy => copy.member !== ownHash && copy.member !== memberHash && group.members.has(copy.member))
+            .map(copy => copy.packed);
+        const delivery = await this._fanoutGroupEnvelope([memberHash], "", {
+            groupId,
+            groupAction: "status",
+            groupSender: ownHash,
+            groupStatuses: statuses,
+        });
+        console.log(`[retichat] 👥 Status for group ${groupId.slice(0,8)} with ${statuses.length} element(s) to ${memberHash.slice(0,12)}: delivered to ${delivery.fulfilled} of ${delivery.total}`);
+        Harness.event("group-status-sent", { group: groupId.slice(0, 8), to: memberHash.slice(0, 12), elements: statuses.length });
+        return delivery;
     },
 
     /** The user's leave of group `groupId`, sent when the user leaves a
@@ -5550,7 +5835,10 @@ const RnsClient = {
      *  per invite message) is asked for, and sent the leave once its
      *  announce brings the key (_sendGroupEnvelope). The list is read
      *  before the first await, so the caller closes the group at once and
-     *  the leave does not depend on it. Returns the fan-out's delivery.
+     *  the leave does not depend on it. It carries the user's own key
+     *  (_ownGroupMemberKey), as an accept does, so a member that never heard
+     *  of this device can verify it (James, 2026-10-06). Returns the
+     *  fan-out's delivery.
      *  Until 2026-10-02 a leave went to the members marked accepted only,
      *  and a decline sent nothing. */
     async sendGroupLeave(groupId) {
@@ -5566,6 +5854,7 @@ const RnsClient = {
             groupId,
             groupAction: "leave",
             groupSender: ownHash,
+            groupMemberKey: this._ownGroupMemberKey(),
         });
         console.log(`[retichat] 👥 Leave for group ${groupId.slice(0,8)} delivered to ${delivery.fulfilled} of ${delivery.total} member(s)`);
         return delivery;

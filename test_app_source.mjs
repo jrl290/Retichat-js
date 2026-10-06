@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { addInOrder } from "./lib/message_order.js";
 import Cryptography from "./lib/rns/cryptography.js";
+import { statusChangeVerdict, packedMessage, packedHeld } from "./lib/group_status.js";
+import { GROUP_ENTRIES_IN_RETICHAT_FIELD } from "./lib/retichat_field.js";
 
 export const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -139,4 +141,28 @@ export function installPropagated(self, env) {
         "_ingestPropagatedBlob(lxmfData, label)",
         "_onPropagatedPush(lxmfData)",
     ]);
+}
+
+/**
+ * The methods an accept or a leave goes through once the group handler has
+ * taken it (RFed-spec Group.md, "Member statuses and keys"): the decision by
+ * signature, the count (and the creator's copy), the hold, and the elements
+ * of a `status`. A test that runs the real _handleGroupMessage over accepts
+ * and leaves installs these beside it, over groupStatusEnv().
+ */
+export const GROUP_STATUS_METHODS = [
+    "_applyGroupStatusChange(groupId, src, action, event = null, packed = null)",
+    "_takeGroupStatusChange(lxmfMsg, groupId, src, action, event = null)",
+    "_takeGroupStatuses(group, statuses)",
+    "_takeGroupStatusElement(groupId, element, ownHash)",
+    "_holdGroupStatusChange(lxmfMsg, groupId, src, action)",
+    "_decideHeldGroupChanges()",
+];
+
+/** What GROUP_STATUS_METHODS read from the page beside the stores: the
+ *  verdict and packing helpers, and the switch (GROUP_ENTRIES_IN_RETICHAT_FIELD,
+ *  false until around 2026-10-26; `overrides` {GROUP_ENTRIES_IN_RETICHAT_FIELD:
+ *  true} is the page after it). */
+export function groupStatusEnv(overrides = {}) {
+    return { statusChangeVerdict, packedMessage, packedHeld, GROUP_ENTRIES_IN_RETICHAT_FIELD, ...overrides };
 }

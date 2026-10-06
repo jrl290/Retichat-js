@@ -60,8 +60,9 @@ import { sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
 import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
+import { senderKeyEntry } from "./lib/group_status.js";
 import { NameLedger } from "./lib/name_ledger.js";
-import { installPropagated } from "./test_app_source.mjs";
+import { installPropagated, GROUP_STATUS_METHODS, groupStatusEnv } from "./test_app_source.mjs";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -704,7 +705,7 @@ test("a group invite from a co-member who is not allowlisted is dropped unproved
 
 /** The real _handleGroupMessage behind `r`'s handler, over its real
  *  GroupStore and ContactStore and a real GroupMsgStore. */
-function withGroupHandler(r) {
+function withGroupHandler(r, { switched = false } = {}) {
     const GroupMsgStore = build("GroupMsgStore", { sGet: r.storage.sGet, sSet: r.storage.sSet, Date, ContactStore: r.ContactStore });
     const own = () => lxmfHash(r.me);
     r.self.ownHash = own();
@@ -715,12 +716,11 @@ function withGroupHandler(r) {
     const env = {
         GroupStore: r.GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, Buffer,
         ownLxmfDestinationHash: own, PrivacyFilter: r.PrivacyFilter, sentTimeMs, LXMessage, Harness: r.Harness,
+        ...groupStatusEnv({ GROUP_ENTRIES_IN_RETICHAT_FIELD: switched }),
     };
     for (const signature of [
         "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
-        "_applyGroupStatusChange(groupId, src, action, event = null)",
-        "_holdGroupStatusChange(lxmfMsg, groupId, src, action)",
-        "_decideHeldGroupChanges()",
+        ...GROUP_STATUS_METHODS,
     ]) {
         const name = signature.slice(0, signature.indexOf("("));
         r.self[name] = compile(signature, env)(r.self);
@@ -1160,9 +1160,9 @@ test("group model: nothing adds a member: an accept from a source not on the lis
 /** A group the user holds, `kind` "active" (created here) or "pending"
  *  (invited by an allowlisted contact I), listing `ids` besides this device
  *  (and I); the real group handler behind `r`, with the filter as given. */
-function heldGroup(kind, ids, { filter = true } = {}) {
+function heldGroup(kind, ids, { filter = true, switched = false } = {}) {
     const r = recipient({ filter });
-    const posts = withGroupHandler(r);
+    const posts = withGroupHandler(r, { switched });
     const relays = [];
     r.self._performGroupRelay = (...a) => relays.push(a);
     const ME = lxmfHash(r.me);
@@ -1613,9 +1613,9 @@ function quittingPage({ GroupStore, GroupMsgStore, RnsClient }) {
  * _leaveGroup (`accepts` and `leaves` are the groups it sent an accept or a
  * leave for: a decline sends the leave too). `filter` as recipient() takes it.
  */
-function answeringClient({ filter = true } = {}) {
+function answeringClient({ filter = true, switched = false } = {}) {
     const r = recipient({ filter });
-    const posts = withGroupHandler(r);
+    const posts = withGroupHandler(r, { switched });
     const relays = [];
     r.self._performGroupRelay = (...a) => relays.push(a);
     const ME = lxmfHash(r.me);
@@ -1999,7 +1999,7 @@ test("group model, signatures: an accept or leave from a member whose key is not
     // propagation node in one batch): not an attack, and not to be lost.
     for (const filter of [true, false]) {
         const on = filter ? "filter on" : "filter off";
-        const c = answeringClient({ filter });
+        const c = answeringClient({ filter, switched: true });      // from the switch: held (Group.md, Mixed versions)
         const { r } = c;
         const [inviter, b, d, attacker] = [1, 2, 3, 4].map(() => Identity.create());
         const [I, B, D] = [inviter, b, d].map(lxmfHash);
@@ -2059,7 +2059,7 @@ test("group model, signatures: an accept or leave from a member whose key is not
 test("group model, signatures: a held accept survives a reload and is decided when the user accepts the group (every key is here then), before the group fans out; a declined group's held ones go with it", async () => {
     for (const filter of [true, false]) {
         const on = filter ? "filter on" : "filter off";
-        const c = answeringClient({ filter });
+        const c = answeringClient({ filter, switched: true });      // from the switch: held (Group.md, Mixed versions)
         const { r } = c;
         const [inviter, b, d] = [1, 2, 3].map(() => Identity.create());
         const [I, B, D] = [inviter, b, d].map(lxmfHash);
@@ -2078,7 +2078,7 @@ test("group model, signatures: a held accept survives a reload and is decided wh
 
         // Reload.
         const again = recipient({ me: r.me, storage: r.storage, filter });
-        const posts = withGroupHandler(again);
+        const posts = withGroupHandler(again, { switched: true });
         assert.deepEqual(again.GroupStore.heldChanges().map((e) => [e.groupId, e.src, e.action]), [[G, B, "accept"], [G2, D, "accept"]], `${on}: read back`);
         // B's key arrives another way (a channel post's prelude, a contact
         // added with its key): nothing decides yet.
@@ -2112,7 +2112,7 @@ test("group model, signatures: in a joined group, a member whose key is not here
         const on = filter ? "filter on" : "filter off";
         const [member, a] = [1, 2].map(() => Identity.create());
         const [M, A] = [member, a].map(lxmfHash);
-        const g = heldGroup("active", [member, a], { filter });
+        const g = heldGroup("active", [member, a], { filter, switched: true });   // from the switch: held
         const { r } = g;
         r.packet(lxm(member, r.me, "", g.ctl("accept", M)));
         await settle();
@@ -2150,7 +2150,7 @@ test("group model, signatures: in a joined group, a member whose key is not here
 test("group model, signatures: a validated message from a member decides its held accept or leave first, so they count in the order they came", async () => {
     const [b] = [1].map(() => Identity.create());
     const B = lxmfHash(b);
-    const c = answeringClient();
+    const c = answeringClient({ switched: true });      // from the switch: held (Group.md, Mixed versions)
     const { r } = c;
     const inviter = Identity.create(), I = lxmfHash(inviter);
     r.ContactStore.add(I, false, inviter.getPublicKey().toString("hex"));
@@ -2213,7 +2213,7 @@ test("group model, signatures: what is held is bounded: a payload over HELD_PAYL
     assert.deepEqual(stores(me, t).GroupStore.heldChanges().map((e) => e.lxmfHash), [entry(ids[0], M, 0).lxmfHash]);
 
     // Through the handler: an accept too big to hold is dropped and said.
-    const c = answeringClient();
+    const c = answeringClient({ switched: true });      // from the switch: held (Group.md, Mixed versions)
     const { r } = c;
     const [inviter, b] = [1, 2].map(() => Identity.create());
     r.ContactStore.add(lxmfHash(inviter), false, inviter.getPublicKey().toString("hex"));
@@ -2438,12 +2438,13 @@ function leavingClient(c, { messageName = "Dee" } = {}) {
     };
     const env = {
         GroupStore: r.GroupStore, ContactStore: r.ContactStore, console: quiet, Identity, Destination, Buffer, LXMessage, Date,
-        Link: WireLink, GroupDeliveryEvidence, applyGroupFields, applyDisplayName: DN.applyToFields, IdMgr: { id: r.me },
+        Link: WireLink, GroupDeliveryEvidence, applyGroupFields, applyDisplayName: DN.applyToFields,
+        IdMgr: { id: r.me, pubKey: r.me.getPublicKey().toString("hex") }, senderKeyEntry,
         NameLedgerStore: new NameLedger({ get: r.storage.sGet, set: r.storage.sSet }), OwnNames: { message: messageName },
         crypto: globalThis.crypto, ownLxmfDestinationHash: () => lxmfHash(r.me),
     };
     for (const signature of [
-        "async sendGroupLeave(groupId)", "async _fanoutGroupEnvelope(targets, content, fields)",
+        "async sendGroupLeave(groupId)", "_ownGroupMemberKey()", "async _fanoutGroupEnvelope(targets, content, fields)",
         "async _sendGroupEnvelope(memberHash, content, fields)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "_decideMessageName(sourceHex, recipientHex)", "_requestGroupPeer(memberHash)", "_waitForGroupPeer(memberHash)",
@@ -2589,7 +2590,7 @@ function groupInfoRows(r, G) {
     return rows;
 }
 
-test("a decline, received: the decliner's leave (its real bytes) counts at every member as any leave does, from a member still invited: in the creator's group, a member's joined group and a pending one (held there until the decliner's key comes); final (a later accept is dropped unproved); said and shown as a member who left, as one that left after accepting is", async () => {
+test("a decline, received: the decliner's leave (its real bytes) counts at every member as any leave does, from a member still invited: in the creator's group, a member's joined group and a pending one (where the decliner's key is not held yet: the leave carries it); final (a later accept is dropped unproved); said and shown as a member who left, as one that left after accepting is", async () => {
     // James's group model (2026-10-01): "Each person can accept or reject.
     // And each person can leave at any time. Once the group is
     // rejected/left, that person cannot rejoin." A reject reaches the
@@ -2656,11 +2657,13 @@ test("a decline, received: the decliner's leave (its real bytes) counts at every
             assert.equal(proofs(x), proved + 1, `${on}: proved`);
             assert.equal(status(x, D), "left", `${on}: D left, at ${lxmfHash(at(x).me).slice(0, 4)}`);
         }
-        // At P, D's key is not here yet: held until it comes, then counted.
+        // At P, D's key is not here yet. D's leave carries it (RFed-spec
+        // Group.md, "The sender's key"): bound, remembered, the signature
+        // checked under it, and counted as it arrives, not held for D's key.
+        assert.equal(pc.r.ContactStore.get(D)?.publicKey ?? null, null, `${on}: P holds no key of D's`);
         await deliver(pc, declineTo.get(P));
-        assert.deepEqual([status(pc, D), heldEvents(pc.r, "group-change-held")], ["invited", [[D.slice(0, 12), "leave"]]], `${on}: held at P`);
-        await deliver(pc, inviteChunk(creator.me, pc.r.me, G, ids.filter((id) => id !== pc.r.me), dc.r.me));
-        assert.deepEqual([status(pc, D), pc.r.GroupStore.heldChanges()], ["left", []], `${on}: counted at P once D's key came`);
+        assert.deepEqual([status(pc, D), heldEvents(pc.r, "group-change-held"), pc.r.GroupStore.heldChanges(), pc.r.ContactStore.get(D)?.publicKey],
+            ["left", [], [], keyHex(dc.r.me)], `${on}: counted at P on arrival, by the key it carries, which P now holds`);
 
         // L, who had accepted, leaves, with the real send path: to every
         // listed member that has not left, so not to D.

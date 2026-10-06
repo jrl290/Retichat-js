@@ -56,7 +56,7 @@ import { ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { ChannelPublishes } from "./lib/channel_publish.js";
 import { lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { settle } from "./test_link_pair.mjs";
-import { app, build, compile, constValue, fn, install, methodBody, memoryStorage, messageHandler, objectLiteral } from "./test_app_source.mjs";
+import { app, build, compile, constValue, fn, install, methodBody, memoryStorage, messageHandler, objectLiteral, GROUP_STATUS_METHODS, groupStatusEnv } from "./test_app_source.mjs";
 
 const CHANNEL = "public.general";
 const quiet = { log() {}, warn() {}, error() {} };
@@ -119,11 +119,10 @@ function receiver(p) {
     install(self, {
         GroupStore: p.GroupStore, GroupMsgStore: p.GroupMsgStore, ContactStore: p.ContactStore, PrivacyFilter: p.PrivacyFilter,
         console: quiet, Date, Buffer, LXMessage, Harness: p.Harness, sentTimeMs, ownLxmfDestinationHash: p.own, Identity, Destination,
+        ...groupStatusEnv(),
     }, [
         "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
-        "_applyGroupStatusChange(groupId, src, action, event = null)",
-        "_holdGroupStatusChange(lxmfMsg, groupId, src, action)",
-        "_decideHeldGroupChanges()",
+        ...GROUP_STATUS_METHODS,
         "_rememberGroupMemberKeys(memberKeys)",
     ]);
     router.on("message", messageHandler({
