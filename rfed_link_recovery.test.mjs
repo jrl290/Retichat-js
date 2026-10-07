@@ -637,7 +637,7 @@ test("an exchange outage that times out rfed.link: nothing starts while it is do
         iface.isDown = !up;
         iface.dispatchEvent(new Event(up ? "up" : "down"));
     };
-    Object.assign(c.self, { _setStatus() {}, _onExchangeRegistered() {}, _onPacketsLost() {} });
+    Object.assign(c.self, { _setStatus() {}, _onExchangeRegistered() {}, _onPacketsLost() {}, _sendDistroNeverLeft() {} });
     compileMethod("_followExchange(iface)", c.env)(c.self)(iface);
     exchange(true); // the connection's first "up"
 

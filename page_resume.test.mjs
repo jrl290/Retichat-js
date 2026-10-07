@@ -238,15 +238,17 @@ function makeExchange() {
     const emit = (type, arg) => (listeners.get(type) ?? []).forEach((fn) => fn(arg));
     const statuses = [];
     const resumes = [];
+    const distroReturns = [];
     const self = {
         _rns: { interfaces: [iface] },
         _setStatus: (s) => statuses.push(s),
         _onExchangeRegistered() {},
         _onPacketsLost() {},
         _onPageResume: (trigger) => resumes.push(trigger),
+        _sendDistroNeverLeft: (trigger) => distroReturns.push(trigger),
     };
     compile("_followExchange(iface)", {})(self)(iface);
-    return { self, emit, statuses, resumes };
+    return { self, emit, statuses, resumes, distroReturns };
 }
 
 test("the exchange coming back resumes the persistent links; its first \"up\" is initialization", () => {
@@ -264,12 +266,16 @@ test("the exchange coming back resumes the persistent links; its first \"up\" is
     x.emit("down", "b");
     x.emit("up");
     assert.deepEqual(x.resumes, ["exchange back", "exchange back"], "one resume per return");
+    // What is owed to the distro and never left the device while the exchange was down goes at the same event, and at no
+    // other: once per return, never at the first up, nor for an up that follows no down (James, 2026-10-06).
+    assert.deepEqual(x.distroReturns, x.resumes, "the distro's flush runs at each return and only there");
 
     // A page opened offline: its first up follows a down, and is still initialization.
     const offline = makeExchange();
     offline.emit("down", "offline");
     offline.emit("up");
     assert.deepEqual(offline.resumes, []);
+    assert.deepEqual(offline.distroReturns, [], "nor is it a return for the distro: nothing was sent before the page had a connection");
 
     // An interface disconnect() stopped is no longer this connection's.
     const stopped = makeExchange();
@@ -278,6 +284,7 @@ test("the exchange coming back resumes the persistent links; its first \"up\" is
     stopped.self._rns = null;
     stopped.emit("up");
     assert.deepEqual(stopped.resumes, []);
+    assert.deepEqual(stopped.distroReturns, [], "and sends nothing for the distro");
 });
 
 test("the resume path schedules nothing", () => {

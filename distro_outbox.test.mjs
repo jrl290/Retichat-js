@@ -224,3 +224,48 @@ test("UnprovedUploads: a failure record is one message's (its id and its bytes);
     unproved.forget(other);
     assert.equal(unproved.size, 0);
 });
+
+test("UnprovedUploads: a message whose last upload never left the device is no failure: it has no coming-up, holds back no flush, and is one message's record like a failure's", () => {
+    // James, 2026-10-06 (DESIGN_PRINCIPLES §3, what a device owes its
+    // distro): nothing was sent, so a flush at any coming-up sends it, and
+    // the exchange's return does too (app.js _sendDistroNeverLeft).
+    const unproved = new UnprovedUploads();
+    const join = entry("channel:aa", "AAAA");
+    const leave = entry("channel:aa", "CCCC", { op: "leave", at: 2 });
+    const other = entry("channel:bb", "AAAA");
+    assert.deepEqual([unproved.neverLeft(leave), unproved.neverLeftSize], [false, 0]);
+    unproved.recordNeverLeft(leave);
+    assert.deepEqual([unproved.neverLeft(leave), unproved.neverLeft(join), unproved.neverLeft(other), unproved.neverLeftSize], [true, false, false, 1],
+        "the leave's, and not the join's under the same id, nor the same bytes under another id");
+    assert.deepEqual([unproved.at(leave), unproved.since(leave, 0), unproved.size], [undefined, false, 0],
+        "no coming-up is recorded, so no flush leaves it for the next one");
+    unproved.recordNeverLeft(leave);
+    unproved.recordNeverLeft(join);
+    unproved.recordNeverLeft(other);
+    assert.equal(unproved.neverLeftSize, 3, "recording one again is the same record");
+    unproved.clearNeverLeft(join);         // an upload of the join begins
+    assert.deepEqual([unproved.neverLeft(join), unproved.neverLeft(leave), unproved.neverLeft(other), unproved.neverLeftSize], [false, true, true, 2]);
+    unproved.clearNeverLeft(join);         // nothing left of it to clear
+    assert.equal(unproved.neverLeftSize, 2);
+    unproved.forget(other);                // owed no more
+    assert.deepEqual([unproved.neverLeft(leave), unproved.neverLeft(other), unproved.neverLeftSize], [true, false, 1]);
+    unproved.forget(leave);
+    assert.deepEqual([unproved.neverLeft(leave), unproved.neverLeftSize], [false, 0]);
+});
+
+test("UnprovedUploads: forget() ends a message's failure record and its never-left record together, and clearNeverLeft() ends the second alone", () => {
+    const unproved = new UnprovedUploads();
+    const message = entry("channel:aa", "AAAA");
+    unproved.record(message, 3);
+    unproved.recordNeverLeft(message);
+    unproved.clearNeverLeft(message);
+    assert.deepEqual([unproved.neverLeft(message), unproved.at(message), unproved.size], [false, 3, 1], "an upload begun ends only the never-left record");
+    unproved.recordNeverLeft(message);
+    unproved.forget(message);
+    assert.deepEqual([unproved.neverLeft(message), unproved.at(message), unproved.size, unproved.neverLeftSize], [false, undefined, 0, 0],
+        "proved, replaced or dropped with its distro ends both, whichever it had");
+    // A message with only a never-left record is forgotten too (forget() returned early without one).
+    unproved.recordNeverLeft(message);
+    unproved.forget(message);
+    assert.equal(unproved.neverLeftSize, 0);
+});

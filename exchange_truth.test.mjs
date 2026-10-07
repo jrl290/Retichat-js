@@ -18,6 +18,13 @@
  * considered dead" — a DM whose packet was lost fails at once and is never
  * sent again, and a DM, group message or channel post sent while the
  * exchange is down fails at once.
+ * James, 2026-10-06 (DESIGN_PRINCIPLES §3, what a device owes its distro): an
+ * upload for the distro that never left the device, because the exchange
+ * could not carry its packet, is no failure and goes when the exchange is
+ * back; one lost after it left still waits for the propagation link's next
+ * coming-up. The last tests run that over the real PostInterface and the
+ * real _followExchange (the staging case: a short drop, the propagation link
+ * still up).
  *
  * The real PostInterface runs against a scripted node (a fake fetch). The app
  * tests run the real shipped method bodies from app.js: the DM path over a
@@ -36,6 +43,10 @@ import test from "node:test";
 import { Buffer } from "node:buffer";
 import { Reticulum, Identity, Destination, LXMessage, Link, Packet } from "./lib/rns/reticulum.js";
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
+import Cryptography from "./lib/rns/cryptography.js";
+import LXMF from "./lib/rns/lxmf/lxmf.js";
+import { DistroUploads } from "./lib/distro_upload.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { applyToFields as applyDisplayName, ABSENT } from "./lib/display_name.js";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -316,6 +327,7 @@ test("check() aborts a hung exchange, loses its batch and exchanges at once", as
     assert.deepEqual(seen.lost()[0].packetHashes, [a.hash]);
     assert.equal(seen.lost()[0].abandoned, true,
         "as abandoned: the node may have taken it, so a link attempt keeps waiting for its LRPROOF (Link.requestLost)");
+    assert.deepEqual(seen.lost()[0].unsent, [], "and so none of it is said never to have been sent: it was in a request");
     assert.deepEqual(fresh.body.packets, [], "the abandoned packet is not re-sent");
 
     fresh.respond(200, {});
@@ -355,13 +367,16 @@ test("a failed exchange loses its batch and the queue behind it, and a down inte
     await eventually(() => seen.lost().length === 1, "lost");
     assert.deepEqual(seen.lost()[0].packetHashes, [a.hash, b.hash]);
     assert.equal(seen.lost()[0].abandoned, false, "a failed exchange's report is not an abandoned one");
+    assert.deepEqual(seen.lost()[0].unsent, [b.hash],
+        "what was queued behind the batch went into no request, so nothing of it was sent; the batch itself may have reached the node");
     assert.equal(seen.kinds().indexOf("down") < seen.kinds().indexOf("lost"), true, "down, then what it lost");
 
     const requestsBefore = node.requests.length;
     const c = rawPacket(0xc3);
     iface.sendData(c.raw);
     await eventually(() => seen.lost().length === 2, "lost at once");
-    assert.deepEqual(seen.lost()[1], { packetHashes: [c.hash], reason: "the exchange is down", abandoned: false });
+    assert.deepEqual(seen.lost()[1], { packetHashes: [c.hash], reason: "the exchange is down", abandoned: false, unsent: [c.hash] },
+        "refused while down: nothing of it was sent");
     assert.equal(node.requests.length, requestsBefore, "nothing is sent for it");
 
     // The next attempt re-sends none of them (a re-send is a retry, §3).
@@ -518,13 +533,47 @@ test("block(): an exchange the page's policy blocks is never asked again, and wh
         const a = rawPacket(0xa1);
         iface.sendData(a.raw);
         await eventually(() => seen.lost().length === 1, "lost at once");
-        assert.deepEqual(seen.lost()[0], { packetHashes: [a.hash], reason: REASON, abandoned: false }, `${label}: lost at once, saying why`);
+        assert.deepEqual(seen.lost()[0], { packetHashes: [a.hash], reason: REASON, abandoned: false, unsent: [a.hash] },
+            `${label}: lost at once, saying why, and nothing of it was sent`);
         iface.check("online");
         iface.check("visible");
         await tick(); await tick();
         assert.equal(node.requests.length, 1, `${label}: nothing is asked of it again, a check included`);
         assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0);
     }
+});
+
+test("what was still queued when a registration fails, or when the page's policy blocks the exchange, went into no request: it is reported unsent", async (t) => {
+    // James, 2026-10-06 (DESIGN_PRINCIPLES §3, what a device owes its
+    // distro): the sender of an upload for the distro whose packet is in
+    // `unsent` may say that nothing was sent, which is no failure.
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+
+    // A registration that fails takes the packets queued behind it: none was sent.
+    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", "ab".repeat(16));
+    const seen = record(iface);
+    t.after(() => iface.disconnect());
+    iface.connect();
+    const registering = await node.pending("register");
+    const queued = rawPacket(0xd4);
+    iface.sendData(queued.raw);
+    registering.fail();
+    await eventually(() => seen.lost().length === 1, "lost");
+    assert.deepEqual(seen.lost()[0], { packetHashes: [queued.hash], reason: "Failed to fetch", abandoned: false, unsent: [queued.hash] });
+    assert.equal(node.count("exchange"), 0, "and no request ever carried it");
+    iface.disconnect();
+
+    // block() drops what is queued, and none of it was sent either; the exchange in flight carries nothing.
+    const blocked = await upInterface(t, fakeNode(t), clock);
+    blocked.iface.check("online");
+    const queuedAtBlock = rawPacket(0xe5);
+    blocked.iface.sendData(queuedAtBlock.raw);
+    blocked.iface.block("the exchange URL is blocked by this page's Content-Security-Policy");
+    await eventually(() => blocked.seen.lost().length === 1, "lost at once");
+    assert.deepEqual(blocked.seen.lost()[0].packetHashes, [queuedAtBlock.hash]);
+    assert.deepEqual(blocked.seen.lost()[0].unsent, [queuedAtBlock.hash]);
 });
 
 // ── A DM whose packet is lost (app.js) ─────────────────────────────────────
@@ -577,7 +626,7 @@ const DM_METHODS = [
     "_sendPacket(contactHash, publicKeyHex, content, messageId, onProof, onError)",
     "async _propagateMessage(contact, outMsg)", "_signerFor(srcHash)",
     "_armSendCeiling(contactHash, msgId)", "_failSending(contactHash, msgId, why = null)",
-    "_exchangeIsDown()", "_onPacketsLost({ packetHashes, reason })",
+    "_exchangeIsDown()", "_onPacketsLost({ packetHashes, reason, unsent = [] })",
 ];
 
 /** The real DM send path from app.js over a real Reticulum whose one interface is `iface`. */
@@ -809,6 +858,8 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     self._onPacketsLost = (detail) => lost.push(detail);
     const resumes = [];
     self._onPageResume = (trigger) => resumes.push(trigger);
+    const distroReturns = [];
+    self._sendDistroNeverLeft = (trigger) => distroReturns.push(trigger);
     self._setStatus = compile("_setStatus(s, type)", env)(self);
     compile("_followExchange(iface)", env)(self)(iface);
 
@@ -818,6 +869,7 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     await eventually(() => self._status === "online", "online on up");
     assert.equal(registered.length, 1, "the registration initializes the connection");
     assert.deepEqual(resumes, [], "the first up is initialization, not a return");
+    assert.deepEqual(distroReturns, [], "and sends nothing owed to the distro");
 
     clock.fire(clock.armed());
     const failing = await node.pending("exchange");
@@ -834,6 +886,8 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     assert.deepEqual(statuses, ["online", "offline", "online"], "credentials alone never made it green");
     assert.deepEqual(resumes, ["exchange back"],
         "the exchange's return re-drives the persistent links (app-links interface_online)");
+    assert.deepEqual(distroReturns, ["exchange back"],
+        "and sends what is owed to the distro and never left the device while it was down (James, 2026-10-06)");
 
     // disconnect() replaced the interface: its events are no longer this connection's.
     self._rns = { interfaces: [] };
@@ -843,8 +897,285 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
     await tick(); await tick();
     assert.deepEqual(statuses, ["online", "offline", "online"], "a stopped interface does not move the dot");
     assert.deepEqual(resumes, ["exchange back"], "nor re-drive anything");
+    assert.deepEqual(distroReturns, ["exchange back"], "nor send anything for the distro");
 
     assert.match(extractMethod("async connect()"), /this\._followExchange\(iface\);\s*this\._rns\.addInterface\(iface\);/,
         "hooked before addInterface() connects it");
     assert.doesNotMatch(app, /_monTimer/, "the credential monitor is gone");
+});
+
+// ── An upload owed to the distro, over the real exchange (app.js) ──────────
+//
+// James, 2026-10-06: on staging a short network drop left an Android phone's
+// propagation link up, the owed upload attempted during the drop never left
+// the device, and no coming-up followed, so it waited 35 s for an unrelated
+// link close. The web has the same chain: the exchange refuses a packet sent
+// while it is down, reports it lost, and the page treated it as a loss.
+
+const DISTRO_METHODS = [
+    "_followExchange(iface)", "_setStatus(s, type)", "_exchangeIsDown()", "_onPacketsLost({ packetHashes, reason, unsent = [] })",
+    "async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
+    "async _sendDistroNeverLeft(trigger)", "_distroAttemptOpen(entry, link)", "_unprovedSince(entry, comingUp)",
+    "async _uploadOwed(link, entry, comingUp = null)", "_stillOwed(entry)", "_dropMembershipOwedToOtherDistros()",
+    "_distroOwedOutcome(entry, how, error, goesNow = false)", "_distroOwedNeverLeft(entry, error)",
+    "_uploadForDistro(link, propagationPacked, label)",
+];
+
+const R = "0123456789abcdef0123456789abcdef";
+
+/**
+ * The real distro-outbox path from app.js over the real PostInterface `iface`:
+ * the propagation link is a stand-in whose packets go through
+ * iface.sendData, so the exchange itself refuses, queues, carries or loses
+ * them, and its events reach the page through the real _followExchange.
+ */
+function makeDistroClient(iface) {
+    const { sGet, sSet } = memoryStorage();
+    const distro = Identity.create();
+    const events = [];
+    const resumes = [];
+    const Harness = {
+        event: (kind, detail) => events.push({ kind, detail }),
+        error: (where, e) => events.push({ kind: "error", detail: { where, message: e.message } }),
+        markReady() {},
+    };
+    const quietLog = { log() {}, warn() {}, error() {} };
+    const watches = [];     // the §1 watch's timers, which this test's clock never runs
+    const uploadOf = new Map();  // a packet's hash → the propagation upload it carries
+    let made = 0;
+    const link = {
+        status: Link.ACTIVE,
+        newLinkPacket: (context, data) => {
+            const raw = rawPacket(0x30 + made++).raw;
+            uploadOf.set(Packet.fromBytes(raw).packetHash.toString("hex"), Buffer.from(data));
+            return { packetHash: Packet.fromBytes(raw).packetHash, pack: () => raw };
+        },
+        _transmit: (raw) => { iface.sendData(raw); return raw; },
+        sendResource: async () => { throw new Error("no Resource in this test"); },
+    };
+    const env = {
+        Harness, console: quietLog, Buffer, Cryptography, LXMessage, LXMF, Packet: { NONE: 0x00 }, Link: { MDU: 100_000, ACTIVE: Link.ACTIVE },
+        DistroManager: { has: true, identity: distro, lxmfDeliveryHash: lxmfHash(distro), pubKey: distro.getPublicKey().toString("hex") },
+        DistroOutboxStore: new DistroOutbox({ get: sGet, set: sSet }), sentCopyEntryId, channelSyncEntryId, ActiveTab: { held: true },
+    };
+    const self = {
+        ownHash: lxmfHash(me), _rns: { interfaces: [iface] }, _status: "connecting", _connType: "exchange", _onStatus: [],
+        _pendingPacketHashes: new Map(), _distroOutboxInFlight: new Map(), _propComingUps: 0, _distroUnproved: new UnprovedUploads(),
+        _distroUploads: new DistroUploads({
+            log: quietLog,
+            setTimer: (fn, ms) => { const timer = { fn, ms, cleared: false }; watches.push(timer); return timer; },
+            clearTimer: (timer) => { timer.cleared = true; },
+        }),
+        _propLink: link, _buildPropagationPacked: async (packed) => packed,
+        _onExchangeRegistered() {}, _onPageResume: (trigger) => resumes.push(trigger),
+    };
+    for (const signature of DISTRO_METHODS) self[methodName(signature)] = compile(signature, env)(self);
+    return {
+        self, env, link, events, resumes, watches, uploadOf,
+        errors: () => events.filter((e) => e.kind === "error"),
+        sentCopies: () => events.filter((e) => e.kind === "distro-sent-copy"),
+        owed: () => env.DistroOutboxStore.list(),
+        /** What the exchange has carried to the node so far: every upload packet in a request, by hash. */
+        carried: (node) => node.requests.filter((r) => r.path === "/v1/interfaces/exchange")
+            .flatMap((r) => (r.body.packets ?? []).map((b64) => Packet.fromBytes(Buffer.from(b64, "base64")).packetHash.toString("hex")))
+            .filter((hash) => uploadOf.has(hash)),
+        /** The node proves the upload whose packet has this hash (the proof handler's entry). */
+        prove: (hash) => {
+            const key = hash.slice(0, 32);
+            const pending = self._pendingPacketHashes.get(key);
+            if (!pending) return false;
+            self._pendingPacketHashes.delete(key);
+            pending.onProof?.(pending.messageId);
+            return true;
+        },
+    };
+}
+
+/** An interface the page follows from its first request (so its first "up" is initialization), registered and up, with the distro client over it. */
+async function upWithDistroClient(t, node, clock) {
+    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", "ab".repeat(16));
+    t.after(() => iface.disconnect());
+    const c = makeDistroClient(iface);
+    c.self._followExchange(iface);
+    iface.connect();
+    (await node.pending("register")).respond(200, REGISTERED);
+    (await node.pending("exchange")).respond(200, {});
+    await eventually(() => c.self._status === "online", "online on up");
+    assert.equal(clock.armed().ms, 1000, "polls on the node's idle interval");
+    return { iface, c };
+}
+
+/** The network drops: the poll that comes due fails, and the page has heard the exchange go down. */
+async function dropExchange(c, iface, node, clock) {
+    clock.fire(clock.armed());
+    (await node.pending("exchange")).fail();
+    await eventually(() => iface.isDown && c.self._status === "offline", "down");
+}
+
+/** The network is back: the next attempt (the reconnect wait is cut short by check() on the browser's "online") is answered, and the page hears "up". */
+async function returnExchange(c, iface, node, clock, { check = false } = {}) {
+    if (check) iface.check("online");
+    else clock.fire(clock.armed());
+    (await node.pending("exchange")).respond(200, {});
+    await eventually(() => c.self._status === "online", "online again on up");
+}
+
+test("the staging case: a short drop with the propagation link still up; the upload owed during it never left, is no failure, and goes when the exchange answers again, once", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { iface, c } = await upWithDistroClient(t, node, clock);
+    await dropExchange(c, iface, node, clock);
+    assert.equal(c.link.status, Link.ACTIVE, "the propagation link never went STALE and never closed");
+
+    // The user sends as the distro during the drop: the sent-copy is owed and attempted at once on the link that is up.
+    await c.self._sendDistroSentCopy(R, "", "sent during the drop");
+    await eventually(() => c.self._distroUnproved.neverLeftSize === 1, "the exchange said nothing of it was sent");
+    const [entry] = c.owed();
+    assert.deepEqual(c.carried(node), [], "nothing reached the node");
+    assert.deepEqual(c.errors(), [], "and it is no failure: the Harness hears none");
+    assert.equal(c.self._distroUnproved.neverLeft(entry), true);
+    assert.deepEqual([c.self._distroUnproved.size, c.self._propComingUps], [0, 0], "no failure recorded, and no coming-up since");
+    assert.equal(c.owed().length, 1, "still owed");
+    assert.deepEqual(c.watches.filter((w) => !w.cleared), [], "no §1 watch is left for a packet nobody sent");
+    assert.deepEqual(c.resumes, [], "and the page has not resumed anything");
+
+    // Timers decide nothing: the reconnect attempts come and the network is still down.
+    clock.fire(clock.armed());
+    (await node.pending("exchange")).fail();
+    await tick(); await tick();
+    assert.deepEqual(c.carried(node), [], "no timer sends it");
+    assert.equal(c.self._distroUnproved.neverLeftSize, 1);
+
+    // The network is back, the exchange answers: that is the event.
+    await returnExchange(c, iface, node, clock);
+    assert.deepEqual(c.resumes, ["exchange back"], "the return re-drives the persistent links as before");
+    const carrying = await node.pending("exchange");
+    const hashes = (request) => request.body.packets.map((b64) => Packet.fromBytes(Buffer.from(b64, "base64")).packetHash.toString("hex"));
+    assert.equal(carrying.body.packets.length, 1, "the owed upload left in this exchange");
+    const [hash] = hashes(carrying);
+    assert.deepEqual(c.uploadOf.get(hash), Buffer.from(entry.packed, "base64"), "the LXMF message packed when the user acted, not a new one");
+    carrying.respond(200, {});
+    await eventually(() => c.self._distroUnproved.neverLeftSize === 0, "an upload of it has begun");
+
+    // Its proof makes it owed no more; the next return sends nothing.
+    assert.equal(c.prove(hash), true);
+    await eventually(() => c.sentCopies().length === 1, "proved: said sent");
+    assert.deepEqual(c.owed(), []);
+    assert.deepEqual(c.errors(), []);
+    await dropExchange(c, iface, node, clock);
+    await returnExchange(c, iface, node, clock);
+    await tick(); await tick();
+    assert.deepEqual(c.carried(node), [hash], "nothing more went: it was proved");
+    assert.deepEqual(c.resumes, ["exchange back", "exchange back"]);
+});
+
+test("the browser's \"online\" does not send it, and the exchange's answer to the check it makes does: the return is the interface's, never the window's", async (t) => {
+    // PostInterface hooks the window's "online" to check(); the page's own
+    // listener of it re-arms the links (_onPageResume) and, while the
+    // exchange is down, does nothing more. The upload goes when the exchange
+    // answers, not when the browser says it has a network.
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { iface, c } = await upWithDistroClient(t, node, clock);
+    await dropExchange(c, iface, node, clock);
+    await c.self._sendDistroSentCopy(R, "", "sent during the drop");
+    await eventually(() => c.self._distroUnproved.neverLeftSize === 1, "never left");
+
+    // "online": the check is an exchange attempt now. It fails: the network is not really back, and nothing is sent.
+    iface.check("online");
+    (await node.pending("exchange")).fail();
+    await tick(); await tick();
+    assert.deepEqual([c.carried(node), c.resumes, c.self._distroUnproved.neverLeftSize], [[], [], 1]);
+    // "online" again, and this time the exchange answers: now it goes.
+    await returnExchange(c, iface, node, clock, { check: true });
+    const carrying = await node.pending("exchange");
+    assert.equal(carrying.body.packets.length, 1, "it left with the exchange's return");
+    carrying.respond(200, {});
+});
+
+test("an upload that left in a batch the exchange then failed is a loss: it does not go when the exchange answers again, and goes at the propagation link's next coming-up", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { iface, c } = await upWithDistroClient(t, node, clock);
+
+    // Sent while the exchange is up: it is in the batch an exchange is carrying when the network drops.
+    await c.self._sendDistroSentCopy(R, "", "in a batch that failed");
+    const carrying = await node.pending("exchange");
+    assert.equal(carrying.body.packets.length, 1, "it left");
+    const [hash] = c.carried(node);
+    carrying.fail();
+    await eventually(() => c.errors().length === 1, "reported lost");
+    assert.deepEqual(c.errors().map((e) => [e.detail.where, e.detail.message]),
+        [["distro-sent-copy", "its packet was lost (Failed to fetch)"]], "a loss after the packet left is a failure, and reported");
+    const [entry] = c.owed();
+    assert.equal(c.self._distroUnproved.neverLeft(entry), false, "not a packet that never left");
+    assert.equal(c.self._distroUnproved.at(entry), 0, "recorded at the coming-up it was decided at");
+
+    // The exchange answers again: nothing is retried on a failure.
+    await returnExchange(c, iface, node, clock);
+    await tick(); await tick();
+    assert.equal(node.requests.at(-1).body.packets.length, 0, "no upload went with the exchange's return");
+    clock.fire(clock.armed());
+    const next = await node.pending("exchange");
+    assert.deepEqual(next.body.packets, [], "nor on the next poll: a failure waits for a coming-up");
+    next.respond(200, {});
+    await tick(); await tick();
+    assert.deepEqual(c.carried(node), [hash], "only the first upload ever left");
+    assert.equal(c.owed().length, 1, "still owed");
+
+    // The propagation link's next coming-up sends it.
+    await c.self._sendDistroOutbox(c.link, "established");
+    const again = await node.pending("exchange");
+    assert.equal(again.body.packets.length, 1, "the coming-up sent it");
+    again.respond(200, {});
+    const [, second] = c.carried(node);
+    assert.equal(c.prove(second), true);
+    await eventually(() => c.sentCopies().length === 1, "proved");
+    assert.deepEqual(c.owed(), []);
+});
+
+test("an upload queued behind a failed batch went into no request: it never left, and goes when the exchange answers again", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { iface, c } = await upWithDistroClient(t, node, clock);
+    // An exchange is in flight (the idle poll, carrying nothing) when the user acts: the upload is queued behind it.
+    clock.fire(clock.armed());
+    const poll = await node.pending("exchange");
+    assert.equal(poll.body.packets.length, 0);
+    await c.self._sendDistroSentCopy(R, "", "queued behind a batch that failed");
+    await eventually(() => c.self._distroUploads._open.size === 1, "the upload was handed to the exchange");
+    poll.fail();
+    await eventually(() => c.self._distroUnproved.neverLeftSize === 1, "the exchange said it went into no request");
+    assert.deepEqual([c.carried(node), c.errors(), c.self._distroUnproved.size], [[], [], 0], "nothing sent, no failure, none recorded");
+
+    await returnExchange(c, iface, node, clock);
+    const carrying = await node.pending("exchange");
+    assert.equal(carrying.body.packets.length, 1, "it goes at the return");
+    carrying.respond(200, {});
+});
+
+test("an upload for the distro is the only reader of `unsent`: a DM queued behind a failed batch fails at once, as ever (D3)", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", "ab".repeat(16));
+    t.after(() => iface.disconnect());
+    const c = makeDmClient(iface);
+    const seen = record(iface);
+    c.rns.addInterface(iface);
+    (await node.pending("register")).respond(200, REGISTERED);
+    (await node.pending("exchange")).respond(200, {});
+    await eventually(() => iface.isUp, "up");
+    clock.fire(clock.armed());
+    const poll = await node.pending("exchange");
+    const msg = c.self.sendMessage(alice, "queued behind a batch that is about to fail");
+    assert.equal(msg.status, "sending");
+    poll.fail();
+    await eventually(() => c.MsgStore.get(alice.destHash)[0].status === "failed", "the DM failed at once");
+    assert.deepEqual(seen.lost()[0].unsent, [seen.lost()[0].packetHashes[0]], "its packet was never sent, and the interface says so");
+    assert.ok(c.events.some((e) => e.kind === "dm-lost" && e.detail.id === msg.id), "and the DM path treats it as lost, nothing sends it again");
 });
