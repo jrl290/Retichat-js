@@ -46,7 +46,7 @@ import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
-import { installPropagated } from "./test_app_source.mjs";
+import { installPropagated, GROUP_STATUS_METHODS, groupStatusEnv } from "./test_app_source.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -503,9 +503,10 @@ test("the group invite notice and the distro import prompt name the sender throu
     // An accept or a leave is about its own source (James's group model,
     // 2026-10-01), so the notice names the source, by hash: counted as it
     // arrives, or once its key is here (a held one).
-    assert.match(handler, /this\._applyGroupStatusChange\(groupId, srcHash, groupAction, lxmfMsg\)/);
-    assert.match(methodBody("_decideHeldGroupChanges()"), /this\._applyGroupStatusChange\(entry\.groupId, entry\.src, entry\.action\)/);
-    assert.match(methodBody("_applyGroupStatusChange(groupId, src, action, event = null)"),
+    assert.match(handler, /this\._takeGroupStatusChange\(lxmfMsg, groupId, srcHash, groupAction, lxmfMsg\)/);
+    assert.match(methodBody("_takeGroupStatusChange(lxmfMsg, groupId, src, action, event = null)"), /this\._applyGroupStatusChange\(groupId, src, action, event, packedMessage\(lxmfMsg\)\)/);
+    assert.match(methodBody("_decideHeldGroupChanges()"), /this\._applyGroupStatusChange\(entry\.groupId, entry\.src, entry\.action, null, packedHeld\(entry\)\)/);
+    assert.match(methodBody("_applyGroupStatusChange(groupId, src, action, event = null, packed = null)"),
         /GroupMsgStore\.addSystem\(groupId, action === "leave" \? "left the group" : "joined the group", src\)/);
     const transfer = methodBody("_handleDistroIdentityTransfer(lxmfMsg, srcHash, privateKeyHex)");
     assert.match(transfer, /const senderName = ContactStore\.name\(srcHash\);/);
@@ -1171,7 +1172,7 @@ test("§5.2 order: a name is taken only from a message newer than the one that l
 const GROUP = "9".repeat(32);
 
 /** The router's handler with the real _handleGroupMessage behind it. */
-function makeGroupReceiver(me, memberHashes) {
+function makeGroupReceiver(me, memberHashes, { switched = false } = {}) {
     const r = makeReceiver(me);
     const groups = new Map([[GROUP, {
         groupId: GROUP, groupName: "G", groupStatus: "active", lastActivity: 0,
@@ -1216,13 +1217,11 @@ function makeGroupReceiver(me, memberHashes) {
         verify: (d, src, sig, p) => LXMessage.verify(d, src, sig, p, r.recall) };
     const env = {
         GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, ownLxmfDestinationHash: own,
-        PrivacyFilter, sentTimeMs, Buffer, LXMessage: LXM, Harness,
+        PrivacyFilter, sentTimeMs, Buffer, LXMessage: LXM, Harness, ...groupStatusEnv({ GROUP_ENTRIES_IN_RETICHAT_FIELD: switched }),
     };
     for (const signature of [
         "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
-        "_applyGroupStatusChange(groupId, src, action, event = null)",
-        "_holdGroupStatusChange(lxmfMsg, groupId, src, action)",
-        "_decideHeldGroupChanges()",
+        ...GROUP_STATUS_METHODS,
     ]) r.self[signature.slice(0, signature.indexOf("("))] = compile(signature, env)(r.self);
     const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
     const groupLabel = fn("groupSenderLabel", "m", { ContactStore: r.ContactStore });
@@ -1244,7 +1243,7 @@ const groupFields = (name, action = null, extra = []) => new Map([
 test("§5.2 a group member with no row still gets its name: a hidden row, named on every group surface", () => {
     const me = Identity.create(), carol = Identity.create();
     const C = lxmfHash(carol);
-    const r = makeGroupReceiver(me, [C]);
+    const r = makeGroupReceiver(me, [C], { switched: true });   // from the switch an unverifiable accept is held (Group.md, Mixed versions)
     assert.equal(r.ContactStore.get(C), null, "a member the web user has never added and holds no key for");
 
     const t = tick() + 1000;
