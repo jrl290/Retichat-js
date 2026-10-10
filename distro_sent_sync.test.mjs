@@ -621,16 +621,21 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     assert.deepEqual(code.match(/\.\s*(?:lost|cut)\s*\(/g), [".cut(", ".lost(", ".lost(", ".lost(", ".cut("],
         "nothing else in the page is told .lost or .cut");
     assert.match(method("_onPacketsLost({ packetHashes, reason, unsent = [] })"),
-        /if \(pending\?\.distroUpload\) \{\s*if \(unsent\.includes\(packetHash\)\) this\._distroUploads\.neverLeft\(pending\.distroUpload, `its packet never left: \$\{reason\}`\);\s*else this\._distroUploads\.lost\(pending\.distroUpload, `its packet was lost \(\$\{reason\}\)`\);\s*continue;\s*\}/,
-        "the exchange's loss report (James, 2026-10-04), and its report that the packet never left, which is no loss (James, 2026-10-06)");
-    assert.equal(count(code, /\bdistroUpload\b/g), 4, "the loss report knows an upload by the entry _uploadForDistro makes for its proof, and by nothing else");
+        /if \(pending\?\.distroUpload\) \{\s*if \(unsent\.includes\(packetHash\)\) \{\s*this\._distroUploads\.neverLeft\(pending\.distroUpload, pending\.resourceAdvert\s*\? `its Resource's first advertisement never left: \$\{reason\}` : `its packet never left: \$\{reason\}`\);\s*if \(pending\.resourceAdvert\) \{\s*this\._pendingPacketHashes\.delete\(packetHash\.slice\(0, 32\)\);\s*pending\.resource\.cancel\("its first advertisement never left the device"\);\s*\}\s*\} else if \(!pending\.resourceAdvert\) this\._distroUploads\.lost\(pending\.distroUpload, `its packet was lost \(\$\{reason\}\)`\);\s*continue;\s*\}/,
+        "the exchange's loss report (James, 2026-10-04), and its report that the packet never left, which is no loss (James, 2026-10-06); "
+        + "a Resource's first advertisement never left is the same, and cancels the Resource on this device, and a loss report for it decides nothing (James, 2026-10-10)");
+    assert.equal(count(code, /\bdistroUpload\b/g), 5,
+        "the loss report knows an upload by the entry _uploadForDistro makes for its packet's proof, or for its Resource's first advertisement, and by nothing else");
+    assert.equal(count(code, /\bresourceAdvert\b/g), 4, "an advertisement's entry: made by _uploadForDistro alone, and read by the loss report alone");
     assert.equal(count(code, /_onPacketsLost/g), 2, "the loss report's handler and its one call");
     assert.match(method("_followExchange(iface)"), /iface\.on\("lost", \(lost\) => \{\s*if \(current\(\)\) this\._onPacketsLost\(lost\);\s*\}\);/,
         "the loss report is the exchange's \"lost\"");
     const forDistro = method("_uploadForDistro(link, propagationPacked, label)");
     assert.equal(count(forDistro, /_distroUploads\.lost\(/g), 2);
-    assert.match(forDistro, /link\.sendResource\(propagationPacked\)\.then\(\s*\(\) => this\._distroUploads\.proved\(upload\),\s*\(error\) => this\._distroUploads\.lost\(upload, `its Resource failed/,
-        "a Resource's own failure (no ruling names it yet)");
+    assert.match(forDistro, /\}\)\.then\(\s*\(\) => \{ ended\(\); this\._distroUploads\.proved\(upload\); \},\s*\(error\) => \{ ended\(\); this\._distroUploads\.lost\(upload, `its Resource failed/,
+        "a Resource's own failure, once its first advertisement has left (ruling of 2026-10-04)");
+    assert.match(forDistro, /link\.sendResource\(propagationPacked, \{\s*onFirstAdvertisement: \(packetHash, resource\) => \{\s*advertKey = packetHash\.slice\(0, 16\)\.toString\("hex"\);\s*advert = \{\s*contactHash: DistroManager\.lxmfDeliveryHash,\s*messageId: advertKey,\s*distroUpload: upload,\s*resourceAdvert: true,\s*resource,\s*onProof: \(\) => \{\},\s*\};\s*this\._pendingPacketHashes\.set\(advertKey, advert\);\s*\},\s*\}\)/,
+        "the Resource's first advertisement is tracked before it can go, so the exchange's report that it never left reaches _onPacketsLost (James, 2026-10-10); its proof, were it ever proved, decides nothing");
     assert.match(forDistro, /^\s*if \(this\._propLink !== link \|\| link\.status !== Link\.ACTIVE\) return null;/);
     assert.match(forDistro, /if \(link\._transmit\(raw\) === null\) \{\s*this\._pendingPacketHashes\.delete\(proofKey\);\s*this\._distroUploads\.lost\(upload, "the propagation link closed before the upload"\);/,
         "a packet that never left, on the link checked to be the propagation link in the same task: no newer link is up");

@@ -173,6 +173,53 @@ test("a request names the resource and the parts it wants", () => {
     receiver.cancel("test over");
 });
 
+// ── The first advertisement (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a)) ─────────
+
+test("advertise() reports its first advertisement once, before it is handed to the link, by the hash of the packet the link sends; the watchdog's re-advertisements are not reported, and what is sent is unchanged", async () => {
+    // James, 2026-10-10: a Resource upload whose first advertisement no
+    // interface carried never left the device. The advertisement's send says
+    // nothing of that (RNS/Resource.py __advertise_job ignores
+    // Packet.send()), so the sender learns its hash first and the interface
+    // says whether it went (app.js _uploadForDistro, _onPacketsLost).
+    const { a, wire } = linkPair({ drop: () => true });
+    const transmitted = [];
+    const transmit = a._transmit.bind(a);
+    a._transmit = (raw, ...rest) => {
+        transmitted.push(Packet.fromBytes(Buffer.from(raw)).packetHash.toString("hex"));
+        return transmit(raw, ...rest);
+    };
+    const reports = [];
+    const sent = a.sendResource(bytes(3000, 3), {
+        onFirstAdvertisement: (packetHash, resource) => reports.push({ hash: packetHash.toString("hex"), resource, before: transmitted.length }),
+    });
+    sent.catch(() => {});
+    assert.equal(reports.length, 1, "reported once");
+    assert.equal(reports[0].before, 0, "before the packet is handed to the link");
+    assert.deepEqual(transmitted, [reports[0].hash], "the hash is the sent packet's, as the interface's loss report names it");
+    assert.equal(wire.a[0].context, Packet.RESOURCE_ADV);
+    const resource = reports[0].resource;
+    assert.ok(resource instanceof Resource && resource.status === Resource.ADVERTISED && a.outgoingResources.includes(resource),
+        "the Resource itself, advertised");
+
+    // The watchdog re-advertises (the protocol's own retries): sent, not reported.
+    resource.watchdog(Date.now() + 3_600_000);
+    assert.equal(transmitted.length, 2, "re-advertised");
+    assert.equal(wire.a[1].context, Packet.RESOURCE_ADV);
+    assert.equal(reports.length, 1, "only the first is reported");
+    resource.cancel("test over");
+    await assert.rejects(sent);
+
+    // Without the option the same Resource goes the same way.
+    const plain = linkPair({ drop: () => true });
+    const quiet = plain.a.sendResource(bytes(3000, 3));
+    quiet.catch(() => {});
+    assert.equal(plain.wire.a.length, 1);
+    assert.equal(plain.wire.a[0].context, Packet.RESOURCE_ADV);
+    assert.equal(plain.a.outgoingResources[0].onFirstAdvertisement, null);
+    plain.a.outgoingResources[0].cancel("test over");
+    await assert.rejects(quiet);
+});
+
 // ── Transfers ─────────────────────────────────────────────────────────────
 
 test("a resource larger than a link packet transfers end to end", async () => {

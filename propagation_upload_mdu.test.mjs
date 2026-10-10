@@ -66,10 +66,11 @@ function method(signature) {
 
 /** The over-MDU branch comes before the packet path in `window`, uses
  *  link.sendResource (or _sendWithProgress, which hands it the upload and
- *  reports its progress), and leaves the packet path. */
+ *  reports its progress; the distro's upload passes its options, to hear of
+ *  its first advertisement), and leaves the packet path. */
 function assertResourceFirst(window, where) {
     assert.match(window, /propagationPacked\.length > Link\.MDU/, `${where}: no MDU branch before the packet`);
-    assert.match(window, /link\.sendResource\(propagationPacked\)|this\._sendWithProgress\(link, propagationPacked,/,
+    assert.match(window, /link\.sendResource\(propagationPacked(?:\)|, \{)|this\._sendWithProgress\(link, propagationPacked,/,
         `${where}: the over-MDU branch must use link.sendResource`);
     assert.match(window, /\n\s+return( null| "resource"| upload)?;\n/, `${where}: the Resource branch must not fall through to the packet`);
 }

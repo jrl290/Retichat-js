@@ -4297,7 +4297,10 @@ const RnsClient = {
      * or still queued when an exchange failed). Only an upload for the
      * distro reads it: nothing of it was sent, so it is no loss and no
      * failure (James, 2026-10-06, DESIGN_PRINCIPLES §3, what a device owes
-     * its distro). A DM, a channel post and the rest are lost as ever.
+     * its distro). A DM, a channel post and the rest are lost as ever. An
+     * upload that goes as a Resource is known here by its first
+     * advertisement, and only `unsent` decides it (James, 2026-10-10,
+     * DISTRO-SYNC-PROOF-DESIGN.md §5.3(a)).
      */
     _onPacketsLost({ packetHashes, reason, unsent = [] }) {
         for (const packetHash of packetHashes) {
@@ -4310,8 +4313,24 @@ const RnsClient = {
                 // the next coming-up); one lost after it left is a loss, and
                 // waits for the next coming-up alone. A proof that still
                 // arrives is logged, and changes nothing.
-                if (unsent.includes(packetHash)) this._distroUploads.neverLeft(pending.distroUpload, `its packet never left: ${reason}`);
-                else this._distroUploads.lost(pending.distroUpload, `its packet was lost (${reason})`);
+                //
+                // For a Resource upload this is its first advertisement
+                // (`resourceAdvert`; DISTRO-SYNC-PROOF-DESIGN.md §5.3(a),
+                // James, 2026-10-10). Unsent, it never left either: decided
+                // so, and the Resource is cancelled here, on this device,
+                // with the propagation link kept, so its later rejection
+                // decides nothing (DistroUploads decides an upload once).
+                // Lost after it left, the Resource's own retries and failure
+                // decide, as for any Resource (ruling of 2026-10-04): the
+                // report decides nothing.
+                if (unsent.includes(packetHash)) {
+                    this._distroUploads.neverLeft(pending.distroUpload, pending.resourceAdvert
+                        ? `its Resource's first advertisement never left: ${reason}` : `its packet never left: ${reason}`);
+                    if (pending.resourceAdvert) {
+                        this._pendingPacketHashes.delete(packetHash.slice(0, 32));
+                        pending.resource.cancel("its first advertisement never left the device");
+                    }
+                } else if (!pending.resourceAdvert) this._distroUploads.lost(pending.distroUpload, `its packet was lost (${reason})`);
                 continue;
             }
             if (pending?.channelPost) {
@@ -4997,6 +5016,9 @@ const RnsClient = {
      * Resource when it is proved, and rejects when it never will be: the
      * exchange lost the packet (_onPacketsLost), the link closed or the
      * connection stopped first (DistroUploads.cut), or the Resource failed.
+     * It also rejects, as no failure, when nothing of it left the device:
+     * the exchange put the packet, or a Resource's first advertisement,
+     * into no request (_onPacketsLost, DistroUploads.neverLeft).
      * The packet's proof has a §1 watch (lib/distro_upload.js).
      *
      * Until 2026-10-03 (review of 69ff01e) the distro's uploads were handed
@@ -5017,9 +5039,37 @@ const RnsClient = {
         if (propagationPacked.length > Link.MDU) {
             console.log(`[distro] 📤 ${label}: ${propagationPacked.length} B exceeds the MDU — sending as a resource`);
             const upload = this._distroUploads.track(label, link, "resource");
-            link.sendResource(propagationPacked).then(
-                () => this._distroUploads.proved(upload),
-                (error) => this._distroUploads.lost(upload, `its Resource failed (${error?.message ?? error})`));
+            // Never left, for a Resource (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a);
+            // James, 2026-10-10, under his ruling of 2026-10-06): its first
+            // advertisement is tracked before it can go (DESIGN_PRINCIPLES
+            // §5), so the exchange's report that it went into no request
+            // reaches _onPacketsLost, which decides the upload never left and
+            // cancels the Resource. Once that advertisement has left, the
+            // Resource's own retries and failure decide, as before (ruling of
+            // 2026-10-04): a plain loss report for it decides nothing. The
+            // advertisement is never proved; were it, that would decide
+            // nothing either. Its entry goes when the Resource ends.
+            let advertKey = null;
+            let advert = null;
+            const ended = () => {
+                if (advert && this._pendingPacketHashes.get(advertKey) === advert) this._pendingPacketHashes.delete(advertKey);
+            };
+            link.sendResource(propagationPacked, {
+                onFirstAdvertisement: (packetHash, resource) => {
+                    advertKey = packetHash.slice(0, 16).toString("hex");
+                    advert = {
+                        contactHash: DistroManager.lxmfDeliveryHash,
+                        messageId: advertKey,
+                        distroUpload: upload,
+                        resourceAdvert: true,
+                        resource,
+                        onProof: () => {},
+                    };
+                    this._pendingPacketHashes.set(advertKey, advert);
+                },
+            }).then(
+                () => { ended(); this._distroUploads.proved(upload); },
+                (error) => { ended(); this._distroUploads.lost(upload, `its Resource failed (${error?.message ?? error})`); });
             return upload;
         }
         // A LINK-type DATA packet, through the link as every link send is.

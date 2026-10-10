@@ -24,7 +24,11 @@
  * back; one lost after it left still waits for the propagation link's next
  * coming-up. The last tests run that over the real PostInterface and the
  * real _followExchange (the staging case: a short drop, the propagation link
- * still up).
+ * still up). James, 2026-10-10 (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a)): the
+ * same holds for an upload that goes as a Resource, whose first
+ * advertisement the exchange never sent; once that has left, the
+ * Resource's own failure decides. Those run a real Resource over a real
+ * propagation link (test_link_pair.mjs) whose packets the exchange carries.
  *
  * The real PostInterface runs against a scripted node (a fake fetch). The app
  * tests run the real shipped method bodies from app.js: the DM path over a
@@ -41,13 +45,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { Buffer } from "node:buffer";
-import { Reticulum, Identity, Destination, LXMessage, Link, Packet } from "./lib/rns/reticulum.js";
+import { Reticulum, Identity, Destination, LXMessage, Link, Packet, Resource } from "./lib/rns/reticulum.js";
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import LXMF from "./lib/rns/lxmf/lxmf.js";
 import { DistroUploads } from "./lib/distro_upload.js";
 import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
 import { applyToFields as applyDisplayName, ABSENT } from "./lib/display_name.js";
+import { linkPair } from "./test_link_pair.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -929,7 +934,7 @@ const R = "0123456789abcdef0123456789abcdef";
  * iface.sendData, so the exchange itself refuses, queues, carries or loses
  * them, and its events reach the page through the real _followExchange.
  */
-function makeDistroClient(iface) {
+function makeDistroClient(iface, { link: realLink = null } = {}) {
     const { sGet, sSet } = memoryStorage();
     const distro = Identity.create();
     const events = [];
@@ -943,7 +948,8 @@ function makeDistroClient(iface) {
     const watches = [];     // the §1 watch's timers, which this test's clock never runs
     const uploadOf = new Map();  // a packet's hash → the propagation upload it carries
     let made = 0;
-    const link = {
+    // `realLink`: this device's end of a real propagation link (resourceLink), whose uploads over the MDU go as real Resources.
+    const link = realLink ?? {
         status: Link.ACTIVE,
         newLinkPacket: (context, data) => {
             const raw = rawPacket(0x30 + made++).raw;
@@ -954,7 +960,7 @@ function makeDistroClient(iface) {
         sendResource: async () => { throw new Error("no Resource in this test"); },
     };
     const env = {
-        Harness, console: quietLog, Buffer, Cryptography, LXMessage, LXMF, Packet: { NONE: 0x00 }, Link: { MDU: 100_000, ACTIVE: Link.ACTIVE },
+        Harness, console: quietLog, Buffer, Cryptography, LXMessage, LXMF, Packet: { NONE: 0x00 }, Link: { MDU: realLink ? Link.MDU : 100_000, ACTIVE: Link.ACTIVE },
         DistroManager: { has: true, identity: distro, lxmfDeliveryHash: lxmfHash(distro), pubKey: distro.getPublicKey().toString("hex") },
         DistroOutboxStore: new DistroOutbox({ get: sGet, set: sSet }), sentCopyEntryId, channelSyncEntryId, ActiveTab: { held: true },
     };
@@ -1178,4 +1184,168 @@ test("an upload for the distro is the only reader of `unsent`: a DM queued behin
     await eventually(() => c.MsgStore.get(alice.destHash)[0].status === "failed", "the DM failed at once");
     assert.deepEqual(seen.lost()[0].unsent, [seen.lost()[0].packetHashes[0]], "its packet was never sent, and the interface says so");
     assert.ok(c.events.some((e) => e.kind === "dm-lost" && e.detail.id === msg.id), "and the DM path treats it as lost, nothing sends it again");
+});
+
+// ── An upload owed to the distro that goes as a Resource (app.js) ──────────
+//
+// James, 2026-10-10 (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a), under his ruling
+// of 2026-10-06): a Resource upload whose first advertisement no interface
+// could carry never left the device. It is no failure, the Resource is
+// cancelled on this device and the propagation link kept, and it goes at the
+// exchange's return like a packet that never left. Once its first
+// advertisement has left, the Resource's own retries and failure decide, as
+// before (ruling of 2026-10-04). Every sent copy over the link MDU is a
+// Resource today, and with the sync proof every upload for the distro is.
+
+/**
+ * A real propagation link (test_link_pair.mjs): this device's end `a` sends
+ * through the exchange `iface`, and the node's end `b` takes every Resource;
+ * what `b` sends back reaches `a` directly, as the node's answers would.
+ */
+function resourceLink(iface) {
+    const { a, b } = linkPair();
+    a.destination = { rns: { sendData: (raw) => iface.sendData(raw) } };
+    b.setResourceStrategy(Link.ACCEPT_ALL);
+    const received = [];
+    b.on("resource", ({ data }) => received.push(Buffer.from(data)));
+    return { a, b, received };
+}
+
+/** The node takes the packets an exchange carries: each goes to the link's far end `b`, as linkPair's wire routes it. */
+function toNode(b, request) {
+    for (const b64 of request.body.packets ?? []) {
+        const packet = Packet.fromBytes(Buffer.from(b64, "base64"));
+        if (packet.packetType === Packet.DATA) b.onPacket(packet);
+        else if (packet.packetType === Packet.PROOF && packet.context === Packet.RESOURCE_PRF) b.onResourceProof(packet);
+        else if (packet.packetType === Packet.PROOF) b.onPacketProof(packet);
+    }
+}
+
+/** Answer every exchange (handing what it carries to `b` unless `deliver` is false) until `done()`. A failure mechanism only. */
+async function carryUntil(node, b, done, what, { deliver = true } = {}) {
+    for (let i = 0; i < 400 && !done(); i++) {
+        const request = node.requests.find((r) => !r.settled && r.path === "/v1/interfaces/exchange");
+        if (request) {
+            request.respond(200, {});
+            if (deliver) toNode(b, request);
+        }
+        await tick();
+    }
+    assert.ok(done(), `never happened: ${what}`);
+}
+
+/** The hashes of the packets one exchange carries, by context. */
+const carriedContexts = (request) => (request.body.packets ?? []).map((b64) => Packet.fromBytes(Buffer.from(b64, "base64")).context);
+
+/** Over the link MDU, so the upload of its sent copy goes as a Resource. */
+const LONG = "a sent copy over the link MDU, so its upload is a Resource: ".padEnd(900, "x");
+
+async function upWithResourceClient(t, node) {
+    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", "ab".repeat(16));
+    t.after(() => iface.disconnect());
+    const { a, b, received } = resourceLink(iface);
+    const c = makeDistroClient(iface, { link: a });
+    c.self._followExchange(iface);
+    iface.connect();
+    (await node.pending("register")).respond(200, REGISTERED);
+    (await node.pending("exchange")).respond(200, {});
+    await eventually(() => c.self._status === "online", "online on up");
+    return { iface, c, a, b, received };
+}
+
+test("the staging case for a Resource upload: its first advertisement never left in a short drop, so the upload never left: no failure, the Resource cancelled on this device and the link kept, and it goes when the exchange answers again, at once and once (James, 2026-10-10)", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { iface, c, a, b, received } = await upWithResourceClient(t, node);
+    await dropExchange(c, iface, node, clock);
+
+    // The user sends as the distro during the drop: its sent copy is over the MDU, so the upload is a Resource.
+    await c.self._sendDistroSentCopy(R, "", LONG);
+    const [entry] = c.owed();
+    assert.ok(Buffer.from(entry.packed, "base64").length > Link.MDU, "a Resource upload");
+    await eventually(() => c.self._distroUnproved.neverLeftSize === 1, "the exchange said its first advertisement went into no request");
+    assert.equal(c.self._distroUnproved.neverLeft(entry), true, "decided never left");
+    assert.deepEqual([c.self._distroUnproved.size, c.self._propComingUps], [0, 0], "no failure recorded, and no coming-up since");
+    assert.deepEqual(c.errors(), [], "no failure: the Harness hears none");
+    assert.equal(a.status, Link.ACTIVE, "the propagation link is kept");
+    assert.deepEqual(a.outgoingResources, [], "the Resource was cancelled on this device");
+    assert.equal(c.self._pendingPacketHashes.size, 0, "and its advertisement's entry went with it");
+
+    // The Resource's rejection (its cancel) comes later, and decides nothing: DistroUploads decided it once.
+    await tick(); await tick(); await tick();
+    assert.deepEqual([c.self._distroUnproved.neverLeftSize, c.self._distroUnproved.size, c.errors()], [1, 0, []],
+        "its rejection is no loss and no failure");
+    assert.equal(c.self._distroUploads._open.size, 0, "the upload is decided");
+    assert.deepEqual(received, [], "nothing reached the node");
+    assert.deepEqual(clock.timers.filter((x) => !x.cleared && !x.fired).map((x) => x.ms), [PostInterface.RECONNECT_WAIT_MS],
+        "the Resource's own timers went with it: only the exchange's reconnect wait is armed");
+
+    // The exchange answers again: that is the event. The upload goes in the next exchange, before any timer fires: no 35 s wait.
+    await returnExchange(c, iface, node, clock);
+    const fired = clock.timers.filter((x) => x.fired).length;
+    const carrying = await node.pending("exchange");
+    assert.deepEqual(carriedContexts(carrying), [Packet.RESOURCE_ADV], "a new Resource's first advertisement left with the exchange's return");
+    assert.equal(c.self._distroUnproved.neverLeftSize, 0, "an upload of it has begun");
+    await carryUntil(node, b, () => received.length === 1 && c.sentCopies().length === 1, "the node took it, and it was proved");
+    assert.equal(clock.timers.filter((x) => x.fired).length, fired, "no timer was fired for it: the return sent it");
+    assert.deepEqual(received[0], Buffer.from(entry.packed, "base64"), "the LXMF message packed when the user acted, once");
+    assert.deepEqual([c.owed(), c.errors(), c.self._distroUnproved.size, c.self._distroUnproved.neverLeftSize], [[], [], 0, 0], "owed no more");
+});
+
+test("a Resource upload whose first advertisement left: a loss report for it decides nothing, and the Resource's own failure is a loss that waits for the propagation link's next coming-up, never the exchange's return (ruling of 2026-10-04)", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { iface, c, a, b, received } = await upWithResourceClient(t, node);
+
+    // Sent while the exchange is up: its first advertisement is in the batch an exchange is carrying when the network drops.
+    await c.self._sendDistroSentCopy(R, "", LONG);
+    const [entry] = c.owed();
+    const carrying = await node.pending("exchange");
+    assert.deepEqual(carriedContexts(carrying), [Packet.RESOURCE_ADV], "its first advertisement left");
+    const [resource] = a.outgoingResources;
+    carrying.fail();
+    await eventually(() => iface.isDown && c.self._status === "offline", "down");
+    await tick(); await tick();
+    // The exchange reported the advertisement lost, not unsent: it may have reached the node. That decides nothing.
+    assert.deepEqual([c.errors(), c.self._distroUnproved.size, c.self._distroUnproved.neverLeftSize], [[], 0, 0],
+        "no failure and no never-left: the loss report for an advertisement that left decides nothing");
+    assert.equal(c.self._distroUploads._open.size, 1, "the upload is still open");
+    assert.equal(resource.status, Resource.ADVERTISED, "the Resource goes on: its own retries decide");
+    assert.equal(c.self._pendingPacketHashes.size, 1, "its first advertisement is still tracked");
+
+    // The exchange answers again: nothing goes for it (it did not never leave), and the Resource is untouched.
+    await returnExchange(c, iface, node, clock, { check: true });
+    await carryUntil(node, b, () => true, "the return's exchange answered", { deliver: false });
+    assert.equal(resource.status, Resource.ADVERTISED);
+    assert.equal(a.outgoingResources.length, 1, "no second upload: one Resource");
+
+    // The node never answers: the Resource re-advertises (the protocol's own retries, carried but not delivered here) and fails.
+    let now = Date.now();
+    for (let i = 0; i < 20 && resource.status === Resource.ADVERTISED; i++) {
+        now += 3_600_000;
+        resource.watchdog(now);
+        await carryUntil(node, b, () => !node.requests.some((r) => !r.settled && r.path === "/v1/interfaces/exchange"), "re-advertisement carried", { deliver: false });
+    }
+    assert.equal(resource.status, Resource.FAILED, "the Resource failed by its own retries");
+    await eventually(() => c.errors().length === 1, "decided lost");
+    assert.match(c.errors()[0].detail.message, /^its Resource failed \(no response to the resource advertisement\)$/, "a loss, and reported");
+    assert.deepEqual([c.self._distroUnproved.neverLeft(entry), c.self._distroUnproved.at(entry)], [false, 0],
+        "a failure recorded at the coming-up it was decided at, not a never-left");
+    assert.equal(c.self._pendingPacketHashes.size, 0, "its advertisement's entry went with the Resource");
+    assert.equal(a.status, Link.ACTIVE, "the link is kept");
+
+    // The exchange's return sends nothing for a failure.
+    await dropExchange(c, iface, node, clock);
+    await returnExchange(c, iface, node, clock);
+    await carryUntil(node, b, () => true, "answered", { deliver: false });
+    assert.equal(a.outgoingResources.length, 0, "nothing went at the exchange's return");
+    assert.deepEqual(received, []);
+
+    // The propagation link's next coming-up sends it, and the node takes it.
+    await c.self._sendDistroOutbox(a, "established");
+    await carryUntil(node, b, () => received.length === 1 && c.sentCopies().length === 1, "uploaded again at the coming-up, and proved");
+    assert.deepEqual(received[0], Buffer.from(entry.packed, "base64"));
+    assert.deepEqual([c.owed(), c.self._distroUnproved.size], [[], 0], "owed no more");
 });
