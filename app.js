@@ -64,7 +64,7 @@ import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.j
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import { sealForSync, syncClaimFor, buildSealedUpload } from "./lib/distro_sync.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { withoutLocation } from "./lib/photo_metadata.js";
@@ -3121,10 +3121,11 @@ const RnsClient = {
      *  carries the same bytes. With `syncSig`, which _uploadOwed passes only
      *  where the proof may go (_distroSyncProofGoes), the distro sync proof
      *  is the third element. A proof that is not this message's is never
-     *  sent: it is said as an error and the upload goes without it. A
-     *  sealed upload whose stamp cannot be computed is not built (it would
-     *  be refused by the node, which may still prove its transfer): the
-     *  build fails, and the message stays owed.
+     *  sent: it is said as an error, recorded as a "distro-sync-proof"
+     *  Harness error, and the upload goes without it. A sealed upload whose
+     *  stamp cannot be computed is not built (it would be refused by the
+     *  node, which may still prove its transfer): the build fails, and the
+     *  message stays owed.
      */
     async _buildPropagationPacked(lxmfPacked, peerPublicKeyHex, sealed = null, syncSig = null) {
         if (sealed) {
@@ -3134,6 +3135,7 @@ const RnsClient = {
                     claim = syncClaimFor(sealed, Buffer.from(peerPublicKeyHex, "hex"), syncSig);
                 } catch (error) {
                     console.error(`[distro] ✗ The distro sync proof kept with this upload is not its own (${error.message}): it goes without it, and RFed wakes the distro's devices for it as before (§17.13)`);
+                    Harness.error("distro-sync-proof", error);
                 }
             }
             const stamp = await this._computePropagationStamp(sealed);
@@ -4522,9 +4524,11 @@ const RnsClient = {
      * same proof (_uploadOwed), even after this device gives D up. Both
      * kinds carry it, the membership message C as well as the sent-copy
      * (James, 2026-10-10, Q1). When the message cannot be sealed it says so,
-     * as an error, and returns nothing: the message is owed as before and
-     * built as before, without a proof, so RFed wakes D's devices for it as
-     * it does today. `label` is what the line calls it.
+     * as an error and a "distro-sync-proof" Harness error (a staging stage
+     * counts them: a page that quietly stopped proving would wake every
+     * device of D again unseen), and returns nothing: the message is owed
+     * as before and built as before, without a proof, so RFed wakes D's
+     * devices for it as it does today. `label` is what the line calls it.
      */
     _sealForDistroSync(packed, label) {
         try {
@@ -4532,6 +4536,7 @@ const RnsClient = {
             return { sealed: sealed.toString("base64"), syncSig: sig.toString("base64") };
         } catch (error) {
             console.error(`[distro] ✗ ${label} could not be sealed for the distro sync proof (${error.message}): it is owed without one, and RFed wakes the distro's devices for it as before (§17.13)`);
+            Harness.error("distro-sync-proof", error);
             return {};
         }
     },
@@ -4884,8 +4889,15 @@ const RnsClient = {
             // proof goes with it only to the configured RFed's own
             // propagation node (§5.4, _distroSyncProofGoes). A message owed
             // before entries were sealed, or one that could not be, is built
-            // as before, with no proof.
-            const sealed = entry.sealed ? Buffer.from(entry.sealed, "base64") : null;
+            // as before, with no proof. So is one whose stored pair is broken
+            // (lib/distro_outbox.js syncProofKept), which is said: the proof
+            // is lost, never the message.
+            const proof = syncProofKept(entry);
+            if (proof === "broken") {
+                console.error(`[distro] ✗ The distro sync proof kept with ${entry.label} is broken (half of it, not base64, or without the distro's key): it goes without it, built as before, and RFed wakes the distro's devices for it as before (§17.13)`);
+                Harness.error("distro-sync-proof", new Error(`the distro sync proof kept with ${entry.label} is broken`));
+            }
+            const sealed = proof === "whole" ? Buffer.from(entry.sealed, "base64") : null;
             const syncSig = sealed && this._distroSyncProofGoes(link) ? Buffer.from(entry.syncSig, "base64") : null;
             const propagationPacked = await this._buildPropagationPacked(Buffer.from(entry.packed, "base64"), distroKey, sealed, syncSig);
             // Building it yields: a later action on the same channel may

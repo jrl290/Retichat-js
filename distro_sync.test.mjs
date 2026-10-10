@@ -20,8 +20,10 @@
  *      propagation node (§5.4), never with lxmfPropagationOverride; a
  *      sent-copy owed to a distro given up still proved; an entry owed
  *      before this built as before; a message that cannot be sealed, a
- *      stored proof that is not the message's, and a stamp that cannot be
- *      computed.
+ *      stored proof that is not the message's, a stored pair that is
+ *      broken (each said, and recorded as a "distro-sync-proof" Harness
+ *      error, the proof lost and never the message), and a stamp that
+ *      cannot be computed.
  *
  * Run: node --test distro_sync.test.mjs
  */
@@ -39,7 +41,7 @@ import Link from "./lib/rns/link.js";
 import { readHead, skipValue } from "./lib/rns/msgpack_raw.js";
 import { channelSyncFields, readChannelSync } from "./lib/channel_sync.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import {
     DISTRO_SYNC_KEY, DISTRO_SYNC_SIGNED_LEN, buildSealedUpload, sealForSync, syncClaimFor, syncClaimRefusal, syncSignedBytes,
     syncTransientId,
@@ -257,7 +259,7 @@ function device({ distro = Identity.create(), override = "", node = null, rfed =
         Link: { MDU: Link.MDU, ACTIVE: Link.ACTIVE }, Packet: { NONE: 0x00 },
         DistroOutboxStore: new DistroOutbox({ get: storage.sGet, set: storage.sSet }), sentCopyEntryId, channelSyncEntryId,
         channelSyncFields, ownLxmfDestinationHash: () => lxmfHash(me).toString("hex"),
-        sealForSync: seal, syncClaimFor, buildSealedUpload,
+        sealForSync: seal, syncClaimFor, buildSealedUpload, syncProofKept,
     };
     let n = 0;
     const self = {
@@ -436,20 +438,25 @@ test("an entry owed before entries were sealed is built as before: encrypted ane
     assert.ok(!second.sealed.equals(first.sealed), "encrypted anew, as before");
 });
 
-test("a message that cannot be sealed is said as an error, owed without a proof, and built as before", async () => {
+/** The Harness errors the page recorded: [where, message]. */
+const harnessErrors = (d) => d.events.filter((e) => e.kind === "error").map((e) => [e.detail.where, e.detail.message]);
+
+test("a message that cannot be sealed is said as an error, recorded as a Harness error a staging stage counts, owed without a proof, and built as before", async () => {
     const d = device({ seal: () => { throw new Error("the distro identity has no private key: a sync proof needs D's signature"); } });
     await d.sendCopy();
     const [entry] = d.owed();
     assert.equal("sealed" in entry || "syncSig" in entry, false, "owed without them");
     assert.equal(d.errors().length, 1);
     assert.match(d.errors()[0], /could not be sealed for the distro sync proof \(the distro identity has no private key/);
+    assert.deepEqual(harnessErrors(d), [["distro-sync-proof", "the distro identity has no private key: a sync proof needs D's signature"]],
+        "exactly one, so a page that quietly stopped proving is seen");
     await d.establish();
     const upload = readUpload(d.uploads[0]);
     assert.equal(upload.elements, 2, "no proof");
     assert.ok(d.distro.decrypt(upload.sealed.subarray(16)).equals(Buffer.from(entry.packed, "base64").subarray(16)), "the legacy build");
 });
 
-test("a stored proof that is not the message's is never sent: said as an error, and the sealed message goes without it", async () => {
+test("a stored proof that is not the message's is never sent: said as an error, recorded as a Harness error, and the sealed message goes without it", async () => {
     const d = device();
     await d.sendCopy();
     const entry = d.owed()[0];
@@ -460,6 +467,34 @@ test("a stored proof that is not the message's is never sent: said as an error, 
     assert.ok(upload.sealed.equals(Buffer.from(entry.sealed, "base64")), "the sealed bytes, not encrypted again");
     assert.equal(d.errors().length, 1);
     assert.match(d.errors()[0], /The distro sync proof kept with this upload is not its own \(the sync claim is not this message's: signature invalid\)/);
+    assert.deepEqual(harnessErrors(d), [["distro-sync-proof", "the sync claim is not this message's: signature invalid"]], "exactly one");
+});
+
+test("a stored pair that is broken (half of it, not base64, or without the distro's key: a corrupted row) costs the proof, never the message: it stays owed, goes as one owed before entries were sealed, and that is said and recorded (review of Retichat-js 7b69904)", async () => {
+    for (const [why, broken] of [
+        ["syncSig missing", (e) => { const { syncSig, ...rest } = e; return rest; }],
+        ["sealed missing", (e) => { const { sealed, ...rest } = e; return rest; }],
+        ["syncSig not base64", (e) => ({ ...e, syncSig: "not base64!" })],
+        ["without the distro's key (the distro held is its own)", (e) => { const { distroKey, ...rest } = e; return rest; }],
+    ]) {
+        const d = device();
+        await d.sendCopy();
+        const entry = d.owed()[0];
+        d.storage.sSet("distro_outbox_v1", [broken(entry)]);
+        assert.equal(d.owed().length, 1, `${why}: still owed`);
+        await d.establish();
+        assert.equal(d.uploads.length, 1, `${why}: uploaded`);
+        const upload = readUpload(d.uploads[0]);
+        assert.equal(upload.elements, 2, `${why}: no proof`);
+        assert.ok(d.distro.decrypt(upload.sealed.subarray(16)).equals(Buffer.from(entry.packed, "base64").subarray(16)), `${why}: the message, encrypted to D at build time`);
+        assert.equal(d.errors().length, 1, why);
+        assert.match(d.errors()[0], /The distro sync proof kept with the sent-copy for 01234567 \(§17\.11\) is broken \(half of it, not base64, or without the distro's key\): it goes without it, built as before/);
+        assert.deepEqual(harnessErrors(d), [["distro-sync-proof", "the distro sync proof kept with the sent-copy for 01234567 (§17.11) is broken"]], `${why}: exactly one`);
+        d.resources.shift()?.resolve();
+        d.prove();
+        await tick();
+        assert.deepEqual(d.owed(), [], `${why}: proved, owed no more`);
+    }
 });
 
 test("a sealed upload whose stamp cannot be computed is not built: nothing is sent, the failure is said, and the message stays owed for the next coming-up", async () => {

@@ -50,7 +50,7 @@ import PostInterface from "./lib/rns/interfaces/post_interface.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import LXMF from "./lib/rns/lxmf/lxmf.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import { applyToFields as applyDisplayName, ABSENT } from "./lib/display_name.js";
 import { linkPair } from "./test_link_pair.mjs";
 import { sealForSync } from "./lib/distro_sync.js";
@@ -965,7 +965,7 @@ function makeDistroClient(iface, { link: realLink = null } = {}) {
         Harness, console: quietLog, Buffer, Cryptography, LXMessage, LXMF, Packet: { NONE: 0x00 }, Link: { MDU: realLink ? Link.MDU : 100_000, ACTIVE: Link.ACTIVE },
         DistroManager: { has: true, identity: distro, lxmfDeliveryHash: lxmfHash(distro), pubKey: distro.getPublicKey().toString("hex") },
         DistroOutboxStore: new DistroOutbox({ get: sGet, set: sSet }), sentCopyEntryId, channelSyncEntryId, ActiveTab: { held: true },
-        sealForSync, Destination,
+        sealForSync, syncProofKept, Destination,
     };
     const self = {
         ownHash: lxmfHash(me), _rns: { interfaces: [iface] }, _status: "connecting", _connType: "exchange", _onStatus: [],

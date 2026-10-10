@@ -30,7 +30,7 @@ import Packet from "./lib/rns/packet.js";
 import { decodePayload as decodeDisplayName } from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import { sealForSync } from "./lib/distro_sync.js";
 import { install, memoryStorage } from "./test_app_source.mjs";
 
@@ -180,7 +180,7 @@ function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
         DistroManager, LXMessage, LXMF, Buffer, Cryptography, Packet, Harness, console: quiet,
         Link: { MDU: 100000, ACTIVE: Link.ACTIVE },
         DistroOutboxStore: new DistroOutbox({ get: storage.sGet, set: storage.sSet }), sentCopyEntryId, channelSyncEntryId,
-        sealForSync, Destination,
+        sealForSync, syncProofKept, Destination,
     };
     install(self, env, [
         "async _sendDistroSentCopy(recipientHex, title, content)", "_sealForDistroSync(packed, label)", "_distroSyncProofGoes(link)",
@@ -769,20 +769,20 @@ test("the distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5)
         "sealed where each kind is packed, the sent-copy and the membership message, and nowhere else");
     assert.deepEqual(sites(code, /\bsealForSync\(/g, spans), ["RnsClient._sealForDistroSync"], "one place seals");
     assert.match(method("_sealForDistroSync(packed, label)"),
-        /try \{\s*const \{ sealed, sig \} = sealForSync\(DistroManager\.identity, packed\);\s*return \{ sealed: sealed\.toString\("base64"\), syncSig: sig\.toString\("base64"\) \};\s*\} catch \(error\) \{\s*console\.error\([^\n]*\);\s*return \{\};\s*\}/,
-        "with D's key, and a failure is said as an error and owes the message as before");
+        /try \{\s*const \{ sealed, sig \} = sealForSync\(DistroManager\.identity, packed\);\s*return \{ sealed: sealed\.toString\("base64"\), syncSig: sig\.toString\("base64"\) \};\s*\} catch \(error\) \{\s*console\.error\([^\n]*\);\s*Harness\.error\("distro-sync-proof", error\);\s*return \{\};\s*\}/,
+        "with D's key, and a failure is said as an error, recorded as a Harness error a staging stage counts, and owes the message as before");
     assert.deepEqual(sites(code, "_distroSyncProofGoes", spans), ["RnsClient._distroSyncProofGoes", "RnsClient._uploadOwed"], "the gate: made, and read where the upload is built");
     assert.match(method("_distroSyncProofGoes(link)"),
         /if \(!cfg \|\| cfg\.lxmfPropagationOverride \|\| !cfg\.rfedNodeHash\) return false;\s*const derived = Destination\.hash\(\{ hash: Buffer\.from\(cfg\.rfedNodeHash, "hex"\) \}, "lxmf", "propagation"\)\.toString\("hex"\);\s*const node = link\?\.destination\?\.hash;\s*return cfg\.propagationNodeHash === derived && !!node && Buffer\.from\(node\)\.toString\("hex"\) === derived;/,
         "only the derived node of the configured RFed, never an override, and only on a link to that node");
     const upload = method("async _uploadOwed(link, entry, comingUp = null)");
-    assert.match(upload, /const sealed = entry\.sealed \? Buffer\.from\(entry\.sealed, "base64"\) : null;\s*const syncSig = sealed && this\._distroSyncProofGoes\(link\) \? Buffer\.from\(entry\.syncSig, "base64"\) : null;\s*const propagationPacked = await this\._buildPropagationPacked\(Buffer\.from\(entry\.packed, "base64"\), distroKey, sealed, syncSig\);/,
-        "the stored sealed bytes, never sealed again, and the proof only through the gate");
+    assert.match(upload, /const proof = syncProofKept\(entry\);\s*if \(proof === "broken"\) \{\s*console\.error\([^\n]*\);\s*Harness\.error\("distro-sync-proof", new Error\([^\n]*\)\);\s*\}\s*const sealed = proof === "whole" \? Buffer\.from\(entry\.sealed, "base64"\) : null;\s*const syncSig = sealed && this\._distroSyncProofGoes\(link\) \? Buffer\.from\(entry\.syncSig, "base64"\) : null;\s*const propagationPacked = await this\._buildPropagationPacked\(Buffer\.from\(entry\.packed, "base64"\), distroKey, sealed, syncSig\);/,
+        "the stored sealed bytes, never sealed again, and the proof only through the gate; a broken stored pair costs the proof, said and recorded, never the message");
     assert.deepEqual(sites(code, /\b(?:buildSealedUpload|syncClaimFor)\(/g, spans), ["RnsClient._buildPropagationPacked", "RnsClient._buildPropagationPacked"],
         "the sealed upload and its claim are built in one place");
     assert.match(method("async _buildPropagationPacked(lxmfPacked, peerPublicKeyHex, sealed = null, syncSig = null)"),
-        /^\s*if \(sealed\) \{[\s\S]*const stamp = await this\._computePropagationStamp\(sealed\);\s*if \(!stamp\) throw new Error\("its propagation stamp could not be computed"\);[\s\S]*return buildSealedUpload\(sealed, stamp, claim\);\s*\}/,
-        "a sealed message is stamped over its sealed bytes and not encrypted again; no stampless sealed upload is built");
+        /^\s*if \(sealed\) \{\s*let claim = null;\s*if \(syncSig\) \{\s*try \{\s*claim = syncClaimFor\(sealed, Buffer\.from\(peerPublicKeyHex, "hex"\), syncSig\);\s*\} catch \(error\) \{\s*console\.error\([^\n]*\);\s*Harness\.error\("distro-sync-proof", error\);\s*\}\s*\}\s*const stamp = await this\._computePropagationStamp\(sealed\);\s*if \(!stamp\) throw new Error\("its propagation stamp could not be computed"\);[\s\S]*return buildSealedUpload\(sealed, stamp, claim\);\s*\}/,
+        "a sealed message is stamped over its sealed bytes and not encrypted again; a refused claim is said and recorded, and the upload goes without it; no stampless sealed upload is built");
 });
 
 test("what reaches the user's own action (_oweDistro) begins with the user and nothing else: a DM from the composer, a join from the channel form, a leave from the channel's Leave button, the test harness's send, join and leave, and a DM sent before the exchange first registered", async () => {

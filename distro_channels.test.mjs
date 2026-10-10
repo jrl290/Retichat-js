@@ -52,7 +52,7 @@ import {
     readChannelSync, supersedes,
 } from "./lib/channel_sync.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import { sealForSync } from "./lib/distro_sync.js";
 import { app, build, compile, install, methodBody, memoryStorage } from "./test_app_source.mjs";
 
@@ -141,7 +141,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         ChannelStore, ChannelMsgStore,
         ChannelSenderNamesStore: new ChannelSenderNames(names), ChannelPostNamesStore: new ChannelPostNames(names),
         ChannelMembershipStore: new ChannelMembership(names),
-        DistroOutboxStore: new DistroOutbox(names), channelSyncEntryId, sentCopyEntryId, sealForSync,
+        DistroOutboxStore: new DistroOutbox(names), channelSyncEntryId, sentCopyEntryId, sealForSync, syncProofKept,
         channelIdentity, channelLxmPack, channelLxmUnpack, channelComputeStamp, channelSyncFields, channelSyncDisposition,
         CHANNEL_PUBLISH_PATH, OwnNames: { channel: ownName },
         ownLxmfDestinationHash: () => lxmfHash(me), sentTimeMs, decodeDisplayName: DN.decodePayload,

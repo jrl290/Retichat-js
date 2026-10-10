@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import { memoryStorage } from "./test_app_source.mjs";
 
 const D = "d".repeat(32);
@@ -170,7 +170,7 @@ test("an entry may carry its distro's public key, 128 lowercase hex; one without
     }
 });
 
-test("an entry may carry the distro sync proof (RFed SPEC §17.13): `sealed` and `syncSig` together, as base64, with the distro's key; one without either (owed before, or not sealed) is still an entry, and one with half of it or a malformed one is not", () => {
+test("an entry may carry the distro sync proof (RFed SPEC §17.13): `sealed` and `syncSig` together, as base64, with the distro's key; one without either (owed before, or not sealed) is still an entry, and so is one whose pair is broken: the proof is lost, never the message (review of Retichat-js 7b69904)", () => {
     const { storage, box } = outbox();
     const KEY = "ab".repeat(64);
     const SEALED = Buffer.alloc(200, 3).toString("base64");
@@ -182,7 +182,8 @@ test("an entry may carry the distro sync proof (RFed SPEC §17.13): `sealed` and
         [["sent:ff", null, null], ["sent:ee", SEALED, SIG], ["channel:aa", SEALED, SIG]], "both kinds, kept as they were written");
     assert.deepEqual(new DistroOutbox({ get: storage.sGet, set: storage.sSet }).list().map((e) => e.sealed ?? null), [null, SEALED, SEALED],
         "in storage, for the next page");
-    for (const [why, bad] of [
+    assert.deepEqual(box.list().map(syncProofKept), ["none", "whole", "whole"]);
+    const broken = [
         ["sealed alone", { distroKey: KEY, sealed: SEALED }],
         ["syncSig alone", { distroKey: KEY, syncSig: SIG }],
         ["without the distro's key", { sealed: SEALED, syncSig: SIG }],
@@ -190,12 +191,22 @@ test("an entry may carry the distro sync proof (RFed SPEC §17.13): `sealed` and
         ["syncSig not base64", { distroKey: KEY, sealed: SEALED, syncSig: "" }],
         ["sealed not a string", { distroKey: KEY, sealed: 7, syncSig: SIG }],
         ["syncSig null", { distroKey: KEY, sealed: SEALED, syncSig: null }],
-    ]) {
-        assert.throws(() => box.put({ ...SENT("dd", "FFFF"), ...bad }), /not an entry the distro can be owed/, why);
+    ];
+    for (const [why, bad] of broken) {
+        assert.equal(syncProofKept({ ...SENT("dd", "FFFF"), ...bad }), "broken", why);
+        // Owed all the same: app.js _uploadOwed builds it without the pair, and says so.
+        assert.doesNotThrow(() => box.put({ ...SENT("dd", "FFFF"), ...bad }), why);
+        assert.equal(box.get("sent:dd")?.packed, "FFFF", `${why}: owed`);
     }
-    // Stored rows that are not entries are ignored.
+    // Stored rows with a broken pair (a corrupted row) stay owed, and a
+    // later write keeps them: the message is never erased for its proof.
+    const lines = [];
+    const reader = new DistroOutbox({ get: storage.sGet, set: storage.sSet }, { log: { error: (line) => lines.push(line) } });
     storage.sSet("distro_outbox_v1", [{ ...SENT("cc", "GGGG"), distroKey: KEY, sealed: SEALED }, { ...SENT("bb", "HHHH"), distroKey: KEY, sealed: SEALED, syncSig: SIG }]);
-    assert.deepEqual(box.list().map((e) => e.id), ["sent:bb"]);
+    assert.deepEqual(reader.list().map((e) => [e.id, syncProofKept(e)]), [["sent:cc", "broken"], ["sent:bb", "whole"]]);
+    reader.put(SENT("aa", "IIII"));
+    assert.deepEqual(reader.list().map((e) => e.id), ["sent:cc", "sent:bb", "sent:aa"], "kept by the next write");
+    assert.deepEqual(lines, [], "an entry, not a row dropped");
 });
 
 test("a later entry under the same id replaces the one owed, and goes to the end", () => {
@@ -215,14 +226,24 @@ test("settling the earlier message under an id leaves the later one owed", () =>
     assert.equal(box.settle("channel:aa", "CCCC"), true);
 });
 
-test("what is stored and is not an entry is ignored, and a malformed entry is refused", () => {
+test("what is stored and is not an entry is ignored, and said once per page, never silent; a malformed entry is refused", () => {
     const storage = memoryStorage();
     storage.sSet("distro_outbox_v1", [null, 7, { id: "x" }, entry("channel:aa", "not base64!"), entry("channel:bb", "QUJD", { distro: "short" }),
         entry("channel:cc", "QUJD", { kind: "other" }), entry("channel:ok", "QUJD")]);
-    const { box } = outbox(storage);
+    const lines = [];
+    const box = new DistroOutbox({ get: storage.sGet, set: storage.sSet }, { log: { error: (line) => lines.push(line) } });
     assert.deepEqual(box.list().map((e) => e.id), ["channel:ok"]);
+    assert.equal(lines.length, 6, "each row that is not an entry, said");
+    assert.ok(lines.every((line) => /^\[distro\] ✗ storage holds a row of what is owed to the distro that is not an entry \(.*\): it is not sent, and the next write of what is owed leaves it out$/.test(line)), lines.join("\n"));
+    assert.match(lines[2], /\(x\)/, "named by its id when it has no label");
+    assert.match(lines[3], /\(the join of #channel:aa\)/, "by its label");
+    box.list();
+    box.get("channel:ok");
+    assert.equal(lines.length, 6, "once per page, not on every read");
     storage.sSet("distro_outbox_v1", { not: "a list" });
     assert.deepEqual(box.list(), []);
+    assert.equal(lines.length, 7);
+    assert.match(lines[6], /what storage holds of what is owed to the distro is not a list/);
     for (const bad of [null, entry("", "QUJD"), entry("channel:x", ""), entry("channel:x", "QUJD", { distro: "D".repeat(32) }),
         entry("channel:x", "QUJD", { label: 7 })]) {
         assert.throws(() => box.put(bad), /not an entry the distro can be owed/);
