@@ -65,6 +65,7 @@ import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
 import { DistroUploads } from "./lib/distro_upload.js";
 import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { sealForSync, syncClaimFor, buildSealedUpload } from "./lib/distro_sync.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
 import { withoutLocation } from "./lib/photo_metadata.js";
 import { ObjectUrls } from "./lib/object_urls.js";
@@ -3110,8 +3111,36 @@ const RnsClient = {
     /** Build the propagation_packed wire format matching iOS/Rust.
      *  lxmfPacked = dest_hash(16) | source_hash(16) | sig(64) | msgpack_payload
      *  Returns: msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | stamp(32)]]])
+     *
+     *  `sealed` is set for an upload owed to the distro that was sealed when
+     *  it was owed (_sealForDistroSync, RFed SPEC §17.13,
+     *  DISTRO-SYNC-PROOF-DESIGN.md §5.2): `lxmfPacked` encrypted to the
+     *  distro (`peerPublicKeyHex`) then, once. It is not encrypted again: the
+     *  stamp is mined over it and the upload built from it
+     *  (lib/distro_sync.js buildSealedUpload), so every upload of the message
+     *  carries the same bytes. With `syncSig`, which _uploadOwed passes only
+     *  where the proof may go (_distroSyncProofGoes), the distro sync proof
+     *  is the third element. A proof that is not this message's is never
+     *  sent: it is said as an error and the upload goes without it. A
+     *  sealed upload whose stamp cannot be computed is not built (it would
+     *  be refused by the node, which may still prove its transfer): the
+     *  build fails, and the message stays owed.
      */
-    async _buildPropagationPacked(lxmfPacked, peerPublicKeyHex) {
+    async _buildPropagationPacked(lxmfPacked, peerPublicKeyHex, sealed = null, syncSig = null) {
+        if (sealed) {
+            let claim = null;
+            if (syncSig) {
+                try {
+                    claim = syncClaimFor(sealed, Buffer.from(peerPublicKeyHex, "hex"), syncSig);
+                } catch (error) {
+                    console.error(`[distro] ✗ The distro sync proof kept with this upload is not its own (${error.message}): it goes without it, and RFed wakes the distro's devices for it as before (§17.13)`);
+                }
+            }
+            const stamp = await this._computePropagationStamp(sealed);
+            if (!stamp) throw new Error("its propagation stamp could not be computed");
+            console.log(`[retichat] 🔨 Propagation stamp computed over the sealed message, appended 32B${claim ? ", with the distro sync proof" : ""}`);
+            return buildSealedUpload(sealed, stamp, claim);
+        }
         const destHash = lxmfPacked.slice(0, 16);
         const rest = lxmfPacked.slice(16);  // source_hash | sig | payload
         const peerIdentity = Identity.fromPublicKey(Buffer.from(peerPublicKeyHex, "hex"));
@@ -4472,11 +4501,60 @@ const RnsClient = {
         // Non-opportunistic: the propagation node reads dest_hash (D) in
         // cleartext from offset 0 — that is how RFed recognises a distro.
         const packed = msg.pack(DistroManager.identity, false);
+        const label = `the sent-copy for ${to.slice(0,8)} (§17.11)`;
         this._oweDistro({
             id: sentCopyEntryId(Cryptography.fullHash(packed).toString("hex")),
             kind: "sent", distro: distroHash, distroKey: DistroManager.pubKey, packed: Buffer.from(packed).toString("base64"),
-            label: `the sent-copy for ${to.slice(0,8)} (§17.11)`, to,
+            ...this._sealForDistroSync(packed, label),
+            label, to,
         });
+    },
+
+    /**
+     * Seal `packed`, the message the user's action has just packed and
+     * signed as the distro D (_sendDistroSentCopy, _sendDistroChannelSync),
+     * for the distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md
+     * §5.1; lib/distro_sync.js): encrypted to D once and signed with D's key,
+     * here, while this device holds D's private key. Returns the entry's
+     * `sealed` and `syncSig` (base64), which _oweDistro stores in the same
+     * write that owes the message, before anything can yield and before any
+     * upload: every upload of it then carries the same sealed bytes and the
+     * same proof (_uploadOwed), even after this device gives D up. Both
+     * kinds carry it, the membership message C as well as the sent-copy
+     * (James, 2026-10-10, Q1). When the message cannot be sealed it says so,
+     * as an error, and returns nothing: the message is owed as before and
+     * built as before, without a proof, so RFed wakes D's devices for it as
+     * it does today. `label` is what the line calls it.
+     */
+    _sealForDistroSync(packed, label) {
+        try {
+            const { sealed, sig } = sealForSync(DistroManager.identity, packed);
+            return { sealed: sealed.toString("base64"), syncSig: sig.toString("base64") };
+        } catch (error) {
+            console.error(`[distro] ✗ ${label} could not be sealed for the distro sync proof (${error.message}): it is owed without one, and RFed wakes the distro's devices for it as before (§17.13)`);
+            return {};
+        }
+    },
+
+    /**
+     * Whether the distro sync proof may go with an upload on the propagation
+     * link `link` (DISTRO-SYNC-PROOF-DESIGN.md §5.4, the client gate, which
+     * is mandatory): only when the propagation node is the configured RFed's
+     * own, Destination.hash(<RFed identity>, "lxmf", "propagation"), the hash
+     * connect() derives when no override is set, and `link` goes to that
+     * very node. Any override (lxmfPropagationOverride: a Python or
+     * LXMF-rust lxmd, another RFed, a hash typed in) gets LXMF's
+     * two-element upload, as every upload was before: LXMF ignores a
+     * Resource whose envelope is not exactly two elements (LXMRouter.py), so
+     * the message would be lost without a word. So does a link to another
+     * node, which a stored propagation key for an earlier RFed would make.
+     */
+    _distroSyncProofGoes(link) {
+        const cfg = this._cfg;
+        if (!cfg || cfg.lxmfPropagationOverride || !cfg.rfedNodeHash) return false;
+        const derived = Destination.hash({ hash: Buffer.from(cfg.rfedNodeHash, "hex") }, "lxmf", "propagation").toString("hex");
+        const node = link?.destination?.hash;
+        return cfg.propagationNodeHash === derived && !!node && Buffer.from(node).toString("hex") === derived;
     },
 
     /**
@@ -4701,10 +4779,12 @@ const RnsClient = {
 
     /**
      * Upload the owed `entry` on `link`: build its propagation upload (it is
-     * encrypted to the entry's distro and stamped for the node anew each
-     * time; the LXMF message inside is the one packed when the user acted)
-     * and hand it to _uploadForDistro. `comingUp` is the flush's coming-up
-     * when a flush uploads it (_sendDistroOutbox), null for the user's own
+     * stamped for the node anew each time; the LXMF message inside is the
+     * one packed when the user acted, encrypted to the entry's distro once,
+     * when it was owed, or, for an entry owed before entries were sealed,
+     * anew each time) and hand it to _uploadForDistro. `comingUp` is the
+     * flush's coming-up when a flush uploads it (_sendDistroOutbox), null
+     * for the user's own
      * action and for a replaced link's close. Resolves once it has left, or
      * could not leave; never rejects. Its proof makes it owed no more. If it
      * is not proved, or its build fails, that is recorded with the coming-up
@@ -4797,7 +4877,17 @@ const RnsClient = {
         }
         let upload;
         try {
-            const propagationPacked = await this._buildPropagationPacked(Buffer.from(entry.packed, "base64"), distroKey);
+            // Sealed when it was owed (_sealForDistroSync; RFed SPEC §17.13,
+            // DISTRO-SYNC-PROOF-DESIGN.md §5.2): every upload of it carries
+            // those bytes, never encrypted again, so the node holds a second
+            // upload under the same id and fans it out once. The distro sync
+            // proof goes with it only to the configured RFed's own
+            // propagation node (§5.4, _distroSyncProofGoes). A message owed
+            // before entries were sealed, or one that could not be, is built
+            // as before, with no proof.
+            const sealed = entry.sealed ? Buffer.from(entry.sealed, "base64") : null;
+            const syncSig = sealed && this._distroSyncProofGoes(link) ? Buffer.from(entry.syncSig, "base64") : null;
+            const propagationPacked = await this._buildPropagationPacked(Buffer.from(entry.packed, "base64"), distroKey, sealed, syncSig);
             // Building it yields: a later action on the same channel may
             // have replaced it meanwhile, or another upload of it been
             // proved, or the distro changed. Then it is not sent: only the
@@ -5145,10 +5235,12 @@ const RnsClient = {
         msg.content = "";
         msg.fields = channelSyncFields(op, ch.channelName, atMs, deviceHash);
         const packed = msg.pack(DistroManager.identity, false);
+        const label = `the ${op} of #${ch.channelName} (§17.12)`;
         this._oweDistro({
             id: channelSyncEntryId(ch.channelHash),
             kind: "channel", distro: distroHash, distroKey: DistroManager.pubKey, packed: Buffer.from(packed).toString("base64"),
-            label: `the ${op} of #${ch.channelName} (§17.12)`, op, name: ch.channelName, at: atMs,
+            ...this._sealForDistroSync(packed, label),
+            label, op, name: ch.channelName, at: atMs,
         });
     },
 

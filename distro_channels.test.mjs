@@ -53,6 +53,7 @@ import {
 } from "./lib/channel_sync.js";
 import { DistroUploads } from "./lib/distro_upload.js";
 import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { sealForSync } from "./lib/distro_sync.js";
 import { app, build, compile, install, methodBody, memoryStorage } from "./test_app_source.mjs";
 
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
@@ -140,7 +141,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         ChannelStore, ChannelMsgStore,
         ChannelSenderNamesStore: new ChannelSenderNames(names), ChannelPostNamesStore: new ChannelPostNames(names),
         ChannelMembershipStore: new ChannelMembership(names),
-        DistroOutboxStore: new DistroOutbox(names), channelSyncEntryId, sentCopyEntryId,
+        DistroOutboxStore: new DistroOutbox(names), channelSyncEntryId, sentCopyEntryId, sealForSync,
         channelIdentity, channelLxmPack, channelLxmUnpack, channelComputeStamp, channelSyncFields, channelSyncDisposition,
         CHANNEL_PUBLISH_PATH, OwnNames: { channel: ownName },
         ownLxmfDestinationHash: () => lxmfHash(me), sentTimeMs, decodeDisplayName: DN.decodePayload,
@@ -240,6 +241,8 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         "_syncChannelMembership(op, ch)",
         "_sendDistroChannelSync(op, ch, atMs)",
         "async _sendDistroSentCopy(recipientHex, title, content)",
+        "_sealForDistroSync(packed, label)",
+        "_distroSyncProofGoes(link)",
         "_oweDistro(entry)",
         "async _sendDistroOutbox(link, trigger)",
         "_distroAttemptOpen(entry, link)",
@@ -1881,9 +1884,10 @@ test("a sent-copy kept before entries carried the distro's key, owed to a distro
     const d2 = Identity.create();
     const a = device(d1, { linkUp: false });
     await a.self._sendDistroSentCopy(R1, "", "sent as D1");
-    // As Retichat-js 145ca2f stored it: no distroKey.
-    const { distroKey, ...old } = a.env.DistroOutboxStore.list()[0];
+    // As Retichat-js 145ca2f stored it: no distroKey (and so, from before the distro sync proof, nothing sealed).
+    const { distroKey, sealed, syncSig, ...old } = a.env.DistroOutboxStore.list()[0];
     assert.equal(distroKey, keyOf(d1), "entries carry their distro's key now");
+    assert.ok(sealed && syncSig, "and its sealed message and sync proof");
     a.env.DistroOutboxStore.put(old);
     changeDistro(a, d2);
     const keys = keysBuiltFor(a);

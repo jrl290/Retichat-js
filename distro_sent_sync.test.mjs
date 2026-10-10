@@ -31,6 +31,7 @@ import { decodePayload as decodeDisplayName } from "./lib/display_name.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { DistroUploads } from "./lib/distro_upload.js";
 import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId } from "./lib/distro_outbox.js";
+import { sealForSync } from "./lib/distro_sync.js";
 import { install, memoryStorage } from "./test_app_source.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -179,9 +180,11 @@ function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
         DistroManager, LXMessage, LXMF, Buffer, Cryptography, Packet, Harness, console: quiet,
         Link: { MDU: 100000, ACTIVE: Link.ACTIVE },
         DistroOutboxStore: new DistroOutbox({ get: storage.sGet, set: storage.sSet }), sentCopyEntryId, channelSyncEntryId,
+        sealForSync, Destination,
     };
     install(self, env, [
-        "async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
+        "async _sendDistroSentCopy(recipientHex, title, content)", "_sealForDistroSync(packed, label)", "_distroSyncProofGoes(link)",
+        "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
         "_distroAttemptOpen(entry, link)", "_unprovedSince(entry, comingUp)", "async _uploadOwed(link, entry, comingUp = null)", "_stillOwed(entry)",
         "_dropMembershipOwedToOtherDistros()", "_distroOwedOutcome(entry, how, error, goesNow = false)", "_uploadForDistro(link, propagationPacked, label)",
     ]);
@@ -739,8 +742,8 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     for (const signature of ["async _sendDistroSentCopy(recipientHex, title, content)", "_sendDistroChannelSync(op, ch, atMs)"]) {
         const body = method(signature);
         assert.equal(count(body, /_oweDistro/g), 1, signature);
-        assert.match(body, /const msg = new LXMessage\(\);[\s\S]*const packed = msg\.pack\(DistroManager\.identity, false\);\s*this\._oweDistro\(\{[^}]*\bpacked: Buffer\.from\(packed\)\.toString\("base64"\),/,
-            `${signature} owes the message it has just packed`);
+        assert.match(body, /const msg = new LXMessage\(\);[\s\S]*const packed = msg\.pack\(DistroManager\.identity, false\);\s*const label = `[^`\n]*`;\s*this\._oweDistro\(\{[^}]*\bpacked: Buffer\.from\(packed\)\.toString\("base64"\),\s*\.\.\.this\._sealForDistroSync\(packed, label\),/,
+            `${signature} owes the message it has just packed, sealed for the distro sync proof in the same write (both kinds: James, 2026-10-10, Q1)`);
     }
     assert.equal(count(code, /_sendDistroSentCopy/g), 2, "made in a DM's dispatch alone");
     assert.equal(count(method("_dispatchMessage(contact, outMsg)"), /_sendDistroSentCopy/g), 1);
@@ -752,6 +755,34 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     assert.equal(count(code, /_syncChannelMembership/g), 3, "the user's join and leave");
     assert.equal(count(method("async joinChannel(channelName)"), /this\._syncChannelMembership\("join", ch\);/g), 1);
     assert.equal(count(method("async leaveChannel(channelName)"), /this\._syncChannelMembership\("leave", ch\);/g), 1);
+});
+
+test("the distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5): both kinds are sealed where they are packed, in the write that owes them; the upload is built from those bytes; the proof goes only where the client gate lets it, decided in one place", () => {
+    // James, 2026-10-10: the proof travels inside the upload, both kinds
+    // carry it (Q1), and a claim may reach only the configured RFed's own
+    // propagation node (§5.4: LXMF drops a three-element Resource without a
+    // word). distro_sync.test.mjs runs all of it; this pins where it is.
+    const code = withoutComments(app);
+    const method = (signature) => extractMethod(code, signature);
+    const spans = members(code);
+    assert.deepEqual(sites(code, "_sealForDistroSync", spans), ["RnsClient._sendDistroSentCopy", "RnsClient._sealForDistroSync", "RnsClient._sendDistroChannelSync"],
+        "sealed where each kind is packed, the sent-copy and the membership message, and nowhere else");
+    assert.deepEqual(sites(code, /\bsealForSync\(/g, spans), ["RnsClient._sealForDistroSync"], "one place seals");
+    assert.match(method("_sealForDistroSync(packed, label)"),
+        /try \{\s*const \{ sealed, sig \} = sealForSync\(DistroManager\.identity, packed\);\s*return \{ sealed: sealed\.toString\("base64"\), syncSig: sig\.toString\("base64"\) \};\s*\} catch \(error\) \{\s*console\.error\([^\n]*\);\s*return \{\};\s*\}/,
+        "with D's key, and a failure is said as an error and owes the message as before");
+    assert.deepEqual(sites(code, "_distroSyncProofGoes", spans), ["RnsClient._distroSyncProofGoes", "RnsClient._uploadOwed"], "the gate: made, and read where the upload is built");
+    assert.match(method("_distroSyncProofGoes(link)"),
+        /if \(!cfg \|\| cfg\.lxmfPropagationOverride \|\| !cfg\.rfedNodeHash\) return false;\s*const derived = Destination\.hash\(\{ hash: Buffer\.from\(cfg\.rfedNodeHash, "hex"\) \}, "lxmf", "propagation"\)\.toString\("hex"\);\s*const node = link\?\.destination\?\.hash;\s*return cfg\.propagationNodeHash === derived && !!node && Buffer\.from\(node\)\.toString\("hex"\) === derived;/,
+        "only the derived node of the configured RFed, never an override, and only on a link to that node");
+    const upload = method("async _uploadOwed(link, entry, comingUp = null)");
+    assert.match(upload, /const sealed = entry\.sealed \? Buffer\.from\(entry\.sealed, "base64"\) : null;\s*const syncSig = sealed && this\._distroSyncProofGoes\(link\) \? Buffer\.from\(entry\.syncSig, "base64"\) : null;\s*const propagationPacked = await this\._buildPropagationPacked\(Buffer\.from\(entry\.packed, "base64"\), distroKey, sealed, syncSig\);/,
+        "the stored sealed bytes, never sealed again, and the proof only through the gate");
+    assert.deepEqual(sites(code, /\b(?:buildSealedUpload|syncClaimFor)\(/g, spans), ["RnsClient._buildPropagationPacked", "RnsClient._buildPropagationPacked"],
+        "the sealed upload and its claim are built in one place");
+    assert.match(method("async _buildPropagationPacked(lxmfPacked, peerPublicKeyHex, sealed = null, syncSig = null)"),
+        /^\s*if \(sealed\) \{[\s\S]*const stamp = await this\._computePropagationStamp\(sealed\);\s*if \(!stamp\) throw new Error\("its propagation stamp could not be computed"\);[\s\S]*return buildSealedUpload\(sealed, stamp, claim\);\s*\}/,
+        "a sealed message is stamped over its sealed bytes and not encrypted again; no stampless sealed upload is built");
 });
 
 test("what reaches the user's own action (_oweDistro) begins with the user and nothing else: a DM from the composer, a join from the channel form, a leave from the channel's Leave button, the test harness's send, join and leave, and a DM sent before the exchange first registered", async () => {

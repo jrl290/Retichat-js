@@ -170,6 +170,34 @@ test("an entry may carry its distro's public key, 128 lowercase hex; one without
     }
 });
 
+test("an entry may carry the distro sync proof (RFed SPEC §17.13): `sealed` and `syncSig` together, as base64, with the distro's key; one without either (owed before, or not sealed) is still an entry, and one with half of it or a malformed one is not", () => {
+    const { storage, box } = outbox();
+    const KEY = "ab".repeat(64);
+    const SEALED = Buffer.alloc(200, 3).toString("base64");
+    const SIG = Buffer.alloc(64, 4).toString("base64");
+    box.put({ ...SENT("ff", "CCCC"), distroKey: KEY });
+    box.put({ ...SENT("ee", "DDDD"), distroKey: KEY, sealed: SEALED, syncSig: SIG });
+    box.put(entry("channel:aa", "EEEE", { distroKey: KEY, sealed: SEALED, syncSig: SIG }));
+    assert.deepEqual(box.list().map((e) => [e.id, e.sealed ?? null, e.syncSig ?? null]),
+        [["sent:ff", null, null], ["sent:ee", SEALED, SIG], ["channel:aa", SEALED, SIG]], "both kinds, kept as they were written");
+    assert.deepEqual(new DistroOutbox({ get: storage.sGet, set: storage.sSet }).list().map((e) => e.sealed ?? null), [null, SEALED, SEALED],
+        "in storage, for the next page");
+    for (const [why, bad] of [
+        ["sealed alone", { distroKey: KEY, sealed: SEALED }],
+        ["syncSig alone", { distroKey: KEY, syncSig: SIG }],
+        ["without the distro's key", { sealed: SEALED, syncSig: SIG }],
+        ["sealed not base64", { distroKey: KEY, sealed: "not base64!", syncSig: SIG }],
+        ["syncSig not base64", { distroKey: KEY, sealed: SEALED, syncSig: "" }],
+        ["sealed not a string", { distroKey: KEY, sealed: 7, syncSig: SIG }],
+        ["syncSig null", { distroKey: KEY, sealed: SEALED, syncSig: null }],
+    ]) {
+        assert.throws(() => box.put({ ...SENT("dd", "FFFF"), ...bad }), /not an entry the distro can be owed/, why);
+    }
+    // Stored rows that are not entries are ignored.
+    storage.sSet("distro_outbox_v1", [{ ...SENT("cc", "GGGG"), distroKey: KEY, sealed: SEALED }, { ...SENT("bb", "HHHH"), distroKey: KEY, sealed: SEALED, syncSig: SIG }]);
+    assert.deepEqual(box.list().map((e) => e.id), ["sent:bb"]);
+});
+
 test("a later entry under the same id replaces the one owed, and goes to the end", () => {
     const { box } = outbox();
     box.put(entry("channel:aa", "AAAA"));
