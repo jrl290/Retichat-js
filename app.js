@@ -2228,6 +2228,11 @@ const RnsClient = {
     _rfedLinkGeneration: 0,
     _propReopenArmed: false,
     _distroPullInFlight: null,
+    // Why each stopped connection (its Reticulum instance, `_rns`) was
+    // stopped, as disconnect() was told: a request it closed under it says
+    // that it was cancelled by that, never that it failed (the truth rule).
+    _stopReasons: new WeakMap(),
+    _stopWhy: null,
     // The distro (its hash) whose registration with RFed has been asked for
     // and not yet answered yes in this connection. Every new rfed.link
     // registers it again, once, until one does (_registerOwedDistro).
@@ -7145,6 +7150,9 @@ const RnsClient = {
 
         if (!this._channelsResubscribed) {
             this._channelsResubscribed = true;
+            // With a distro, its queue first: a channel a sibling left is
+            // left here before anything is subscribed again (_distroFirst).
+            if (DistroManager.has && !(await this._distroFirst())) return;
             const subscriptions = ChannelStore.getAll()
                 .filter(ch => ch.isSubscribed)
                 .map(channel => this._ensureChannelSubscribed(channel));
@@ -7450,10 +7458,14 @@ const RnsClient = {
                     return false;
                 }
             } catch(e) {
+                // Ended by disconnect() (the request's link closed under it):
+                // cancelled by that switch, not failed, and nothing of the
+                // next connection's is parked (its rfed.link state is its own).
+                if (this._rns !== rns) {
+                    console.log(`[distro] Registration cancelled by ${this._stopReasons?.get(rns) ?? "disconnect()"}: ${e?.message ?? e}`);
+                    return false;
+                }
                 console.error(`[distro] Registration failed:`, e);
-                // Failed after disconnect(): nothing of the next connection's
-                // is parked (its rfed.link state is its own).
-                if (this._rns !== rns) return false;
                 // A link that never established is transient on this transport
                 // (one lost LINKREQUEST/LRPROOF ends the attempt). The request
                 // travels on rfed.link (RFED_LINK_PATHS), so it is that link's
@@ -7523,6 +7535,7 @@ const RnsClient = {
      */
     async _publishDistroAnnounce() {
         if (!DistroManager.has) return false;
+        const rns = this._rns;
         try {
             const distroIdentity = DistroManager.identity;
             // Not registered with the Reticulum instance: this destination is
@@ -7560,6 +7573,11 @@ const RnsClient = {
             console.warn(`[distro] RFed refused the pre-signed announce:`, response);
             return false;
         } catch(e) {
+            if (this._rns !== rns) {
+                // disconnect() closed the link under it: cancelled, not failed.
+                console.log(`[distro] Announce publication cancelled by ${this._stopReasons?.get(rns) ?? "disconnect()"}: ${e?.message ?? e}`);
+                return false;
+            }
             console.error(`[distro] Announce publication failed:`, e);
             return false;
         }
@@ -7589,55 +7607,91 @@ const RnsClient = {
      * while one is in flight gets that pull's result (the rfed.link
      * "established", the propagation link, a /notify wake and the page
      * resuming can all ask at once). A page that says more is queued, and
-     * brought something, is followed by one more pull when it has been
-     * handled: the completed response is the event, never a timer.
+     * brought something, is followed by the next page when it has been
+     * handled, in the same pull (until 2026-10-10 as a new pull, so a caller
+     * waiting for it had the first page only): the completed response is the
+     * event, never a timer. The pull carries how it ended (`outcome`).
      */
     async _pullDistroMessages() {
         if (!DistroManager.has) return [];
         if (this._distroPullInFlight) return this._distroPullInFlight;
-        let again = false;
+        // Its connection: a disconnect() under it is said as cancelled (catch).
+        const rns = this._rns;
+        // How it ended, for the start's gate (_distroFirst).
+        const outcome = { blobs: 0, unfinished: null };
         const pull = (async () => {
             // The link this pull travels on (rfed.link for the mapped path).
             const linkKey = this._rfedLinkKeyFor(["distro", "register"], "/rfed/pull");
+            const got = [];
             try {
-                // No request data → msgpack nil, per the Python reference
-                // (request(path, data=None)). Buffer.alloc(0) here produced a
-                // malformed 2-element request the server could not parse — see
-                // sendRequestPacked's guard.
-                const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", MsgPack.pack(null));
-                // PULL authenticates by link identity, so the server can
-                // refuse with a bare LXMF error code — mirroring the reference
-                // propagation node, LXMF/LXMRouter.py:1445. The reference
-                // client's reaction (LXMRouter.py:1525) is to tear the link
-                // down: LINKIDENTIFY is fire-and-forget, so a fresh link whose
-                // identify precedes the next request is the recovery. The link
-                // is the one the pull used — rfed.link since the migration;
-                // until 2026-09-30 this closed "distro.register", which a
-                // mapped pull never opens, so the refused link stayed up. No
-                // auto-retry and no re-open (DESIGN_PRINCIPLES §3): the next
-                // request or explicit event makes the next link.
-                if (typeof response === "number") {
-                    const names = {0xF0:"NO_IDENTITY",0xF1:"NO_ACCESS",0xF3:"INVALID_KEY",0xF4:"INVALID_DATA"};
-                    console.warn(`[distro] 📬 PULL refused: 0x${response.toString(16)} (${names[response]||"unknown"})`);
-                    if (response === 0xF0 || response === 0xF1) {
-                        this._closeRefusedRfedLink(linkKey, "[distro] 📬 PULL refused (ref: LXMRouter.message_list_response)");
+                // Page after page while more is queued (see above).
+                for (;;) {
+                    // No request data → msgpack nil, per the Python reference
+                    // (request(path, data=None)). Buffer.alloc(0) here produced a
+                    // malformed 2-element request the server could not parse — see
+                    // sendRequestPacked's guard.
+                    const response = await this._rfedRequest(["distro", "register"], "/rfed/pull", MsgPack.pack(null));
+                    // PULL authenticates by link identity, so the server can
+                    // refuse with a bare LXMF error code — mirroring the reference
+                    // propagation node, LXMF/LXMRouter.py:1445. The reference
+                    // client's reaction (LXMRouter.py:1525) is to tear the link
+                    // down: LINKIDENTIFY is fire-and-forget, so a fresh link whose
+                    // identify precedes the next request is the recovery. The link
+                    // is the one the pull used — rfed.link since the migration;
+                    // until 2026-09-30 this closed "distro.register", which a
+                    // mapped pull never opens, so the refused link stayed up. No
+                    // auto-retry and no re-open (DESIGN_PRINCIPLES §3): the next
+                    // request or explicit event makes the next link.
+                    if (typeof response === "number") {
+                        const names = {0xF0:"NO_IDENTITY",0xF1:"NO_ACCESS",0xF3:"INVALID_KEY",0xF4:"INVALID_DATA"};
+                        console.warn(`[distro] 📬 PULL refused: 0x${response.toString(16)} (${names[response]||"unknown"})`);
+                        outcome.unfinished = `refused: 0x${response.toString(16)} (${names[response]||"unknown"})`;
+                        if (response === 0xF0 || response === 0xF1) {
+                            this._closeRefusedRfedLink(linkKey, "[distro] 📬 PULL refused (ref: LXMRouter.message_list_response)");
+                        }
+                        return got;
                     }
-                    return [];
+                    if (!Array.isArray(response) || response.length < 2) {
+                        // Said, never silent (until 2026-10-10 it returned without a word).
+                        outcome.unfinished = "an answer that is not a page";
+                        console.warn(`[distro] 📬 PULL answered with something that is not a page — nothing handled:`, response);
+                        return got;
+                    }
+                    const [pairs, morePending] = response;
+                    const count = pairs?.length ?? 0;
+                    console.log(`[distro] 📬 PULL returned ${count} blob(s), more=${morePending}`);
+                    for (const pair of pairs || []) {
+                        if (!Array.isArray(pair) || pair.length < 2) continue;
+                        const [distroHash, blob] = pair;
+                        this._handleDistroBlob(distroHash, blob);
+                    }
+                    got.push(...(pairs || []));
+                    outcome.blobs += count;
+                    // A page that brought nothing is not followed, whatever it
+                    // says: pulling again would repeat the same answer.
+                    if (!(morePending === true && count > 0)) return got;
+                    if (this._rns !== rns) {
+                        // Stopped while this page was handled: the next page is
+                        // not pulled on the stopped connection.
+                        const by = this._stopReasons?.get(rns) ?? "disconnect()";
+                        outcome.unfinished = `cancelled by ${by} with more queued`;
+                        console.log(`[distro] 📬 More is queued, but ${by} stopped the connection: the next page is not pulled on it`);
+                        return got;
+                    }
+                    console.log("[distro] 📬 More is queued — pulling the next page");
                 }
-                if (!Array.isArray(response) || response.length < 2) return [];
-                const [pairs, morePending] = response;
-                const count = pairs?.length ?? 0;
-                console.log(`[distro] 📬 PULL returned ${count} blob(s), more=${morePending}`);
-                for (const pair of pairs || []) {
-                    if (!Array.isArray(pair) || pair.length < 2) continue;
-                    const [distroHash, blob] = pair;
-                    this._handleDistroBlob(distroHash, blob);
-                }
-                // A page that brought nothing is not followed, whatever it
-                // says: pulling again would repeat the same answer.
-                again = morePending === true && count > 0;
-                return pairs || [];
             } catch(e) {
+                if (this._rns !== rns) {
+                    // disconnect() closed the link under it: cancelled by that
+                    // switch, not failed. Nothing of the next connection's is
+                    // parked (its rfed.link state is its own). Until 2026-10-10
+                    // this read "[distro] PULL failed: Error: /distro/pull: the
+                    // link closed before a response".
+                    outcome.unfinished = `cancelled by ${this._stopReasons?.get(rns) ?? "disconnect()"}`;
+                    console.log(`[distro] 📬 PULL ${outcome.unfinished}: ${e?.message ?? e}`);
+                    return got;
+                }
+                outcome.unfinished = `failed: ${e?.message ?? e}`;
                 console.error(`[distro] PULL failed:`, e);
                 // The link never came up. On rfed.link the re-drive is parked
                 // (its "established" pulls again); a legacy link parks the
@@ -7649,20 +7703,55 @@ const RnsClient = {
                         this._rfedDeferUntilAnnounce(linkKey, "distro pull", () => this._pullDistroMessages());
                     }
                 }
-                return [];
+                return got;
             }
         })();
+        pull.outcome = outcome;
         this._distroPullInFlight = pull;
         try {
             return await pull;
         } finally {
             // Only its own entry: after a reconnect a newer pull may hold it.
             if (this._distroPullInFlight === pull) this._distroPullInFlight = null;
-            if (again) {
-                console.log("[distro] 📬 More is queued — pulling the next page");
-                this._pullDistroMessages();
-            }
         }
+    },
+
+    /**
+     * With a distro, its queue first (DESIGN_PRINCIPLES §5): the siblings'
+     * joins and leaves RFed holds for this device (RFed SPEC §17.12) are
+     * pulled and applied before _initChannels subscribes the stored channels
+     * again. Found on Android in private staging, 2026-10-10: RFed saw
+     * /rfed/subscribe, then 0.3 s later the /rfed/unsubscribe of the leave
+     * the pull applied, and a post fanned out between them reached a device
+     * whose distro had left the channel; this page subscribed its stored
+     * channels on the rfed.channel announce, beside the distro pull, the same
+     * way. The pull's outcome, whatever it is, is the event: it is said, and
+     * the subscription goes on. Never a timer, never forever: the pull's
+     * request has its own budget, and disconnect() ends it. Resolves, never
+     * rejects: true when the subscription is this connection's to make,
+     * false when the connection was stopped meanwhile (said).
+     */
+    async _distroFirst() {
+        const rns = this._rns;
+        const asked = this._pullDistroMessages();
+        // The pull this joined or started (set before _pullDistroMessages first awaits).
+        const pull = this._distroPullInFlight;
+        let threw = null;
+        try { await asked; } catch (e) { threw = e; }
+        if (this._rns !== rns) {
+            console.log(`[retichat] 📡 Stored channels not subscribed on the stopped connection (${this._stopReasons?.get(rns) ?? "disconnect()"}): the distro pull before it did not finish on it`);
+            return false;
+        }
+        const o = pull?.outcome ?? { blobs: 0, unfinished: null };
+        const later = "a sibling's leave still queued at RFed, if any, is applied when a later pull brings it";
+        if (threw) {
+            console.warn(`[retichat] 📡 Distro pull before re-subscribing threw (${threw?.message ?? threw}): re-subscribing stored channels now; ${later}`);
+        } else if (o.unfinished) {
+            console.warn(`[retichat] 📡 Distro pull before re-subscribing stopped after ${o.blobs} blob(s): ${o.unfinished}; re-subscribing stored channels now; ${later}`);
+        } else {
+            console.log(`[retichat] 📡 Distro queue pulled and applied first (${o.blobs} blob(s)): re-subscribing stored channels`);
+        }
+        return true;
     },
 
     /**
@@ -8267,6 +8356,11 @@ const RnsClient = {
     },
 
     disconnect() {
+        // What stopped this connection, said by a request it closes under it
+        // ("cancelled by …", never "failed"): reconnect() and the tab
+        // takeover name themselves in _stopWhy.
+        if (this._rns) this._stopReasons?.set(this._rns, this._stopWhy ?? "disconnect()");
+        this._stopWhy = null;
         if (this._annTimer) { clearInterval(this._annTimer); this._annTimer = null; }
         // A stopped tab (taken over by another, or reconnecting) re-drives
         // nothing: no page events, and no persistent link re-opens. The
@@ -8363,7 +8457,7 @@ const RnsClient = {
         this._setStatus("offline");
     },
 
-    async reconnect() { this.disconnect(); await this.connect(); },
+    async reconnect(why = "reconnect()") { this._stopWhy = why; this.disconnect(); await this.connect(); },
 };
 
 // RFed SPEC §17.12 "On the sending device" (James, 2026-10-03): the
@@ -8564,6 +8658,7 @@ const ActiveTab = {
     /** TabLock onTakenOver: stop exchanging before the lock is released. */
     _takenOver() {
         console.log("[retichat] Retichat was opened in another tab — stopping here");
+        RnsClient._stopWhy = "another tab taking over";
         RnsClient.disconnect();
         Harness.event("tab", { state: "taken-over" });
         this._show("taken-over");
@@ -10657,7 +10752,7 @@ const App = {
         // that disagrees with the announce silently breaks channel subscribe.
         if (rfedHash !== undefined) { RnsClient._cfg.rfedNodeHash = rfedHash; sSet("rfedNodeHash", rfedHash); }
         if (propOverride !== undefined) { RnsClient._cfg.lxmfPropagationOverride = propOverride; sSet("lxmfPropagationOverride", propOverride); }
-        try { await RnsClient.reconnect(); } catch(e) { console.error(e); }
+        try { await RnsClient.reconnect("reconnect() for the saved settings"); } catch(e) { console.error(e); }
         this.state.showSettings = false;
         this.render();
     },
