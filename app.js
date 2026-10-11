@@ -6153,6 +6153,17 @@ const RnsClient = {
         // entry (an older device of the user, §9.2).
         const fromSibling = mine.has(srcHash) && this._isKnownSibling(group, srcHash);
         if (mine.has(srcHash) && !fromSibling) return dropped("its source is the user's own address: an echo of the user's own message");
+        // RFed SPEC §17.14: a device of D is never another member, and only
+        // a validly signed message from it is the user's own. One whose
+        // signature is not validated (its key not held and none carried:
+        // SOURCE_UNKNOWN; an invalid one is dropped above) is dropped, on
+        // both paths, in every group, whatever its action, as iOS
+        // (GroupFirstRules .selfSourceUnproven) and Android drop it. Until
+        // 2026-10-11 such a post was kept here as a member's incoming post,
+        // and such an accept or leave counted as the user's own.
+        if (fromSibling && signature !== "validated") {
+            return dropped("its source is a device of the user's distro (a known sibling) and its signature is not validated: a device of the distro is never another member, and only a validly signed message from it is the user's own");
+        }
         // §12.3: no device of D acts on a relay request reaching D.
         if (viaDistro && groupAction === "relay_req") return dropped("a relay request reaching the distro is acted on by no device of it, and no relay_done is sent");
         // §6.3, §9.3: an invite reaching D must list D.

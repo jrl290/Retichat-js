@@ -1287,3 +1287,27 @@ test("SPEC §17.14 \"Repeated keys\", the privacy filter's look: with the filter
     await u.receive(lxmRaw(m.me, u.own, "from a member", rawMap([0xA0, str(id)], [0x77, "d40500"])));
     assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "from a member"), true, "kept in the pending group");
 });
+
+// ═══ RFed SPEC §17.14: a device of D is never another member ═════════════
+
+test("SPEC §17.14: a group message whose packet source is a known sibling of D and whose signature is not validated (SOURCE_UNKNOWN: its key not held, none carried) is dropped, on the distro and the direct path, whatever its action: never stored, counted or held; validly signed, it is the user's own", async () => {
+    const { u, D, S, Sid, id } = await dPending({ sibling: true });
+    u.page._acceptGroupInvite(id);
+    await settle();
+    const before = u.GroupMsgStore.get(id).length;
+    // S's key is not held here, and none of these carries it.
+    await u.receiveDistro(lxm(Sid, D, "unproven post", oldFields({ id })));
+    await u.receiveDistro(lxm(Sid, D, "", oldFields({ id, action: "accept", sender: S })));
+    await u.receiveDistro(lxm(Sid, D, "", oldFields({ id, action: "leave", sender: S })));
+    assert.deepEqual(u.distroKept, [false, false, false], "each dropped on the distro path");
+    await u.receive(lxm(Sid, u.own, "unproven, direct", oldFields({ id })));
+    await u.receive(lxm(Sid, u.own, "", oldFields({ id, action: "accept", sender: S })));
+    assert.equal(u.GroupMsgStore.get(id).length, before, "nothing stored, in or out, and no notice");
+    assert.equal(u.status(id, S), "invited", "neither counted");
+    assert.deepEqual(u.held(), [], "nor held for its key");
+    assert.deepEqual(u.HeldGroupArrivalsStore.list(), [], "nor held as an arrival");
+    // Validly signed, the same post is the user's own (§9.2).
+    u.know(Sid);
+    await u.receiveDistro(lxm(Sid, D, "proven post", oldFields({ id })));
+    assert.deepEqual(u.GroupMsgStore.get(id).filter((x) => x.content === "proven post").map((x) => [x.dir, x.status]), [["out", "sent"]]);
+});
