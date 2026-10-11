@@ -1429,3 +1429,74 @@ test("SPEC §17.14: a group message whose packet source is a known sibling of D 
     await u.receiveDistro(lxm(Sid, D, "proven post", oldFields({ id })));
     assert.deepEqual(u.GroupMsgStore.get(id).filter((x) => x.content === "proven post").map((x) => [x.dir, x.status]), [["out", "sent"]]);
 });
+
+// ═══ The audit's gaps: rule 1 alone, finality against a control, §6.5 ═════
+
+test("§11.1 rule 1, alone: a G whose source is not D is dropped with one line naming rule 1, though D's key signed it (so rule 2 would pass): nothing applied, nobody learned, not recorded as seen; the same G from D is applied", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u = groupClient({ distro: Did });
+    const other = groupClient({ distro: Did });
+    const m = Identity.create();
+    const M = lxmfHash(m);
+    const X = "c".repeat(32);
+    const create = { op: "create", group_id: X, at_ms: 1000, name: "X", members: [M, D].join(","), keys: [] };
+    const notD = G(Did, other.own, create, { from: m, signer: Did });
+    const kept = (x) => JSON.stringify([...x.storage.data.entries()].filter(([k]) => k !== "lxmfSeen" && k !== "distro_seen"));
+    const before = kept(u);
+    const lines = await logLines(() => u.receiveDistro(notD));
+    assert.deepEqual(u.distroKept, [false], "dropped: rfed is told so");
+    assert.deepEqual(said(lines), [`[distro] ⚠️ The create sync of group ${X.slice(0, 8)} from device ${other.own.slice(0, 12)} dropped: its source is not this device's distro (§17.14 rule 1)`]);
+    assert.deepEqual(u.events.filter((e) => e.kind === "distro-group-sync").map((e) => e.detail), [{ result: "dropped", rule: 1, reason: "its source is not this device's distro" }]);
+    assert.equal(u.GroupStore.get(X), null, "nothing applied");
+    assert.equal(u.DistroSeen._keys.has(`gsync:${packingHash(notD)}`), false, "not recorded as seen");
+    assert.equal(kept(u), before, "nothing kept: no group, no sibling, no held arrival, no tombstone");
+    assert.deepEqual([u.sent.length, u.owed.length, u.emitted.length], [0, 0, 0], "nothing sent, owed or handed to the page");
+    // The control: the same sync from D, signed by D, is applied.
+    await u.receiveDistro(G(Did, other.own, create));
+    assert.equal(u.distroKept.at(-1), true);
+    assert.equal(u.GroupStore.get(X)?.groupStatus, "active", "applied from D");
+});
+
+test("§11.1 finality, against a control: at the creator, an accept from D is counted while D has not left, and the same accept after D's leave is ignored, said, whatever its stamp; each validly signed by D", async () => {
+    const { c, D, Did, id } = await dPending();
+    const from = (action) => lxm(Did, c.own, "", oldFields({ id, action, sender: D }));
+    const signature = (packed) => LXMessage.fromBytes(packed.subarray(16), packed.subarray(0, 16), () => Did).signatureState;
+    assert.equal(c.status(id, D), "invited");
+    await c.receive(from("accept"));
+    assert.equal(c.status(id, D), "accepted", "the control: counted while D has not left");
+    await c.receive(from("leave"));
+    assert.equal(c.status(id, D), "left", "the leave counted");
+    const late = from("accept");
+    assert.equal(signature(late), "validated", "signed by D, as the counted accept was: only the leave between them differs");
+    const lines = await logLines(() => c.receive(late));
+    assert.equal(c.status(id, D), "left", "a later accept never reopens it");
+    assert.deepEqual(said(lines), [`[lxmf-router] 🔒 opportunistic message from ${D.slice(0, 12)}... dropped by the privacy filter: no proof, nothing stored`], "refused at the router's first look (the group rule), with one line");
+    assert.equal(c.emitted.filter((x) => decodeFields(x).groupAction === "accept" && hex(x.sourceHash) === D).length, 1, "only the first accept reached the handler");
+});
+
+test("§6.5 at a pending device of D: a listed co-member's accept and leave reaching D are counted, and its post kept, none held; a creator's status and a post G are held, and nothing else", async () => {
+    const { us: [u1, u2], c, m, D, net, id } = await viaD({ devices: 2 });
+    assert.equal(u2.GroupStore.get(id)?.groupStatus, "pending");
+    m.page._acceptGroupInvite(id);
+    await net.pump(m, { to: D });
+    assert.equal(u2.status(id, m.own), "accepted", "the accept counted while pending");
+    await u2.receiveDistro(lxm(m.me, D, "a member's post while pending", oldFields({ id })));
+    assert.equal(u2.distroKept.at(-1), true);
+    assert.deepEqual(u2.GroupMsgStore.get(id).filter((x) => x.content === "a member's post while pending").map((x) => [x.dir, x.srcHash]), [["in", m.own]], "the post kept, as the member's, not held");
+    assert.deepEqual(u2.HeldGroupArrivalsStore.forGroup(id), [], "nothing held yet");
+    // The user accepts on u1: C answers D with a status; u1 posts and owes a post G.
+    u1.page._acceptGroupInvite(id);
+    await net.pump(u1, { to: c });
+    await net.pump(c, { to: D });
+    void u1.self.sendGroupMessage(id, "the user's post");
+    await settle();
+    const postG = u1.owed.find((o) => o.op === "post");
+    await u2.receiveDistro(Buffer.from(postG.packed, "base64"));
+    assert.equal(u2.GroupStore.get(id)?.groupStatus, "pending", "u2 has not joined");
+    assert.deepEqual(u2.HeldGroupArrivalsStore.forGroup(id).map((r) => r.src), [c.own, D], "held: the creator's status, then the post G");
+    // The member's leave reaching D is counted, not held.
+    await u2.receiveDistro(lxm(m.me, D, "", oldFields({ id, action: "leave", sender: m.own })));
+    assert.equal(u2.status(id, m.own), "left", "the leave counted while pending");
+    assert.deepEqual(u2.HeldGroupArrivalsStore.forGroup(id).map((r) => r.src), [c.own, D], "still only the status and the post G");
+});
