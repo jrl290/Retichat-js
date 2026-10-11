@@ -3904,12 +3904,17 @@ const RnsClient = {
      * pre-parse here threw on such a map first, so the message was lost,
      * never purged, and downloaded again on every fetch.
      *
-     * `label` names it in the log. Returns { kept, unread }: `kept` is true
-     * when it was handed to the listeners (one already received included:
-     * the handler drops that copy), false when the privacy filter dropped
-     * it or it could not be read; `unread` is why it could not be read (too
-     * short, not for this destination, not decryptable, no payload, a
-     * throw), else null.
+     * `label` names it in the log. Returns { kept, unread, refused }:
+     * `kept` is true when it was handed to the listeners (one already
+     * received included: the handler drops that copy), false when the
+     * privacy filter dropped it, it was refused, or it could not be read;
+     * `unread` is why it could not be read (too short, not for this
+     * destination, not decryptable, no payload, a throw), else null;
+     * `refused` is true when it was read and refused whole (a payload that
+     * repeats a key, a GROUP_ID that is not 32 hex: RFed SPEC §17.14),
+     * already said once where it was refused. A refused one is purged as a
+     * read one is: LXMF records it as delivered (lxmf_propagation) whatever
+     * lxmf_delivery then makes of it.
      */
     _ingestPropagatedBlob(lxmfData, label) {
         if (lxmfData.length < 48) return { kept: false, unread: "too short" };
@@ -3926,9 +3931,17 @@ const RnsClient = {
         if (!decrypted || decrypted.length < 80) return { kept: false, unread: "decrypt failed" };
         try {
             if (!this._lxmfRouter.acceptsSource(decrypted, "propagated")) return { kept: false, unread: null };
-            const message = LXMessage.fromBytes(decrypted, destHash);
-            if (!message) return { kept: false, unread: "bad payload" };
-            if (!this._lxmfRouter.acceptsMessage(message, "propagated")) return { kept: false, unread: null };
+            let message;
+            try {
+                message = LXMessage.unpackFromBytes(decrypted, destHash);
+            } catch (e) {
+                if (LXMessage.isRefusal(e)) return { kept: false, unread: null, refused: true };
+                console.log("failed to parse lxmf message from bytes", e);
+                return { kept: false, unread: "bad payload" };
+            }
+            if (!this._lxmfRouter.acceptsMessage(message, "propagated")) {
+                return { kept: false, unread: null, refused: LXMessage.groupIdRefusal(message) !== null };
+            }
             console.log(`[retichat] ${label} ✅ from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
             this._lxmfRouter.emit("message", message);
             return { kept: true, unread: null };
@@ -3972,13 +3985,15 @@ const RnsClient = {
             console.log(`[retichat] rfed.link push ${tidHex}: already held here — not read again`);
             return true;
         }
-        const { kept, unread } = this._ingestPropagatedBlob(lxmfData, `rfed.link push ${tidHex}`);
+        const { kept, unread, refused } = this._ingestPropagatedBlob(lxmfData, `rfed.link push ${tidHex}`);
         if (unread !== null) {
             console.warn(`[retichat] rfed.link push ${tidHex} ${unread}: refused, left to the next /get`);
             return false;
         }
         PropagatedHeld.add(tid);
-        if (!kept) console.log(`[retichat] rfed.link push ${tidHex} dropped by the privacy filter: answered as taken, purged by the next /get`);
+        // A refused message was said where it was refused; taken, as the
+        // filter's drop is, and purged by the next /get.
+        if (!kept && !refused) console.log(`[retichat] rfed.link push ${tidHex} dropped by the privacy filter: answered as taken, purged by the next /get`);
         return true;
     },
 
@@ -7992,8 +8007,10 @@ const RnsClient = {
             // rejected there (DISPLAY_NAMES.md §2.3), before any key below
             // is remembered.
             const result = channelLxmUnpack(ch.channelName, data);
-            if (!result) {
-                console.warn(`[retichat] 📡 Channel unpack failed for ${ch.channelName}`);
+            if (!result || result.refused) {
+                // A post refused whole (its payload repeats a key, RFed SPEC
+                // §17.14) was said where it was refused, once.
+                if (!result) console.warn(`[retichat] 📡 Channel unpack failed for ${ch.channelName}`);
                 return false;
             }
 
@@ -8684,11 +8701,14 @@ const RnsClient = {
             if (!decrypted || decrypted.length < 80) return false;
             const srcHash = decrypted.slice(0, 16);
             const payloadBytes = decrypted.slice(80);
-            // LXMessage.decodePayload: a fields map that cannot be decoded
-            // costs the fields (and so the attachments), never the message
-            // (Android 702e5fb: such a map from a stranger lost the text for
-            // good, and every later copy was deduped as seen).
-            const payload = LXMessage.decodePayload(payloadBytes);
+            // LXMessage.decodePayload: a payload that repeats a key is
+            // refused whole here, before any field is read, with one line,
+            // as Python LXMF refuses it (RFed SPEC §17.14 "Repeated keys";
+            // the catch below adds none); a fields map that cannot be
+            // decoded costs the fields (and so the attachments), never the
+            // message (Android 702e5fb: such a map from a stranger lost the
+            // text for good, and every later copy was deduped as seen).
+            const payload = LXMessage.decodePayload(payloadBytes, `distro message from ${srcHash.toString("hex").slice(0, 12)}`);
             const { timestamp: ts, content: contentBin, fields: fieldsMap } = payload;
             const content = Buffer.from(contentBin || []).toString();
             const srcHashHex = srcHash.toString("hex");
@@ -8901,7 +8921,8 @@ const RnsClient = {
             this._onMsg.forEach(fn => fn(stored, srcHashHex));
             return true;
         } catch(e) {
-            console.error(`[distro] Failed to handle blob:`, e);
+            // A refused payload was said where it was refused, once.
+            if (!LXMessage.isRefusal(e)) console.error(`[distro] Failed to handle blob:`, e);
             return false;
         }
     },

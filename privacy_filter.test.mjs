@@ -245,12 +245,13 @@ async function deliveryLink(r) {
     return pair;
 }
 
-/** Count LXMessage.fromBytes calls (msgpack, hash and signature check). */
+/** Count the parses (msgpack, hash and signature check): LXMessage.unpackFromBytes,
+ *  which the router calls and fromBytes wraps. */
 function watchParses(t) {
-    const real = LXMessage.fromBytes;
+    const real = LXMessage.unpackFromBytes;
     const calls = [];
-    LXMessage.fromBytes = (...a) => { calls.push(a); return real.apply(LXMessage, a); };
-    t.after(() => { LXMessage.fromBytes = real; });
+    LXMessage.unpackFromBytes = (...a) => { calls.push(a); return real.apply(LXMessage, a); };
+    t.after(() => { LXMessage.unpackFromBytes = real; });
     return calls;
 }
 
@@ -489,7 +490,7 @@ test("propagated: a stranger's message is dropped after decryption and before an
     await settle();
     assert.deepEqual(r.emitted.map((m) => m.content), ["stored by a friend"]);
     assert.equal(parses.length, 1, "only the contact's message was parsed");
-    assert.equal(unpacks, 0, "no msgpack pre-parse of its own: fromBytes, counted above, is the only parse, and never of the stranger's");
+    assert.equal(unpacks, 0, "no msgpack pre-parse of its own: the parse counted above is the only one, and never of the stranger's");
     assert.deepEqual(purged.sort(), [1, 2], "both are reported as had, so the node purges both (LXMRouter.py message_get_response)");
     assert.equal(r.ContactStore.get(S), null);
     assert.deepEqual(r.drops(), [{ src: S.slice(0, 12), path: "propagated", at: "source" }]);
@@ -888,9 +889,9 @@ test("a stranger's packet let in as a group message but not parseable is not pro
     const member = Identity.create(), stranger = Identity.create(), friend = Identity.create();
     const G = r.GroupStore.create("G", [lxmfHash(member)]).groupId;
     r.ContactStore.allow(lxmfHash(friend));
-    const real = LXMessage.fromBytes;
-    LXMessage.fromBytes = () => null;
-    t.after(() => { LXMessage.fromBytes = real; });
+    const real = LXMessage.unpackFromBytes;
+    LXMessage.unpackFromBytes = () => { throw new Error("not a message"); };
+    t.after(() => { LXMessage.unpackFromBytes = real; });
 
     r.packet(lxm(stranger, r.me, "x", new Map([[GROUP_FIELDS.GROUP_ID, G]])));
     r.packet(lxm(friend, r.me, "x"));

@@ -109,7 +109,7 @@ function page({ me = Identity.create(), storage = memoryStorage(), node = propag
     let decrypts = 0;
     let parses = 0;
     const IdMgr = { id: { decrypt: (b) => { decrypts++; return me.decrypt(b); } } };
-    const counted = new Proxy(LXMessage, { get: (t, k) => (k === "fromBytes" ? (...a) => { parses++; return LXMessage.fromBytes(...a); } : t[k]) });
+    const counted = new Proxy(LXMessage, { get: (t, k) => (k === "unpackFromBytes" ? (...a) => { parses++; return LXMessage.unpackFromBytes(...a); } : t[k]) });
     installPropagated(self, { Link, Buffer, LXMessage: counted, MsgPack, IdMgr, console: log, PropagatedHeld: propagatedHeld(storage) });
 
     // rfed.link, as _ensureRfedLink wires it: rfed is `a`, this page `b`.
@@ -313,4 +313,44 @@ test("a distro push still goes to the distro's handler, untouched; a push for ne
     await settle();
     assert.deepEqual(plain.inbox(sender), ["to the device"]);
     assert.deepEqual(plain.distroBlobs, []);
+});
+
+/** The full packing from `from` to `toHash` whose fields map is the bytes `fieldsHex` as given. */
+function lxmRaw(from, toHash, content, fieldsHex) {
+    const payload = Buffer.concat([Buffer.from([0x94]), MsgPack.pack(clock += 1), MsgPack.pack(Buffer.alloc(0)),
+        MsgPack.pack(Buffer.from(content)), Buffer.from(fieldsHex, "hex")]);
+    const dest = Buffer.from(toHash), src = lxmfHash(from);
+    const hash = Cryptography.fullHash(Buffer.concat([dest, src, payload]));
+    return Buffer.concat([dest, src, from.sign(Buffer.concat([dest, src, payload, hash])), payload]);
+}
+
+test("SPEC §17.14: a pushed message refused whole (its payload repeats a key, or its GROUP_ID is not 32 hex) is said once, stored nowhere, answered as taken as LXMF records it delivered, and purged by the next /get without a download", async () => {
+    const p = page();
+    const sender = Identity.create();
+    const repeats = stored(p.me, lxmRaw(sender, p.myHash, "twice", "82" + "0f" + "a161" + "0f" + "a162"));
+    const binId = stored(p.me, lxmRaw(sender, p.myHash, "bin id", "81" + "cca0" + "c420" + "ab".repeat(32)));
+    const tRepeats = p.node.hold(repeats);
+    const tBinId = p.node.hold(binId);
+    const lines = [];
+    const push = (...a) => lines.push(a.map(String).join(" "));
+    const saved = { log: console.log, warn: console.warn, error: console.error };
+    const appLines = p.logs.length;
+    Object.assign(console, { log: push, warn: push, error: push });
+    let answers;
+    try {
+        answers = [await p.push(repeats), await p.push(binId)];
+    } finally {
+        Object.assign(console, saved);
+    }
+    assert.deepEqual(answers, [true, true], "taken");
+    assert.deepEqual(p.inbox(sender), [], "nothing stored");
+    assert.deepEqual(p.emitted, [], "nothing handed to the page");
+    // Every line but the trace of each push's arrival ("rfed.link push path=... bytes=...").
+    const said = [...lines, ...p.logs.slice(appLines)].filter((l) => !/rfed\.link push path=[0-9a-f]+ bytes=/.test(l));
+    assert.equal(said.length, 2, `one line each: ${said.join(" | ")}`);
+    assert.match(said[0], /refused whole: a map at depth 1 repeats a key \(15\)/);
+    assert.match(said[1], /refused: its GROUP_ID is not a str of 32 hex characters/);
+    await p.fetch();
+    assert.deepEqual(p.node.downloads, [], "neither is downloaded again");
+    assert.deepEqual(p.node.purged.sort(), [tRepeats, tBinId].sort(), "both purged");
 });

@@ -830,7 +830,7 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
 
 const CHANNEL = "public.names";
 
-function makeChannelReceiver(me) {
+function makeChannelReceiver(me, log = quiet) {
     const storage = memory();
     const ContactStore = contactStore(storage);
     const stores = {
@@ -839,7 +839,7 @@ function makeChannelReceiver(me) {
     };
     const posts = [];
     const env = {
-        Buffer, DistroManager: { has: false }, Harness, console: quiet, channelLxmUnpack, ContactStore,
+        Buffer, DistroManager: { has: false }, Harness, console: log, channelLxmUnpack, ContactStore,
         ChannelStore: { getByHash: () => ({ channelName: CHANNEL }), touch() {} },
         ChannelMsgStore: {
             add: (c, m) => posts.push(m),
@@ -865,6 +865,40 @@ test("§2.3 a channel post that fails the key binding is dropped and plants no k
     assert.equal(r.handle(Buffer.concat([hash, identity.encrypt(plain)])), false);
     assert.equal(r.ContactStore.get(lxmfHash(alice)), null, "no contact, no key under Alice's hash");
     assert.equal(r.posts.length, 0);
+});
+
+test("SPEC §17.14 \"Repeated keys\": a channel post whose payload repeats a key is refused whole, as LXMF-rust's channel unpack refuses it, with one line: nothing stored, no key or name remembered; the same post without the repeat is kept", () => {
+    const me = Identity.create(), alice = Identity.create();
+    const lines = [];
+    const push = (...a) => lines.push(a.map(String).join(" "));
+    const r = makeChannelReceiver(me, { log: push, warn: push, error: push });
+    const A = lxmfHash(alice);
+    const post = (fieldsHex) => {
+        const destHash = channelDeliveryHash(CHANNEL);
+        const payload = Buffer.concat([Buffer.from([0x94]), MsgPack.pack(Date.now() / 1000), MsgPack.pack(Buffer.alloc(0)), MsgPack.pack(Buffer.from("hello")), Buffer.from(fieldsHex, "hex")]);
+        const hashed = Buffer.concat([destHash, Buffer.from(A, "hex"), payload]);
+        const signature = alice.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
+        const plain = Buffer.concat([Buffer.from("RTID"), alice.getPublicKey(), Buffer.from(A, "hex"), signature, payload]);
+        const { identity, hash } = channelIdentity(CHANNEL);
+        return Buffer.concat([hash, identity.encrypt(plain)]);
+    };
+    // { 0xD1: { 0: bin "Pseud" }, 0x0F: "a", 0x0F: "b" }
+    const saved = { log: console.log, warn: console.warn, error: console.error };
+    Object.assign(console, { log: push, warn: push, error: push });
+    let kept;
+    try {
+        kept = r.handle(post("83" + "ccd1" + "81" + "00" + "c405" + Buffer.from("Pseud").toString("hex") + "cc0f" + "a161" + "cc0f" + "a162"));
+    } finally {
+        Object.assign(console, saved);
+    }
+    assert.equal(kept, false, "refused");
+    assert.equal(r.posts.length, 0, "nothing stored");
+    assert.equal(r.ContactStore.get(A), null, "no row, no key under Alice's hash");
+    assert.equal(r.ChannelSenderNamesStore.get(CHANNEL, A), null, "no name");
+    assert.equal(lines.length, 1, `one line: ${lines.join(" | ")}`);
+    assert.match(lines[0], /^\[LXMF\] channel post from [0-9a-f]{12} on #public\.names refused whole: a map at depth 1 repeats a key \(15\)/);
+    assert.equal(r.handle(post("82" + "ccd1" + "81" + "00" + "c405" + Buffer.from("Pseud").toString("hex") + "cc0f" + "a161")), true, "without the repeat: kept");
+    assert.equal(r.posts.length, 1);
 });
 
 test("§5.2 a post's 0xD1 sets that sender's channel name, never the contact's name", () => {

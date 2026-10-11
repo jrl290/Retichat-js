@@ -14,10 +14,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Buffer } from "node:buffer";
+import { readFileSync } from "node:fs";
 import { senderKeyEntry } from "./lib/group_status.js";
 import { shortHash } from "./lib/display_name.js";
 import { app, compile, methodBody } from "./test_app_source.mjs";
-import { groupClient, network, settle, lxmfHash, lxm, oldFields, quiet, appFunction, Identity, LXMessage, GROUP_FIELDS } from "./test_group_net.mjs";
+import { groupClient, network, settle, lxmfHash, lxm, oldFields, quiet, appFunction, logLines, Identity, LXMessage, GROUP_FIELDS } from "./test_group_net.mjs";
 import { HeldGroupArrivals } from "./lib/group_distro.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import { groupSyncFields } from "./lib/group_sync.js";
@@ -1224,7 +1225,7 @@ test("DESIGN_PRINCIPLES (every drop path speaks), §6.5: the stores of groups re
     assert.equal(said.filter((l) => /this page only/.test(l)).length, 1, said.join("\n"));
 });
 
-// ═══ RFed SPEC §17.14 "Repeated keys": the group entries from the bytes ═══
+// ═══ RFed SPEC §17.14 "Repeated keys" and the group entries from the bytes ═══
 
 let rawClock = Date.now() / 1000;
 /** A message from `from` (an Identity) to `to` (a hash), signed by `from`,
@@ -1245,7 +1246,19 @@ const str = (s) => {
 /** A msgpack fields map of the [key, value hex] given, in order, repeats kept. */
 const rawMap = (...entries) => (0x80 | entries.length).toString(16) + entries.map(([k, v]) => (k < 0x80 ? k.toString(16).padStart(2, "0") : "cc" + k.toString(16)) + v).join("");
 
-test("SPEC §17.14 \"Repeated keys\", the direct path: a member's accept whose GROUP_ACTION comes twice is read from the first; a post whose fields hold an unknown ext beside the group id is the group's, never a DM", async () => {
+const REFUSAL_LINE = /^\[LXMF\] .* refused whole: a map at depth \d+ repeats a key \(.+\), as Python LXMF refuses it/;
+/** What was said about a message's fate: every line logged but the router's
+ *  trace of each packet's arrival ("📨 Opportunistic packet: N bytes"). */
+const said = (lines) => lines.filter((l) => !/^\[lxmf-router\] 📨 /.test(l));
+
+/** Everything a client keeps (its storage, byte for byte), what it handed
+ *  the page, proved and sent: a refused message changes none of it. */
+const footprint = (x) => JSON.stringify({
+    storage: [...x.storage.data.entries()].filter(([k]) => k !== "lxmfSeen"),
+    emitted: x.emitted.length, sent: x.sent.length, owed: x.owed.length, events: x.events.map((e) => e.kind),
+});
+
+test("SPEC §17.14 \"Repeated keys\", the direct path: a payload that repeats a key is refused whole with one log line (a member's accept whose GROUP_ACTION comes twice is never counted, shown or stored); a post whose fields hold an unknown ext beside the group id is still the group's, never a DM", async () => {
     const c = groupClient(), m = groupClient(), u = groupClient();
     const all = [c, m, u];
     for (const x of all) for (const y of all) if (x !== y) x.reachable(y.own).know(y);
@@ -1259,26 +1272,121 @@ test("SPEC §17.14 \"Repeated keys\", the direct path: a member's accept whose G
     await settle();
     assert.equal(u.GroupStore.get(id)?.groupStatus, "active");
     assert.equal(u.status(id, m.own), "invited");
-    // { 0xA0: id, 0xA3: "accept", 0xA3: "leave" }: msgpackr keeps "leave".
-    await u.receive(lxmRaw(m.me, u.own, "", rawMap([0xA0, str(id)], [0xA3, str("accept")], [0xA3, str("leave")])));
-    assert.equal(u.status(id, m.own), "accepted", "the first GROUP_ACTION: an accept, never a leave");
+    // { 0xA0: id, 0xA3: "accept", 0xA3: "leave" }: Python LXMF refuses it whole.
+    const before = footprint(u);
+    const proofs = u.proofs.length;
+    const lines = said(await logLines(() => u.receive(lxmRaw(m.me, u.own, "", rawMap([0xA0, str(id)], [0xA3, str("accept")], [0xA3, str("leave")])))));
+    assert.equal(u.status(id, m.own), "invited", "neither the accept nor the leave");
+    assert.equal(footprint(u), before, "nothing shown, stored or applied");
+    assert.equal(lines.length, 1, `one line: ${lines.join(" | ")}`);
+    assert.match(lines[0], REFUSAL_LINE);
+    assert.ok(lines[0].includes(m.own.slice(0, 12)), "naming its source");
+    assert.equal(u.proofs.length, proofs + 1, "proved, as LXMF delivery_packet proves before it parses, for a source the filter keeps");
     // { 0xA0: id, 0xA4: C, 0x77: an ext of type 5 }: msgpackr refuses the map whole.
     await u.receive(lxmRaw(c.me, u.own, "with an ext", rawMap([0xA0, str(id)], [0xA4, str(c.own)], [0x77, "d40500"])));
     assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "with an ext" && x.dir === "in"), true, "stored in the group");
     assert.equal((u.MsgStore.get(c.own) ?? []).some((x) => x.content === "with an ext"), false, "never a DM");
 });
 
-test("SPEC §17.14 \"Repeated keys\", the distro path: the group handler reads the entries the classification read (the first of a repeated key), and a group message beside an unknown ext is handled, not dropped as unreadable", async () => {
+test("SPEC §17.14 \"Repeated keys\", the distro path: a payload that repeats a key is refused whole with one log line, before anything is read or recorded; a group message beside an unknown ext is handled, not dropped as unreadable", async () => {
     const { u, m, D, id } = await dPending();
     u.page._acceptGroupInvite(id);
     await settle();
     assert.equal(u.status(id, m.own), "invited");
-    await u.receiveDistro(lxmRaw(m.me, D, "", rawMap([0xA0, str(id)], [0xA3, str("accept")], [0xA3, str("leave")])));
-    assert.deepEqual(u.distroKept, [true]);
-    assert.equal(u.status(id, m.own), "accepted", "the first GROUP_ACTION, as the classification read it");
+    const before = footprint(u);
+    const lines = await logLines(() => u.receiveDistro(lxmRaw(m.me, D, "", rawMap([0xA0, str(id)], [0xA3, str("accept")], [0xA3, str("leave")]))));
+    assert.deepEqual(u.distroKept, [false], "not taken");
+    assert.equal(u.status(id, m.own), "invited");
+    assert.equal(footprint(u), before, "nothing shown, stored, held or recorded as seen");
+    assert.equal(lines.length, 1, `one line: ${lines.join(" | ")}`);
+    assert.match(lines[0], REFUSAL_LINE);
     await u.receiveDistro(lxmRaw(m.me, D, "beside an ext", rawMap([0xA0, str(id)], [0x77, "d40500"])));
-    assert.deepEqual(u.distroKept, [true, true]);
+    assert.deepEqual(u.distroKept, [false, true]);
     assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "beside an ext"), true, "stored in the group");
+});
+
+test("SPEC §17.14 \"Repeated keys\": every refused vector (LXMF-rust 16a9902, each refused by the reference) is refused whole on the real handler, on the direct path and on the distro path, with one log line, and leaves nothing behind: no message, group, contact, held arrival, sibling or seen key", async () => {
+    const V = JSON.parse(readFileSync(new URL("./distro_group_sync_vectors.json", import.meta.url), "utf8"));
+    const Did = Identity.fromPrivateKey(Buffer.from(V.distro.private_key_hex, "hex"));
+    const Mid = Identity.fromPrivateKey(Buffer.from(V.member.private_key_hex, "hex"));
+    const D = lxmfHash(Did);
+    assert.equal(V.refused.length, 11);
+    for (const v of V.refused) {
+        const packed = Buffer.from(v.packed_hex, "hex");
+        // The direct path: the vectors are addressed to D, so this device's
+        // own address is D here; both sources are known and allowlisted, and
+        // the group the entries name is held, so nothing else would drop it.
+        const direct = groupClient({ me: Did });
+        direct.know(Mid).know(Did);
+        direct.ContactStore.allow(lxmfHash(Mid));
+        direct.GroupStore.addPending(V.group.group_id, "G", lxmfHash(Mid), [lxmfHash(Mid), D], D);
+        const directBefore = footprint(direct);
+        const directLines = said(await logLines(() => direct.receive(packed)));
+        assert.equal(footprint(direct), directBefore, `${v.name}: the direct path leaves nothing (${v.why})`);
+        assert.deepEqual([directLines.length, REFUSAL_LINE.test(directLines[0] ?? "")], [1, true], `${v.name}: ${directLines.join(" | ")}`);
+        // The distro path: a device holding D, as RFed fans it out.
+        const viaDistro = groupClient({ distro: Did });
+        viaDistro.know(Mid);
+        viaDistro.GroupStore.addPending(V.group.group_id, "G", lxmfHash(Mid), [lxmfHash(Mid), D], D);
+        const distroBefore = footprint(viaDistro);
+        const distroLines = await logLines(() => viaDistro.receiveDistro(packed));
+        assert.deepEqual(viaDistro.distroKept, [false], `${v.name}: not taken`);
+        assert.equal(footprint(viaDistro), distroBefore, `${v.name}: the distro path leaves nothing`);
+        assert.deepEqual([distroLines.length, REFUSAL_LINE.test(distroLines[0] ?? "")], [1, true], `${v.name}: ${distroLines.join(" | ")}`);
+    }
+});
+
+// ═══ RFed SPEC §17.14: the group id on the direct path ═══════════════════
+
+test("SPEC §17.14, the direct path: a GROUP_ID that is not a str of 32 hex (a bin, an int, nil, 31 hex, not hex) refuses the message with one line: never a DM, never a group of that name, unproved; an uppercase id is the group's, lowercased; a distro marker does not change it", async () => {
+    const c = groupClient(), m = groupClient(), u = groupClient();
+    const all = [c, m, u];
+    for (const x of all) for (const y of all) if (x !== y) x.reachable(y.own).know(y);
+    u.ContactStore.allow(c.own);
+    const net = network(...all);
+    const listed = [m.own, u.own];
+    const id = c.GroupStore.create("G", listed).groupId;
+    void c.self.sendGroupInvites(id, "G", listed);
+    await net.pump(c);
+    u.page._acceptGroupInvite(id);
+    await settle();
+    const ascii = (s) => Buffer.from(s, "ascii").toString("hex");
+    const malformed = {
+        "a bin": "c420" + ascii(id),
+        "an int": "05",
+        "nil": "c0",
+        "31 hex": str(id.slice(1)),
+        "not hex": str("xyz"),
+        "32 characters, not hex": str("g".repeat(32)),
+    };
+    for (const [what, value] of Object.entries(malformed)) {
+        for (const [form, fields] of [["0xA0", rawMap([0xA0, value], [0xA3, str("invite")], [0xA2, str("Trap")])],
+            ["0xD1 key 1", rawMap([0xD1, "83" + "01" + value + "04" + str("invite") + "03" + str("Trap")])]]) {
+            const before = footprint(u);
+            const proofs = u.proofs.length;
+            const lines = said(await logLines(() => u.receive(lxmRaw(c.me, u.own, `GROUP_ID ${what} in ${form}`, fields))));
+            assert.equal(footprint(u), before, `${what} in ${form}: nothing stored, shown or applied`);
+            assert.equal((u.MsgStore.get(c.own) ?? []).length, 0, `${what} in ${form}: never a DM`);
+            assert.equal(u.GroupStore.get("xyz"), null, "never a group of that name");
+            assert.equal(u.proofs.length, proofs, `${what} in ${form}: unproved`);
+            assert.equal(lines.length, 1, `${what} in ${form}: one line: ${lines.join(" | ")}`);
+            assert.match(lines[0], /refused: its GROUP_ID is not a str of 32 hex characters \(RFed SPEC §17\.14\)/);
+        }
+    }
+    // An uppercase id is the group's, read lowercased.
+    await u.receive(lxmRaw(m.me, u.own, "in uppercase", rawMap([0xA0, str(id.toUpperCase())])));
+    assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "in uppercase" && x.dir === "in"), true, "stored in the group");
+    // A key 1 of 0xD1 that is a bin gives way to a valid 0xA0, as on the distro path.
+    await u.receive(lxmRaw(m.me, u.own, "0xA0 behind a bin", rawMap([0xD1, "81" + "01" + "c420" + ascii(id)], [0xA0, str(id)])));
+    assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "0xA0 behind a bin"), true);
+    // A distro marker means nothing on the direct path: the group id decides.
+    for (const marker of ["rfed.distro.channel", "rfed.distro.group"]) {
+        await u.receive(lxmRaw(m.me, u.own, `beside ${marker}`, rawMap([0xFB, str(marker)], [0xA0, str(id)])));
+        assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === `beside ${marker}`), true, `${marker}: the group's`);
+        const lines = said(await logLines(() => u.receive(lxmRaw(c.me, u.own, `bin id beside ${marker}`, rawMap([0xFB, str(marker)], [0xA0, "c420" + ascii(id)])))));
+        assert.equal((u.MsgStore.get(c.own) ?? []).length, 0, `${marker}: a bin id beside it is still refused, never a DM`);
+        assert.equal(lines.length, 1);
+    }
 });
 
 test("SPEC §17.14 \"Repeated keys\", the privacy filter's look: with the filter on, a post from a listed member who is not allowlisted, beside an unknown ext, reaches a pending group as the group's (the filter reads the entries from the bytes too)", async () => {

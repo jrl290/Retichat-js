@@ -912,15 +912,15 @@ test("a stranger's status is dropped at the router's first look, unproved and un
     const { r, creator, C } = joined({ filter: true, members: [a] });
     const element = control(a, creator, "accept", { groupId: G });
     let parses = 0;
-    const real = LXMessage.fromBytes;
-    LXMessage.fromBytes = (...args) => { parses++; return real.apply(LXMessage, args); };
+    const real = LXMessage.unpackFromBytes;
+    LXMessage.unpackFromBytes = (...args) => { parses++; return real.apply(LXMessage, args); };
     try {
         await r.receive(status(stranger, r.me, [element]));
         assert.equal(parses, 0, "a stranger's message, not a member's: dropped before the parse");
         assert.deepEqual([r.proofs.length, r.status(G, A)], [0, "invited"]);
         assert.ok(r.events.some((e) => e.kind === "privacy-drop" && e.detail.at === "source"), "dropped by the first look");
     } finally {
-        LXMessage.fromBytes = real;
+        LXMessage.unpackFromBytes = real;
     }
     // The creator left (its leave counted, final); a status it had sent before still counts.
     await r.receive(control(creator, r.me, "leave", { groupId: G }));

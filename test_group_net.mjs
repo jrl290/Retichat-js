@@ -49,6 +49,30 @@ export const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delive
 export const hex = (b) => Buffer.from(b).toString("hex");
 export const quiet = { log() {}, warn() {}, error() {} };
 
+/** Where the app code of every client logs (the `console` its methods are
+ *  compiled with): nowhere, unless logLines is listening. */
+const appSink = { line: null };
+const toSink = (...a) => appSink.line?.(a.map(String).join(" "));
+const appLog = { log: toSink, warn: toSink, error: toSink };
+
+/** Every line logged while `run` runs: by the app code of any client
+ *  (appLog) and by the shared modules it runs over (the router, LXMessage,
+ *  msgpack_keys.js, the privacy filter: the global console). */
+export async function logLines(run) {
+    const lines = [];
+    const push = (...a) => lines.push(a.map(String).join(" "));
+    const saved = { log: console.log, warn: console.warn, error: console.error };
+    appSink.line = (line) => lines.push(line);
+    Object.assign(console, { log: push, warn: push, error: push });
+    try {
+        await run();
+    } finally {
+        Object.assign(console, saved);
+        appSink.line = null;
+    }
+    return lines;
+}
+
 /** A top-level function of app.js, compiled over `env`, with its own parameter list. */
 export function appFunction(name, env) {
     const m = app.match(new RegExp(`\\nfunction ${name}\\(([^)]*)\\)`));
@@ -209,7 +233,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
     for (const signature of GROUP_SELF_METHODS) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, selfEnv)(self);
 
     const receiveEnv = {
-        GroupStore, GroupMsgStore, ContactStore, PrivacyFilter, console: quiet, Date, Buffer, LXMessage, Harness,
+        GroupStore, GroupMsgStore, ContactStore, PrivacyFilter, console: appLog, Date, Buffer, LXMessage, Harness,
         sentTimeMs, ownLxmfDestinationHash: () => own, Identity, Destination, DistroManager, KnownSiblingsStore,
         HeldGroupArrivalsStore, FilteredInvitesStore, DistroLeftStore, DistroSeen, LXMF, Cryptography, MsgStore,
         decodeDisplayName: DN.decodePayload, DISTRO_ATTACHMENT_PLACEHOLDER: constValue("DISTRO_ATTACHMENT_PLACEHOLDER"),
@@ -223,7 +247,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
 
     const NameLedgerStore = new NameLedger({ get: sGet, set: sSet });
     const sendEnv = {
-        GroupStore, ContactStore, console: quiet, Identity, Destination, Buffer, LXMessage, Date, Harness,
+        GroupStore, ContactStore, console: appLog, Identity, Destination, Buffer, LXMessage, Date, Harness,
         Link: WireLink, GroupDeliveryEvidence, applyGroupFields: (fields, group) => applyGroupFields(fields, group, switched),
         applyDisplayName: DN.applyToFields, IdMgr, senderKeyEntry,
         NameLedgerStore, OwnNames: { message: name },
@@ -254,7 +278,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
     const alerts = [], confirms = [];
     const page = { state: { activeHash: null }, render() {} };
     const pageEnv = {
-        GroupStore, ContactStore, GroupMsgStore, console: quiet, RnsClient: self, confirm: (text) => { confirms.push(text); return true; },
+        GroupStore, ContactStore, GroupMsgStore, console: appLog, RnsClient: self, confirm: (text) => { confirms.push(text); return true; },
         HeldGroupArrivalsStore,
         alert: (m) => alerts.push(m), document: { body: { classList: { remove() {} } } },
     };
@@ -265,7 +289,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
 
     const seen = new Set();
     const handle = messageHandler({
-        Buffer, LxmfSeen: { check: (h) => (seen.has(h) ? true : (seen.add(h), false)) }, Harness, console: quiet,
+        Buffer, LxmfSeen: { check: (h) => (seen.has(h) ? true : (seen.add(h), false)) }, Harness, console: appLog,
         RnsClient: { ownHash: own }, LXMF, LXMessage, ContactStore, MsgStore, decodeDisplayName: DN.decodePayload, sentTimeMs,
     })(self);
     const emitted = [];
