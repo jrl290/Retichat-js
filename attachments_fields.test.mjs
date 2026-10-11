@@ -29,6 +29,9 @@ import LXMF, {
     attachmentsFromFields, carriesAttachment, isImageAttachment, mimeForName, IMAGE_EXTENSIONS,
     FIELD_FILE_ATTACHMENTS, FIELD_IMAGE, FIELD_AUDIO, FIELD_TICKET,
 } from "./lib/rns/lxmf/lxmf.js";
+import LXMRouter from "./lib/rns/lxmf/lxmf_router.js";
+import Cryptography from "./lib/rns/cryptography.js";
+import { channelIdentity, channelDeliveryHash, channelLxmUnpack } from "./lib/rns/rfed_channel.js";
 
 const bytes = (n, fill = 7) => Buffer.alloc(n, fill);
 const shape = (list) => list.map(({ name, mime, bytes: b, field }) => ({ name, mime, size: b.length, field }));
@@ -212,6 +215,134 @@ test("a payload whose text cannot be read is still no message", () => {
     const bad = Buffer.from([0x94, 0xcb, 0, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0x00, 0xd4, 0x01, 0x00, 0x80]);
     assert.throws(() => LXMessage.decodePayload(bad));
     assert.throws(() => LXMessage.decodePayload(Buffer.from([0xc1])));
+});
+
+// ── field keys as the phones read them (RFed SPEC §17.14) ──────────────────
+//
+// LXMF-rust (key_is, as_u64), Android (LxmfFields.readMap) and iOS (readKey)
+// read a field number from a msgpack integer of any width, and never from a
+// float. msgpackr gives an integral float key as the number it equals and a
+// 64-bit integer key as a BigInt, so until 2026-10-11 the web read float 5.0
+// as an attachment and missed uint 64 5.
+
+/** Key `k` (0..127) in each integer encoding a sender may choose. */
+const INTEGER_KEYS = {
+    "positive fixint": (k) => [k],
+    "uint 8": (k) => [0xcc, k],
+    "uint 16": (k) => [0xcd, 0, k],
+    "uint 32": (k) => [0xce, 0, 0, 0, k],
+    "uint 64": (k) => [0xcf, 0, 0, 0, 0, 0, 0, 0, k],
+    "int 8": (k) => [0xd0, k],
+    "int 16": (k) => [0xd1, 0, k],
+    "int 32": (k) => [0xd2, 0, 0, 0, k],
+    "int 64": (k) => [0xd3, 0, 0, 0, 0, 0, 0, 0, k],
+};
+/** Key `k` as a float, which is no field on either phone. */
+const FLOAT_KEYS = {
+    "float 32": (k) => { const b = Buffer.alloc(5); b[0] = 0xca; b.writeFloatBE(k, 1); return [...b]; },
+    "float 64": (k) => { const b = Buffer.alloc(9); b[0] = 0xcb; b.writeDoubleBE(k, 1); return [...b]; },
+};
+/** A fields map of the entries [key bytes, value] given, the values packed as msgpackr packs them. */
+const rawMap = (entries) => Buffer.concat([Buffer.from([0x80 | entries.length]),
+    ...entries.flatMap(([k, v]) => [Buffer.from(k), Buffer.from(MsgPack.pack(v))])]);
+const WEB = "0123456789abcdef";
+const recallOf = (from) => (h) => (h.equals(lxmfHash(from)) ? from : null);
+const receive = (from, to, content, fieldsBytes) => {
+    const p = packedWithRawFields(from, to, content, fieldsBytes);
+    return LXMessage.fromBytes(p.subarray(16), p.subarray(0, 16), recallOf(from));
+};
+const ATTACHMENT_FIELDS = [[0x05, [["a.png", bytes(20, 5)]]], [0x06, ["png", bytes(20, 6)]], [0x07, [0x10, bytes(20, 7)]]];
+
+test("attachments 0x05, 0x06 and 0x07 are read under an integer key of any width, uint 64 and int 64 included, and never under a float key, as both phones read them", () => {
+    const from = Identity.create(), to = Identity.create();
+    for (const [name, key] of Object.entries(INTEGER_KEYS)) {
+        for (const [field, value] of ATTACHMENT_FIELDS) {
+            const m = receive(from, to, "", rawMap([[key(field), value]]));
+            assert.deepEqual(m.attachments.map((a) => a.field), [field], `${name} ${field}`);
+            assert.deepEqual([...m.fields.keys()], [field], `${name} ${field}: the key is the number`);
+            assert.equal(LXMessage.decodePayload(packedWithRawFields(from, to, "", rawMap([[key(field), value]])).subarray(96)).attachments.length, 1);
+        }
+    }
+    for (const [name, key] of Object.entries(FLOAT_KEYS)) {
+        for (const [field, value] of ATTACHMENT_FIELDS) {
+            const m = receive(from, to, "text", rawMap([[key(field), value]]));
+            assert.equal(m.content, "text", "the message stays");
+            assert.deepEqual([...m.attachments], [], `${name} ${field}.0 is no field`);
+            assert.equal(m.attachments.skipped, 0, "nor a field that could not be read");
+            assert.deepEqual([...m.fields.keys()], [], `${name}: no entry under a float key`);
+            assert.equal(carriesAttachment(m.fields), false);
+        }
+    }
+});
+
+test("the ticket 0x0C: a delivery notification and the web's own ticket are read under an integer key of any width and never under a float key; an attachment under a uint 64 key keeps a ticketed message a message", () => {
+    const from = Identity.create(), to = Identity.create();
+    for (const [name, key] of Object.entries(INTEGER_KEYS)) {
+        const m = receive(from, to, "", rawMap([[key(0x0C), WEB]]));
+        assert.equal(LXMF.isDeliveryNotification(m.fields, m.content), true, name);
+        assert.equal(LXMF.webTicket(m.fields), WEB, name);
+        // A captionless photo whose attachment key is this width, the ticket a fixint (LXMF-rust 06c40e1).
+        const photo = receive(from, to, "", rawMap([[[0x0C], WEB], [key(0x05), [["p.jpg", bytes(9)]]]]));
+        assert.equal(LXMF.isDeliveryNotification(photo.fields, photo.content), false, `${name}: a photo, not a notification`);
+        assert.equal(photo.attachments.length, 1);
+    }
+    for (const [name, key] of Object.entries(FLOAT_KEYS)) {
+        const m = receive(from, to, "", rawMap([[key(0x0C), WEB]]));
+        assert.equal(LXMF.isDeliveryNotification(m.fields, m.content), false, `${name} 12.0 is no ticket`);
+        assert.equal(LXMF.webTicket(m.fields), null, name);
+    }
+});
+
+test("the router remembers a ticket [expires, ticket] under an integer key of any width, and none under a float key", () => {
+    const from = Identity.create(), to = Identity.create();
+    const ticket = [Date.now() / 1000 + 3600, bytes(16, 4)];
+    const remembers = (fieldsBytes) => {
+        const router = { outboundTickets: new Map() };
+        const m = receive(from, to, "hi", fieldsBytes);
+        assert.equal(m.signatureValidated, true);
+        return LXMRouter.prototype.rememberTicket.call(router, m) && router.outboundTickets.size === 1;
+    };
+    for (const [name, key] of Object.entries(INTEGER_KEYS)) assert.equal(remembers(rawMap([[key(0x0C), ticket]])), true, name);
+    for (const [name, key] of Object.entries(FLOAT_KEYS)) assert.equal(remembers(rawMap([[key(0x0C), ticket]])), false, name);
+});
+
+test("a channel post's fields are keyed the same way (channelLxmUnpack)", () => {
+    const sender = Identity.create();
+    const post = (fieldsBytes) => {
+        const payload = Buffer.concat([Buffer.from("94cb41daab8c00000000c400c40178", "hex"), fieldsBytes]);
+        const sourceHash = lxmfHash(sender);
+        const hashedPart = Buffer.concat([channelDeliveryHash("general"), sourceHash, payload]);
+        const signature = sender.sign(Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)]));
+        const { identity, hash } = channelIdentity("general");
+        const data = Buffer.concat([hash, identity.encrypt(Buffer.concat([Buffer.from("RTID"), sender.getPublicKey(), sourceHash, signature, payload]))]);
+        const saved = { log: console.log, warn: console.warn };
+        console.log = console.warn = () => {};
+        try { return channelLxmUnpack("general", data); } finally { Object.assign(console, saved); }
+    };
+    for (const [name, key] of Object.entries(INTEGER_KEYS)) {
+        const got = post(rawMap([[key(0x05), [["a.png", bytes(4)]]]]));
+        assert.equal(got?.content, "x", name);
+        assert.deepEqual([...got.fields.keys()], [0x05], name);
+    }
+    for (const [name, key] of Object.entries(FLOAT_KEYS)) {
+        assert.deepEqual([...post(rawMap([[key(0x05), [["a.png", bytes(4)]]]])).fields.keys()], [], name);
+    }
+});
+
+test("every other key is kept as it was: a 64-bit key past 2^53 stays a BigInt (no field), a negative one is its number, a str or bin key is msgpackr's; two NaN keys, one key in a JS Map, cost nothing else", () => {
+    const from = Identity.create(), to = Identity.create();
+    const m = receive(from, to, "", rawMap([
+        [[0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], 1],
+        [[0xd3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], 2],
+        [[0xa1, 0x35], 3],                                                   // the str "5"
+        [[0xcb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0], 4],
+        [[0xcb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0], 5],
+        [[0xcf, 0, 0, 0, 0, 0, 0, 0, 0x05], [["a.png", bytes(3)]]],
+    ]));
+    assert.deepEqual([...m.fields.entries()].map(([k, v]) => [typeof k, String(k), Array.isArray(v) ? "list" : v]),
+        [["bigint", "18446744073709551615", 1], ["number", "-1", 2], ["string", "5", 3], ["number", "5", "list"]]);
+    assert.deepEqual(m.attachments.map((a) => a.name), ["a.png"]);
+    assert.equal(m.fieldsUnreadable, null);
 });
 
 // ── the page loads these modules before app.js sets globalThis.Buffer ───────

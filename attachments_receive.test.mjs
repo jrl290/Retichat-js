@@ -410,6 +410,63 @@ test("distro: a fields map that cannot be decoded costs the attachments, never t
     assert.equal(rec.fieldsUnreadable, true);
 });
 
+// ── field keys as the phones read them (RFed SPEC §17.14) ──────────────────
+
+/** A message from `from` to `toHash`, signed, whose fields map is the bytes
+ *  `rawFields` as given (keys of any encoding, which no Map packs). */
+function lxmRaw(from, toHash, content, rawFields) {
+    const head = MsgPack.pack([(clock += 1), Buffer.alloc(0), Buffer.from(content)]);
+    const raw = Buffer.concat([Buffer.from([0x94]), head.subarray(1), rawFields]);
+    const dest = Buffer.from(toHash, "hex"), src = Buffer.from(lxmfHash(from), "hex");
+    const hash = LXMessage.hashOf(dest, src, raw);
+    const packed = Buffer.concat([dest, src, from.sign(Buffer.concat([dest, src, raw, hash])), raw]);
+    packed.lxmfHash = hash.toString("hex");
+    return packed;
+}
+const UINT64 = (k) => Buffer.from([0xcf, 0, 0, 0, 0, 0, 0, 0, k]);
+const FLOAT64 = (k) => { const b = Buffer.alloc(9); b[0] = 0xcb; b.writeDoubleBE(k, 1); return b; };
+/** {0x0C: ticket under `ticketKey`, and 0x05: one file under `fileKey` when given}. */
+const ticketed = (ticketKey, ticket, fileKey = null, file = null) => Buffer.concat([
+    Buffer.from([fileKey ? 0x82 : 0x81]), ticketKey, Buffer.from(MsgPack.pack(ticket)),
+    ...(fileKey ? [fileKey, Buffer.from(MsgPack.pack([["p.jpg", file]]))] : []),
+]);
+
+test("the handlers read the ticket and the attachments under an integer key of any width and never under a float key: a uint 64 photo with a ticket is a message, a uint 64 ticket proves, a float 12.0 one is no ticket (direct path and distro path)", async () => {
+    const photo = payload(64, 3);
+    const paths = [
+        ["direct", () => {
+            const r = recipient();
+            return { r, to: r.myHash, deliver: async (p) => { r.packet(p); await settle(); } };
+        }],
+        ["distro", () => {
+            const d = distroPage();
+            return { r: d, to: d.D, deliver: async (p) => { d.self._handleDistroBlob(null, d.blob(p)); } };
+        }],
+    ];
+    for (const [path, open] of paths) {
+        const { r, to, deliver } = open();
+        const sender = Identity.create();
+        const S = lxmfHash(sender);
+
+        const p = lxmRaw(sender, to, "", ticketed(Buffer.from([0x0C]), WEB_TICKET, UINT64(0x05), photo));
+        await deliver(p);
+        const rec = byHash(r, S, p.lxmfHash);
+        assert.ok(rec, `${path}: a captionless photo under a uint 64 key, ticket or not, is a message`);
+        assert.equal(rec.attachments.length, 1, path);
+        assert.equal((await storedBytes(r, rec.id))[0].sha256, sha(photo), path);
+
+        const looked = [];
+        let proved = null;
+        r.self._pendingTickets = new Map([[WEB_TICKET, { contactHash: S, messageId: "m1", onProof: (id) => { proved = id; } }]]);
+        const realGet = r.self._pendingTickets.get.bind(r.self._pendingTickets);
+        r.self._pendingTickets.get = (k) => { looked.push(k); return realGet(k); };
+        await deliver(lxmRaw(sender, to, "", ticketed(FLOAT64(0x0C), WEB_TICKET)));
+        assert.deepEqual([looked, proved], [[], null], `${path}: a ticket under float 12.0 is no ticket, never looked up`);
+        await deliver(lxmRaw(sender, to, "", ticketed(UINT64(0x0C), WEB_TICKET)));
+        assert.deepEqual([looked, proved], [[WEB_TICKET], "m1"], `${path}: one under a uint 64 key proves the message it was sent with`);
+    }
+});
+
 // ── §17.11 sent-copies ──────────────────────────────────────────────────────
 
 const OTHER_DEVICE = "fedcba9876543210fedcba9876543210";
