@@ -154,10 +154,45 @@ export const GROUP_STATUS_METHODS = [
     "_applyGroupStatusChange(groupId, src, action, event = null, packed = null)",
     "_takeGroupStatusChange(lxmfMsg, groupId, src, action, event = null)",
     "_takeGroupStatuses(group, statuses)",
-    "_takeGroupStatusElement(groupId, element, ownHash)",
+    "_takeGroupStatusElement(groupId, element, mine)",
     "_holdGroupStatusChange(lxmfMsg, groupId, src, action)",
     "_decideHeldGroupChanges()",
 ];
+
+/**
+ * Who the user is in a group, and as whom it sends there
+ * (GROUPS-DISTRO-DESIGN.md §8.1, §8.7, §9.1): the self set of a member list,
+ * a held group's, the group signer and the §8.7 refusal, over the sending
+ * identity they resolve through. A test that runs group code installs these
+ * beside it, over groupSelfEnv().
+ */
+export const GROUP_SELF_METHODS = [
+    "sendingIdentity()",
+    "_signerFor(srcHash)",
+    "_selfOf(members, ownMember)",
+    "_groupSelf(group)",
+    "_groupSigner(group)",
+    "_inviteOwnMember(listed)",
+    "groupFormerDistroText(group)",
+];
+
+/** What GROUP_SELF_METHODS read from the page: the distro this device holds
+ *  (none unless `DistroManager` is given), its known siblings (none unless
+ *  `KnownSiblingsStore` is given), the device's identity and hash. */
+export function groupSelfEnv({ DistroManager = { has: false, identity: null, lxmfDeliveryHash: null, pubKey: null },
+    KnownSiblingsStore = { of: () => [] }, IdMgr, own, shortHash = (h) => `${String(h ?? "").slice(0, 8)}…` } = {}) {
+    return { DistroManager, KnownSiblingsStore, IdMgr, ownLxmfDestinationHash: () => own, shortHash };
+}
+
+/** GROUP_SELF_METHODS compiled onto `self` over groupSelfEnv and
+ *  `GroupStore`, leaving any of them `self` already has (a test's own
+ *  sendingIdentity, say). `own` is the device's lxmf.delivery hash, `me` its
+ *  identity. Returns `self`. */
+export function installGroupSelf(self, { GroupStore, own, me = null, DistroManager, KnownSiblingsStore } = {}) {
+    const IdMgr = { has: true, id: me, pubKey: me ? me.getPublicKey().toString("hex") : null };
+    const env = { ...groupSelfEnv({ DistroManager, KnownSiblingsStore, IdMgr, own }), GroupStore };
+    return install(self, env, GROUP_SELF_METHODS.filter((signature) => !(methodName(signature) in self)));
+}
 
 /** What GROUP_STATUS_METHODS read from the page beside the stores: the
  *  verdict and packing helpers, and the switch (GROUP_ENTRIES_IN_RETICHAT_FIELD,

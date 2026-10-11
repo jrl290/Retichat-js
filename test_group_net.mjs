@@ -39,7 +39,8 @@ import { sentTimeMs } from "./lib/day_markers.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
 import { senderKeyEntry } from "./lib/group_status.js";
 import { NameLedger } from "./lib/name_ledger.js";
-import { app, build, compile, constValue, fn, memoryStorage, messageHandler, GROUP_STATUS_METHODS, groupStatusEnv } from "./test_app_source.mjs";
+import { KnownSiblings } from "./lib/group_distro.js";
+import { app, build, compile, constValue, fn, memoryStorage, messageHandler, GROUP_STATUS_METHODS, groupStatusEnv, GROUP_SELF_METHODS, groupSelfEnv } from "./test_app_source.mjs";
 import { settle } from "./test_link_pair.mjs";
 
 export { settle, GROUP_FIELDS, LXMessage, Identity, Destination };
@@ -99,9 +100,11 @@ export function newFields(entries) {
  * A web client. `identity`/`me` is its identity (made when none is given);
  * `storage` is the localStorage it runs over (a reload is another client over
  * the same storage); `filter` is the Settings "Privacy filter" switch;
- * `switched` is the page after the switch; `name` the Message Display Name.
+ * `switched` is the page after the switch; `name` the Message Display Name;
+ * `distro` the identity of the distro D this device holds (GROUPS-DISTRO-DESIGN.md),
+ * none unless given; `DistroManager.set(identity)` gives it up or replaces it.
  */
-export function groupClient({ me = Identity.create(), storage = memoryStorage(), filter = false, switched = false, name = null, creates = true } = {}) {
+export function groupClient({ me = Identity.create(), storage = memoryStorage(), filter = false, switched = false, name = null, creates = true, distro = null } = {}) {
     const { sGet, sSet } = storage;
     if (filter && sGet("filterStrangers") === null) sSet("filterStrangers", true);
     const own = lxmfHash(me);
@@ -123,6 +126,17 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
     });
     PrivacyFilter.init();
     const MsgStore = build("MsgStore", { sGet, sSet, Harness, Date });
+    // The distro this device holds (lib/distro.js, as far as groups read it).
+    const DistroManager = {
+        _id: distro,
+        get has() { return this._id !== null; },
+        get identity() { return this._id; },
+        get lxmfDeliveryHash() { return this._id ? lxmfHash(this._id) : null; },
+        get pubKey() { return this._id ? this._id.getPublicKey().toString("hex") : null; },
+        set(identity) { this._id = identity; },
+    };
+    const KnownSiblingsStore = new KnownSiblings({ get: sGet, set: sSet });
+    const IdMgr = { has: true, id: me, pubKey, hash: me.hash.toString("hex") };
     const GroupMsgStore = build("GroupMsgStore", { sGet, sSet, Date, ContactStore });
 
     const recall = appFunction("recallLxmfIdentity", {
@@ -134,7 +148,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
     const router = new LXMRouter({ registerDestination: () => destination }, me, { filter: PrivacyFilter });
 
     // What the transport edge records.
-    const paths = [], sent = [], proofs = [], relays = [];
+    const paths = [], sent = [], proofs = [], relays = [], propagated = [];
     class WireLink {
         static ACTIVE = Link.ACTIVE;
         static MDU = Link.MDU;
@@ -171,44 +185,54 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
         _groupLinks: new Map(), _groupLinkPromises: new Map(), _pendingPacketHashes: new Map(),
         _groupFallbacks: { schedule: (key) => { fallbacks.push(key.slice(0, key.indexOf(":"))); return true; }, prove() {} },
         _performGroupRelay: (...a) => { relays.push(a); },
+        // The propagation node's edge: what is propagated is recorded.
+        _sendGroupPropagationFallback: async (bytes, publicKeyHex, memberHash) => { propagated.push({ to: memberHash, bytes: Buffer.from(bytes) }); return null; },
         _handleDistroIdentityTransfer() {},
         _keepAttachments() {},
+        _initialized: true,
+        _exchangeIsDown: () => false,
     };
+
+    const selfEnv = { ...groupSelfEnv({ DistroManager, KnownSiblingsStore, IdMgr, own, shortHash: DN.shortHash }), GroupStore };
+    for (const signature of GROUP_SELF_METHODS) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, selfEnv)(self);
 
     const receiveEnv = {
         GroupStore, GroupMsgStore, ContactStore, PrivacyFilter, console: quiet, Date, Buffer, LXMessage, Harness,
-        sentTimeMs, ownLxmfDestinationHash: () => own, Identity, Destination,
+        sentTimeMs, ownLxmfDestinationHash: () => own, Identity, Destination, DistroManager, KnownSiblingsStore,
         ...groupStatusEnv({ GROUP_ENTRIES_IN_RETICHAT_FIELD: switched }),
     };
     for (const signature of [
         "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", ...GROUP_STATUS_METHODS,
-        "_rememberGroupMemberKeys(memberKeys)",
+        "_rememberGroupMemberKeys(memberKeys, mine = null)",
     ]) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, receiveEnv)(self);
 
+    const NameLedgerStore = new NameLedger({ get: sGet, set: sSet });
     const sendEnv = {
         GroupStore, ContactStore, console: quiet, Identity, Destination, Buffer, LXMessage, Date, Harness,
         Link: WireLink, GroupDeliveryEvidence, applyGroupFields: (fields, group) => applyGroupFields(fields, group, switched),
-        applyDisplayName: DN.applyToFields, IdMgr: { id: me, pubKey }, senderKeyEntry,
-        NameLedgerStore: new NameLedger({ get: sGet, set: sSet }), OwnNames: { message: name },
-        crypto: globalThis.crypto, ownLxmfDestinationHash: () => own,
+        applyDisplayName: DN.applyToFields, IdMgr, senderKeyEntry,
+        NameLedgerStore, OwnNames: { message: name },
+        crypto: globalThis.crypto, ownLxmfDestinationHash: () => own, DistroManager, GroupMsgStore,
     };
     for (const signature of [
         "async sendGroupInvites(groupId, groupName, memberHashes)", "async sendGroupAccept(groupId)", "async sendGroupLeave(groupId)",
-        "async sendGroupStatus(groupId, memberHash)", "_ownGroupMemberKey()", "_groupMemberKeys(memberHashes)",
-        "async _fanoutGroupEnvelope(targets, content, fields)", "async _sendGroupEnvelope(memberHash, content, fields)",
+        "async sendGroupStatus(groupId, memberHash)", "_ownGroupMemberKey(signer = null)", "_groupMemberKeys(memberHashes, signer = null)",
+        "createGroup(groupName, memberHashes)", "async sendGroupMessage(groupId, content)", "async _dispatchGroupMessage(groupId, outMsg)",
+        "async _fanoutGroupEnvelope(targets, content, fields, signer = null)", "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "_decideMessageName(sourceHex, recipientHex)", "_requestGroupPeer(memberHash)", "_waitForGroupPeer(memberHash)",
         "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)",
     ]) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, sendEnv)(self);
 
     // The user's own acts, as the page runs them.
-    const alerts = [];
+    const alerts = [], confirms = [];
     const page = { state: { activeHash: null }, render() {} };
     const pageEnv = {
-        GroupStore, ContactStore, GroupMsgStore, console: quiet, RnsClient: self, confirm: () => true,
+        GroupStore, ContactStore, GroupMsgStore, console: quiet, RnsClient: self, confirm: (text) => { confirms.push(text); return true; },
         alert: (m) => alerts.push(m), document: { body: { classList: { remove() {} } } },
     };
-    for (const signature of ["_acceptGroupInvite(groupId)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)", "_quitGroup(groupId, how)"]) {
+    for (const signature of ["_acceptGroupInvite(groupId)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)", "_quitGroup(groupId, how)",
+        "_deleteGroupFromDevice(groupId)"]) {
         page[signature.slice(0, signature.indexOf("("))] = compile(signature, pageEnv)(page);
     }
 
@@ -223,7 +247,8 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
     const client = {
         me, own, pubKey, storage, switched, filter, name,
         ContactStore, GroupStore, GroupMsgStore, PrivacyFilter, MsgStore, Harness, events,
-        router, destination, self, page, alerts, paths, sent, proofs, relays, fallbacks, emitted, recall,
+        router, destination, self, page, alerts, confirms, paths, sent, proofs, relays, fallbacks, emitted, recall, propagated,
+        DistroManager, KnownSiblingsStore, NameLedgerStore,
         /** Deliver `packed` (a full packing, destination first) as an
          *  opportunistic packet: signatures are checked against this
          *  client's identity store. */
@@ -251,10 +276,11 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
         notices: (groupId) => GroupMsgStore.get(groupId).filter((m) => m.dir === "system").map((m) => [m.content, m.actor ?? null]),
         held: () => GroupStore.heldChanges().map((e) => [e.src, e.action]),
         /** Another client over the same storage, as after a reload. */
-        reload: (options = {}) => groupClient({ me, storage, filter, switched, name, ...options }),
-        /** The messages sent, as their recipient parses them (no keys needed). */
-        decoded: (from = 0) => sent.slice(from).map(({ to, bytes, via }) =>
-            ({ to, via, bytes, message: LXMessage.fromBytes(bytes.subarray(16), bytes.subarray(0, 16), () => me) })),
+        reload: (options = {}) => groupClient({ me, storage, filter, switched, name, distro: DistroManager.identity, ...options }),
+        /** The messages sent, as their recipient parses them (no keys needed):
+         *  the signature checked under the device's key, or `signer`'s. */
+        decoded: (from = 0, signer = me) => sent.slice(from).map(({ to, bytes, via }) =>
+            ({ to, via, bytes, message: LXMessage.fromBytes(bytes.subarray(16), bytes.subarray(0, 16), () => signer) })),
     };
     return client;
 }

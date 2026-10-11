@@ -152,7 +152,7 @@ test("a leave and a decline (the very message) carry the sender's own key too; t
 
 test("the key is read from the identity, not from the router: a leave carries it with no connection (the group is closed at once, the leave goes on after it)", async () => {
     const { c, ms: [a], id } = await started({ members: 1 });
-    const body = methodBody("_ownGroupMemberKey()");
+    const body = methodBody("_ownGroupMemberKey(signer = null)");
     assert.doesNotMatch(body, /_lxmfRouter|this\.ownHash/, "no router needed");
     assert.match(body, /ownLxmfDestinationHash\(\)/);
     const fresh = a.reload();
@@ -1046,7 +1046,7 @@ test("the web still lets a group's members through the privacy filter from the u
 
 test("wiring: the carried key is remembered before anything looks for it; every accept and leave that counts keeps the creator's copy; the creator answers from the handler alone, and only an accept that counted and carried its key", () => {
     const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
-    const remember = handler.indexOf('this._rememberGroupMemberKeys(new Map([[srcHash, Buffer.from(lxmfMsg.senderKey).toString("base64")]]));');
+    const remember = handler.indexOf('this._rememberGroupMemberKeys(new Map([[srcHash, Buffer.from(lxmfMsg.senderKey).toString("base64")]]), this._groupSelf(group));');
     const held = handler.indexOf('GroupStore.heldChanges().some(e => e.src === srcHash)) this._decideHeldGroupChanges();');
     const rule = handler.indexOf("PrivacyFilter.groupAccepts(groupInfo, srcHash, signature)");
     const dedup = handler.indexOf("this._groupSeenIds.add(dedupKey);");
@@ -1061,11 +1061,11 @@ test("wiring: the carried key is remembered before anything looks for it; every 
     assert.match(methodBody("_takeGroupStatusChange(lxmfMsg, groupId, src, action, event = null)"),
         /const verdict = statusChangeVerdict\(lxmfMsg\.signatureState \?\? "invalid", GROUP_ENTRIES_IN_RETICHAT_FIELD\);\n\s*if \(verdict === "hold"\) \{\n\s*this\._holdGroupStatusChange\(lxmfMsg, groupId, src, action\);\n\s*return false;\n\s*\}\n\s*if \(verdict === "ignore"\) return false;\n\s*this\._applyGroupStatusChange\(groupId, src, action, event, packedMessage\(lxmfMsg\)\);\n\s*return true;/);
     assert.match(methodBody("_decideHeldGroupChanges()"), /this\._applyGroupStatusChange\(entry\.groupId, entry\.src, entry\.action, null, packedHeld\(entry\)\);/);
-    assert.match(methodBody("_takeGroupStatusElement(groupId, element, ownHash)"), /return this\._takeGroupStatusChange\(message, groupId, src, action\) \? "counted" : "held";/);
+    assert.match(methodBody("_takeGroupStatusElement(groupId, element, mine)"), /return this\._takeGroupStatusChange\(message, groupId, src, action\) \? "counted" : "held";/);
     // Every count goes through _applyGroupStatusChange, with the copy: its callers are these two and nothing else.
     assert.equal((app.match(/this\._applyGroupStatusChange\(/g) ?? []).length, 2, "the verdict's, and the held decision's");
     assert.match(methodBody("_applyGroupStatusChange(groupId, src, action, event = null, packed = null)"),
-        /if \(packed && group\.creator === \(this\.ownHash \?\? ownLxmfDestinationHash\(\)\)\) \{\n\s*const refused = GroupStore\.keepStatus\(groupId, src, action, packed\);[^]*?\n\s*\}\n\s*if \(!GroupStore\.updateMember\(/, "kept before the member's status moves, by the creator only");
+        /const mine = this\._groupSelf\(group\);\n\s*if \(packed && mine\.has\(group\.creator\)\) \{\n\s*const refused = GroupStore\.keepStatus\(groupId, src, action, packed\);[^]*?\n\s*\}\n\s*if \(!GroupStore\.updateMember\(/, "kept before the member's status moves, by the creator only");
     // The switch is the one constant, imported, not a second.
     assert.match(app, /import \{ applyGroupFields, GROUP_ENTRIES_IN_RETICHAT_FIELD \} from "\.\/lib\/retichat_field\.js";/);
     assert.doesNotMatch(app, /const GROUP_ENTRIES_IN_RETICHAT_FIELD/);
@@ -1073,13 +1073,14 @@ test("wiring: the carried key is remembered before anything looks for it; every 
 });
 
 test("wiring: every accept and leave the page sends is built in one place each and carries the user's own key; a creator is recorded when a group is made or invited into; nothing here runs a timer or a retry", () => {
-    assert.match(methodBody("async sendGroupAccept(groupId)"), /groupAction: "accept",\n\s*groupSender: ownHash,\n\s*groupMemberKey: this\._ownGroupMemberKey\(\),/);
-    assert.match(methodBody("async sendGroupLeave(groupId)"), /groupAction: "leave",\n\s*groupSender: ownHash,\n\s*groupMemberKey: this\._ownGroupMemberKey\(\),/);
+    // The key is the group signer's (GROUPS-DISTRO-DESIGN.md §8.2: D's in a D-group).
+    assert.match(methodBody("async sendGroupAccept(groupId)"), /groupAction: "accept",\n\s*groupSender: ownHash,\n\s*groupMemberKey: this\._ownGroupMemberKey\(signer\),/);
+    assert.match(methodBody("async sendGroupLeave(groupId)"), /const memberKey = this\._ownGroupMemberKey\(signer\);[^]*?groupAction: "leave",\n\s*groupSender: ownHash,\n\s*groupMemberKey: memberKey,/);
     assert.equal((app.match(/groupAction: "accept"/g) ?? []).length, 1, "no other accept is built");
     assert.equal((app.match(/groupAction: "leave"/g) ?? []).length, 1, "no other leave is built: a decline is this one");
     assert.match(methodBody("_quitGroup(groupId, how)"), /RnsClient\.sendGroupLeave\(groupId\)/, "a decline and a leave are one path");
-    assert.match(methodBody("create(groupName, memberHashes)"), /lastActivity: Date\.now\(\), creator: ownHash \};/);
-    assert.match(methodBody("addPending(groupId, groupName, senderHash, memberHashes)"), /if \(existing\) return existing;[^]*?lastActivity: Date\.now\(\), creator: senderHash \};/, "the invite's source, recorded once");
+    assert.match(methodBody("create(groupName, memberHashes, ownMember = null)"), /lastActivity: Date\.now\(\), creator: ownHash, ownMember: ownMember \?\? null \};/);
+    assert.match(methodBody("addPending(groupId, groupName, senderHash, memberHashes, ownMember = null)"), /if \(existing\) return existing;[^]*?lastActivity: Date\.now\(\), creator: senderHash, ownMember: ownMember \?\? null \};/, "the invite's source, recorded once");
     assert.match(objectLiteral("GroupStore"), /creator: g\.creator \?\? null,/, "persisted with the group");
     assert.match(methodBody("remove(groupId)"), /if \(this\._statuses\.delete\(groupId\)\) this\._saveStatuses\(\);/);
     const filter = objectLiteral("PrivacyFilter");
@@ -1087,7 +1088,7 @@ test("wiring: every accept and leave the page sends is built in one place each a
     assert.match(filter, /named !== src, s\.closed, signature, s\.sourceIsCreator\);/);
 
     for (const method of ["_takeGroupStatusChange(lxmfMsg, groupId, src, action, event = null)", "_takeGroupStatuses(group, statuses)",
-        "_takeGroupStatusElement(groupId, element, ownHash)", "async sendGroupStatus(groupId, memberHash)", "_ownGroupMemberKey()"]) {
+        "_takeGroupStatusElement(groupId, element, mine)", "async sendGroupStatus(groupId, memberHash)", "_ownGroupMemberKey(signer = null)"]) {
         assert.doesNotMatch(methodBody(method), /setTimeout|setInterval|requestAnimationFrame|retry|again|Promise\.race|while \(/i, `${method.split("(")[0]}: no timer, no retry (DESIGN_PRINCIPLES.md §1, §3)`);
     }
 });

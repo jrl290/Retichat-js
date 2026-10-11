@@ -516,7 +516,7 @@ test("the group propagation fallback uploads the exact direct envelope, so the s
         _buildPropagationPacked: async (packed) => { uploaded.push(packed); return Buffer.alloc(8); },
     };
     for (const signature of [
-        "async _sendGroupEnvelope(memberHash, content, fields)",
+        "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "async _sendGroupPropagationFallback(fullLxmfBytes, publicKeyHex, memberHash)",
     ]) self[methodName(signature)] = compile(signature, env)(self);

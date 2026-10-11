@@ -56,7 +56,7 @@ import { ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { ChannelPublishes } from "./lib/channel_publish.js";
 import { lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { settle } from "./test_link_pair.mjs";
-import { app, build, compile, constValue, fn, install, methodBody, memoryStorage, messageHandler, objectLiteral, GROUP_STATUS_METHODS, groupStatusEnv } from "./test_app_source.mjs";
+import { app, build, compile, constValue, fn, install, methodBody, memoryStorage, messageHandler, objectLiteral, GROUP_STATUS_METHODS, groupStatusEnv, installGroupSelf } from "./test_app_source.mjs";
 
 const CHANNEL = "public.general";
 const quiet = { log() {}, warn() {}, error() {} };
@@ -116,6 +116,7 @@ function receiver(p) {
     destination.hash = Destination.hash(p.me, "lxmf", "delivery");
     const router = new LXMRouter({ registerDestination: () => destination }, p.me, { filter: p.PrivacyFilter });
     const self = { ownHash: p.own(), _onMsg: [], _pendingTickets: new Map(), _performGroupRelay() {}, _handleDistroIdentityTransfer() {} };
+    installGroupSelf(self, { GroupStore: p.GroupStore, own: p.own(), me: p.me });
     install(self, {
         GroupStore: p.GroupStore, GroupMsgStore: p.GroupMsgStore, ContactStore: p.ContactStore, PrivacyFilter: p.PrivacyFilter,
         console: quiet, Date, Buffer, LXMessage, Harness: p.Harness, sentTimeMs, ownLxmfDestinationHash: p.own, Identity, Destination,
@@ -123,7 +124,7 @@ function receiver(p) {
     }, [
         "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
         ...GROUP_STATUS_METHODS,
-        "_rememberGroupMemberKeys(memberKeys)",
+        "_rememberGroupMemberKeys(memberKeys, mine = null)",
     ]);
     router.on("message", messageHandler({
         Buffer, LxmfSeen: { check: () => false }, Harness: p.Harness, console: quiet,
@@ -370,7 +371,8 @@ test("a group invite and the user's accept keep every member by association: all
     // The user accepts (the real _acceptGroupInvite): every member allowed.
     compile("_acceptGroupInvite(groupId)", {
         GroupStore: p.GroupStore, ContactStore: p.ContactStore, GroupMsgStore: p.GroupMsgStore, console: quiet,
-        RnsClient: { ownHash: p.own(), _decideHeldGroupChanges() {}, _requestGroupPeer() {}, sendGroupAccept: async () => {} },
+        RnsClient: { ownHash: p.own(), _decideHeldGroupChanges() {}, _requestGroupPeer() {}, sendGroupAccept: async () => {},
+            _groupSelf: (g) => p.rns._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(m),
     })({ render() {} })(G);
     assert.equal(p.GroupStore.get(G).groupStatus, "active");
@@ -504,7 +506,7 @@ test("deleting a stranger's conversation the user replied to takes the reply's a
         const stranger = Identity.create(), S = lxmfHash(stranger);
         // A group invite still pending lists them: no group the user has
         // joined, so it allows nobody (the group trust rule).
-        if (pendingGroup) p.GroupStore.addPending("7".repeat(32), "Pending", lxmfHash(Identity.create()), [S]);
+        if (pendingGroup) p.GroupStore.addPending("7".repeat(32), "Pending", lxmfHash(Identity.create()), [S, p.own()]);
         await p.dm(lxm(stranger, p.own(), "hello from nowhere"));
         p.ContactStore.updateFromAnnounce(S, { appData: null, identity: stranger });
         const send = compile("sendMessage(contact, content, attachments = [])", { ContactStore: p.ContactStore, MsgStore: p.MsgStore, console: quiet })({

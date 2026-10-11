@@ -62,7 +62,7 @@ import { GroupDeliveryEvidence } from "./lib/rns/group_fallback.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
 import { senderKeyEntry } from "./lib/group_status.js";
 import { NameLedger } from "./lib/name_ledger.js";
-import { installPropagated, GROUP_STATUS_METHODS, groupStatusEnv } from "./test_app_source.mjs";
+import { installPropagated, GROUP_STATUS_METHODS, groupStatusEnv, installGroupSelf } from "./test_app_source.mjs";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
@@ -549,7 +549,7 @@ test("a co-member who is not allowlisted: group traffic for a held group is kept
     const inviter = Identity.create(), member = Identity.create();
     const I = lxmfHash(inviter), M = lxmfHash(member);
     const G = "9".repeat(32), OTHER = "8".repeat(32);
-    r.GroupStore.addPending(G, "G", I, [M]);
+    r.GroupStore.addPending(G, "G", I, [M, lxmfHash(r.me)]);
     r.ContactStore.keep(M);                      // its key and names, hidden
     assert.equal(r.ContactStore.allowlisted(M), false);
     const transfer = () => lxm(member, r.me, "", new Map([[LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_TRANSFER_TYPE], [LXMF.FIELD_CUSTOM_DATA, "a".repeat(128)]]));
@@ -613,7 +613,7 @@ test("a co-member's DM over a link or fetched from the node is dropped unproved,
         const r = recipient();
         const inviter = Identity.create(), member = Identity.create();
         const M = lxmfHash(member);
-        r.GroupStore.addPending("9".repeat(32), "G", lxmfHash(inviter), [M]);
+        r.GroupStore.addPending("9".repeat(32), "G", lxmfHash(inviter), [M, lxmfHash(r.me)]);
         if (joined) r.GroupStore.accept("9".repeat(32));
         const { a, wire } = await deliveryLink(r);
 
@@ -676,7 +676,7 @@ test("a group invite from a co-member who is not allowlisted is dropped unproved
     const r = recipient();
     const inviter = Identity.create(), member = Identity.create();
     const I = lxmfHash(inviter), M = lxmfHash(member);
-    r.GroupStore.addPending("9".repeat(32), "G", I, [M]);
+    r.GroupStore.addPending("9".repeat(32), "G", I, [M, lxmfHash(r.me)]);
     r.ContactStore.keep(M);                      // a co-member: its key, hidden
     const invite = (groupId) => lxm(member, r.me, "", new Map([[GROUP_FIELDS.GROUP_ID, groupId], [GROUP_FIELDS.GROUP_ACTION, "invite"],
         [GROUP_FIELDS.GROUP_MEMBERS, `${M},${lxmfHash(r.me)}`]]));
@@ -713,6 +713,7 @@ function withGroupHandler(r, { switched = false } = {}) {
     r.self._performGroupRelay = () => {};
     r.self._rememberGroupMemberKeys = () => [];
     r.self._keepAttachments = () => {};
+    installGroupSelf(r.self, { GroupStore: r.GroupStore, own: own(), me: r.me });
     const env = {
         GroupStore: r.GroupStore, GroupMsgStore, ContactStore: r.ContactStore, console: quiet, Date, Buffer,
         ownLxmfDestinationHash: own, PrivacyFilter: r.PrivacyFilter, sentTimeMs, LXMessage, Harness: r.Harness,
@@ -1349,8 +1350,10 @@ test("group model: the user's decline and leave are final: an invite to that gro
     }
 
     // The confirmations say it is final.
-    assert.match(methodBody("_declineGroupInvite(groupId)"), /confirm\("Decline this group invite\? You won't be able to join this group later\."\)/);
-    assert.match(methodBody("_leaveGroup(groupId)"), /confirm\("Leave this group\? You won't receive future messages, and you won't be able to rejoin it\."\)/);
+    // In a device-listed group as before; in a D-group they say all the
+    // user's devices (GROUPS-DISTRO-DESIGN.md §13, group_distro_app.test.mjs).
+    assert.match(methodBody("_declineGroupInvite(groupId)"), /: "Decline this group invite\? You won't be able to join this group later\.";\n\s*if \(!confirm\(text\)\) return;/);
+    assert.match(methodBody("_leaveGroup(groupId)"), /: "Leave this group\? You won't receive future messages, and you won't be able to rejoin it\.";\n\s*if \(!confirm\(text\)\) return;/);
 });
 
 test("group model: the record of declined and left groups is bounded at GroupStore.CLOSED_LIMIT, oldest forgotten first; a stored one longer than that keeps its newest", () => {
@@ -1441,7 +1444,8 @@ test("accepting an invite allows every member of the group, whatever row it has;
     const sent = [];
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore, ContactStore, GroupMsgStore: { addSystem() {} }, console: quiet,
-        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _decideHeldGroupChanges() {}, sendGroupAccept: async (id) => { sent.push(id); } },
+        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _decideHeldGroupChanges() {}, sendGroupAccept: async (id) => { sent.push(id); },
+            _groupSelf: () => new Set([ME]), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
     })({ render() {} });
 
@@ -1565,7 +1569,8 @@ test("group trust rule: once the user accepts, every listed member is allowed (X
     const alerts = [];
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore: p.r.GroupStore, ContactStore: p.r.ContactStore, GroupMsgStore: p.posts, console: quiet,
-        RnsClient: { ownHash: p.ME, _requestGroupPeer() {}, _decideHeldGroupChanges: () => p.r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {} },
+        RnsClient: { ownHash: p.ME, _requestGroupPeer() {}, _decideHeldGroupChanges: () => p.r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
+            _groupSelf: (g) => p.r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
     })({ render() {} });
     accept(p.G);
@@ -1598,6 +1603,8 @@ test("group trust rule: once the user accepts, every listed member is allowed (X
  */
 function quittingPage({ GroupStore, GroupMsgStore, RnsClient }) {
     const page = { state: { activeHash: null }, render() {} };
+    // A device-listed group: never a former distro's (GROUPS-DISTRO-DESIGN.md §8.7).
+    if (!("groupFormerDistroText" in RnsClient)) RnsClient.groupFormerDistroText = () => null;
     const env = { confirm: () => true, GroupStore, GroupMsgStore, RnsClient, console: quiet,
         document: { body: { classList: { remove() {} } } } };
     for (const signature of ["_quitGroup(groupId, how)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)"]) {
@@ -1619,7 +1626,7 @@ function answeringClient({ filter = true, switched = false } = {}) {
     const relays = [];
     r.self._performGroupRelay = (...a) => relays.push(a);
     const ME = lxmfHash(r.me);
-    r.self._rememberGroupMemberKeys = compile("_rememberGroupMemberKeys(memberKeys)", {
+    r.self._rememberGroupMemberKeys = compile("_rememberGroupMemberKeys(memberKeys, mine = null)", {
         Buffer, Identity, Destination, ContactStore: r.ContactStore, console: quiet, ownLxmfDestinationHash: () => ME,
     })(r.self);
     const alerts = [];
@@ -1628,6 +1635,7 @@ function answeringClient({ filter = true, switched = false } = {}) {
     const acceptInvite = compile("_acceptGroupInvite(groupId)", {
         GroupStore: r.GroupStore, ContactStore: r.ContactStore, GroupMsgStore: posts, console: quiet,
         RnsClient: { ownHash: ME, _requestGroupPeer() {}, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(),
+            _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: (g) => r.self.groupFormerDistroText(g),
             sendGroupAccept: async (id) => { accepts.push(id); } },
         alert: (m) => alerts.push(m),
     })({ render() {} });
@@ -1868,6 +1876,9 @@ test("_performGroupRelay sends nothing for a group the user has not joined, whoe
         ownHash: "0".repeat(32),
         _fanoutGroupEnvelope: async (targets, content, fields) => { sent.push(["fanout", targets, content, fields.groupSender]); },
         _sendGroupEnvelope: async (target, content, fields) => { sent.push(["send", target, fields.groupAction]); },
+        // A device-listed group: the device signs, and is the only self address.
+        _groupSigner: () => ({ identity: null, hash: "0".repeat(32), isDistro: false }),
+        _groupSelf: () => new Set(["0".repeat(32)]),
     };
     const relay = compile("async _performGroupRelay(group, content, originalSender, alreadySeen, requester)", { console: quiet })(self);
     const [A, B, R] = ["a", "b", "c"].map((x) => x.repeat(32));
@@ -2090,6 +2101,7 @@ test("group model, signatures: a held accept survives a reload and is decided wh
         const accept = compile("_acceptGroupInvite(groupId)", {
             GroupStore: again.GroupStore, ContactStore: again.ContactStore, GroupMsgStore: posts, console: quiet,
             RnsClient: { ownHash: lxmfHash(r.me), _requestGroupPeer() {}, _decideHeldGroupChanges: () => again.self._decideHeldGroupChanges(),
+                _groupSelf: (g) => again.self._groupSelf(g), groupFormerDistroText: () => null,
                 sendGroupAccept: async (id) => { fannedTo.push(...[...again.GroupStore.get(id).members.entries()].filter(([, s]) => s === "accepted").map(([h]) => h)); } },
             alert: (m) => assert.fail(m),
         })({ render() {} });
@@ -2187,7 +2199,7 @@ test("group model, signatures: what is held is bounded: a payload over HELD_PAYL
     const s = memory();
     const { GroupStore } = stores(me, s);
     assert.deepEqual([GroupStore.HELD_LIMIT, GroupStore.HELD_PER_MEMBER, GroupStore.HELD_PAYLOAD_LIMIT], [128, 4, 2048]);
-    const ids = Array.from({ length: 40 }, (_, n) => GroupStore.addPending(n.toString(16).padStart(32, "0"), "G", "1".repeat(32), []).groupId);
+    const ids = Array.from({ length: 40 }, (_, n) => GroupStore.addPending(n.toString(16).padStart(32, "0"), "G", "1".repeat(32), [lxmfHash(me)]).groupId);
     const entry = (groupId, src, n, payloadBytes = 100) => ({ groupId, src, action: "accept", lxmfHash: `${groupId}${src}${n}`,
         dest: "aa".repeat(16), signature: "bb".repeat(64), payload: Buffer.alloc(payloadBytes, 1).toString("base64") });
     const M = "2".repeat(32);
@@ -2234,7 +2246,7 @@ test("group model, signatures: the wiring: the router's second look passes the s
     const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
     assert.match(handler, /const signature = lxmfMsg\.signatureState \?\? "invalid";\n\s*if \(!PrivacyFilter\.groupAccepts\(groupInfo, srcHash, signature\)\)/);
     assert.match(handler, /const actualSender = PrivacyFilter\.groupMember\(groupInfo, srcHash, signature\);/);
-    assert.match(handler, /this\._rememberGroupMemberKeys\(memberKeys\);\n(\s*\/\/[^\n]*\n)*\s*this\._decideHeldGroupChanges\(\);/);
+    assert.match(handler, /this\._rememberGroupMemberKeys\(memberKeys, [^\n]*\);\n(\s*\/\/[^\n]*\n)*\s*this\._decideHeldGroupChanges\(\);/);
     const accept = methodBody("_acceptGroupInvite(groupId)");
     assert.ok(accept.indexOf("RnsClient._decideHeldGroupChanges();") > accept.indexOf("missingKeys.length > 0"), "after every key is checked present");
     assert.ok(accept.indexOf("RnsClient._decideHeldGroupChanges();") < accept.indexOf("GroupStore.accept(groupId);"), "before the group is joined");
@@ -2443,9 +2455,10 @@ function leavingClient(c, { messageName = "Dee" } = {}) {
         NameLedgerStore: new NameLedger({ get: r.storage.sGet, set: r.storage.sSet }), OwnNames: { message: messageName },
         crypto: globalThis.crypto, ownLxmfDestinationHash: () => lxmfHash(r.me),
     };
+    installGroupSelf(rc, { GroupStore: r.GroupStore, own: lxmfHash(r.me), me: r.me });
     for (const signature of [
-        "async sendGroupLeave(groupId)", "_ownGroupMemberKey()", "async _fanoutGroupEnvelope(targets, content, fields)",
-        "async _sendGroupEnvelope(memberHash, content, fields)",
+        "async sendGroupLeave(groupId)", "_ownGroupMemberKey(signer = null)", "async _fanoutGroupEnvelope(targets, content, fields, signer = null)",
+        "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "_decideMessageName(sourceHex, recipientHex)", "_requestGroupPeer(memberHash)", "_waitForGroupPeer(memberHash)",
         "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)",
@@ -2580,7 +2593,7 @@ function groupInfoRows(r, G) {
     const root = new Node_("div");
     const page = { state: { groupInfoId: G, showGroupInfo: true }, root, render() {},
         _groupMemberLabel: (hash) => r.ContactStore.name(hash), _paintMemberAvatar() {} };
-    compile("_renderGroupInfoModal()", { GroupStore: r.GroupStore, h: fn("h", "tag, a={}, ...kids", { document }) })(page)();
+    compile("_renderGroupInfoModal()", { GroupStore: r.GroupStore, RnsClient: { groupFormerDistroText: () => null }, h: fn("h", "tag, a={}, ...kids", { document }) })(page)();
     const rows = new Map();
     const walk = (node) => {
         if (node.attrs?.["data-member-hash"]) rows.set(node.attrs["data-member-hash"], node.children[1].textContent);
@@ -2893,8 +2906,11 @@ test("the user allowlists a peer by adding it, writing to it, or creating a grou
     }
     assert.match(methodBody("_addContact(destHash, publicKey = null)"), /ContactStore\.add\(destHash, false, publicKey\);\s+ContactStore\.allow\(c\.destHash\);/);
     assert.match(app, /addPeer\(destHash, publicKeyHex\) \{[\s\S]*?App\._addContact\(destHash, publicKeyHex \|\| null\);/);
-    // Creating a group allowlists its members (iOS createGroupChat).
-    assert.match(methodBody("_renderGroupForm(top, scroll, footer)"), /for \(const hash of selected\) ContactStore\.allow\(hash\);/);
+    // Creating a group allowlists its members (iOS createGroupChat), never a
+    // self address (GROUPS-DISTRO-DESIGN.md §9.2): the form creates through
+    // RnsClient.createGroup.
+    assert.match(methodBody("_renderGroupForm(top, scroll, footer)"), /RnsClient\.createGroup\(name, selected\)/);
+    assert.match(methodBody("createGroup(groupName, memberHashes)"), /for \(const hash of memberHashes\) if \(!mine\.has\(hash\)\) ContactStore\.allow\(hash\);/);
 });
 
 test("an allowlisted hidden row stays allowlisted and hidden: a co-member's DMs are a conversation and pass; adding keeps the mark", async () => {

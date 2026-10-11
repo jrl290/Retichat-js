@@ -46,7 +46,7 @@ import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js
 import { NameLedger, ChannelPostNames, ChannelSenderNames } from "./lib/name_ledger.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
-import { installPropagated, GROUP_STATUS_METHODS, groupStatusEnv } from "./test_app_source.mjs";
+import { installPropagated, GROUP_STATUS_METHODS, groupStatusEnv, installGroupSelf } from "./test_app_source.mjs";
 
 const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -709,7 +709,7 @@ test("§4.1 group envelopes (invites included) carry the name per member; only a
         _ensureGroupLink: async () => ({ link: { send: (bytes) => { direct.push(bytes); return { packetHash: Buffer.alloc(32, direct.length) }; } } }),
     };
     for (const signature of [
-        "async _sendGroupEnvelope(memberHash, content, fields)",
+        "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "_decideMessageName(sourceHex, recipientHex)",
     ]) self[methodName(signature)] = compile(signature, env)(self);
@@ -750,7 +750,7 @@ test("§10 the group envelope: old fields now, the 0xD1 map after the switch; th
             _ensureGroupLink: async () => ({ link: { send: (bytes) => { direct.push(bytes); return { packetHash: Buffer.alloc(32, direct.length) }; } } }),
         };
         for (const signature of [
-            "async _sendGroupEnvelope(memberHash, content, fields)",
+            "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
             "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
             "_decideMessageName(sourceHex, recipientHex)",
         ]) self[methodName(signature)] = compile(signature, env)(self);
@@ -1064,7 +1064,7 @@ test("§5.2 a message fetched from the propagation node is verified and named by
 test("audit L4: group member keys and own channel posts never add this device as a contact", () => {
     const me = Identity.create(), bob = Identity.create();
     const store = contactStore(memory());
-    const remember = compile("_rememberGroupMemberKeys(memberKeys)", {
+    const remember = compile("_rememberGroupMemberKeys(memberKeys, mine = null)", {
         Buffer, Identity, Destination, ContactStore: store, console: quiet, ownLxmfDestinationHash: () => lxmfHash(me),
     })({ ownHash: lxmfHash(me) });
     remember([
@@ -1090,7 +1090,8 @@ test("§5.3 an open Group Info modal relabels its members when a name arrives", 
         return { parts, getAttribute: () => hash, querySelector: (q) => parts[q] ?? null };
     };
     const rows = [row(h, DN.shortHash(h)), row(me, "You")];
-    const env = { ContactStore: store, ownLxmfDestinationHash: () => me, avatarHue: () => 120 };
+    const env = { ContactStore: store, ownLxmfDestinationHash: () => me, avatarHue: () => 120,
+        GroupStore: { get: () => null }, RnsClient: { _groupSelf: () => new Set([me]) } };
     const self = {
         state: { showGroupInfo: true },
         root: { querySelectorAll: (q) => (q === ".modal-sheet [data-member-hash]" ? rows : []) },
@@ -1208,7 +1209,8 @@ function makeGroupReceiver(me, memberHashes, { switched = false } = {}) {
     const own = () => lxmfHash(me);
     r.self.ownHash = own();
     r.self._performGroupRelay = () => {};
-    r.self._rememberGroupMemberKeys = compile("_rememberGroupMemberKeys(memberKeys)", {
+    installGroupSelf(r.self, { GroupStore, own: own(), me });
+    r.self._rememberGroupMemberKeys = compile("_rememberGroupMemberKeys(memberKeys, mine = null)", {
         Buffer, Identity, Destination, ContactStore: r.ContactStore, console: quiet, ownLxmfDestinationHash: own,
     })(r.self);
     // LXMessage as the held accepts and leaves see it: checked against this
@@ -1228,7 +1230,8 @@ function makeGroupReceiver(me, memberHashes, { switched = false } = {}) {
     /** The user pressing Accept on a pending invite (the real _acceptGroupInvite). */
     const acceptInvite = compile("_acceptGroupInvite(groupId)", {
         GroupStore, ContactStore: r.ContactStore, GroupMsgStore, console: quiet,
-        RnsClient: { ownHash: own(), _requestGroupPeer() {}, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {} },
+        RnsClient: { ownHash: own(), _requestGroupPeer() {}, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
+            _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(`the accept was held back: ${m}`),
     })({ render() {} });
     return { ...r, groups, notices, posts, systemText, groupLabel, PrivacyFilter, acceptInvite };
@@ -1399,7 +1402,7 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     const me = Identity.create(), bob = Identity.create(), alice = Identity.create();
     const B = lxmfHash(bob), A = lxmfHash(alice);
     const store = contactStore(memory());
-    compile("_rememberGroupMemberKeys(memberKeys)", {
+    compile("_rememberGroupMemberKeys(memberKeys, mine = null)", {
         Buffer, Identity, Destination, ContactStore: store, console: quiet, ownLxmfDestinationHash: () => lxmfHash(me),
     })({ ownHash: lxmfHash(me) })([[B, bob.getPublicKey().toString("base64")]]);
     assert.equal(store.get(B).hidden, true, "a group member's key");
@@ -1411,7 +1414,8 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore: { get: () => ({ groupName: "G", members: new Map([[B, "accepted"], [A, "invited"], [lxmfHash(me), "invited"]]) }), accept() {} },
         ContactStore: store, GroupMsgStore: { addSystem() {} }, console: quiet,
-        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, _decideHeldGroupChanges() {}, sendGroupAccept: async () => {} },
+        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, _decideHeldGroupChanges() {}, sendGroupAccept: async () => {},
+            _groupSelf: () => new Set([lxmfHash(me)]), groupFormerDistroText: () => null },
         alert: () => assert.fail("keys are all there"),
     });
     store.keep(A, alice.getPublicKey().toString("hex"));
@@ -1450,8 +1454,8 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     // DM records), never a hidden row with none (contacts_explicit.test.mjs).
     assert.match(methodBody("_buildSidebarContent()"), /ContactStore\.chats\(\(hash\) => MsgStore\.get\(hash\)\.length > 0\)/);
     assert.doesNotMatch(methodBody("_buildSidebarContent()"), /ContactStore\.(getAll|listed)\(/);
-    for (const method of ["async _sendGroupEnvelope(memberHash, content, fields)", "async openGroupConversation(groupId)",
-        "_rememberGroupMemberKeys(memberKeys)", "_handleChannelPacket(packetData)", "_acceptGroupInvite(groupId)"]) {
+    for (const method of ["async _sendGroupEnvelope(memberHash, content, fields, signer = null)", "async openGroupConversation(groupId)",
+        "_rememberGroupMemberKeys(memberKeys, mine = null)", "_handleChannelPacket(packetData)", "_acceptGroupInvite(groupId)"]) {
         assert.doesNotMatch(methodBody(method), /ContactStore\.add\(/, `${method} never adds a contact`);
     }
 });

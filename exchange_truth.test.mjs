@@ -770,6 +770,9 @@ function makeGroupClient(iface) {
     const self = {
         _rns: { interfaces: [iface] }, _initialized: true, ownHash: "a".repeat(32), _onMsg: [],
         _dispatchGroupMessage: async (groupId, outMsg) => { dispatched.push(outMsg); return outMsg; },
+        // A device-listed group: the device signs (GROUPS-DISTRO-DESIGN.md §8.1).
+        _groupSigner: () => ({ identity: null, hash: "a".repeat(32), isDistro: false }),
+        groupFormerDistroText: () => null,
     };
     for (const signature of ["async sendGroupMessage(groupId, content)", "_exchangeIsDown()"]) {
         self[methodName(signature)] = compile(signature, env)(self);

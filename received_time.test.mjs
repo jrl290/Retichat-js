@@ -24,6 +24,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Buffer } from "node:buffer";
+import { installGroupSelf } from "./test_app_source.mjs";
 import MsgPack from "./lib/rns/msgpack.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import Identity from "./lib/rns/identity.js";
@@ -117,9 +118,11 @@ test("a group message is stored at the time its sender sent it", () => {
     const G = "9".repeat(32);
     const groups = new Map([[G, { groupId: G, groupName: "G", members: new Map(), lastActivity: 0 }]]);
     const self = { _onMsg: [] };
+    const GroupStore = { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
+        isClosed: () => false, heldChanges: () => [], _save() {} };
+    installGroupSelf(self, { GroupStore, own: lxmfHash(me), me });
     const handleGroup = compile("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", {
-        GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
-            isClosed: () => false, heldChanges: () => [], _save() {} },
+        GroupStore,
         GroupMsgStore: p.GroupMsgStore, ContactStore: p.ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => lxmfHash(me),
         // The group rule is not what this tests: it lets the plain post

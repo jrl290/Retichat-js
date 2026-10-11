@@ -24,6 +24,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Buffer } from "node:buffer";
+import { installGroupSelf } from "./test_app_source.mjs";
 import { readFileSync } from "node:fs";
 import { bubbleText, enterSends, TOUCH_FIRST } from "./lib/message_text.js";
 import { clean as cleanDisplayName } from "./lib/display_name.js";
@@ -327,9 +328,11 @@ function recipient({ groups = new Map(), relayed = [] } = {}) {
         _fanoutGroupEnvelope: async (targets, content, fields) => { relayed.push({ targets, content, fields }); return { fulfilled: targets.length, total: targets.length, methods: [] }; },
         _sendGroupEnvelope: async () => ({ method: "direct" }),
     };
+    const GroupStore = { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
+        isClosed: () => false, heldChanges: () => [], _save() {} };
+    installGroupSelf(self, { GroupStore, own: hex(me), me });
     install(self, {
-        GroupStore: { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
-            isClosed: () => false, heldChanges: () => [], _save() {} },
+        GroupStore,
         GroupMsgStore: s.GroupMsgStore, ContactStore: s.ContactStore, console: quiet, Date, Buffer, LXMF, sentTimeMs,
         ownLxmfDestinationHash: () => hex(me),
         // The group rule is not what this tests (privacy_filter.test.mjs pins it).
