@@ -6413,11 +6413,15 @@ const RnsClient = {
         }
         if (!GroupStore.updateMember(groupId, src, action === "leave" ? "left" : "accepted")) return false;
         if (action === "accept" && group.groupStatus === "active" && !mine.has(src)) ContactStore.allow(src);
-        // §9.2: a self address (a known sibling acting as its own listed
-        // entry, §14) is shown as "You", as iOS names it (label(for:));
-        // anyone else is named when shown. Until the review of 96fffd9 a
-        // sibling's accept read "<its own name> joined the group".
-        if (mine.has(src)) GroupMsgStore.addSystem(groupId, action === "leave" ? "You left the group" : "You joined the group");
+        // §9.2: a known sibling acting as its own listed entry (§14) is
+        // the user's other device: "Your other device joined the group" /
+        // "... left the group", the same text on every client (2026-10-11).
+        // "You left the group" read as if the user had left, and until the
+        // review of 96fffd9 it read "<its own name> joined the group". Any
+        // other self address is "You"; anyone else is named when shown.
+        if (mine.has(src) && this._isKnownSibling(group, src)) {
+            GroupMsgStore.addSystem(groupId, action === "leave" ? "Your other device left the group" : "Your other device joined the group");
+        } else if (mine.has(src)) GroupMsgStore.addSystem(groupId, action === "leave" ? "You left the group" : "You joined the group");
         else GroupMsgStore.addSystem(groupId, action === "leave" ? "left the group" : "joined the group", src);
         this._onMsg.forEach(fn => fn(event ?? { kind: "group-status", groupId }, groupId));
         return true;

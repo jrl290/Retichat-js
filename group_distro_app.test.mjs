@@ -1110,7 +1110,7 @@ test("§6.5: a validated message whose packet source is a known sibling (a self 
     assert.deepEqual(u.HeldGroupArrivalsStore.list(), [], "a self source is never held");
 });
 
-test("§9.2: a known sibling's accept and leave in a D-group are shown as the user's ('You joined the group'), never under the sibling's own name", async () => {
+test("§9.2: a known sibling's accept and leave in a D-group are shown as the user's other device's ('Your other device joined the group'), never under the sibling's own name, and never as the user's own ('You left the group' would read as if the user left)", async () => {
     const Did = Identity.create();
     const D = lxmfHash(Did);
     const u = groupClient({ distro: Did });
@@ -1131,7 +1131,7 @@ test("§9.2: a known sibling's accept and leave in a D-group are shown as the us
     assert.equal(u.status(id, S), "left");
     assert.equal(u.GroupStore.get(id)?.groupStatus, "active", "the user, D, is still in the group");
     const lines = u.GroupMsgStore.get(id).filter((x) => x.dir === "system").slice(-2);
-    assert.deepEqual(lines.map((x) => [x.content, x.actor ?? null]), [["You joined the group", null], ["You left the group", null]]);
+    assert.deepEqual(lines.map((x) => [x.content, x.actor ?? null]), [["Your other device joined the group", null], ["Your other device left the group", null]]);
 });
 
 test("§17.14 rule 3: the 0xFD of a G from D, signed by D, is remembered as a device of D before rule 4, so a G whose form rule 4 refuses still teaches its sibling", async () => {
