@@ -146,3 +146,36 @@ test("known siblings: per D, learned once, persisted, dropped for distros given 
     assert.deepEqual(new KnownSiblings(s).of("e".repeat(32)), []);
     assert.equal(new KnownSiblings(s).has(D, hex32(1)), true);
 });
+
+// ── Review of 96fffd9: storage that refuses a write is said ─────────────────
+
+test("storage that refuses a write (a full localStorage) is said, store by store, naming the store and what it did not keep; a blob storage refused is held by this page only, and says so", () => {
+    const refusals = [];
+    const onRefused = (key, what) => refusals.push([key, what]);
+    const refusing = { get: () => null, set: () => false };
+    const held = new HeldGroupArrivals(refusing, { onRefused });
+    const result = held.hold(arrival(hex32(1), hex32(0xa), { pending: true }), D);
+    assert.deepEqual([result.held, result.stored], [true, false], "held, by this page only");
+    assert.equal(held.list().length, 1);
+    new FilteredInvites(refusing, { onRefused }).add(hex32(2));
+    new DistroLeftGroups(refusing, { onRefused }).record(D, hex32(3));
+    new KnownSiblings(refusing, { onRefused }).add(D, hex32(4));
+    assert.deepEqual(refusals.map(([key]) => key), [HeldGroupArrivals.KEY, FilteredInvites.KEY, DistroLeftGroups.KEY, KnownSiblings.KEY]);
+    for (const [key, what] of refusals) assert.ok(typeof what === "string" && what.length > 0, key);
+    // Without a hook, the store says it itself.
+    const lines = [];
+    const warn = console.warn;
+    console.warn = (...a) => lines.push(a.join(" "));
+    try {
+        new KnownSiblings(refusing).add(D, hex32(5));
+    } finally {
+        console.warn = warn;
+    }
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], new RegExp(KnownSiblings.KEY));
+    // Storage that keeps the write: nothing said, and no `stored` in hold's answer.
+    const kept = [];
+    const ok = new HeldGroupArrivals(store(), { onRefused: (...a) => kept.push(a) });
+    assert.deepEqual(ok.hold(arrival(hex32(1), hex32(0xb), { pending: true }), D), { held: true, why: null, evicted: [] });
+    assert.deepEqual(kept, []);
+});

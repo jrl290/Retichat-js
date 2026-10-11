@@ -30,6 +30,7 @@ import {
     DISTRO_GROUP_TYPE, DISTRO_MARKERS, INVITE_SPACE, MAX_AT_MS, GROUP_SYNC_LEFT_MAX,
     inviteMembers, isInviteSpace, groupEntriesOf, groupSyncFields, readGroupSync, readGroupSyncFields, groupSyncDisposition,
 } from "./lib/group_sync.js";
+import * as GroupSync from "./lib/group_sync.js";
 
 const COPY = new URL("./distro_group_sync_vectors.json", import.meta.url);
 const ORIGINAL = new URL("../LXMF-rust/tests/distro_group_sync_vectors.json", import.meta.url);
@@ -294,4 +295,57 @@ test("an invite's GROUP_MEMBERS is parsed on the web with the phones' invite par
         assert.deepEqual(LXMessage.extractGroupFields(decoded).members, inviteMembers(csv), `0xD1: ${inRetichat}`);
         assert.deepEqual(LXMessage.extractGroupFields(decoded).members, [M, "e1".repeat(16)]);
     }
+});
+
+// ── Review of 96fffd9 ──────────────────────────────────────────────────────
+
+test("rule 3 comes before rule 4: a G from D, signed by D, that rule 4 refuses still names its sending device (its 0xFD), for the known siblings; one that rule 1 or 2 drops names nobody", () => {
+    const bad = readGroupSyncFields(hex(V.rejects[0].fields_hex), 0, D);
+    assert.match(bad.by, /^[0-9a-f]{32}$/, "the vector names a device");
+    const facts = { fromDistro: true, signedByDistro: true, ownDeviceHex: "ab".repeat(16) };
+    assert.deepEqual(groupSyncDisposition(bad, facts), { verdict: "drop", rule: 4, reason: bad.problem, by: bad.by });
+    assert.equal(groupSyncDisposition(bad, { ...facts, fromDistro: false }).by, undefined);
+    assert.equal(groupSyncDisposition(bad, { ...facts, signedByDistro: false }).by, undefined);
+});
+
+/** A packed LXMF payload [timestamp, title, content, fields] whose fields
+ *  map is the bytes `fieldsHex`, as given. */
+const payloadWith = (fieldsHex) => Buffer.concat([Buffer.from("94" + "cb41daab8c00000000" + "c400" + "c4026869", "hex"), Buffer.from(fieldsHex, "hex")]);
+const ascii = (s) => Buffer.from(s, "ascii").toString("hex");
+
+test("the group entries read from the payload's bytes (GROUPS-DISTRO-DESIGN.md §7, as LXMF-rust unwrap_blob reads them): the vectors' for every fields map and sealed message, and a group message for a fields map msgpackr cannot decode", () => {
+    const { readGroupEntries, groupEntriesOfPayload } = GroupSync;
+    assert.equal(typeof readGroupEntries, "function");
+    assert.equal(typeof groupEntriesOfPayload, "function");
+    for (const v of V.group_entries) {
+        const { group_sync, ...entries } = v.expected;
+        assert.deepEqual(readGroupEntries(hex(v.fields_hex), 0), entries, v.name);
+        assert.deepEqual(groupEntriesOfPayload(payloadWith(v.fields_hex)), entries, `${v.name} in a payload`);
+    }
+    for (const s of V.sealed) {
+        const blob = hex(s.blob_hex);
+        const plaintext = distro.decrypt(blob.subarray(16));
+        const e = s.expected;
+        assert.deepEqual(groupEntriesOfPayload(plaintext.subarray(80)),
+            { has_group_id: e.has_group_id, group_id: e.group_id, group_action: e.group_action, group_name: e.group_name }, s.name);
+    }
+    const id = "4".repeat(32);
+    // { 0xA0: id, 0x77: an ext of type 5 }: msgpackr refuses the map whole; rmpv reads it.
+    const ext = payloadWith("82" + "cca0" + "d920" + ascii(id) + "77" + "d40500");
+    assert.ok(LXMessage.decodePayload(ext).fieldsUnreadable, "msgpackr cannot decode it");
+    assert.deepEqual(groupEntriesOf(LXMessage.decodePayload(ext).fields).has_group_id, false, "so the decoded map shows no group");
+    assert.deepEqual(groupEntriesOfPayload(ext), { has_group_id: true, group_id: id, group_action: null, group_name: null });
+    // In the Retichat field, with an action, beside an ext of type 9 (fixext 4).
+    const inD1 = payloadWith("82" + "ccd1" + "82" + "01" + "d920" + ascii(id) + "04" + "a6" + ascii("accept") + "0a" + "d60901020304");
+    assert.deepEqual(groupEntriesOfPayload(inD1), { has_group_id: true, group_id: id, group_action: "accept", group_name: null });
+    // A distro marker (the last 0xFB) makes it none, as rmpv's reading does.
+    assert.equal(groupEntriesOfPayload(payloadWith("83" + "cca0" + "d920" + ascii(id) + "ccfb" + "b1" + ascii("rfed.distro.group") + "77" + "d40500")).has_group_id, false);
+    // The first of a repeated key, as LXMF-rust top_level reads it.
+    assert.deepEqual(groupEntriesOfPayload(payloadWith("82" + "cca0" + "a1" + ascii("x") + "cca0" + "d920" + ascii(id))),
+        { has_group_id: true, group_id: null, group_action: null, group_name: null });
+    // No fields map, fields that are not a map, or bytes cut short: none.
+    const none = { has_group_id: false, group_id: null, group_action: null, group_name: null };
+    assert.deepEqual(groupEntriesOfPayload(Buffer.from("93" + "cb41daab8c00000000" + "c400" + "c4026869", "hex")), none);
+    assert.deepEqual(groupEntriesOfPayload(payloadWith("c0")), none);
+    assert.deepEqual(groupEntriesOfPayload(payloadWith("82" + "cca0" + "d920" + ascii(id).slice(0, 20))), none);
 });
