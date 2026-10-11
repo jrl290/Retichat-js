@@ -8709,10 +8709,11 @@ const RnsClient = {
             if (!decrypted || decrypted.length < 80) return false;
             const srcHash = decrypted.slice(0, 16);
             const payloadBytes = decrypted.slice(80);
-            // LXMessage.decodePayload: a payload that repeats a key is
-            // refused whole here, before any field is read, with one line,
-            // as Python LXMF refuses it (RFed SPEC §17.14 "Repeated keys";
-            // the catch below adds none); a fields map that cannot be
+            // LXMessage.decodePayload: a payload that repeats a key, has a
+            // key Python cannot hash or nests past depth 493 is refused
+            // whole here, before any field is read, with one line, as Python
+            // LXMF refuses it (RFed SPEC §17.14 "Repeated keys", "Unhashable
+            // keys", "Nesting"; the catch below adds none); a fields map that cannot be
             // decoded costs the fields (and so the attachments), never the
             // message (Android 702e5fb: such a map from a stranger lost the
             // text for good, and every later copy was deduped as seen).

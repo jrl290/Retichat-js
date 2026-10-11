@@ -26,7 +26,7 @@ import { Buffer } from "node:buffer";
 import { existsSync, readFileSync } from "node:fs";
 import MsgPack from "./lib/rns/msgpack.js";
 import { readHead, skipValue } from "./lib/rns/msgpack_raw.js";
-import { repeatedKey, isRefusal } from "./lib/rns/msgpack_keys.js";
+import { refusal, isRefusal, NESTING_MAX_DEPTH } from "./lib/rns/msgpack_keys.js";
 import Identity from "./lib/rns/identity.js";
 import Destination from "./lib/rns/destination.js";
 import Cryptography from "./lib/rns/cryptography.js";
@@ -468,67 +468,131 @@ function logged(run) {
     }
 }
 
-const REFUSAL_LINE = /^\[LXMF\] .* refused whole: a map at depth \d+ repeats a key \(.+\), as Python LXMF refuses it/;
+const REFUSAL_LINE = /^\[LXMF\] .* refused whole: .*, as Python LXMF refuses it \(/;
+/** What a refusal's text says for each `reason` of the vectors (LXMF-rust
+ *  tests/distro_group_sync_vectors.rs reason_text): the reference's own. */
+const REASON_TEXT = { repeated_key: "repeats a key", unhashable_key: "cannot hash", too_deep: "nested past depth" };
 /** M and D as the receiver knows them: every vector message is signed by its source. */
 const recallMD = (h) => ({ [M]: member, [D]: distro })[Buffer.from(h).toString("hex")] ?? null;
 
-test("refused: every vector's payload repeats a key and is refused whole, with one log line, on the direct path (LXMessage.fromBytes, unpackFromBytes) and on the distro path (the blob D | D.encrypt(packed[16:]) decrypted and decoded as _handleDistroBlob decodes it)", () => {
-    assert.deepEqual(V.refused.map((v) => v.name), [
-        "group_id_twice", "group_id_twice_one_malformed", "retichat_field_group_id_twice", "retichat_field_twice",
-        "group_action_and_name_twice", "custom_type_twice_marker_first", "custom_type_twice_marker_last", "g_leave_0xfb_twice",
-        "retichat_field_nested_map_repeats_a_key", "non_group_field_twice", "non_group_field_nested_repeat",
+/** A vector's message, refused whole for `reason` with one log line saying
+ *  so, on the direct path (LXMessage.fromBytes, unpackFromBytes) and on the
+ *  distro path (the blob D | D.encrypt(packed[16:]) decrypted and decoded as
+ *  _handleDistroBlob decodes it). */
+function refusedOnBothPaths(v, reason) {
+    const packed = hex(v.packed_hex);
+    const dest = packed.subarray(0, 16);
+    const plaintext = packed.subarray(16);
+    const why = REASON_TEXT[reason];
+    const direct = logged(() => LXMessage.fromBytes(plaintext, dest, recallMD));
+    assert.equal(direct.result, null, `${v.name}: no message (${v.why})`);
+    assert.equal(direct.lines.length, 1, `${v.name}: one line: ${direct.lines.join(" | ")}`);
+    assert.match(direct.lines[0], REFUSAL_LINE, v.name);
+    assert.ok(direct.lines[0].includes(why), `${v.name}: refused because it ${why}: ${direct.lines[0]}`);
+    assert.ok(direct.lines[0].includes(plaintext.subarray(0, 6).toString("hex")), `${v.name}: the line names the source`);
+    const thrown = logged(() => { try { LXMessage.unpackFromBytes(plaintext, dest, recallMD); return null; } catch (e) { return e; } });
+    assert.ok(isRefusal(thrown.result), `${v.name}: unpackFromBytes throws the refusal`);
+    assert.equal(thrown.result.reason, reason, v.name);
+    assert.equal(thrown.lines.length, 1);
+    // The distro path: the unwrap decrypts, then decodes the payload.
+    const blob = Buffer.concat([dest, distro.encrypt(plaintext)]);
+    const decrypted = distro.decrypt(blob.subarray(16));
+    assert.ok(decrypted.equals(plaintext));
+    const unwrapped = logged(() => { try { LXMessage.decodePayload(decrypted.subarray(80), "distro message"); return null; } catch (e) { return e; } });
+    assert.ok(isRefusal(unwrapped.result), `${v.name}: the distro path's decode refuses it`);
+    assert.equal(unwrapped.result.reason, reason, v.name);
+    assert.equal(unwrapped.lines.length, 1);
+    assert.match(unwrapped.lines[0], REFUSAL_LINE);
+    assert.ok(unwrapped.lines[0].includes(why), `${v.name}: ${unwrapped.lines[0]}`);
+}
+
+/** A vector's message, read on the direct path (signed by its source) and
+ *  on the distro path, its fields as sent; nothing logged. */
+function readOnBothPaths(v) {
+    const packed = hex(v.packed_hex);
+    const { result, lines } = logged(() => LXMessage.fromBytes(packed.subarray(16), packed.subarray(0, 16), recallMD));
+    assert.notEqual(result, null, `${v.name}: read (${v.why}): ${lines.join(" | ")}`);
+    assert.equal(result.signatureValidated, true, `${v.name}: read, signed by its source`);
+    assert.deepEqual(lines, [], v.name);
+    const decrypted = distro.decrypt(Buffer.concat([packed.subarray(0, 16), distro.encrypt(packed.subarray(16))]).subarray(16));
+    const decoded = logged(() => LXMessage.decodePayload(decrypted.subarray(80), "distro message"));
+    assert.deepEqual(decoded.lines, [], v.name);
+    // Its fields are read, but for an ext msgpackr does not know, which costs
+    // the fields and never the message (decodePayload, as before).
+    if (decoded.result.fieldsUnreadable !== null) assert.match(decoded.result.fieldsUnreadable, /^Unknown extension/, v.name);
+    assert.ok(hex(v.packed_hex).subarray(96).subarray(fieldsAt(hex(v.packed_hex).subarray(96))).equals(hex(v.fields_hex)), `${v.name}: the fields end the payload, as sent`);
+}
+
+test("refused: every vector's payload repeats a key or has a key Python cannot hash, and is refused whole for the reference's own reason (the first umsgpack meets), with one log line, on the direct path and on the distro path", () => {
+    assert.deepEqual(V.refused.map((v) => [v.name, v.reason]), [
+        ["group_id_twice", "repeated_key"], ["group_id_twice_one_malformed", "repeated_key"],
+        ["retichat_field_group_id_twice", "repeated_key"], ["retichat_field_twice", "repeated_key"],
+        ["group_action_and_name_twice", "repeated_key"], ["custom_type_twice_marker_first", "repeated_key"],
+        ["custom_type_twice_marker_last", "repeated_key"], ["g_leave_0xfb_twice", "repeated_key"],
+        ["retichat_field_nested_map_repeats_a_key", "repeated_key"], ["non_group_field_twice", "repeated_key"],
+        ["non_group_field_nested_repeat", "repeated_key"], ["map_key_beside_group_id", "unhashable_key"],
+        ["map_key_not_empty", "unhashable_key"], ["array_key_holding_a_map", "unhashable_key"],
+        ["array_key_holding_a_map_deeper", "unhashable_key"], ["retichat_field_map_key", "unhashable_key"],
+        ["non_group_field_nested_map_key", "unhashable_key"], ["g_leave_map_key", "unhashable_key"],
+        ["map_key_that_repeats_a_key", "repeated_key"], ["map_key_whose_value_repeats_a_key", "unhashable_key"],
+        ["array_key_holding_a_map_whose_value_repeats_a_key", "repeated_key"], ["array_key_holding_a_map_then_a_repeat", "unhashable_key"],
     ]);
     for (const v of V.refused) {
         const packed = hex(v.packed_hex);
-        const dest = packed.subarray(0, 16);
-        const plaintext = packed.subarray(16);
-        assert.equal(dest.toString("hex"), D, `${v.name}: to D`);
-        assert.equal(plaintext.subarray(0, 16).toString("hex"), v.source === "distro" ? D : M, `${v.name}: from its source`);
-        assert.notEqual(repeatedKey(packed.subarray(96)), null, `${v.name}: the payload repeats a key`);
-        assert.equal(repeatedKey(hex(v.fields_hex))?.depth, repeatedKey(packed.subarray(96)).depth - 1, `${v.name}: in the fields`);
-        // The direct path.
-        const direct = logged(() => LXMessage.fromBytes(plaintext, dest, recallMD));
-        assert.equal(direct.result, null, `${v.name}: no message (${v.why})`);
-        assert.equal(direct.lines.length, 1, `${v.name}: one line: ${direct.lines.join(" | ")}`);
-        assert.match(direct.lines[0], REFUSAL_LINE, v.name);
-        assert.ok(direct.lines[0].includes(plaintext.subarray(0, 6).toString("hex")), `${v.name}: the line names the source`);
-        assert.equal(typeof LXMessage.unpackFromBytes, "function");
-        const thrown = logged(() => { try { LXMessage.unpackFromBytes(plaintext, dest, recallMD); return null; } catch (e) { return e; } });
-        assert.ok(isRefusal(thrown.result), `${v.name}: unpackFromBytes throws the refusal`);
-        assert.equal(thrown.lines.length, 1);
-        // The distro path: the unwrap decrypts, then decodes the payload.
-        const blob = Buffer.concat([dest, distro.encrypt(plaintext)]);
-        const decrypted = distro.decrypt(blob.subarray(16));
-        assert.ok(decrypted.equals(plaintext));
-        const unwrapped = logged(() => { try { LXMessage.decodePayload(decrypted.subarray(80), "distro message"); return null; } catch (e) { return e; } });
-        assert.ok(isRefusal(unwrapped.result), `${v.name}: the distro path's decode refuses it`);
-        assert.equal(unwrapped.lines.length, 1);
-        assert.match(unwrapped.lines[0], REFUSAL_LINE);
+        assert.equal(packed.subarray(0, 16).toString("hex"), D, `${v.name}: to D`);
+        assert.equal(packed.subarray(16, 32).toString("hex"), v.source === "distro" ? D : M, `${v.name}: from its source`);
+        const inPayload = refusal(packed.subarray(96));
+        const inFields = refusal(hex(v.fields_hex));
+        assert.equal(inPayload?.reason, v.reason, `${v.name}: the payload, for the reference's reason`);
+        assert.equal(inFields?.reason, v.reason, `${v.name}: in the fields`);
+        assert.equal(inFields.depth, inPayload.depth - 1, `${v.name}: one deeper in the payload`);
+        refusedOnBothPaths(v, v.reason);
     }
 });
 
-test("key_equality: two keys are one key exactly when Python's umsgpack says so; the message is refused exactly then, with one line, and read otherwise", () => {
-    assert.equal(V.key_equality.length, 22);
+test("key_equality: two keys are one key exactly when Python's umsgpack says so; the message is refused exactly then, with one line, and read otherwise, its fields as sent; an array key that holds no map is read", () => {
+    assert.equal(V.key_equality.length, 24);
     assert.equal(V.key_equality.filter((v) => v.refused).length, 15);
+    for (const name of ["array_twice", "empty_array_twice", "array_holding_an_array_twice"]) {
+        assert.equal(V.key_equality.find((v) => v.name === name)?.refused, false, name);
+    }
     for (const v of V.key_equality) {
-        assert.equal(repeatedKey(hex(v.fields_hex)) !== null, v.refused, `${v.name}: the fields map (${v.why})`);
-        const packed = hex(v.packed_hex);
-        assert.equal(repeatedKey(packed.subarray(96)) !== null, v.refused, `${v.name}: the payload`);
-        const { result, lines } = logged(() => LXMessage.fromBytes(packed.subarray(16), packed.subarray(0, 16), recallMD));
-        assert.equal(result === null, v.refused, `${v.name}: ${v.why}`);
-        assert.equal(lines.length, v.refused ? 1 : 0, `${v.name}: ${lines.join(" | ")}`);
-        if (!v.refused) assert.equal(result.signatureValidated, true, `${v.name}: read, signed by M`);
+        assert.equal(refusal(hex(v.fields_hex))?.reason ?? null, v.refused ? "repeated_key" : null, `${v.name}: the fields map (${v.why})`);
+        assert.equal(refusal(hex(v.packed_hex).subarray(96))?.reason ?? null, v.refused ? "repeated_key" : null, `${v.name}: the payload`);
+        if (v.refused) refusedOnBothPaths(v, "repeated_key");
+        else readOnBothPaths(v);
     }
 });
 
-test("no vector outside refused and key_equality repeats a key, so every other reading here is a reading of a message the reference reads", () => {
-    for (const set of ["ops", "variants", "at_ms_encodings", "rejects", "group_entries"]) {
-        for (const v of V[set]) {
-            assert.equal(repeatedKey(hex(v.fields_hex)), null, `${set} ${v.name}: fields`);
-            if (v.packed_hex) assert.equal(repeatedKey(hex(v.packed_hex).subarray(96)), null, `${set} ${v.name}: payload`);
+test("nesting: a message whose payload holds any value deeper than nesting_max_depth (493) is refused whole on the direct path and on the distro path, with one line; one at the limit is read, its fields as sent", () => {
+    assert.equal(V.nesting_max_depth, NESTING_MAX_DEPTH);
+    assert.equal(NESTING_MAX_DEPTH, 493);
+    assert.deepEqual(V.nesting.map((v) => [v.name, v.refused]), [
+        ["arrays_at_the_limit", false], ["arrays_past_the_limit", true], ["maps_at_the_limit", false], ["maps_past_the_limit", true],
+        ["int_at_the_limit", false], ["int_past_the_limit", true], ["str_at_the_limit", false], ["str_past_the_limit", true],
+        ["key_at_the_limit", false], ["key_past_the_limit", true], ["far_past_the_limit", true],
+    ]);
+    for (const v of V.nesting) {
+        const found = refusal(hex(v.packed_hex).subarray(96));
+        if (v.refused) {
+            assert.equal(v.reason, "too_deep", v.name);
+            assert.deepEqual(found, { reason: "too_deep", depth: NESTING_MAX_DEPTH + 1 }, `${v.name}: ${v.why}`);
+            refusedOnBothPaths(v, "too_deep");
+        } else {
+            assert.equal(found, null, `${v.name}: ${v.why}`);
+            readOnBothPaths(v);
         }
     }
-    for (const s of V.sealed) assert.equal(repeatedKey(distro.decrypt(hex(s.blob_hex).subarray(16)).subarray(80)), null, s.name);
+});
+
+test("no vector outside refused, key_equality and nesting is refused, so every other reading here is a reading of a message the reference reads", () => {
+    for (const set of ["ops", "variants", "at_ms_encodings", "rejects", "group_entries"]) {
+        for (const v of V[set]) {
+            assert.equal(refusal(hex(v.fields_hex)), null, `${set} ${v.name}: fields`);
+            if (v.packed_hex) assert.equal(refusal(hex(v.packed_hex).subarray(96)), null, `${set} ${v.name}: payload`);
+        }
+    }
+    for (const s of V.sealed) assert.equal(refusal(distro.decrypt(hex(s.blob_hex).subarray(16)).subarray(80)), null, s.name);
 });
 
 test("by is 0xFD as text, lowercased, when 0xFD is a str or a bin, else \"\": absent, an int, an array (the variants)", () => {

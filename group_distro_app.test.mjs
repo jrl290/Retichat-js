@@ -1305,14 +1305,25 @@ test("SPEC §17.14 \"Repeated keys\", the distro path: a payload that repeats a 
     assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "beside an ext"), true, "stored in the group");
 });
 
-test("SPEC §17.14 \"Repeated keys\": every refused vector (LXMF-rust 16a9902, each refused by the reference) is refused whole on the real handler, on the direct path and on the distro path, with one log line, and leaves nothing behind: no message, group, contact, held arrival, sibling or seen key", async () => {
+/** The one line of a payload refused whole for its msgpack, for `reason`
+ *  (a vector's: repeated_key, unhashable_key, too_deep). */
+const REFUSED_FOR = {
+    repeated_key: /^\[LXMF\] .* refused whole: a map at depth \d+ repeats a key \(.+\), as Python LXMF refuses it \(umsgpack DuplicateKeyException/,
+    unhashable_key: /^\[LXMF\] .* refused whole: a map at depth \d+ has a key Python cannot hash \(.+\), as Python LXMF refuses it \(umsgpack UnhashableKeyException/,
+    too_deep: /^\[LXMF\] .* refused whole: a value at depth 494 is nested past depth 493, as Python LXMF refuses it \(RecursionError/,
+};
+
+test("SPEC §17.14 \"Repeated keys\", \"Unhashable keys\", \"Nesting\": every refused vector and every nesting vector past the limit (LXMF-rust b873c00, each refused by the reference) is refused whole on the real handler, on the direct path and on the distro path, with one log line giving the reference's reason, and leaves nothing behind: no message, group, contact, held arrival, sibling or seen key; a nesting vector at the limit is taken on both", async () => {
     const V = JSON.parse(readFileSync(new URL("./distro_group_sync_vectors.json", import.meta.url), "utf8"));
     const Did = Identity.fromPrivateKey(Buffer.from(V.distro.private_key_hex, "hex"));
     const Mid = Identity.fromPrivateKey(Buffer.from(V.member.private_key_hex, "hex"));
     const D = lxmfHash(Did);
-    assert.equal(V.refused.length, 11);
-    for (const v of V.refused) {
+    assert.equal(V.refused.length, 22);
+    assert.equal(V.nesting.length, 11);
+    for (const v of [...V.refused, ...V.nesting]) {
         const packed = Buffer.from(v.packed_hex, "hex");
+        const refused = v.reason !== undefined;
+        assert.equal(refused, v.refused !== false, v.name);
         // The direct path: the vectors are addressed to D, so this device's
         // own address is D here; both sources are known and allowlisted, and
         // the group the entries name is held, so nothing else would drop it.
@@ -1322,17 +1333,23 @@ test("SPEC §17.14 \"Repeated keys\": every refused vector (LXMF-rust 16a9902, e
         direct.GroupStore.addPending(V.group.group_id, "G", lxmfHash(Mid), [lxmfHash(Mid), D], D);
         const directBefore = footprint(direct);
         const directLines = said(await logLines(() => direct.receive(packed)));
-        assert.equal(footprint(direct), directBefore, `${v.name}: the direct path leaves nothing (${v.why})`);
-        assert.deepEqual([directLines.length, REFUSAL_LINE.test(directLines[0] ?? "")], [1, true], `${v.name}: ${directLines.join(" | ")}`);
         // The distro path: a device holding D, as RFed fans it out.
         const viaDistro = groupClient({ distro: Did });
         viaDistro.know(Mid);
         viaDistro.GroupStore.addPending(V.group.group_id, "G", lxmfHash(Mid), [lxmfHash(Mid), D], D);
         const distroBefore = footprint(viaDistro);
         const distroLines = await logLines(() => viaDistro.receiveDistro(packed));
+        if (!refused) {
+            assert.equal(direct.emitted.length, 1, `${v.name}: the direct path takes it (${v.why}): ${directLines.join(" | ")}`);
+            assert.deepEqual(viaDistro.distroKept, [true], `${v.name}: the distro path takes it: ${distroLines.join(" | ")}`);
+            assert.equal([...directLines, ...distroLines].some((l) => /refused whole/.test(l)), false, v.name);
+            continue;
+        }
+        assert.equal(footprint(direct), directBefore, `${v.name}: the direct path leaves nothing (${v.why})`);
+        assert.deepEqual([directLines.length, REFUSED_FOR[v.reason].test(directLines[0] ?? "")], [1, true], `${v.name}: ${directLines.join(" | ")}`);
         assert.deepEqual(viaDistro.distroKept, [false], `${v.name}: not taken`);
         assert.equal(footprint(viaDistro), distroBefore, `${v.name}: the distro path leaves nothing`);
-        assert.deepEqual([distroLines.length, REFUSAL_LINE.test(distroLines[0] ?? "")], [1, true], `${v.name}: ${distroLines.join(" | ")}`);
+        assert.deepEqual([distroLines.length, REFUSED_FOR[v.reason].test(distroLines[0] ?? "")], [1, true], `${v.name}: ${distroLines.join(" | ")}`);
     }
 });
 
