@@ -16,7 +16,7 @@ import test from "node:test";
 import { Buffer } from "node:buffer";
 import { senderKeyEntry } from "./lib/group_status.js";
 import { shortHash } from "./lib/display_name.js";
-import { compile, methodBody } from "./test_app_source.mjs";
+import { app, compile, methodBody } from "./test_app_source.mjs";
 import { groupClient, network, settle, lxmfHash, lxm, oldFields, Identity, LXMessage, GROUP_FIELDS } from "./test_group_net.mjs";
 import { groupSyncFields } from "./lib/group_sync.js";
 import LXMF from "./lib/rns/lxmf/lxmf.js";
@@ -630,6 +630,12 @@ test("§9.2, §12: a creator that is D counts a known sibling's keyed accept rea
 const G = (Did, dev, sync, { signer = Did, from = Did } = {}) =>
     lxm(from, lxmfHash(Did), "", groupSyncFields({ left: [], ...sync }, lxmfHash(Did), dev), { signer, timestamp: Date.now() / 1000 });
 
+/** The §10.1 sync an owed G entry carries, read as a sibling reads it. */
+const readG = (entry, D) => LXMF.distroGroupSyncFromPayload(Buffer.from(entry.packed, "base64").subarray(96), D);
+
+/** A GROUP_MEMBER_KEYS entry for identity `who` (§10.2). */
+const keyEntry = (who) => `${lxmfHash(who)}:${Buffer.from(who.getPublicKey()).toString("base64")}`;
+
 /** Two devices of D, u1 and u2, that both hold C's invite to D pending
  *  (viaD), with M on the list. */
 const twoPending = () => viaD({ devices: 2 });
@@ -674,10 +680,17 @@ test("§19.2: a D-group post owes one post G (and no §17.11 copy) once its fan-
 
 test("§19.2, §11.2: an accept G joins a sibling's matching pending invite, and a leave in a D-group sends one leave as D and owes one leave G, which closes and removes the group on the siblings, sending nothing", async () => {
     const { us: [u1, u2], c, m, D, Did, net, id } = await twoPending();
+    m.page._acceptGroupInvite(id);
+    await net.pump(m);
+    assert.equal(u2.status(id, m.own), "accepted", "M's own accept counts on u2 while pending");
+    const pendingLines = u2.GroupMsgStore.get(id).map((x) => x.id);
+    assert.ok(u2.GroupMsgStore.get(id).some((x) => x.actor === c.own), "C's invite line");
     u1.page._acceptGroupInvite(id);
     const sentBefore = u2.sent.length;
     await net.syncs(u1);
     assert.deepEqual([u2.GroupStore.get(id)?.groupStatus, u2.status(id, D), u2.GroupStore.get(id)?.creator], ["active", "accepted", c.own], "joined as is");
+    assert.equal(u2.status(id, m.own), "accepted", "the invite joined as is, never replaced: M's accept still counts");
+    assert.ok(pendingLines.every((x) => u2.GroupMsgStore.get(id).some((y) => y.id === x)), "and its conversation is kept");
     assert.equal(u2.ContactStore.allowlisted(m.own), true, "the members pass the filter by association");
     assert.equal(u2.sent.length, sentBefore, "joined without sending anything");
     assert.equal(u2.KnownSiblingsStore.has(D, u1.own), true, "u1 is a known sibling now (§9.1)");
@@ -709,6 +722,7 @@ test("§19.2: group sync rules: a source not D, or a forged signature, is droppe
     // Rule 2: source D, signed by someone else.
     await u.receiveDistro(G(Did, other.own, create, { signer: Identity.create() }));
     assert.deepEqual(u.distroKept, [false, false]);
+    assert.deepEqual(u.events.filter((e) => e.kind === "distro-group-sync").map((e) => e.detail.rule), [1, 2], "each by its own rule");
     assert.equal(u.GroupStore.get(X), null, "nothing held from either");
     assert.equal([...u.DistroSeen._keys].some((k) => k.startsWith("gsync:")), false, "neither is recorded as seen");
     // Rule 3: this device's own G: kept, recorded, nothing applied.
@@ -722,6 +736,11 @@ test("§19.2: group sync rules: a source not D, or a forged signature, is droppe
     await u.receiveDistro(G(Did, other.own, { op: "leave", group_id: X, at_ms: 2000 }));
     await u.receiveDistro(G(Did, other.own, { op: "accept", group_id: X, at_ms: 9000, name: "X", members: [M, D].join(","), keys: [], creator: M }));
     assert.deepEqual([u.GroupStore.get(X), u.GroupStore.isClosed(X)], [null, true], "a leave is final, whatever the time");
+    // A post G for a group closed here is dropped, and not recorded as seen.
+    const late = G(Did, other.own, { op: "post", group_id: X, at_ms: 9500, text: "after the leave" });
+    await u.receiveDistro(late);
+    assert.deepEqual([u.distroKept.at(-1), u.GroupMsgStore.get(X), u.HeldGroupArrivalsStore.forGroup(X)], [false, [], []]);
+    assert.equal(u.DistroSeen._keys.has(`gsync:${packingHash(late)}`), false);
     // A leave for a group not held here blocks a later invite.
     const Y = "d".repeat(32);
     await u.receiveDistro(G(Did, other.own, { op: "leave", group_id: Y, at_ms: 1 }));
@@ -734,6 +753,9 @@ test("§19.2: group sync rules: a source not D, or a forged signature, is droppe
     u.GroupStore.addPending(H, "H", M, [M, u.own, D]);
     await u.receiveDistro(G(Did, other.own, { op: "leave", group_id: H, at_ms: 3 }));
     assert.equal(u.GroupStore.get(H)?.groupStatus, "pending", "ignored: the user acts as the device there");
+    // `left` naming it, on a G that passes rules 0-4: still not touched.
+    await u.receiveDistro(G(Did, other.own, { op: "leave", group_id: "a".repeat(32), at_ms: 4, left: [H] }));
+    assert.deepEqual([u.GroupStore.get(H)?.groupStatus, u.GroupStore.isClosed(H)], ["pending", false], "a group held as the device is not closed by `left`");
 });
 
 test("§19.2 (squat): a pending invite from M for id X, then an accept G for X from creator C: M's invite is discarded with nothing sent, the group is held from G with creator C and C's list; nothing ever goes to M's extra member", async () => {
@@ -757,6 +779,7 @@ test("§19.2 (squat): a pending invite from M for id X, then an accept G for X f
     // M's own invite for X, listing M3, reaches D.
     await u2.receiveDistro(lxm(m.me, D, "", oldFields({ id: X, members: [m.own, D, M3].join(","), name: "G", action: "invite", sender: m.own })));
     assert.equal(u2.GroupStore.get(X)?.creator, m.own, "u2 holds M's version, pending");
+    assert.ok(u2.GroupMsgStore.get(X).some((x) => x.actor === m.own), "with M's invite line");
     const sentBefore = u2.sent.length;
     u1.page._acceptGroupInvite(X);
     await net.syncs(u1);
@@ -764,6 +787,7 @@ test("§19.2 (squat): a pending invite from M for id X, then an accept G for X f
     assert.deepEqual([held?.groupStatus, held?.creator, held?.ownMember], ["active", c.own, D], "held from G, creator C");
     assert.deepEqual([...held.members.keys()].sort(), [c.own, m.own, D].sort(), "C's list: M3 is not on it");
     assert.equal(u2.sent.length, sentBefore, "the discard sent nothing (no decline to M's list)");
+    assert.equal(u2.GroupMsgStore.get(X).some((x) => x.actor === m.own), false, "M's version is discarded with its conversation");
     assert.equal(u2.FilteredInvitesStore.has(X), false, "the id left the filtered-invite set");
     u2.GroupStore.updateMember(X, m.own, "accepted");
     void u2.self.sendGroupMessage(X, "to C's group");
@@ -782,7 +806,7 @@ test("§19.2: a create G applied lets the members pass the filter by association
 });
 
 test("§19.2: `left`: a sibling still joined in Y receives a post G for Z carrying Y in left: Y is removed and closed there", async () => {
-    const { u1, u2, a, D, net, ids: [Y, Z] } = await created(["Y", "Z"]);
+    const { u1, u2, a, D, Did, net, ids: [Y, Z] } = await created(["Y", "Z"]);
     u1.page._leaveGroup(Y);
     await net.syncs(u1, { skip: [u2] });             // u2 misses the leave G (a full queue)
     assert.equal(u2.GroupStore.get(Y)?.groupStatus, "active");
@@ -795,6 +819,10 @@ test("§19.2: `left`: a sibling still joined in Y receives a post G for Z carryi
     assert.deepEqual([u2.GroupStore.get(Y), u2.GroupStore.isClosed(Y)], [null, true], "Y repaired by left");
     assert.ok(u2.GroupMsgStore.get(Z).some((x) => x.content === "in Z" && x.dir === "out"), "Z's post shown");
     assert.ok(u2.DistroLeftStore.of(D).includes(Y), "Y travels on in u2's own left list");
+    // Each id other than the G's own group_id (§11.2).
+    await u2.receiveDistro(G(Did, u1.own, { op: "post", group_id: Z, at_ms: Date.now(), text: "Z, in its own left", left: [Z] }));
+    assert.deepEqual([u2.GroupStore.get(Z)?.groupStatus, u2.GroupStore.isClosed(Z)], ["active", false], "a G's own id in its left list closes nothing");
+    assert.ok(u2.GroupMsgStore.get(Z).some((x) => x.content === "Z, in its own left"));
 });
 
 test("§19.2: a creator status and a post G held while pending are applied after the accept G, not dropped as repeats", async () => {
@@ -853,6 +881,10 @@ test("§9.1: a sent-copy's 0xFD teaches a sibling; giving D up forgets what was 
     u.know({ own: lxmfHash(x), pubKey: x.getPublicKey().toString("hex") });
     await u.receiveDistro(lxm(x, D, "early", oldFields({ id: "f".repeat(32) })));
     assert.equal(u.HeldGroupArrivalsStore.list().length, 1);
+    u.self._onDistroChangedForGroups();
+    assert.equal(u.HeldGroupArrivalsStore.list().length, 1, "D still held: what reached it stays held");
+    u.self._learnDistroSibling(D, u.own, "a test");
+    assert.equal(u.KnownSiblingsStore.has(D, u.own), false, "this device is never its own sibling");
     u.DistroManager.set(null);
     u.self._onDistroChangedForGroups();
     assert.deepEqual(u.HeldGroupArrivalsStore.list(), [], "forgotten with D");
@@ -873,5 +905,113 @@ test("§19.2: \"Delete from this device\" owes no G, and nothing is owed for a g
     const { group } = plain.self.createGroup("P", [a.own]);
     plain.page._leaveGroup(group.groupId);
     assert.deepEqual(plain.owed, [], "no D: nothing owed");
-    void D; void Did;
+    // A group held as the device, on a device that holds D: the user acts as the device there.
+    const H = "b".repeat(32);
+    u.DistroManager.set(Did);
+    u.GroupStore.addPending(H, "H", a.own, [a.own, u.own]);
+    const before = u.owed.length;
+    u.page._declineGroupInvite(H);
+    assert.deepEqual([u.owed.length, u.GroupStore.isClosed(H)], [before, true], "declined, and no G");
+    void D;
+});
+
+test("§10.6: a G that cannot be owed is said and recorded, and the user's action goes on: the leave is sent and the group closed", async () => {
+    const { u, c, Did, id } = await dPending();
+    u.page._acceptGroupInvite(id);
+    const errors = [];
+    u.Harness.error = (kind, error) => errors.push([kind, error.message]);
+    u.self._oweDistro = () => { throw new Error("storage is full"); };
+    const from = u.sent.length;
+    u.page._leaveGroup(id);
+    await settle();
+    assert.deepEqual(errors, [["distro-group-sync", "storage is full"]]);
+    assert.equal(u.GroupStore.isClosed(id), true, "closed");
+    assert.ok(u.decoded(from, Did).some((s) => s.to === c.own && decodeFields(s.message)?.groupAction === "leave"), "the leave went, as D");
+});
+
+test("§10.2: what a G carries: a create the csv its invites carried and the keys of the listed members this device holds; a post the time its message was stored, shown there on the sibling; a key a G gives for a member not listed is never kept", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u1 = groupClient({ distro: Did }), u2 = groupClient({ distro: Did });
+    const a = groupClient();
+    for (const u of [u1, u2]) u.know(a).reachable(a.own);
+    const net = network(u1, u2, a);
+    const from = u1.sent.length;
+    const Y = u1.self.createGroup("Y", [a.own]).group.groupId;
+    await settle();
+    const carried = u1.decoded(from, Did).map((s) => decodeFields(s.message)?.membersCsv).find(Boolean);
+    assert.ok(carried);
+    const create = readG(u1.owed[0], D);
+    assert.equal(create.op, "create");
+    assert.equal(create.members, carried, "the csv exactly as its invites carried it");
+    assert.deepEqual([...create.keys].sort(), [keyEntry(a.me), keyEntry(Did)].sort(), "A's key and D's own");
+    // A post stored earlier (queued, say) and dispatched now: at the time it was stored.
+    u1.GroupStore.updateMember(Y, a.own, "accepted");
+    const early = u1.GroupMsgStore.add(Y, { dir: "out", content: "written earlier", status: "queued", waitFor: "init", srcHash: D, timestamp: 5000 });
+    void u1.self._dispatchGroupMessage(Y, early);
+    await settle();
+    const post = readG(u1.owed.find((e) => e.op === "post"), D);
+    assert.deepEqual([post.at_ms, post.text], [5000, "written earlier"]);
+    await net.syncs(u1);
+    assert.equal(u2.GroupMsgStore.get(Y).find((x) => x.content === "written earlier")?.timestamp, 5000, "shown at at_ms on the sibling");
+    // Keys a create G gives: a listed member's is kept, one for a hash not listed is not.
+    const b = Identity.create(), x = Identity.create();
+    const Z = "9".repeat(32);
+    await u2.receiveDistro(G(Did, u1.own, { op: "create", group_id: Z, at_ms: 1, name: "Z", members: [lxmfHash(b), D].join(","), keys: [keyEntry(b), keyEntry(x)] }));
+    assert.equal(u2.GroupStore.get(Z)?.groupStatus, "active");
+    assert.equal(u2.ContactStore.get(lxmfHash(b))?.publicKey, Buffer.from(b.getPublicKey()).toString("hex"), "the listed member's key");
+    assert.equal(u2.ContactStore.get(lxmfHash(x))?.publicKey ?? null, null, "never a key for a hash the list does not name");
+});
+
+test("§11.2: an accept G that brings a member's key decides that member's accept held here for want of it (from the switch, when an accept that cannot be verified is held)", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u1 = groupClient({ distro: Did, switched: true }), u2 = groupClient({ distro: Did, switched: true });
+    const c = groupClient(), m = groupClient();
+    const all = [u1, u2, c, m];
+    for (const p of all) for (const q of all) if (p !== q) p.reachable(q.own);
+    for (const p of all) p.reachable(D);
+    const net = network(...all);
+    for (const u of [u1, u2]) u.know(c);
+    u1.know(m);                                       // u1 holds M's key; u2 does not
+    const id = "7".repeat(32);
+    const invite = lxm(c.me, D, "", oldFields({ id, members: [c.own, m.own, D].join(","), name: "G", action: "invite", sender: c.own }));
+    await u1.receiveDistro(invite);
+    await u2.receiveDistro(invite);
+    assert.deepEqual([u1.GroupStore.get(id)?.groupStatus, u2.GroupStore.get(id)?.groupStatus], ["pending", "pending"]);
+    await u2.receiveDistro(lxm(m.me, D, "", oldFields({ id, action: "accept", sender: m.own })));
+    assert.equal(u2.status(id, m.own), "invited", "M's accept is held: its key is not here");
+    assert.deepEqual(u2.held(), [[m.own, "accept"]]);
+    u1.page._acceptGroupInvite(id);
+    await net.syncs(u1);
+    assert.equal(u2.GroupStore.get(id)?.groupStatus, "active");
+    assert.equal(u2.status(id, m.own), "accepted", "decided once the accept G brought M's key");
+    assert.deepEqual(u2.held(), []);
+});
+
+test("§19.2: a post G for a group not joined here is held (pending: as a pending group's), never for a group whose invite the filter dropped; a decline G closes a pending group as a decline, forgets what was held for it and closes its open chat", async () => {
+    const { us: [u1, u2], Did, net, id } = await twoPending();
+    // A post G for a group not held here.
+    const N = "5".repeat(32);
+    await u2.receiveDistro(G(Did, u1.own, { op: "post", group_id: N, at_ms: 1, text: "elsewhere" }));
+    assert.deepEqual([u2.distroKept.at(-1), u2.HeldGroupArrivalsStore.forGroup(N).map((r) => r.pending)], [true, [false]]);
+    // One for a group whose invite this device's filter dropped.
+    const F = "6".repeat(32);
+    u2.FilteredInvitesStore.add(F);
+    await u2.receiveDistro(G(Did, u1.own, { op: "post", group_id: F, at_ms: 1, text: "filtered" }));
+    assert.deepEqual([u2.distroKept.at(-1), u2.HeldGroupArrivalsStore.forGroup(F)], [false, []], "dropped, never held");
+    // One for the pending group.
+    await u2.receiveDistro(G(Did, u1.own, { op: "post", group_id: id, at_ms: 1, text: "pending" }));
+    assert.deepEqual(u2.HeldGroupArrivalsStore.forGroup(id).map((r) => r.pending), [true], "held as a pending group's");
+    const notes = notified(u2);
+    u1.page._declineGroupInvite(id);
+    await net.syncs(u1);
+    assert.deepEqual([u2.GroupStore.get(id), u2.GroupStore._closed.get(id)], [null, "rejected"], "closed as the local decline closes it");
+    assert.deepEqual(u2.HeldGroupArrivalsStore.forGroup(id), [], "what was held for it goes");
+    assert.deepEqual(notes.filter(([conv, msg]) => conv === id && msg?.kind === "group-left").map(([, msg]) => msg.synced), [true], "the page closes its chat if open");
+});
+
+test("wiring (§6.5, §9.1, §11.2): the distro changing runs what giving D up forgets; a group left on a sibling closes its open chat as a channel left there does", () => {
+    assert.match(app, /\nDistroManager\.onChange\(\(\) => RnsClient\._onDistroChangedForGroups\(\)\);\n/);
+    assert.match(app, /if \(\(msg\.kind === "channel-left" \|\| msg\.kind === "group-left"\) && msg\.synced\) \{\s*if \(inActiveChat\) \{\s*this\.state\.activeHash = null;/);
 });
