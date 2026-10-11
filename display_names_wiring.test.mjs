@@ -498,7 +498,7 @@ test("§5.3 no surface builds a name from displayName or a \"?hash\" placeholder
 });
 
 test("the group invite notice and the distro import prompt name the sender through the resolver (audit M14)", () => {
-    const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
+    const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)");
     assert.match(handler, /GroupMsgStore\.addSystem\(groupId, `invited you to "\$\{groupName \|\| "Group"\}"`, srcHash\)/);
     // An accept or a leave is about its own source (James's group model,
     // 2026-10-01), so the notice names the source, by hash: counted as it
@@ -1222,7 +1222,7 @@ function makeGroupReceiver(me, memberHashes, { switched = false } = {}) {
         PrivacyFilter, sentTimeMs, Buffer, LXMessage: LXM, Harness, ...groupStatusEnv({ GROUP_ENTRIES_IN_RETICHAT_FIELD: switched }),
     };
     for (const signature of [
-        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
+        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)",
         ...GROUP_STATUS_METHODS,
     ]) r.self[signature.slice(0, signature.indexOf("("))] = compile(signature, env)(r.self);
     const systemText = fn("systemMessageText", "m", { ContactStore: r.ContactStore });
@@ -1230,7 +1230,7 @@ function makeGroupReceiver(me, memberHashes, { switched = false } = {}) {
     /** The user pressing Accept on a pending invite (the real _acceptGroupInvite). */
     const acceptInvite = compile("_acceptGroupInvite(groupId)", {
         GroupStore, ContactStore: r.ContactStore, GroupMsgStore, console: quiet,
-        RnsClient: { ownHash: own(), _requestGroupPeer() {}, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
+        RnsClient: { ownHash: own(), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
             _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(`the accept was held back: ${m}`),
     })({ render() {} });
@@ -1414,7 +1414,7 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore: { get: () => ({ groupName: "G", members: new Map([[B, "accepted"], [A, "invited"], [lxmfHash(me), "invited"]]) }), accept() {} },
         ContactStore: store, GroupMsgStore: { addSystem() {} }, console: quiet,
-        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, _decideHeldGroupChanges() {}, sendGroupAccept: async () => {},
+        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges() {}, sendGroupAccept: async () => {},
             _groupSelf: () => new Set([lxmfHash(me)]), groupFormerDistroText: () => null },
         alert: () => assert.fail("keys are all there"),
     });

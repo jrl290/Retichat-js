@@ -39,8 +39,8 @@ import { sentTimeMs } from "./lib/day_markers.js";
 import { applyGroupFields } from "./lib/retichat_field.js";
 import { senderKeyEntry } from "./lib/group_status.js";
 import { NameLedger } from "./lib/name_ledger.js";
-import { KnownSiblings } from "./lib/group_distro.js";
-import { app, build, compile, constValue, fn, memoryStorage, messageHandler, GROUP_STATUS_METHODS, groupStatusEnv, GROUP_SELF_METHODS, groupSelfEnv } from "./test_app_source.mjs";
+import { KnownSiblings, HeldGroupArrivals, FilteredInvites, DistroLeftGroups } from "./lib/group_distro.js";
+import { app, build, compile, constValue, fn, memoryStorage, messageHandler, GROUP_STATUS_METHODS, groupStatusEnv, GROUP_SELF_METHODS, groupSelfEnv, GROUP_DISTRO_METHODS } from "./test_app_source.mjs";
 import { settle } from "./test_link_pair.mjs";
 
 export { settle, GROUP_FIELDS, LXMessage, Identity, Destination };
@@ -141,7 +141,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
 
     const recall = appFunction("recallLxmfIdentity", {
         Buffer, Identity, Destination, IdMgr: { has: true, id: me }, ownLxmfDestinationHash: () => own,
-        DistroManager: { has: false }, ContactStore,
+        DistroManager, ContactStore,
     });
     const destination = new EventEmitter();
     destination.hash = Destination.hash(me, "lxmf", "delivery");
@@ -185,25 +185,40 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
         _groupLinks: new Map(), _groupLinkPromises: new Map(), _pendingPacketHashes: new Map(),
         _groupFallbacks: { schedule: (key) => { fallbacks.push(key.slice(0, key.indexOf(":"))); return true; }, prove() {} },
         _performGroupRelay: (...a) => { relays.push(a); },
-        // The propagation node's edge: what is propagated is recorded.
-        _sendGroupPropagationFallback: async (bytes, publicKeyHex, memberHash) => { propagated.push({ to: memberHash, bytes: Buffer.from(bytes) }); return null; },
+        // The propagation node's edge: what is propagated is recorded, and
+        // carried by the network like what a link carried (via
+        // "propagation"; no proof comes back for it).
+        _sendGroupPropagationFallback: async (bytes, publicKeyHex, memberHash) => {
+            const entry = { to: memberHash, bytes: Buffer.from(bytes), via: "propagation" };
+            propagated.push(entry);
+            sent.push(entry);
+            return null;
+        },
         _handleDistroIdentityTransfer() {},
         _keepAttachments() {},
         _initialized: true,
         _exchangeIsDown: () => false,
     };
 
+    const HeldGroupArrivalsStore = new HeldGroupArrivals({ get: sGet, set: sSet });
+    const FilteredInvitesStore = new FilteredInvites({ get: sGet, set: sSet });
+    const DistroLeftStore = new DistroLeftGroups({ get: sGet, set: sSet });
+    const DistroSeen = build("DistroSeen", { sGet, sSet });
+    DistroSeen.init();
     const selfEnv = { ...groupSelfEnv({ DistroManager, KnownSiblingsStore, IdMgr, own, shortHash: DN.shortHash }), GroupStore };
     for (const signature of GROUP_SELF_METHODS) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, selfEnv)(self);
 
     const receiveEnv = {
         GroupStore, GroupMsgStore, ContactStore, PrivacyFilter, console: quiet, Date, Buffer, LXMessage, Harness,
         sentTimeMs, ownLxmfDestinationHash: () => own, Identity, Destination, DistroManager, KnownSiblingsStore,
+        HeldGroupArrivalsStore, FilteredInvitesStore, DistroLeftStore, DistroSeen, LXMF, Cryptography, MsgStore,
+        decodeDisplayName: DN.decodePayload, DISTRO_ATTACHMENT_PLACEHOLDER: constValue("DISTRO_ATTACHMENT_PLACEHOLDER"),
         ...groupStatusEnv({ GROUP_ENTRIES_IN_RETICHAT_FIELD: switched }),
     };
     for (const signature of [
-        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)", ...GROUP_STATUS_METHODS,
-        "_rememberGroupMemberKeys(memberKeys, mine = null)",
+        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)", ...GROUP_STATUS_METHODS,
+        "_rememberGroupMemberKeys(memberKeys, mine = null)", ...GROUP_DISTRO_METHODS,
+        "_handleDistroBlob(distroHash, blob)",
     ]) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, receiveEnv)(self);
 
     const NameLedgerStore = new NameLedger({ get: sGet, set: sSet });
@@ -229,6 +244,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
     const page = { state: { activeHash: null }, render() {} };
     const pageEnv = {
         GroupStore, ContactStore, GroupMsgStore, console: quiet, RnsClient: self, confirm: (text) => { confirms.push(text); return true; },
+        HeldGroupArrivalsStore,
         alert: (m) => alerts.push(m), document: { body: { classList: { remove() {} } } },
     };
     for (const signature of ["_acceptGroupInvite(groupId)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)", "_quitGroup(groupId, how)",
@@ -248,13 +264,25 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
         me, own, pubKey, storage, switched, filter, name,
         ContactStore, GroupStore, GroupMsgStore, PrivacyFilter, MsgStore, Harness, events,
         router, destination, self, page, alerts, confirms, paths, sent, proofs, relays, fallbacks, emitted, recall, propagated,
-        DistroManager, KnownSiblingsStore, NameLedgerStore,
+        DistroManager, KnownSiblingsStore, NameLedgerStore, HeldGroupArrivalsStore, FilteredInvitesStore, DistroLeftStore, DistroSeen,
+        /** What the distro path returned for each blob given it, in order. */
+        distroKept: [],
         /** Deliver `packed` (a full packing, destination first) as an
          *  opportunistic packet: signatures are checked against this
          *  client's identity store. */
         async receive(packed) {
             LXMessage.recall = recall;
             destination.emit("packet", { data: packed.subarray(16), packet: { prove: () => proofs.push(packed) } });
+            await settle();
+        },
+        /** Deliver `packed` (a full packing addressed to the distro this
+         *  device holds) as RFed fans it out: the blob D | D.encrypt(the
+         *  rest), handed to the distro path (_handleDistroBlob). */
+        async receiveDistro(packed) {
+            LXMessage.recall = recall;
+            const D = DistroManager.lxmfDeliveryHash;
+            const blob = Buffer.concat([Buffer.from(D, "hex"), DistroManager.identity.encrypt(packed.subarray(16))]);
+            client.distroKept.push(self._handleDistroBlob(D, blob));
             await settle();
         },
         /** Hold `other`'s key, as a contact with it would. */
@@ -300,6 +328,8 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
  */
 export function network(...clients) {
     const byHash = new Map(clients.map((c) => [c.own, c]));
+    // Mail to a distro D reaches every device holding D, through RFed's fan-out.
+    const holders = (hash) => clients.filter((c) => c.DistroManager.has && c.DistroManager.lxmfDeliveryHash === hash);
     const cursor = new Map(clients.map((c) => [c, 0]));
     const queued = new Map(clients.map((c) => [c, []]));
     const collect = (from) => {
@@ -319,8 +349,10 @@ export function network(...clients) {
             const rest = [];
             for (const entry of queued.get(from)) {
                 const target = byHash.get(entry.to);
-                if (!target || !wanted(entry, to, skip)) { rest.push(entry); continue; }
-                await target.receive(entry.bytes);
+                const devices = target ? [] : holders(entry.to);
+                if ((!target && devices.length === 0) || !wanted(entry, to, skip)) { rest.push(entry); continue; }
+                if (target) await target.receive(entry.bytes);
+                for (const d of devices) if (!skip.some((s) => s === d)) await d.receiveDistro(entry.bytes);
                 entry.prove?.();
                 delivered.push([entry.to, entry.bytes]);
             }

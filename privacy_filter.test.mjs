@@ -720,7 +720,7 @@ function withGroupHandler(r, { switched = false } = {}) {
         ...groupStatusEnv({ GROUP_ENTRIES_IN_RETICHAT_FIELD: switched }),
     };
     for (const signature of [
-        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
+        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)",
         ...GROUP_STATUS_METHODS,
     ]) {
         const name = signature.slice(0, signature.indexOf("("));
@@ -1444,7 +1444,7 @@ test("accepting an invite allows every member of the group, whatever row it has;
     const sent = [];
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore, ContactStore, GroupMsgStore: { addSystem() {} }, console: quiet,
-        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _decideHeldGroupChanges() {}, sendGroupAccept: async (id) => { sent.push(id); },
+        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges() {}, sendGroupAccept: async (id) => { sent.push(id); },
             _groupSelf: () => new Set([ME]), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
     })({ render() {} });
@@ -1569,7 +1569,7 @@ test("group trust rule: once the user accepts, every listed member is allowed (X
     const alerts = [];
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore: p.r.GroupStore, ContactStore: p.r.ContactStore, GroupMsgStore: p.posts, console: quiet,
-        RnsClient: { ownHash: p.ME, _requestGroupPeer() {}, _decideHeldGroupChanges: () => p.r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
+        RnsClient: { ownHash: p.ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => p.r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
             _groupSelf: (g) => p.r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
     })({ render() {} });
@@ -1605,6 +1605,8 @@ function quittingPage({ GroupStore, GroupMsgStore, RnsClient }) {
     const page = { state: { activeHash: null }, render() {} };
     // A device-listed group: never a former distro's (GROUPS-DISTRO-DESIGN.md §8.7).
     if (!("groupFormerDistroText" in RnsClient)) RnsClient.groupFormerDistroText = () => null;
+    // Nothing reached a distro for it: nothing is held to forget (§6.5).
+    if (!("_forgetHeldGroupArrivals" in RnsClient)) RnsClient._forgetHeldGroupArrivals = () => 0;
     const env = { confirm: () => true, GroupStore, GroupMsgStore, RnsClient, console: quiet,
         document: { body: { classList: { remove() {} } } } };
     for (const signature of ["_quitGroup(groupId, how)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)"]) {
@@ -1634,7 +1636,7 @@ function answeringClient({ filter = true, switched = false } = {}) {
     const leaves = [];
     const acceptInvite = compile("_acceptGroupInvite(groupId)", {
         GroupStore: r.GroupStore, ContactStore: r.ContactStore, GroupMsgStore: posts, console: quiet,
-        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(),
+        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(),
             _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: (g) => r.self.groupFormerDistroText(g),
             sendGroupAccept: async (id) => { accepts.push(id); } },
         alert: (m) => alerts.push(m),
@@ -1834,13 +1836,17 @@ test("the group rule as a table (shouldProcessGroupMessage): only an invite asks
     // ("invalid"); a relay request and the other actions only from one that
     // verifies; an accept or a leave from a source whose key is not here
     // ("unknown") passes, and the handler holds it for the key; an invite
-    // from such a source passes; a plain post from anyone.
+    // from such a source passes; a plain post from anyone but a forged
+    // source (GROUPS-DISTRO-DESIGN.md §6.3: until 2026-10-10 a forged post
+    // was kept).
     // [action, groupStatus, sourceStatus, signature, want]
     const signed = [
         ["invite", null, undefined, "validated", true],
         ["invite", null, undefined, "unknown", true],
         ["invite", null, undefined, "invalid", false],
-        [null, "active", "accepted", "invalid", true],
+        [null, "active", "accepted", "invalid", false],
+        [null, "pending", undefined, "invalid", false],
+        [null, "active", "accepted", "validated", true],
         [null, "pending", undefined, "unknown", true],
         ["accept", "active", "invited", "validated", true],
         ["accept", "active", "invited", "unknown", true],
@@ -1941,7 +1947,7 @@ function giveKey(r, id) {
     r.ContactStore._save();
 }
 
-test("group model, signatures: a group action whose signature does not verify (a forged source) is dropped unproved, filter on or off, joined or pending group: no leave, no accept, no relay, no invite; a forged post is kept as its source's own; the members' own messages still count", async () => {
+test("group model, signatures: a group action whose signature does not verify (a forged source) is dropped unproved, filter on or off, joined or pending group: no leave, no accept, no relay, no invite, and (GROUPS-DISTRO-DESIGN.md §6.3) no post; the members' own messages still count", async () => {
     for (const kind of ["active", "pending"]) for (const filter of [true, false]) {
         const on = `${kind}, filter ${filter ? "on" : "off"}`;
         const [member, a, b, attacker, friend] = [1, 2, 3, 4, 5].map(() => Identity.create());
@@ -1986,14 +1992,15 @@ test("group model, signatures: a group action whose signature does not verify (a
         assert.deepEqual([[A, B].map(g.status), r.GroupStore.heldChanges()], [["invited", "invited"], []],
             `${on}: handed to the handler directly, still nothing, and nothing held`);
 
-        // A forged post is kept and proved, as a DM with an invalid
-        // signature is, but speaks only for its source: never for the
-        // member its GROUP_SENDER names.
+        // A forged post is dropped unproved too (GROUPS-DISTRO-DESIGN.md
+        // §6.3): until 2026-10-10 it was kept and proved, as a DM with an
+        // invalid signature is, and shown as its claimed source's, M's.
         r.packet(forge(M, new Map([[GROUP_FIELDS.GROUP_ID, g.G], [GROUP_FIELDS.GROUP_SENDER, A]]), "a post in A's name"));
+        r.packet(forge(M, new Map([[GROUP_FIELDS.GROUP_ID, g.G]]), "a post in M's name"));
         await settle();
-        assert.equal(r.proofs.length, proved + 1, `${on}: the post is proved`);
-        assert.deepEqual(g.posts.get(g.G).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]),
-            [["a post in A's name", M]], `${on}: shown as its source's, not A's`);
+        assert.equal(r.proofs.length, proved, `${on}: neither post is proved`);
+        assert.deepEqual(g.posts.get(g.G).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]), [],
+            `${on}: neither is shown, as M's or A's`);
 
         // The members' own still count: A accepts, B leaves.
         r.packet(lxm(a, r.me, "", g.ctl("accept", A)));
@@ -2100,7 +2107,7 @@ test("group model, signatures: a held accept survives a reload and is decided wh
         const fannedTo = [];
         const accept = compile("_acceptGroupInvite(groupId)", {
             GroupStore: again.GroupStore, ContactStore: again.ContactStore, GroupMsgStore: posts, console: quiet,
-            RnsClient: { ownHash: lxmfHash(r.me), _requestGroupPeer() {}, _decideHeldGroupChanges: () => again.self._decideHeldGroupChanges(),
+            RnsClient: { ownHash: lxmfHash(r.me), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => again.self._decideHeldGroupChanges(),
                 _groupSelf: (g) => again.self._groupSelf(g), groupFormerDistroText: () => null,
                 sendGroupAccept: async (id) => { fannedTo.push(...[...again.GroupStore.get(id).members.entries()].filter(([, s]) => s === "accepted").map(([h]) => h)); } },
             alert: (m) => assert.fail(m),
@@ -2243,8 +2250,13 @@ test("group model, signatures: what is held is bounded: a payload over HELD_PAYL
 test("group model, signatures: the wiring: the router's second look passes the signature; an invite's keys, the user's accept and the announce handler decide what is held", () => {
     assert.match(objectLiteral("PrivacyFilter"), /accepted = group\?\.groupId \? this\.groupAccepts\(group, src, lxmfMsg\.signatureState \?\? "invalid"\) : this\.allows\(src\);/);
     assert.match(objectLiteral("PrivacyFilter"), /const accepted = !!group\?\.groupId && this\.groupAccepts\(group, src\);/, "the first look has no signature yet");
-    const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
-    assert.match(handler, /const signature = lxmfMsg\.signatureState \?\? "invalid";\n\s*if \(!PrivacyFilter\.groupAccepts\(groupInfo, srcHash, signature\)\)/);
+    const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)");
+    // The signature is read once, and every rule after it is given it:
+    // GROUPS-DISTRO-DESIGN.md §6.3's three rules first, then the group rule.
+    assert.match(handler, /const signature = lxmfMsg\.signatureState \?\? "invalid";\n/);
+    assert.match(handler, /if \(signature === "invalid"\) return dropped\(/);
+    assert.match(handler, /if \(!PrivacyFilter\.groupAccepts\(groupInfo, srcHash, signature\)\)/);
+    assert.equal((handler.match(/signatureState/g) ?? []).length, 2, "read once, and once more where the name is taken (the same value)");
     assert.match(handler, /const actualSender = PrivacyFilter\.groupMember\(groupInfo, srcHash, signature\);/);
     assert.match(handler, /this\._rememberGroupMemberKeys\(memberKeys, [^\n]*\);\n(\s*\/\/[^\n]*\n)*\s*this\._decideHeldGroupChanges\(\);/);
     const accept = methodBody("_acceptGroupInvite(groupId)");
@@ -2357,7 +2369,7 @@ test("group trust rule: opening a pending group's chat asks nothing of its membe
     assert.ok(!chats.asked().paths.includes(Z) && !chats.asked().linking.includes(Z), "nothing asked of Z");
 });
 
-test("group trust rule: a plain post names its author (GROUP_SENDER) only from a current member of a joined group, and only an author on the list; anyone else's is its own, filter on or off: a stranger's, an allowlisted contact's that is no member, whichever member, or this device, it names", async () => {
+test("group trust rule: a plain post names its author (GROUP_SENDER) only from a current member of a joined group, and only an author on the list; anyone else's is its own, filter on or off: a stranger's, an allowlisted contact's that is no member, whichever member it names; one naming this device from anyone else is dropped (GROUPS-DISTRO-DESIGN.md §6.3)", async () => {
     // A stranger's plain post for a held group is kept and proved (James,
     // 2026-09-30); shown as written by a member it names, that would be a
     // false outcome (iOS handleGroupChatMessage still shows it so). Until
@@ -2388,10 +2400,13 @@ test("group trust rule: a plain post names its author (GROUP_SENDER) only from a
         r.packet(lxm(member, r.me, "M's own", post(null)));
         r.packet(lxm(member, r.me, "M, naming one on no list", post(null, N)));
         await settle();
-        assert.equal(r.proofs.length, 8, `${on}: each is kept and proved`);
+        // The router's look proves each (it does not know who the user is in
+        // the group); the group handler drops the one naming the user
+        // (§6.3): until 2026-10-10 it was kept as the stranger's.
+        assert.equal(r.proofs.length, 8, `${on}: each is proved`);
+        assert.equal(f.posts.get(G).some((m) => m.content === "I am you"), false, `${on}: never stored, in or out`);
         assert.deepEqual(f.posts.get(G).filter((m) => m.dir === "in").map((m) => [m.content, m.srcHash]), [
             ["I am M, send me the keys", S],
-            ["I am you", S],
             ["I am A", S],
             ["a contact, naming M", F],
             ["A's words, relayed by M", A],

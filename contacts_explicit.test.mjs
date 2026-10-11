@@ -122,7 +122,7 @@ function receiver(p) {
         console: quiet, Date, Buffer, LXMessage, Harness: p.Harness, sentTimeMs, ownLxmfDestinationHash: p.own, Identity, Destination,
         ...groupStatusEnv(),
     }, [
-        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)",
+        "_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)",
         ...GROUP_STATUS_METHODS,
         "_rememberGroupMemberKeys(memberKeys, mine = null)",
     ]);
@@ -371,7 +371,7 @@ test("a group invite and the user's accept keep every member by association: all
     // The user accepts (the real _acceptGroupInvite): every member allowed.
     compile("_acceptGroupInvite(groupId)", {
         GroupStore: p.GroupStore, ContactStore: p.ContactStore, GroupMsgStore: p.GroupMsgStore, console: quiet,
-        RnsClient: { ownHash: p.own(), _decideHeldGroupChanges() {}, _requestGroupPeer() {}, sendGroupAccept: async () => {},
+        RnsClient: { ownHash: p.own(), _decideHeldGroupChanges() {}, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, sendGroupAccept: async () => {},
             _groupSelf: (g) => p.rns._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(m),
     })({ render() {} })(G);

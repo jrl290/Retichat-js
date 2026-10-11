@@ -1045,7 +1045,7 @@ test("the web still lets a group's members through the privacy filter from the u
 });
 
 test("wiring: the carried key is remembered before anything looks for it; every accept and leave that counts keeps the creator's copy; the creator answers from the handler alone, and only an accept that counted and carried its key", () => {
-    const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)");
+    const handler = methodBody("_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)");
     const remember = handler.indexOf('this._rememberGroupMemberKeys(new Map([[srcHash, Buffer.from(lxmfMsg.senderKey).toString("base64")]]), this._groupSelf(group));');
     const held = handler.indexOf('GroupStore.heldChanges().some(e => e.src === srcHash)) this._decideHeldGroupChanges();');
     const rule = handler.indexOf("PrivacyFilter.groupAccepts(groupInfo, srcHash, signature)");
@@ -1053,7 +1053,9 @@ test("wiring: the carried key is remembered before anything looks for it; every 
     assert.ok(rule < dedup && dedup < remember && remember < held, "after the rule and the duplicate check, before the held decision");
     assert.match(handler, /if \(\(groupAction === "accept" \|\| groupAction === "leave"\) && lxmfMsg\.senderKey\) \{/);
     assert.match(handler, /const counted = this\._takeGroupStatusChange\(lxmfMsg, groupId, srcHash, groupAction, lxmfMsg\);/);
-    assert.match(handler, /if \(counted && groupAction === "accept" && lxmfMsg\.senderKey\) \{\n\s*this\.sendGroupStatus\(groupId, srcHash\)\.catch\(/);
+    // Never to a self address: a known sibling's accept is the user's own
+    // (GROUPS-DISTRO-DESIGN.md §9.2).
+    assert.match(handler, /if \(counted && groupAction === "accept" && lxmfMsg\.senderKey && !fromSibling\) \{\n\s*this\.sendGroupStatus\(groupId, srcHash\)\.catch\(/);
     assert.match(handler, /case "status": \{[^]*?this\._takeGroupStatuses\(group, groupInfo\.statuses\);\n\s*break;/, "a status has its own case: it never falls into a plain message");
     assert.equal((app.match(/\.sendGroupStatus\(/g) ?? []).length, 1, "one caller of the answer");
     assert.equal((app.match(/groupAction: "status"/g) ?? []).length, 1, "and one place that builds a status");

@@ -174,13 +174,28 @@ export const GROUP_SELF_METHODS = [
     "_groupSigner(group)",
     "_inviteOwnMember(listed)",
     "groupFormerDistroText(group)",
+    "_distroSelf()",
+    "_isKnownSibling(group, hash)",
+];
+
+/**
+ * The distro path's group branch (GROUPS-DISTRO-DESIGN.md §6.1-6.5): the
+ * group message reaching D, its hold and the replay and forgetting of what
+ * is held. A test that runs _handleDistroBlob over group traffic installs
+ * these beside it and beside _handleGroupMessage.
+ */
+export const GROUP_DISTRO_METHODS = [
+    "_holdGroupArrival(lxmfMsg, groupInfo, srcHash, group, arrival)",
+    "_replayHeldGroupArrivals(groupId)",
+    "_forgetHeldGroupArrivals(groupId, why)",
+    "_handleDistroGroupMessage(data, destHash, decrypted, srcHex, entries)",
 ];
 
 /** What GROUP_SELF_METHODS read from the page: the distro this device holds
  *  (none unless `DistroManager` is given), its known siblings (none unless
  *  `KnownSiblingsStore` is given), the device's identity and hash. */
 export function groupSelfEnv({ DistroManager = { has: false, identity: null, lxmfDeliveryHash: null, pubKey: null },
-    KnownSiblingsStore = { of: () => [] }, IdMgr, own, shortHash = (h) => `${String(h ?? "").slice(0, 8)}…` } = {}) {
+    KnownSiblingsStore = { of: () => [], has: () => false }, IdMgr, own, shortHash = (h) => `${String(h ?? "").slice(0, 8)}…` } = {}) {
     return { DistroManager, KnownSiblingsStore, IdMgr, ownLxmfDestinationHash: () => own, shortHash };
 }
 

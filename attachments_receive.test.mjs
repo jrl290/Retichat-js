@@ -38,7 +38,7 @@ import * as DN from "./lib/display_name.js";
 import { AttachmentStore, attachmentKey, memoryBackend } from "./lib/attachment_store.js";
 import { sentTimeMs } from "./lib/day_markers.js";
 import { linkPair, settle, within } from "./test_link_pair.mjs";
-import { build, compile, constValue, install, installPropagated, memoryStorage, messageHandler } from "./test_app_source.mjs";
+import { build, compile, constValue, install, installGroupSelf, installPropagated, memoryStorage, messageHandler } from "./test_app_source.mjs";
 
 const quiet = { log() {}, warn() {}, error() {} };
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
@@ -103,7 +103,9 @@ function page(me) {
         // through, and the post is its source's own (privacy_filter.test.mjs
         // pins the rule and GROUP_SENDER).
         PrivacyFilter: { groupAccepts: () => true, groupMember: (group, src) => src },
-    }, ["_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo)"]);
+    }, ["_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)"]);
+    // Who the user is in the group (GROUPS-DISTRO-DESIGN.md §9.1): this device.
+    installGroupSelf(self, { GroupStore, own: lxmfHash(me), me });
     return { me, storage, ContactStore, MsgStore, GroupMsgStore, DistroSeen, Attachments, backend, groups, self };
 }
 

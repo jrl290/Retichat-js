@@ -708,7 +708,12 @@ function shouldProcessGroupMessage(groupAction, sourceAllowed, groupStatus, sour
     const proven = signature === "validated" || signature === null;
     if (groupAction === "invite") return sourceAllowed && !groupClosed && !forged;
     if (!groupStatus) return false;
-    if (!groupAction) return true;
+    // A plain post for a held group: any source's (James, 2026-09-30), but
+    // never a forged one (GROUPS-DISTRO-DESIGN.md §6.3, on both paths and
+    // in every group). Until 2026-10-10 a forged post was kept and shown as
+    // the member it claimed, and through a distro anyone can reach every
+    // device of the user with one.
+    if (!groupAction) return !forged;
     if (GROUP_ACTIONS_THAT_RELAY.has(groupAction)) return groupStatus === "active" && sourceStatus === "accepted" && proven;
     if (groupAction === "accept" || groupAction === "leave") {
         return (sourceStatus === "invited" || sourceStatus === "accepted") && !namesOther && !forged;
@@ -1930,6 +1935,16 @@ const PrivacyFilter = {
         return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, s.groupStatus, s.sourceStatus, named !== src, s.closed, signature, s.sourceIsCreator);
     },
 
+    /** The same rule for a group held here pending, as if the user had
+     *  joined it (GROUPS-DISTRO-DESIGN.md §6.5: its list is known, so a
+     *  listed source, nothing naming another member, a status from the
+     *  recorded creator, proven where the rule asks for proof). */
+    groupAcceptsIfJoined(group, src, signature) {
+        const s = this._groupStanding(group.groupId, src);
+        const named = group.groupSender ? String(group.groupSender).toLowerCase() : src;
+        return shouldProcessGroupMessage(group.groupAction, s.sourceAllowed, "active", s.sourceStatus, named !== src, s.closed, signature, s.sourceIsCreator);
+    },
+
     /** Whom a group message the rule kept is from: its GROUP_SENDER
      *  (lowercased) when the group trusts its source (groupTrustsSource: a
      *  current member of a group the user has joined, relaying), the
@@ -2462,6 +2477,21 @@ const RnsClient = {
         if (nowD && listed.includes(nowD)) return nowD;
         const device = this.ownHash ?? ownLxmfDestinationHash();
         return device && listed.includes(device) ? null : undefined;
+    },
+
+    /** On the distro path the user is also the D this device holds and
+     *  D's known siblings, whatever the group (GROUPS-DISTRO-DESIGN.md
+     *  §6.3): D first. Empty without a distro. */
+    _distroSelf() {
+        const d = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
+        return d ? [d, ...KnownSiblingsStore.of(d)] : [];
+    },
+
+    /** Whether `hash` is a known sibling (§9.1) of the user's D in `group`
+     *  (its own address, when a distro) or of the D this device holds. */
+    _isKnownSibling(group, hash) {
+        const distros = [group?.ownMember, DistroManager.has ? DistroManager.lxmfDeliveryHash : null];
+        return distros.some(d => d && KnownSiblingsStore.has(d, hash));
     },
 
     groupFormerDistroText(group) {
@@ -5687,10 +5717,17 @@ const RnsClient = {
     },
 
     /** Handle an incoming group message (detected by its group id, key 1 of
-     *  0xD1 or the old 0xA0: LXMessage.extractGroupFields). */
-    _handleGroupMessage(lxmfMsg, srcHash, content, groupInfo) {
+     *  0xD1 or the old 0xA0: LXMessage.extractGroupFields), from the router
+     *  (the direct path, `arrival` null) or from the distro path
+     *  (_handleDistroBlob: `arrival` { via: "distro", blob }, the fan-out
+     *  blob as received, held as it came when its group is not joined here,
+     *  GROUPS-DISTRO-DESIGN.md §6.5). Returns "kept" (processed), "dropped"
+     *  (said) or "held"; the distro path records the message as seen only
+     *  when it was kept (§6.2). */
+    _handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null) {
         const { groupId, groupName, groupAction, groupSender, members, relaySeen, memberKeys } = groupInfo;
-        console.log(`[retichat] 👥 Group message: groupId=${groupId.slice(0,8)} action=${groupAction || "message"} from=${srcHash.slice(0,12)}`);
+        const viaDistro = arrival?.via === "distro";
+        console.log(`[retichat] 👥 Group message: groupId=${groupId.slice(0,8)} action=${groupAction || "message"} from=${srcHash.slice(0,12)}${viaDistro ? " via the distro" : ""}`);
 
         const group = GroupStore.get(groupId);
         // The group rule (shouldProcessGroupMessage: iOS groupMessagePolicy
@@ -5714,13 +5751,54 @@ const RnsClient = {
         // (shouldProcessGroupMessage's `signature`): a group action whose
         // signature fails is not its source's.
         const signature = lxmfMsg.signatureState ?? "invalid";
+        const dropped = (why) => {
+            console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}${viaDistro ? " via the distro" : ""}: ${why}`);
+            return "dropped";
+        };
+        // GROUPS-DISTRO-DESIGN.md §6.3: three rules first, on both paths and
+        // in every group. The user's addresses here are the group's self set
+        // (§9.1); on the distro path the D this device holds and its known
+        // siblings are the user's too, whatever the group.
+        const mine = this._groupSelf(group);
+        if (viaDistro) for (const hash of this._distroSelf()) mine.add(hash);
+        // A forged group message is never shown, held or acted on. Until
+        // 2026-10-10 a plain post whose signature failed was kept and shown
+        // as the member it claimed to come from, and through D anyone can
+        // reach every device of the user with one.
+        if (signature === "invalid") return dropped("its signature does not verify: it is not its source's, and a forged group message is never kept");
+        // A post naming the user as its sender is the user's own only from
+        // the user's own address: one from anyone else is dropped, never
+        // stored as the user's outgoing post.
+        const named = groupSender ? String(groupSender).toLowerCase() : null;
+        if (named && mine.has(named) && !mine.has(srcHash)) return dropped("it names the user as its sender, and its source is not the user's");
+        // From the user's own address: an echo (sends never target a self
+        // address), unless it is a known sibling acting as its own listed
+        // entry (an older device of the user, §9.2).
+        const fromSibling = mine.has(srcHash) && this._isKnownSibling(group, srcHash);
+        if (mine.has(srcHash) && !fromSibling) return dropped("its source is the user's own address: an echo of the user's own message");
+        // §12.3: no device of D acts on a relay request reaching D.
+        if (viaDistro && groupAction === "relay_req") return dropped("a relay request reaching the distro is acted on by no device of it, and no relay_done is sent");
+        // §6.3, §9.3: an invite reaching D must list D.
+        if (viaDistro && groupAction === "invite" && !(members || []).includes(this._distroSelf()[0])) {
+            return dropped("an invite reaching the distro whose list does not name the distro is not for this user");
+        }
         if (!PrivacyFilter.groupAccepts(groupInfo, srcHash, signature)) {
+            if (viaDistro) {
+                // §6.3: an invite to D the privacy filter drops: its group's
+                // traffic is never held from now on (§6.5).
+                if (groupAction === "invite" && !group && !GroupStore.isClosed(groupId)) {
+                    FilteredInvitesStore.add(groupId);
+                    return dropped("a source the privacy filter does not allow; its group's traffic is not held from now on");
+                }
+                // §6.5: held, not dropped, when the group not being joined
+                // here is the sole reason.
+                if (this._holdGroupArrival(lxmfMsg, groupInfo, srcHash, group, arrival)) return "held";
+            }
             const why = !group && groupAction !== "invite" ? "a group not held here"
                 : groupAction && signature === "invalid" ? "its signature does not verify: it is not the source's"
                 : groupAction === "invite" ? (GroupStore.isClosed(groupId) ? "a group the user declined or left" : "a source the privacy filter does not allow")
                 : "a source that is not a member of the group (or left it), a member speaking for another, or a relay request from a member that has not accepted, or for a group the user has not joined, or not signed by a key held here";
-            console.log(`[retichat] 👥 Dropped ${groupAction || "message"} for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: ${why}`);
-            return;
+            return dropped(why);
         }
         // GROUP_SENDER only from a source the group trusts, signed by it,
         // naming a member; anyone else's message is its own
@@ -5733,7 +5811,7 @@ const RnsClient = {
             `${groupId}:${actualSender}:${lxmfMsg.timestamp}:${groupAction || "message"}`;
         if (this._groupSeenIds.has(dedupKey)) {
             console.log(`[retichat] 👥 Group dedup ${dedupKey.slice(0,32)}...`);
-            return;
+            return "kept";
         }
         this._groupSeenIds.add(dedupKey);
         if (this._groupSeenIds.size > 2000) {
@@ -5761,10 +5839,15 @@ const RnsClient = {
         // row is kept for it now that the message is processed, and the name
         // taken by the same table. Group labels, the member list and system
         // notices then name it; the contact list does not show it.
-        if (!ContactStore.known(srcHash) && !this._groupSelf(group).has(srcHash)) {
+        // On the distro path the router never saw the message, so the name
+        // of a sender held already is taken here too (GROUPS-DISTRO-DESIGN.md
+        // §6.4): the name row, never a DM, a contact or an allowlisting.
+        if (!ContactStore.known(srcHash) && !mine.has(srcHash)) {
             ContactStore.keep(srcHash, null, true);
             ContactStore.acceptMessageName(srcHash, lxmfMsg.displayName,
                 lxmfMsg.signatureState ?? "invalid", lxmfMsg.timestamp);
+        } else if (viaDistro && !mine.has(srcHash)) {
+            ContactStore.acceptMessageName(srcHash, lxmfMsg.displayName, signature, lxmfMsg.timestamp);
         }
 
         switch (groupAction) {
@@ -5787,10 +5870,7 @@ const RnsClient = {
                 // neither is not for this user, and its keys are not kept.
                 const listed = members || [];
                 const ownMember = group ? (group.ownMember ?? null) : this._inviteOwnMember(listed);
-                if (ownMember === undefined) {
-                    console.log(`[retichat] 👥 Dropped invite for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: its list names neither this device nor the distro it holds, so it is not for this user`);
-                    return;
-                }
+                if (ownMember === undefined) return dropped("its list names neither this device nor the distro it holds, so it is not for this user");
                 // No self address's key is kept as a contact (§9.2).
                 this._rememberGroupMemberKeys(memberKeys, group ? this._groupSelf(group) : this._selfOf(listed, ownMember));
                 // A key it brought may be one an accept or leave is held for
@@ -5804,7 +5884,7 @@ const RnsClient = {
                 // group merged its list in and marked its sender accepted.
                 if (group) {
                     if (group.groupStatus !== "active") this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
-                    return;
+                    return "kept";
                 }
                 // Create pending group entry. The inviter is named when the
                 // notice is shown, through the contact resolver: its 0xD1
@@ -5817,7 +5897,7 @@ const RnsClient = {
             }
             case "accept":
             case "leave": {
-                if (!group) return;
+                if (!group) return dropped("a group not held here");
                 // The source's own accept or leave (the rule took it only
                 // from a member on the list that has not left, naming nobody
                 // else, and not forged). Verified, it counts. From a source
@@ -5831,7 +5911,8 @@ const RnsClient = {
                 // never one that carries none, so a client from before this
                 // change is not sent an action it does not know. Once per
                 // accept received, and never again.
-                if (counted && groupAction === "accept" && lxmfMsg.senderKey) {
+                // Never to a self address (a known sibling's accept, §9.2).
+                if (counted && groupAction === "accept" && lxmfMsg.senderKey && !fromSibling) {
                     this.sendGroupStatus(groupId, srcHash).catch(e => console.warn("Group status send failed:", e.message));
                 }
                 break;
@@ -5841,12 +5922,12 @@ const RnsClient = {
                 // only from the group's creator, for a group the user has
                 // joined, signed by it): each element is a member's own
                 // accept or leave, checked on its own.
-                if (!group) return;
+                if (!group) return dropped("a group not held here");
                 this._takeGroupStatuses(group, groupInfo.statuses);
                 break;
             }
             case "relay_req": {
-                if (!group) return;
+                if (!group) return dropped("a group not held here");
                 this._performGroupRelay(
                     group,
                     content,
@@ -5862,10 +5943,7 @@ const RnsClient = {
             }
             default: {
                 // Regular group chat message
-                if (!group) {
-                    console.log(`[retichat] 👥 Group message for unknown group ${groupId.slice(0,8)}, ignoring`);
-                    return;
-                }
+                if (!group) return dropped("a group not held here");
 
                 // The author (GROUP_SENDER from a source the group trusts,
                 // else the LXMF source: PrivacyFilter.groupMember) is stored
@@ -5879,17 +5957,28 @@ const RnsClient = {
                 const found = lxmfMsg.attachments ?? [];
                 const unreadable = found.skipped || lxmfMsg.fieldsUnreadable;
                 const displayContent = content || (found.length || unreadable ? "" : "(empty)");
-                const stored = GroupMsgStore.add(groupId, { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender,
-                    lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null,
-                    timestamp: sentTimeMs(lxmfMsg.timestamp) });
+                // GROUPS-DISTRO-DESIGN.md §9.2: a validated post from a known
+                // sibling (an older device of the user, posting as its own
+                // listed entry) is the user's own: stored as an outgoing
+                // post, SENT (nothing here saw it delivered), with no
+                // notification, as a §17.11 copy is.
+                const own = fromSibling && signature === "validated";
+                const stored = GroupMsgStore.add(groupId, own
+                    ? { dir: "out", content: displayContent, status: "sent", srcHash,
+                        lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null, timestamp: sentTimeMs(lxmfMsg.timestamp) }
+                    : { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender,
+                        lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null,
+                        timestamp: sentTimeMs(lxmfMsg.timestamp) });
+                if (own) console.log(`[retichat] 👥 Post in group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}, a device of the user's: stored as the user's own`);
                 if (found.length || unreadable) this._keepAttachments(GroupMsgStore, groupId, stored, found, lxmfMsg.fieldsUnreadable);
                 // Update group last activity
                 group.lastActivity = Date.now();
                 GroupStore._save();
-                this._onMsg.forEach(fn => fn(lxmfMsg, groupId));
+                this._onMsg.forEach(fn => fn(own ? stored : lxmfMsg, groupId));
                 break;
             }
         }
+        return "kept";
     },
 
     /** Member `src`'s own accept or leave (`action`) of group `groupId`,
@@ -6271,6 +6360,12 @@ const RnsClient = {
         }
         const ownHash = signer.hash;
         const mine = this._groupSelf(group);
+        // Never to a self address (GROUPS-DISTRO-DESIGN.md §9: sends exclude
+        // every one): the user's own device needs no status from the user.
+        if (mine.has(memberHash)) {
+            console.log(`[retichat] 👥 No status for group ${groupId.slice(0,8)} to ${memberHash.slice(0,12)}: an address of the user's own`);
+            return null;
+        }
         const statuses = GroupStore.statusMessages(groupId)
             .filter(copy => !mine.has(copy.member) && copy.member !== memberHash && group.members.has(copy.member))
             .map(copy => copy.packed);
@@ -7983,6 +8078,116 @@ const RnsClient = {
      * away. A dropped blob is not recorded as seen, so a later copy of it is
      * judged again.
      */
+    /**
+     * GROUPS-DISTRO-DESIGN.md §6.5: hold a group message that reached D
+     * (`arrival` { via: "distro", blob, hash }) when the group not being
+     * joined here is the sole reason it would be dropped: not an invite or
+     * a relay request; the group pending here or not held here, not closed
+     * here, and its invite not one this device's filter dropped; not
+     * forged, not from a self address (both dropped before this is asked);
+     * and kept by the rules as if the group were joined: for a pending
+     * group under its list (PrivacyFilter.groupAcceptsIfJoined), for one
+     * not held here only when proven (its signature validated). Returns
+     * true when it is held; false when the caller drops it, after a log
+     * line for whatever the held store pushed out or refused. A held blob
+     * is never recorded as seen (§6.2): the caller forgets its key.
+     */
+    _holdGroupArrival(lxmfMsg, groupInfo, srcHash, group, arrival) {
+        const { groupId, groupAction } = groupInfo;
+        const d = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
+        if (!d || !arrival?.blob || groupAction === "invite" || groupAction === "relay_req") return false;
+        if (group && group.groupStatus !== "pending") return false;
+        if (GroupStore.isClosed(groupId)) return false;
+        const tag = `group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}`;
+        if (FilteredInvitesStore.has(groupId)) {
+            console.log(`[distro] 👥 Not holding ${groupAction || "message"} for ${tag}: this device's privacy filter dropped the group's invite, and spends nothing more on it`);
+            return false;
+        }
+        const signature = lxmfMsg.signatureState ?? "invalid";
+        const ifJoined = group ? PrivacyFilter.groupAcceptsIfJoined(groupInfo, srcHash, signature) : signature === "validated";
+        if (!ifJoined) return false;
+        const result = HeldGroupArrivalsStore.hold({
+            blob: arrival.blob, groupId, src: srcHash, hash: arrival.hash,
+            signature: Buffer.from(lxmfMsg.signature ?? []).toString("hex"),
+            validated: signature === "validated", pending: !!group,
+        }, d);
+        for (const e of result.evicted) {
+            console.log(`[distro] 👥 Held blob of group ${e.groupId.slice(0,8)} from ${e.src.slice(0,12)} pushed out: the bound of ${e.bound}`);
+        }
+        if (!result.held) {
+            console.log(`[distro] 👥 Not holding ${groupAction || "message"} for ${tag}: ${result.why}`);
+            return false;
+        }
+        console.log(`[distro] 👥 Held ${groupAction || "message"} for ${tag} until the group is joined here (${group ? "pending here" : "not held here"}${result.why ? `; ${result.why}` : ""})`);
+        Harness.event("distro-group-held", { group: groupId.slice(0, 8), src: srcHash.slice(0, 12), action: groupAction || "message" });
+        return true;
+    },
+
+    /** §6.5: group `groupId` became joined here: its held blobs go to the
+     *  distro path again, in arrival order, each released as it goes, and
+     *  are judged there as new arrivals (ordering on the group's readiness,
+     *  never a retry). Without the distro nothing is held. */
+    _replayHeldGroupArrivals(groupId) {
+        const rows = HeldGroupArrivalsStore.forGroup(groupId);
+        if (rows.length === 0) return 0;
+        if (!DistroManager.has) {
+            this._forgetHeldGroupArrivals(groupId, "this device no longer holds the distro");
+            return 0;
+        }
+        console.log(`[distro] 👥 Group ${groupId.slice(0,8)} joined here: replaying ${rows.length} held arrival(s)`);
+        for (const row of rows) {
+            HeldGroupArrivalsStore.release(row);
+            this._handleDistroBlob(DistroManager.lxmfDeliveryHash, Buffer.from(row.blob, "base64"));
+        }
+        return rows.length;
+    },
+
+    /** §6.5: group `groupId` was closed here: what is held for it goes,
+     *  with one log line giving the count. */
+    _forgetHeldGroupArrivals(groupId, why) {
+        const n = HeldGroupArrivalsStore.forgetGroup(groupId);
+        if (n) console.log(`[distro] 👥 Forgot ${n} held arrival(s) for group ${groupId.slice(0,8)}: ${why}`);
+        return n;
+    },
+
+    /**
+     * GROUPS-DISTRO-DESIGN.md §6.1 step 2 on the distro path: a group
+     * message (`entries` from LXMF.groupEntriesOf: a GROUP_ID entry in
+     * either form, of any type, and no distro marker). It is keyed by its
+     * LXMF hash (§6.2: same-millisecond invite chunks share their src:ts),
+     * and handed to the group handler the direct path uses, with the
+     * signature verdict the receipt gives (LXMessage.fromBytes: the carried
+     * key bound, §7), or held (§6.5). It never reaches the DM path: no
+     * contact, chat, DM message or DM notification is made for it. Its key
+     * is recorded only when it is kept; dropped or held, it is forgotten
+     * (§6.2). Returns true when kept or held here (the rfed.link
+     * acknowledgement), false when dropped.
+     */
+    _handleDistroGroupMessage(data, destHash, decrypted, srcHex, entries) {
+        if (!entries.group_id) {
+            console.log(`[distro] 👥 Dropped a group message from ${srcHex.slice(0,12)}: its GROUP_ID is not 32 hex characters (§6.1)`);
+            return false;
+        }
+        const lxmfMsg = LXMessage.fromBytes(decrypted, destHash);
+        const info = lxmfMsg ? LXMessage.extractGroupFields(lxmfMsg.fields) : null;
+        if (!lxmfMsg || !lxmfMsg.hash || !info) {
+            console.log(`[distro] 👥 Dropped a group message for group ${entries.group_id.slice(0,8)} from ${srcHex.slice(0,12)}: it cannot be read`);
+            return false;
+        }
+        const hash = Buffer.from(lxmfMsg.hash).toString("hex");
+        const key = `grp:${hash}`;
+        if (DistroSeen.check(key)) {
+            Harness.event("distro-dup", { src: srcHex.slice(0, 12), group: entries.group_id.slice(0, 8) });
+            console.log(`[distro] ↩︎ duplicate group message, ignoring (${srcHex.slice(0,12)} ${hash.slice(0,12)})`);
+            return true;
+        }
+        const verdict = this._handleGroupMessage(lxmfMsg, srcHex, lxmfMsg.content, { ...info, groupId: entries.group_id },
+            { via: "distro", blob: data, hash });
+        if (verdict === "kept") return true;
+        DistroSeen.forget(key);
+        return verdict === "held";
+    },
+
     _handleDistroBlob(distroHash, blob) {
         try {
             const data = Buffer.from(blob);
@@ -8013,6 +8218,13 @@ const RnsClient = {
             // RFed SPEC §17.12: a channel membership message from another
             // device of this distro (handled below, after the §17.11 copy).
             const channelSync = LXMF.distroChannelSyncFromPayload(payloadBytes);
+
+            // GROUPS-DISTRO-DESIGN.md §6.1 step 2, ahead of the src:ts key: a
+            // group message goes to the group handler, never to the DM path
+            // below (_handleDistroGroupMessage). One that carries a distro
+            // marker is no group message (groupEntriesOf).
+            const groupEntries = channelSync ? null : LXMF.groupEntriesOf(fieldsMap);
+            if (groupEntries?.has_group_id) return this._handleDistroGroupMessage(data, destHash, decrypted, srcHashHex, groupEntries);
 
             // Idempotency: the same blob is delivered more than once (see
             // DistroSeen). Drop repeats before they reach the store, or the
@@ -10461,6 +10673,9 @@ const App = {
             RnsClient._requestGroupPeer(memberHash);
         }
         GroupMsgStore.addSystem(groupId, `You joined "${group.groupName}"`);
+        // GROUPS-DISTRO-DESIGN.md §6.5: what reached D for this group while
+        // it was pending here is judged now that it is joined.
+        RnsClient._replayHeldGroupArrivals(groupId);
         RnsClient.sendGroupAccept(groupId).catch(e => console.warn("Group accept send failed:", e.message));
         this.render();
     },
@@ -10529,6 +10744,7 @@ const App = {
         RnsClient.sendGroupLeave(groupId).catch(e => console.warn("Group leave send failed:", e.message));
         GroupMsgStore.remove(groupId);
         GroupStore.close(groupId, how);
+        RnsClient._forgetHeldGroupArrivals(groupId, how === "left" ? "the user left it" : "the user declined it");
         if (this.state.activeHash === groupId) this.state.activeHash = null;
         document.body.classList.remove("narrow-chat-open");
         this.render();
