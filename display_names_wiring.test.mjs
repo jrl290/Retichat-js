@@ -507,7 +507,7 @@ test("the group invite notice and the distro import prompt name the sender throu
     assert.match(methodBody("_takeGroupStatusChange(lxmfMsg, groupId, src, action, event = null)"), /this\._applyGroupStatusChange\(groupId, src, action, event, packedMessage\(lxmfMsg\)\)/);
     assert.match(methodBody("_decideHeldGroupChanges()"), /this\._applyGroupStatusChange\(entry\.groupId, entry\.src, entry\.action, null, packedHeld\(entry\)\)/);
     assert.match(methodBody("_applyGroupStatusChange(groupId, src, action, event = null, packed = null)"),
-        /GroupMsgStore\.addSystem\(groupId, action === "leave" \? "left the group" : "joined the group", src\)/);
+        /else GroupMsgStore\.addSystem\(groupId, action === "leave" \? "left the group" : "joined the group", src\)/);
     const transfer = methodBody("_handleDistroIdentityTransfer(lxmfMsg, srcHash, privateKeyHex)");
     assert.match(transfer, /const senderName = ContactStore\.name\(srcHash\);/);
 });
@@ -709,7 +709,7 @@ test("§4.1 group envelopes (invites included) carry the name per member; only a
         _ensureGroupLink: async () => ({ link: { send: (bytes) => { direct.push(bytes); return { packetHash: Buffer.alloc(32, direct.length) }; } } }),
     };
     for (const signature of [
-        "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
+        "async _sendGroupEnvelope(memberHash, content, fields, signer = null, onSubmitted = null)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "_decideMessageName(sourceHex, recipientHex)",
     ]) self[methodName(signature)] = compile(signature, env)(self);
@@ -750,7 +750,7 @@ test("§10 the group envelope: old fields now, the 0xD1 map after the switch; th
             _ensureGroupLink: async () => ({ link: { send: (bytes) => { direct.push(bytes); return { packetHash: Buffer.alloc(32, direct.length) }; } } }),
         };
         for (const signature of [
-            "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
+            "async _sendGroupEnvelope(memberHash, content, fields, signer = null, onSubmitted = null)",
             "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
             "_decideMessageName(sourceHex, recipientHex)",
         ]) self[methodName(signature)] = compile(signature, env)(self);
@@ -1454,7 +1454,7 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     // DM records), never a hidden row with none (contacts_explicit.test.mjs).
     assert.match(methodBody("_buildSidebarContent()"), /ContactStore\.chats\(\(hash\) => MsgStore\.get\(hash\)\.length > 0\)/);
     assert.doesNotMatch(methodBody("_buildSidebarContent()"), /ContactStore\.(getAll|listed)\(/);
-    for (const method of ["async _sendGroupEnvelope(memberHash, content, fields, signer = null)", "async openGroupConversation(groupId)",
+    for (const method of ["async _sendGroupEnvelope(memberHash, content, fields, signer = null, onSubmitted = null)", "async openGroupConversation(groupId)",
         "_rememberGroupMemberKeys(memberKeys, mine = null)", "_handleChannelPacket(packetData)", "_acceptGroupInvite(groupId)"]) {
         assert.doesNotMatch(methodBody(method), /ContactStore\.add\(/, `${method} never adds a contact`);
     }

@@ -230,10 +230,11 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
         crypto: globalThis.crypto, ownLxmfDestinationHash: () => own, DistroManager, GroupMsgStore,
     };
     for (const signature of [
-        "async sendGroupInvites(groupId, groupName, memberHashes)", "async sendGroupAccept(groupId)", "async sendGroupLeave(groupId)",
+        "async sendGroupInvites(groupId, groupName, memberHashes)", "_buildGroupInvites(groupId, groupName, memberHashes)",
+        "async _sendGroupInviteChunks(invites)", "async sendGroupAccept(groupId)", "async sendGroupLeave(groupId)",
         "async sendGroupStatus(groupId, memberHash)", "_ownGroupMemberKey(signer = null)", "_groupMemberKeys(memberHashes, signer = null)",
         "createGroup(groupName, memberHashes)", "async sendGroupMessage(groupId, content)", "async _dispatchGroupMessage(groupId, outMsg)",
-        "async _fanoutGroupEnvelope(targets, content, fields, signer = null)", "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
+        "async _fanoutGroupEnvelope(targets, content, fields, signer = null, onSubmitted = null)", "async _sendGroupEnvelope(memberHash, content, fields, signer = null, onSubmitted = null)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "_decideMessageName(sourceHex, recipientHex)", "_requestGroupPeer(memberHash)", "_waitForGroupPeer(memberHash)",
         "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)",

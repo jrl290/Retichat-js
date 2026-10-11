@@ -17,7 +17,9 @@ import { Buffer } from "node:buffer";
 import { senderKeyEntry } from "./lib/group_status.js";
 import { shortHash } from "./lib/display_name.js";
 import { app, compile, methodBody } from "./test_app_source.mjs";
-import { groupClient, network, settle, lxmfHash, lxm, oldFields, Identity, LXMessage, GROUP_FIELDS } from "./test_group_net.mjs";
+import { groupClient, network, settle, lxmfHash, lxm, oldFields, quiet, appFunction, Identity, LXMessage, GROUP_FIELDS } from "./test_group_net.mjs";
+import { HeldGroupArrivals } from "./lib/group_distro.js";
+import Cryptography from "./lib/rns/cryptography.js";
 import { groupSyncFields } from "./lib/group_sync.js";
 import LXMF from "./lib/rns/lxmf/lxmf.js";
 
@@ -348,13 +350,13 @@ test("§9.2: \"You\" is every self address of the group shown: D and a known sib
 });
 
 test("wiring: every group send resolves its signer through _groupSigner at send time, and nothing in group code signs with sendingIdentity() or captures the router's source", () => {
-    for (const sig of ["async sendGroupInvites(groupId, groupName, memberHashes)", "async sendGroupAccept(groupId)", "async sendGroupLeave(groupId)",
+    for (const sig of ["_buildGroupInvites(groupId, groupName, memberHashes)", "async sendGroupAccept(groupId)", "async sendGroupLeave(groupId)",
         "async sendGroupStatus(groupId, memberHash)", "async _dispatchGroupMessage(groupId, outMsg)"]) {
         const body = methodBody(sig);
         assert.match(body, /this\._groupSigner\(/, `${sig} resolves its signer`);
         assert.doesNotMatch(body, /sendingIdentity\(\)/, `${sig} never uses the fallback helper`);
     }
-    assert.doesNotMatch(methodBody("async _sendGroupEnvelope(memberHash, content, fields, signer = null)"), /msg\.sourceHash = this\._lxmfRouter\.destination\.hash;/);
+    assert.doesNotMatch(methodBody("async _sendGroupEnvelope(memberHash, content, fields, signer = null, onSubmitted = null)"), /msg\.sourceHash = this\._lxmfRouter\.destination\.hash;/);
     assert.match(methodBody("_groupSigner(group)"), /this\._signerFor\(/, "groupSigner is _signerFor(ownMember)");
 });
 
@@ -655,7 +657,7 @@ async function created(names = ["Y"]) {
     return { u1, u2, a, D, Did, net, ids };
 }
 
-test("§19.2: a D-group post owes one post G (and no §17.11 copy) once its fan-out is submitted; the siblings show it as the user's own, SENT; a post whose send throws owes nothing", async () => {
+test("§19.2: a D-group post owes one post G (and no §17.11 copy) once its fan-out is submitted; the siblings show it as the user's own, SENT (a post none of whose envelopes left owes nothing: the §10.6 test below)", async () => {
     const { us: [u1, u2], m, D, net, id } = await twoPending();
     u1.page._acceptGroupInvite(id);
     await net.syncs(u1);
@@ -671,11 +673,6 @@ test("§19.2: a D-group post owes one post G (and no §17.11 copy) once its fan-
     const [shown] = u2.GroupMsgStore.get(id).filter((x) => x.content === "hello all");
     assert.deepEqual([shown?.dir, shown?.status, shown?.srcHash, shown?.id], ["out", "sent", D, posts[0].id.slice("group:".length)]);
     assert.equal(u1.GroupMsgStore.get(id).filter((x) => x.content === "hello all").length, 1, "u1's own echo stores nothing more");
-    // A send that throws before its fan-out is submitted owes nothing.
-    const owedBefore = u1.owed.length;
-    u1.self._fanoutGroupEnvelope = () => { throw new Error("the fan-out could not start"); };
-    await assert.rejects(u1.self.sendGroupMessage(id, "never left"));
-    assert.equal(u1.owed.length, owedBefore, "no G for a send that threw");
 });
 
 test("§19.2, §11.2: an accept G joins a sibling's matching pending invite, and a leave in a D-group sends one leave as D and owes one leave G, which closes and removes the group on the siblings, sending nothing", async () => {
@@ -1014,4 +1011,201 @@ test("§19.2: a post G for a group not joined here is held (pending: as a pendin
 test("wiring (§6.5, §9.1, §11.2): the distro changing runs what giving D up forgets; a group left on a sibling closes its open chat as a channel left there does", () => {
     assert.match(app, /\nDistroManager\.onChange\(\(\) => RnsClient\._onDistroChangedForGroups\(\)\);\n/);
     assert.match(app, /if \(\(msg\.kind === "channel-left" \|\| msg\.kind === "group-left"\) && msg\.synced\) \{\s*if \(inActiveChat\) \{\s*this\.state\.activeHash = null;/);
+});
+
+// ═══ Review of 96fffd9 ═══════════════════════════════════════════════════
+
+test("§9.2: opening a D-group's chat keeps no row for D, and asks no path of, and opens no link to, D or a known sibling listed there; the other members get theirs", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u = groupClient({ distro: Did });
+    const a = groupClient();
+    const Sid = Identity.create();
+    const S = lxmfHash(Sid);
+    u.KnownSiblingsStore.add(D, S);
+    u.know(a).know(Sid).reachable(a.own, S);
+    const { group } = u.self.createGroup("G", [a.own, S]);
+    await settle();
+    assert.equal(u.ContactStore.get(D), null, "no row for D before");
+    const asked = [], linked = [];
+    u.self._requestGroupPeer = (h) => asked.push(h);
+    u.self._waitForGroupPeer = async () => {};
+    u.self._ensureGroupLink = async (h) => { linked.push(h); return null; };
+    const open = compile("async openGroupConversation(groupId)", { GroupStore: u.GroupStore, ContactStore: u.ContactStore, console: quiet, Promise })(u.self);
+    await open(group.groupId);
+    assert.equal(u.ContactStore.get(D), null, "D is never kept as a contact");
+    assert.deepEqual(asked, [], "no path is asked of a self address (A's key is held)");
+    assert.deepEqual(linked, [a.own], "a link to A only: never to D or the sibling S");
+});
+
+test("§10.6: a create whose invite chunks cannot be built (a member's key not held) sends no invite and owes no create G, so no sibling holds the group; a create whose chunks are built owes one", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u1 = groupClient({ distro: Did }), u2 = groupClient({ distro: Did });
+    const a = groupClient();
+    const keyless = lxmfHash(Identity.create());
+    for (const u of [u1, u2]) u.know(a).reachable(a.own);
+    u1.ContactStore.keep(keyless);
+    const net = network(u1, u2, a);
+    const { group, sending } = u1.self.createGroup("Y", [a.own, keyless]);
+    await assert.rejects(sending, /Missing public key for group member/);
+    await settle();
+    assert.equal(u1.sent.length, 0, "no invite left");
+    assert.deepEqual(u1.owed.filter((e) => e.op === "create"), [], "no create G");
+    await net.syncs(u1);
+    assert.equal(u2.GroupStore.get(group.groupId), null, "the sibling holds nothing");
+    // The control: every chunk built, one create G.
+    const ok = u1.self.createGroup("Z", [a.own]);
+    void ok.sending;
+    await settle();
+    assert.ok(u1.sent.length > 0 && u1.sent.every((x) => x.to === a.own), "its invite chunks left, to A");
+    assert.deepEqual(u1.owed.filter((e) => e.op === "create").map((e) => e.groupId), [ok.group.groupId]);
+    await net.syncs(u1);
+    assert.equal(u2.GroupStore.get(ok.group.groupId)?.groupStatus, "active");
+});
+
+test("§10.6: a post G is owed once a member envelope was submitted: none when no envelope could be built (every key missing), and the siblings show nothing; exactly one when one of two was", { timeout: 20000 }, async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u1 = groupClient({ distro: Did }), u2 = groupClient({ distro: Did });
+    const a = groupClient(), b = groupClient();
+    for (const u of [u1, u2]) u.know(a).know(b).reachable(a.own, b.own);
+    a.know(Did).reachable(D);
+    const net = network(u1, u2, a, b);
+    const id = u1.self.createGroup("Y", [a.own, b.own]).group.groupId;
+    await net.syncs(u1);
+    u1.GroupStore.updateMember(id, a.own, "accepted");
+    u1.self._waitForGroupPeer = async () => {};
+    // A's key is gone from this device's row: its envelope cannot be built.
+    delete u1.ContactStore.get(a.own).publicKey;
+    const before = u1.owed.length;
+    await u1.self.sendGroupMessage(id, "never left");
+    await settle();
+    assert.equal(u1.GroupMsgStore.get(id).find((x) => x.content === "never left")?.status, "failed");
+    assert.equal(u1.owed.length - before, 0, "no G for a post no envelope of which was submitted");
+    await net.syncs(u1);
+    assert.equal(u2.GroupMsgStore.get(id).some((x) => x.content === "never left"), false, "the siblings never show it");
+    // B accepted too, and B's key is held: one envelope goes, one G.
+    u1.GroupStore.updateMember(id, b.own, "accepted");
+    const from = u1.owed.length;
+    void u1.self.sendGroupMessage(id, "half left");
+    await settle();
+    assert.deepEqual(u1.owed.slice(from).map((e) => e.op), ["post"], "one G, once");
+    await net.syncs(u1);
+    assert.equal(u2.GroupMsgStore.get(id).filter((x) => x.content === "half left").length, 1);
+});
+
+test("§6.5: a validated message whose packet source is a known sibling (a self address), for a group not joined here, is dropped, said, never held", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u = groupClient({ distro: Did });
+    const Sid = Identity.create();
+    const S = lxmfHash(Sid);
+    u.KnownSiblingsStore.add(D, S);
+    u.know(Sid);
+    const id = "9".repeat(32);
+    await u.receiveDistro(lxm(Sid, D, "old phone post", oldFields({ id })));
+    assert.deepEqual(u.distroKept, [false], "dropped");
+    assert.deepEqual(u.HeldGroupArrivalsStore.list(), [], "a self source is never held");
+});
+
+test("§9.2: a known sibling's accept and leave in a D-group are shown as the user's ('You joined the group'), never under the sibling's own name", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u = groupClient({ distro: Did });
+    const Sid = Identity.create();
+    const S = lxmfHash(Sid);
+    const a = groupClient();
+    u.KnownSiblingsStore.add(D, S);
+    u.know(a).know(Sid).reachable(a.own, S);
+    const { group } = u.self.createGroup("G", [a.own, S]);
+    const id = group.groupId;
+    await settle();
+    const keyed = (action) => oldFields({ id, action, sender: S, keys: `${S}:${Buffer.from(Sid.getPublicKey()).toString("base64")}` });
+    await u.receiveDistro(lxm(Sid, D, "", keyed("accept")));
+    await settle();
+    assert.equal(u.status(id, S), "accepted", "the sibling's own entry");
+    await u.receiveDistro(lxm(Sid, D, "", keyed("leave")));
+    await settle();
+    assert.equal(u.status(id, S), "left");
+    assert.equal(u.GroupStore.get(id)?.groupStatus, "active", "the user, D, is still in the group");
+    const lines = u.GroupMsgStore.get(id).filter((x) => x.dir === "system").slice(-2);
+    assert.deepEqual(lines.map((x) => [x.content, x.actor ?? null]), [["You joined the group", null], ["You left the group", null]]);
+});
+
+test("§17.14 rule 3: the 0xFD of a G from D, signed by D, is remembered as a device of D before rule 4, so a G whose form rule 4 refuses still teaches its sibling", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u = groupClient({ distro: Did });
+    const S = lxmfHash(Identity.create());
+    const bad = new Map([[0x0C, new Uint8Array(0)], [0xFB, "rfed.distro.group"], [0xFC, ["create", "not a group id", 1n, "X", D, [], []]], [0xFD, S]]);
+    await u.receiveDistro(lxm(Did, D, "", bad, { timestamp: Date.now() / 1000 }));
+    assert.deepEqual(u.distroKept, [false], "dropped by rule 4");
+    assert.equal(u.KnownSiblingsStore.has(D, S), true, "its sibling learned");
+    // Never from a G that is not D's own: rule 1 and rule 2 come first.
+    const X = lxmfHash(Identity.create());
+    const forgedBad = new Map([...bad, [0xFD, X]]);
+    await u.receiveDistro(lxm(Did, D, "", forgedBad, { signer: Identity.create(), timestamp: Date.now() / 1000 }));
+    assert.equal(u.KnownSiblingsStore.has(D, X), false, "a G not signed by D teaches nothing");
+});
+
+test("§6.1, §6.4: a group message whose fields map msgpackr cannot decode (an unknown ext type in another field) is still a group message on the distro path, as the phones' unwrap finds it: dropped there, said, never filed as a DM", async () => {
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const u = groupClient({ distro: Did });
+    const sender = Identity.create();
+    const A = lxmfHash(sender);
+    u.know(sender);
+    const id = "4".repeat(32);
+    // [timestamp, title, content, { 0xA0: id, 0x77: ext type 5 }]
+    const payload = Buffer.concat([
+        Buffer.from("94" + "cb41daab8c00000000" + "c400" + "c4026869", "hex"),
+        Buffer.from("82" + "cca0" + "d920", "hex"), Buffer.from(id, "ascii"), Buffer.from("77" + "d40500", "hex"),
+    ]);
+    assert.ok(LXMessage.decodePayload(payload).fieldsUnreadable, "msgpackr cannot read its fields");
+    const dest = Buffer.from(D, "hex");
+    const src = Buffer.from(A, "hex");
+    const hashed = Buffer.concat([dest, src, payload]);
+    const signature = sender.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
+    await u.receiveDistro(Buffer.concat([dest, src, signature, payload]));
+    assert.deepEqual(u.distroKept, [false], "dropped in the group branch");
+    assert.deepEqual(u.MsgStore.get(A), [], "never a DM");
+});
+
+test("DESIGN_PRINCIPLES (every drop path speaks), §6.5: the stores of groups reached through D write through storage that says when it refused a write, each refusal is said and recorded, and an arrival held by this page only says so", async () => {
+    // Storage that answers whether it kept the write.
+    const data = new Map();
+    let full = false;
+    const localStorage = { setItem: (k, v) => { if (full) throw new Error("QuotaExceededError"); data.set(k, v); } };
+    const sSetKept = appFunction("sSetKept", { localStorage, PFX: "retichat_", JSON });
+    assert.equal(sSetKept("x", [1]), true);
+    full = true;
+    assert.equal(sSetKept("x", [2]), false);
+    assert.equal(data.get("retichat_x"), "[1]");
+    for (const [store, cls] of [["KnownSiblingsStore", "KnownSiblings"], ["HeldGroupArrivalsStore", "HeldGroupArrivals"],
+        ["FilteredInvitesStore", "FilteredInvites"], ["DistroLeftStore", "DistroLeftGroups"]]) {
+        assert.match(app, new RegExp(`\\nconst ${store} = new ${cls}\\(groupDistroStorage, \\{ onRefused: groupDistroRefused \\}\\);\\n`), store);
+    }
+    assert.match(app, /\nconst groupDistroStorage = \{ get: sGet, set: sSetKept \};\n/);
+    // A refusal is a log line and a Harness error.
+    const lines = [], errors = [];
+    const refused = appFunction("groupDistroRefused", { console: { warn: (...a) => lines.push(a.join(" ")) }, Harness: { error: (where, e) => errors.push([where, e.message]) }, Error });
+    refused("held_group_arrivals_v1", "a held arrival");
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /held_group_arrivals_v1/);
+    assert.match(lines[0], /a held arrival/);
+    assert.deepEqual(errors.map(([where]) => where), ["group-distro-storage"]);
+    // A hold storage refused: held by this page only, said.
+    const Did = Identity.create();
+    const D = lxmfHash(Did);
+    const said = [];
+    const HeldGroupArrivalsStore = new HeldGroupArrivals({ get: () => null, set: () => false }, { onRefused() {} });
+    const hold = compile("_holdGroupArrival(lxmfMsg, groupInfo, srcHash, group, arrival)", {
+        DistroManager: { has: true, lxmfDeliveryHash: D }, GroupStore: { isClosed: () => false }, FilteredInvitesStore: { has: () => false },
+        PrivacyFilter: {}, HeldGroupArrivalsStore, Buffer, Harness: { event() {} }, console: { log: (...a) => said.push(a.join(" ")), warn: (...a) => said.push(a.join(" ")) },
+    })({});
+    const src = "a".repeat(32);
+    assert.equal(hold({ signatureState: "validated", signature: Buffer.alloc(64) }, { groupId: "9".repeat(32), groupAction: null }, src, null,
+        { via: "distro", blob: Buffer.alloc(100), hash: "1".repeat(64) }), true);
+    assert.equal(said.filter((l) => /this page only/.test(l)).length, 1, said.join("\n"));
 });

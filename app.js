@@ -429,6 +429,9 @@ const EXCHANGE_BLOCKED_NOTICE = "This exchange is blocked by the page's security
 const PFX = "retichat_";
 function sGet(k) { try { const r = localStorage.getItem(PFX+k); return r ? JSON.parse(r) : null; } catch(e) { return null; } }
 function sSet(k, v) { try { localStorage.setItem(PFX+k, JSON.stringify(v)); } catch(e) {} }
+// sSet that answers whether storage kept the write (false: refused, a full
+// localStorage), for stores that must say a refusal (lib/group_distro.js).
+function sSetKept(k, v) { try { localStorage.setItem(PFX+k, JSON.stringify(v)); return true; } catch(e) { return false; } }
 
 // Attachment bytes: IndexedDB, or this tab's memory when IndexedDB cannot be
 // opened (lib/attachment_store.js). Never localStorage, which sSet above
@@ -545,10 +548,21 @@ const DistroOutboxStore = new DistroOutbox(nameStorage);
 // for a group not joined here yet (§6.5); the ids of invites the privacy
 // filter dropped on the distro path (§6.3); and per D the groups the user
 // left or declined there, carried in every group sync's `left` (§10.2).
-const KnownSiblingsStore = new KnownSiblings(nameStorage);
-const HeldGroupArrivalsStore = new HeldGroupArrivals(nameStorage);
-const FilteredInvitesStore = new FilteredInvites(nameStorage);
-const DistroLeftStore = new DistroLeftGroups(nameStorage);
+// Each writes through storage that says when it refused a write, and a
+// refusal is said and recorded (groupDistroRefused): what it did not keep
+// lives in this page only. Until the review of 96fffd9 they wrote through
+// sSet, which drops a refused write without a word.
+const groupDistroStorage = { get: sGet, set: sSetKept };
+const KnownSiblingsStore = new KnownSiblings(groupDistroStorage, { onRefused: groupDistroRefused });
+const HeldGroupArrivalsStore = new HeldGroupArrivals(groupDistroStorage, { onRefused: groupDistroRefused });
+const FilteredInvitesStore = new FilteredInvites(groupDistroStorage, { onRefused: groupDistroRefused });
+const DistroLeftStore = new DistroLeftGroups(groupDistroStorage, { onRefused: groupDistroRefused });
+/** A write of `key` (one of the four stores above) that storage refused:
+ *  said, and recorded as a "group-distro-storage" Harness error. */
+function groupDistroRefused(key, what) {
+    console.warn(`[distro] ⚠️ Storage refused a write of ${key}: ${what} is kept by this page only, and is lost when it closes`);
+    Harness.error("group-distro-storage", new Error(`storage refused a write of ${key}: ${what}`));
+}
 
 // =========================================================================
 //  IDENTITY MANAGER
@@ -5540,6 +5554,11 @@ const RnsClient = {
         });
         const tag = `${read.op ?? "?"} sync of group ${(read.group_id ?? "?").slice(0,8)} from device ${read.by ? read.by.slice(0,12) : "?"}`;
         if (disposition.verdict === "drop") {
+            // Rule 3 comes before rule 4: the device a G from D, signed by
+            // D, names is a known sibling even when rule 4 refuses its form
+            // (§9.1), as on the phones. Until the review of 96fffd9 only a G
+            // that passed rule 4 taught it here.
+            if (disposition.rule === 4) this._learnDistroSibling(DistroManager.lxmfDeliveryHash, disposition.by, "a group sync its form refused");
             console.warn(`[distro] ⚠️ The ${tag} dropped: ${disposition.reason} (§17.14 rule ${disposition.rule})`);
             Harness.event("distro-group-sync", { result: "dropped", rule: disposition.rule, reason: disposition.reason });
             DistroSeen.forget(key);
@@ -5635,7 +5654,7 @@ const RnsClient = {
                 console.log(`[distro] 👥 ${tag} dropped, not held: ${result.why}`);
                 return "dropped";
             }
-            console.log(`[distro] 👥 ${tag} held until the group is joined here (${group ? "pending here" : "not held here"}; §6.5)`);
+            console.log(`[distro] 👥 ${tag} held until the group is joined here (${group ? "pending here" : "not held here"}${result.stored === false ? "; held for this page only: storage refused it" : ""}; §6.5)`);
             return "held";
         }
         // The user's own post, from another device of D: outgoing, SENT
@@ -6140,6 +6159,11 @@ const RnsClient = {
                     FilteredInvitesStore.add(groupId);
                     return dropped("a source the privacy filter does not allow; its group's traffic is not held from now on");
                 }
+                // §6.5: never held from a self address (here only a known
+                // sibling reaches this: every other is dropped above as an
+                // echo). Until the review of 96fffd9 a sibling's message
+                // for a group not joined here was held, on its quota.
+                if (mine.has(srcHash)) return dropped("its source is the user's own address (a known sibling of the distro), and a message from a self address is never held for a group not joined here (§6.5)");
                 // §6.5: held, not dropped, when the group not being joined
                 // here is the sole reason.
                 if (this._holdGroupArrival(lxmfMsg, groupInfo, srcHash, group, arrival)) return "held";
@@ -6370,7 +6394,12 @@ const RnsClient = {
         }
         if (!GroupStore.updateMember(groupId, src, action === "leave" ? "left" : "accepted")) return false;
         if (action === "accept" && group.groupStatus === "active" && !mine.has(src)) ContactStore.allow(src);
-        GroupMsgStore.addSystem(groupId, action === "leave" ? "left the group" : "joined the group", src);
+        // §9.2: a self address (a known sibling acting as its own listed
+        // entry, §14) is shown as "You", as iOS names it (label(for:));
+        // anyone else is named when shown. Until the review of 96fffd9 a
+        // sibling's accept read "<its own name> joined the group".
+        if (mine.has(src)) GroupMsgStore.addSystem(groupId, action === "leave" ? "You left the group" : "You joined the group");
+        else GroupMsgStore.addSystem(groupId, action === "leave" ? "left the group" : "joined the group", src);
         this._onMsg.forEach(fn => fn(event ?? { kind: "group-status", groupId }, groupId));
         return true;
     },
@@ -6577,16 +6606,23 @@ const RnsClient = {
         const targets = [...group.members.entries()]
             .filter(([hash, status]) => !mine.has(hash) && status === "accepted")
             .map(([hash]) => hash);
+        // GROUPS-DISTRO-DESIGN.md §10.6: a post in a D-group is owed to D's
+        // other devices as one post sync, once, when its fan-out has handed
+        // its first member envelope on (_fanoutGroupEnvelope's
+        // `onSubmitted`), as a §17.11 copy is owed once its message's
+        // dispatch returned without throwing; with no accepted member,
+        // nothing to submit: now. Never for a post no envelope of which was
+        // built (every member's key missing): it never left, so the
+        // siblings must not show it. Until the review of 96fffd9 it was
+        // owed once the fan-out was called, which never throws, so a post
+        // this device showed failed showed as sent on every sibling.
+        const owePost = () => this._syncGroupAction("post", groupId, { text: outMsg.content, atMs: outMsg.timestamp });
         const fanout = this._fanoutGroupEnvelope(targets, outMsg.content, {
             groupId,
             groupName: group.groupName,
             groupSender: ownHash,
-        }, signer);
-        // GROUPS-DISTRO-DESIGN.md §10.6: a post in a D-group is owed to D's
-        // other devices as one post sync, once, now that its fan-out was
-        // submitted (with no accepted member, nothing to submit: now too),
-        // never for a send that threw before this, as a §17.11 copy.
-        this._syncGroupAction("post", groupId, { text: outMsg.content, atMs: outMsg.timestamp });
+        }, signer, owePost);
+        if (targets.length === 0) owePost();
         const delivery = await fanout;
 
         if (delivery.fulfilled === delivery.total) {
@@ -6606,25 +6642,40 @@ const RnsClient = {
      *  members pass the privacy filter (iOS createGroupChat,
      *  ChatRepository.swift:2532-2536, Android ChatRepository.kt:404-405),
      *  never a self address; and its invites go out. Returns { group,
-     *  sending } (the invites' promise). */
+     *  sending } (the invites' promise).
+     *  GROUPS-DISTRO-DESIGN.md §10.6: a group created as D is owed to D's
+     *  other devices as a create sync once its invite chunks are built, and
+     *  only then, as Android owes it (createGroupChat, `built`). Chunks that
+     *  cannot be built (a selected member whose key is not held, or no
+     *  signer) send no invite to anyone, and owe nothing: `sending` is
+     *  rejected with why, said here. Until the review of 96fffd9 the create
+     *  sync was owed whatever the build did, so every sibling held, as
+     *  created by the user, a group none of whose members was invited. */
     createGroup(groupName, memberHashes) {
         const ownMember = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
         const group = GroupStore.create(groupName, memberHashes, ownMember);
         const mine = this._groupSelf(group);
         for (const hash of memberHashes) if (!mine.has(hash)) ContactStore.allow(hash);
         GroupMsgStore.addSystem(group.groupId, `Group "${groupName}" created`);
-        const sending = this.sendGroupInvites(group.groupId, groupName, memberHashes);
-        // GROUPS-DISTRO-DESIGN.md §10.6: a group created as D is owed to D's
-        // other devices as a create sync, once its invite chunks are built.
+        let invites;
+        try {
+            invites = this._buildGroupInvites(group.groupId, groupName, memberHashes);
+        } catch (error) {
+            console.warn(`[retichat] 👥 The invites of group ${group.groupId.slice(0,8)} could not be built, so none is sent and no create sync is owed: ${error.message}`);
+            return { group, sending: Promise.reject(error) };
+        }
+        const sending = this._sendGroupInviteChunks(invites);
         this._syncGroupAction("create", group.groupId);
         return { group, sending };
     },
 
-    /** Send group invites to all selected members: one chunk per member
-     *  key, each to every member that is not the user, signed by the group
+    /** The invite chunks of group `groupId`, built now: one per member key,
+     *  each for every member that is not the user, signed by the group
      *  signer (§8.2: in a D-group as D, the list naming D and D's chunk
-     *  carrying D's key). */
-    async sendGroupInvites(groupId, groupName, memberHashes) {
+     *  carrying D's key). Returns { signer, targets, chunks } (the fields
+     *  of each chunk). Throws, building nothing, when the group signer is
+     *  gone or a listed member's key is not held (_groupMemberKeys). */
+    _buildGroupInvites(groupId, groupName, memberHashes) {
         const group = GroupStore.get(groupId);
         const signer = this._groupSigner(group);
         if (!signer) throw new Error(this.groupFormerDistroText(group) ?? "Group not found");
@@ -6633,17 +6684,27 @@ const RnsClient = {
         const allMembers = [...new Set([...memberHashes, ownHash])];
         const membersStr = allMembers.join(",");
         const targets = allMembers.filter(hash => !mine.has(hash));
-        const memberKeyEntries = this._groupMemberKeys(allMembers, signer);
-        await Promise.all(memberKeyEntries.map(groupMemberKey =>
-            this._fanoutGroupEnvelope(targets, "", {
-                groupId,
-                groupName,
-                groupMembers: membersStr,
-                groupMemberKey,
-                groupAction: "invite",
-                groupSender: ownHash,
-            }, signer)
-        ));
+        const chunks = this._groupMemberKeys(allMembers, signer).map(groupMemberKey => ({
+            groupId,
+            groupName,
+            groupMembers: membersStr,
+            groupMemberKey,
+            groupAction: "invite",
+            groupSender: ownHash,
+        }));
+        return { signer, targets, chunks };
+    },
+
+    /** Send invite chunks _buildGroupInvites built: each to every target. */
+    async _sendGroupInviteChunks(invites) {
+        const { signer, targets, chunks } = invites;
+        await Promise.all(chunks.map(fields => this._fanoutGroupEnvelope(targets, "", fields, signer)));
+    },
+
+    /** Send group invites to all selected members (_buildGroupInvites,
+     *  _sendGroupInviteChunks). */
+    async sendGroupInvites(groupId, groupName, memberHashes) {
+        await this._sendGroupInviteChunks(this._buildGroupInvites(groupId, groupName, memberHashes));
     },
 
     /** The user's own GROUP_MEMBER_KEYS entry (RFed-spec Group.md, "The
@@ -6840,10 +6901,18 @@ const RnsClient = {
     },
 
     /** Send one envelope to each of `targets`, signed by `signer` (the
-     *  group signer, _groupSigner; the device when null). */
-    async _fanoutGroupEnvelope(targets, content, fields, signer = null) {
+     *  group signer, _groupSigner; the device when null). `onSubmitted`,
+     *  when given, is called once, when the first envelope was built and
+     *  handed on for delivery (_sendGroupEnvelope), never when none was. */
+    async _fanoutGroupEnvelope(targets, content, fields, signer = null, onSubmitted = null) {
+        let submitted = false;
+        const first = onSubmitted ? () => {
+            if (submitted) return;
+            submitted = true;
+            onSubmitted();
+        } : null;
         const results = await Promise.allSettled(
-            targets.map(target => this._sendGroupEnvelope(target, content, fields, signer))
+            targets.map(target => this._sendGroupEnvelope(target, content, fields, signer, first))
         );
         results.forEach((result, index) => {
             if (result.status === "rejected") {
@@ -6862,8 +6931,10 @@ const RnsClient = {
 
     /** One group envelope to member `memberHash`, from and signed by
      *  `signer` (GROUPS-DISTRO-DESIGN.md §8.2: the group signer; the device
-     *  when null, as every envelope was before 2026-10-10). */
-    async _sendGroupEnvelope(memberHash, content, fields, signer = null) {
+     *  when null, as every envelope was before 2026-10-10). `onSubmitted`
+     *  is called once the envelope is built and handed to delivery, never
+     *  when this throws before that (no key for the member, say). */
+    async _sendGroupEnvelope(memberHash, content, fields, signer = null, onSubmitted = null) {
         let contact = ContactStore.keep(memberHash);
         if (!contact.publicKey) {
             this._requestGroupPeer(memberHash);
@@ -6899,12 +6970,14 @@ const RnsClient = {
         // GROUP_ENTRIES_IN_RETICHAT_FIELD selects (false until the switch).
         applyGroupFields(msg.fields, fields);
         const packed = msg.pack(by.identity, true);
-        return this._deliverGroupEnvelope(
+        const delivery = this._deliverGroupEnvelope(
             memberHash,
             Buffer.concat([dest.hash, packed]),
             contact.publicKey,
             () => NameLedgerStore.recordDelivered(sourceHex, memberHash, nameState, Math.floor(Date.now() / 1000)),
         );
+        onSubmitted?.();
+        return delivery;
     },
 
     /** Deliver one packed envelope to member `memberHash`: directly over a
@@ -7134,7 +7207,13 @@ const RnsClient = {
      *  them. The accept itself asks for their paths (_acceptGroupInvite)
      *  and sends to each (sendGroupAccept). Until 2026-10-01 opening a
      *  pending group's chat asked for every listed member's path and opened
-     *  a link to each before the user answered. */
+     *  a link to each before the user answered.
+     *  Never for a self address (GROUPS-DISTRO-DESIGN.md §9.2: the group's
+     *  self set, in a group listing the user's D also D and its known
+     *  siblings): no row is kept for one, no path asked of it, no link
+     *  opened to it. Until the review of 96fffd9 only the device was left
+     *  out here, so opening a D-group's chat kept a hidden row for D, asked
+     *  for D's path and linked to a listed sibling. */
     async openGroupConversation(groupId) {
         const group = GroupStore.get(groupId);
         if (!group) return;
@@ -7142,9 +7221,9 @@ const RnsClient = {
             console.log(`[retichat] 👥 Opened group ${groupId.slice(0,8)} the user has not joined: nothing asked of its members until the invite is accepted`);
             return;
         }
-        const ownHash = this.ownHash;
+        const mine = this._groupSelf(group);
         const links = [...group.members.keys()]
-            .filter(hash => hash !== ownHash)
+            .filter(hash => !mine.has(hash))
             .map(async hash => {
                 let contact = ContactStore.keep(hash);
                 if (!contact.publicKey) {
@@ -8443,7 +8522,8 @@ const RnsClient = {
      * joined here is the sole reason it would be dropped: not an invite or
      * a relay request; the group pending here or not held here, not closed
      * here, and its invite not one this device's filter dropped; not
-     * forged, not from a self address (both dropped before this is asked);
+     * forged, not from a self address, a known sibling included (each
+     * dropped by _handleGroupMessage before this is asked);
      * and kept by the rules as if the group were joined: for a pending
      * group under its list (PrivacyFilter.groupAcceptsIfJoined), for one
      * not held here only when proven (its signature validated). Returns
@@ -8477,7 +8557,8 @@ const RnsClient = {
             console.log(`[distro] 👥 Not holding ${groupAction || "message"} for ${tag}: ${result.why}`);
             return false;
         }
-        console.log(`[distro] 👥 Held ${groupAction || "message"} for ${tag} until the group is joined here (${group ? "pending here" : "not held here"}${result.why ? `; ${result.why}` : ""})`);
+        const pageOnly = result.stored === false ? "; held for this page only: storage refused it" : "";
+        console.log(`[distro] 👥 Held ${groupAction || "message"} for ${tag} until the group is joined here (${group ? "pending here" : "not held here"}${result.why ? `; ${result.why}` : ""}${pageOnly})`);
         Harness.event("distro-group-held", { group: groupId.slice(0, 8), src: srcHash.slice(0, 12), action: groupAction || "message" });
         return true;
     },
@@ -8511,7 +8592,7 @@ const RnsClient = {
 
     /**
      * GROUPS-DISTRO-DESIGN.md §6.1 step 2 on the distro path: a group
-     * message (`entries` from LXMF.groupEntriesOf: a GROUP_ID entry in
+     * message (`entries` from LXMF.groupEntriesOfPayload: a GROUP_ID entry in
      * either form, of any type, and no distro marker). It is keyed by its
      * LXMF hash (§6.2: same-millisecond invite chunks share their src:ts),
      * and handed to the group handler the direct path uses, with the
@@ -8581,7 +8662,7 @@ const RnsClient = {
             // GROUPS-DISTRO-DESIGN.md §6.1 step 2, ahead of the src:ts key: a
             // group message goes to the group handler, never to the DM path
             // below (_handleDistroGroupMessage). One that carries a distro
-            // marker is no group message (groupEntriesOf).
+            // marker is no group message (groupEntriesOfPayload).
             // RFed SPEC §17.14 group sync (GROUPS-DISTRO-DESIGN.md §6.1 step 1,
             // §11), beside the §17.12 one and ahead of the src:ts key: judged
             // on its LXMF hash (gsync:<hash>), its rules and its apply table
@@ -8597,7 +8678,14 @@ const RnsClient = {
                     blob: data,
                 });
             }
-            const groupEntries = channelSync ? null : LXMF.groupEntriesOf(fieldsMap);
+            // Read from the payload's bytes, as the phones' unwrap reads them
+            // (LXMF.groupEntriesOfPayload): a fields map msgpackr cannot
+            // decode (an ext type it does not know) still shows its group,
+            // and the message is dropped in the group branch, said, never
+            // filed as a DM (§6.4). Until the review of 96fffd9 it was read
+            // from the decoded map, empty for such a message, and the
+            // message went down the DM path.
+            const groupEntries = channelSync ? null : LXMF.groupEntriesOfPayload(payloadBytes);
             if (groupEntries?.has_group_id) return this._handleDistroGroupMessage(data, destHash, decrypted, srcHashHex, groupEntries);
 
             // Idempotency: the same blob is delivered more than once (see

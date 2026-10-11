@@ -2297,6 +2297,8 @@ function openingChats(r) {
         "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)"]) {
         rc[signature.replace(/^async /, "").split("(")[0]] = compile(signature, env)(rc);
     }
+    // Who the user is in the group (GROUPS-DISTRO-DESIGN.md §9.2): no distro here, the device alone.
+    installGroupSelf(rc, { GroupStore: r.GroupStore, own: rc.ownHash, me: r.me });
     const page = { state: { activeHash: null, isWide: true }, _closeAllModals() {}, render() {}, _scrollChatBottom() {}, _requestPathForContact() {} };
     const openChat = compile("openChat(hash, activateChannel = true)", {
         ChannelStore: { get: () => null }, GroupStore: r.GroupStore, ContactStore: r.ContactStore, RnsClient: rc, console: quiet,
@@ -2474,8 +2476,8 @@ function leavingClient(c, { messageName = "Dee" } = {}) {
     };
     installGroupSelf(rc, { GroupStore: r.GroupStore, own: lxmfHash(r.me), me: r.me });
     for (const signature of [
-        "async sendGroupLeave(groupId)", "_ownGroupMemberKey(signer = null)", "async _fanoutGroupEnvelope(targets, content, fields, signer = null)",
-        "async _sendGroupEnvelope(memberHash, content, fields, signer = null)",
+        "async sendGroupLeave(groupId)", "_ownGroupMemberKey(signer = null)", "async _fanoutGroupEnvelope(targets, content, fields, signer = null, onSubmitted = null)",
+        "async _sendGroupEnvelope(memberHash, content, fields, signer = null, onSubmitted = null)",
         "_deliverGroupEnvelope(memberHash, fullLxmfBytes, publicKeyHex, onDelivered = null)",
         "_decideMessageName(sourceHex, recipientHex)", "_requestGroupPeer(memberHash)", "_waitForGroupPeer(memberHash)",
         "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)",
