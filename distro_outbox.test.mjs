@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, groupSyncEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import { memoryStorage } from "./test_app_source.mjs";
 
 const D = "d".repeat(32);
@@ -317,4 +317,60 @@ test("UnprovedUploads: forget() ends a message's failure record and its never-le
     unproved.recordNeverLeft(message);
     unproved.forget(message);
     assert.equal(unproved.neverLeftSize, 0);
+});
+
+// ── RFed SPEC §17.14: the group sync G, a third kind (GROUPS-DISTRO-DESIGN.md §10.5) ──
+
+const gEntry = (hash, packed, extra = {}) => ({ id: groupSyncEntryId(hash), kind: "group", distro: D, packed, label: `the group leave ${hash.slice(0, 4)}`, op: "leave", groupId: "9".repeat(32), ...extra });
+
+test("RFed SPEC §17.14: a group sync is owed under its own id, group:<its LXMF hash>, each on its own (no later G replaces it), under its own storage key distro_outbox_group_v1", () => {
+    const { storage, box } = outbox();
+    assert.equal(groupSyncEntryId("ab".repeat(32)), `group:${"ab".repeat(32)}`);
+    assert.equal(box.put(entry(channelSyncEntryId("aa"), "AAAA")), true);
+    assert.equal(box.put(gEntry("01".repeat(32), "GGGG")), true);
+    assert.equal(box.put(gEntry("02".repeat(32), "HHHH", { op: "post" })), true);
+    assert.deepEqual(box.list().map((e) => e.id), ["channel:aa", groupSyncEntryId("01".repeat(32)), groupSyncEntryId("02".repeat(32))]);
+    assert.deepEqual(storage.sGet("distro_outbox_v1").map((e) => e.id), ["channel:aa"], "the old key holds the two old kinds only");
+    assert.deepEqual(storage.sGet("distro_outbox_group_v1").map((e) => e.id), [groupSyncEntryId("01".repeat(32)), groupSyncEntryId("02".repeat(32))]);
+    assert.equal(box.get(groupSyncEntryId("01".repeat(32))).packed, "GGGG");
+    const other = new DistroOutbox({ get: storage.sGet, set: storage.sSet });
+    assert.equal(other.settle(groupSyncEntryId("01".repeat(32)), "GGGG"), true);
+    assert.deepEqual(box.list().map((e) => e.id), ["channel:aa", groupSyncEntryId("02".repeat(32))]);
+    assert.equal(box.settle("channel:aa", "AAAA"), true);
+    assert.deepEqual(storage.sGet("distro_outbox_group_v1").map((e) => e.id), [groupSyncEntryId("02".repeat(32))], "settling an old kind leaves the group key alone");
+});
+
+test("RFed SPEC §17.14 (James, 2026-10-10, Q1): a group sync owed to a distro this device gives up stays owed, as a sent-copy does; only §17.12 membership messages are dropped", () => {
+    const { box } = outbox();
+    box.put(entry(channelSyncEntryId("aa"), "AAAA"));
+    box.put(gEntry("01".repeat(32), "GGGG"));
+    box.put(entry(sentCopyEntryId("ff"), "BBBB", { kind: "sent", to: "0".repeat(32) }));
+    assert.deepEqual(box.dropMembershipNotFor(null).map((e) => e.id), ["channel:aa"]);
+    assert.deepEqual(box.list().map((e) => e.id), ["sent:ff", groupSyncEntryId("01".repeat(32))]);
+});
+
+test("a stale page (the 6d0cf8b DistroOutbox, a cached app.js or an older tab taking the TabLock) cannot erase owed group syncs: it never reads or writes their key", async (t) => {
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    let source;
+    try {
+        source = execFileSync("git", ["show", "6d0cf8b:lib/distro_outbox.js"], { cwd: new URL(".", import.meta.url), encoding: "utf8" });
+    } catch {
+        t.skip("6d0cf8b is not in this repository's history");
+        return;
+    }
+    const dir = mkdtempSync(join(tmpdir(), "outbox-6d0cf8b-"));
+    writeFileSync(join(dir, "distro_outbox.mjs"), source);
+    const { DistroOutbox: OldOutbox } = await import(join(dir, "distro_outbox.mjs"));
+    const { storage, box } = outbox();
+    box.put(entry(channelSyncEntryId("aa"), "AAAA"));
+    box.put(gEntry("01".repeat(32), "GGGG"));
+    const old = new OldOutbox({ get: storage.sGet, set: storage.sSet }, { log: { error() {} } });
+    assert.deepEqual(old.list().map((e) => e.id), ["channel:aa"], "the old page sees only the kinds it knows");
+    old.put(entry(channelSyncEntryId("bb"), "BBBB"));
+    old.settle("channel:aa", "AAAA");
+    old.dropMembershipNotFor(null);
+    assert.deepEqual(box.list().map((e) => e.id), [groupSyncEntryId("01".repeat(32))], "every owed G is still owed after the old page's writes");
 });
