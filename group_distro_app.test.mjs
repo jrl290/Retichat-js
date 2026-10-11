@@ -22,6 +22,7 @@ import { HeldGroupArrivals } from "./lib/group_distro.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import { groupSyncFields } from "./lib/group_sync.js";
 import LXMF from "./lib/rns/lxmf/lxmf.js";
+import MsgPack from "./lib/rns/msgpack.js";
 
 const decodeFields = (m) => LXMessage.extractGroupFields(m.fields);
 const hex = (b) => Buffer.from(b).toString("hex");
@@ -1149,7 +1150,7 @@ test("§17.14 rule 3: the 0xFD of a G from D, signed by D, is remembered as a de
     assert.equal(u.KnownSiblingsStore.has(D, X), false, "a G not signed by D teaches nothing");
 });
 
-test("§6.1, §6.4: a group message whose fields map msgpackr cannot decode (an unknown ext type in another field) is still a group message on the distro path, as the phones' unwrap finds it: dropped there, said, never filed as a DM", async () => {
+test("§6.1, §6.4: a group message whose fields map msgpackr cannot decode (an unknown ext type in another field) is still a group message on the distro path, as the phones' unwrap finds it, and is handled as one (SPEC §17.14 \"Repeated keys\": the ext is skipped): held, its group not joined here, never filed as a DM", async () => {
     const Did = Identity.create();
     const D = lxmfHash(Did);
     const u = groupClient({ distro: Did });
@@ -1168,7 +1169,10 @@ test("§6.1, §6.4: a group message whose fields map msgpackr cannot decode (an 
     const hashed = Buffer.concat([dest, src, payload]);
     const signature = sender.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
     await u.receiveDistro(Buffer.concat([dest, src, signature, payload]));
-    assert.deepEqual(u.distroKept, [false], "dropped in the group branch");
+    // Until 2026-10-11 it was dropped there as unreadable: the handler read
+    // msgpackr's empty map.
+    assert.deepEqual(u.distroKept, [true], "taken in the group branch");
+    assert.deepEqual(u.HeldGroupArrivalsStore.list().map((e) => [e.groupId, e.src]), [[id, A]], "held until its group is joined here (§6.5)");
     assert.deepEqual(u.MsgStore.get(A), [], "never a DM");
 });
 
@@ -1208,4 +1212,78 @@ test("DESIGN_PRINCIPLES (every drop path speaks), §6.5: the stores of groups re
     assert.equal(hold({ signatureState: "validated", signature: Buffer.alloc(64) }, { groupId: "9".repeat(32), groupAction: null }, src, null,
         { via: "distro", blob: Buffer.alloc(100), hash: "1".repeat(64) }), true);
     assert.equal(said.filter((l) => /this page only/.test(l)).length, 1, said.join("\n"));
+});
+
+// ═══ RFed SPEC §17.14 "Repeated keys": the group entries from the bytes ═══
+
+let rawClock = Date.now() / 1000;
+/** A message from `from` (an Identity) to `to` (a hash), signed by `from`,
+ *  destination first as lxm() packs it, whose fields map is the bytes
+ *  `fieldsHex` as given: a key repeated, or an ext held, which no Map packs. */
+function lxmRaw(from, to, content, fieldsHex) {
+    const payload = Buffer.concat([Buffer.from([0x94]), MsgPack.pack(rawClock += 1), MsgPack.pack(Buffer.alloc(0)),
+        MsgPack.pack(Buffer.from(content)), Buffer.from(fieldsHex, "hex")]);
+    const dest = Buffer.from(to, "hex"), src = Buffer.from(lxmfHash(from), "hex");
+    const hash = Cryptography.fullHash(Buffer.concat([dest, src, payload]));
+    return Buffer.concat([dest, src, from.sign(Buffer.concat([dest, src, payload, hash])), payload]);
+}
+/** A msgpack str, as hex. */
+const str = (s) => {
+    const b = Buffer.from(s);
+    return (b.length < 32 ? (0xa0 | b.length).toString(16) : "d9" + b.length.toString(16).padStart(2, "0")) + b.toString("hex");
+};
+/** A msgpack fields map of the [key, value hex] given, in order, repeats kept. */
+const rawMap = (...entries) => (0x80 | entries.length).toString(16) + entries.map(([k, v]) => (k < 0x80 ? k.toString(16).padStart(2, "0") : "cc" + k.toString(16)) + v).join("");
+
+test("SPEC §17.14 \"Repeated keys\", the direct path: a member's accept whose GROUP_ACTION comes twice is read from the first; a post whose fields hold an unknown ext beside the group id is the group's, never a DM", async () => {
+    const c = groupClient(), m = groupClient(), u = groupClient();
+    const all = [c, m, u];
+    for (const x of all) for (const y of all) if (x !== y) x.reachable(y.own).know(y);
+    const net = network(...all);
+    const listed = [m.own, u.own];
+    const group = c.GroupStore.create("G", listed);
+    const id = group.groupId;
+    void c.self.sendGroupInvites(id, "G", listed);
+    await net.pump(c);
+    u.page._acceptGroupInvite(id);
+    await settle();
+    assert.equal(u.GroupStore.get(id)?.groupStatus, "active");
+    assert.equal(u.status(id, m.own), "invited");
+    // { 0xA0: id, 0xA3: "accept", 0xA3: "leave" }: msgpackr keeps "leave".
+    await u.receive(lxmRaw(m.me, u.own, "", rawMap([0xA0, str(id)], [0xA3, str("accept")], [0xA3, str("leave")])));
+    assert.equal(u.status(id, m.own), "accepted", "the first GROUP_ACTION: an accept, never a leave");
+    // { 0xA0: id, 0xA4: C, 0x77: an ext of type 5 }: msgpackr refuses the map whole.
+    await u.receive(lxmRaw(c.me, u.own, "with an ext", rawMap([0xA0, str(id)], [0xA4, str(c.own)], [0x77, "d40500"])));
+    assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "with an ext" && x.dir === "in"), true, "stored in the group");
+    assert.equal((u.MsgStore.get(c.own) ?? []).some((x) => x.content === "with an ext"), false, "never a DM");
+});
+
+test("SPEC §17.14 \"Repeated keys\", the distro path: the group handler reads the entries the classification read (the first of a repeated key), and a group message beside an unknown ext is handled, not dropped as unreadable", async () => {
+    const { u, m, D, id } = await dPending();
+    u.page._acceptGroupInvite(id);
+    await settle();
+    assert.equal(u.status(id, m.own), "invited");
+    await u.receiveDistro(lxmRaw(m.me, D, "", rawMap([0xA0, str(id)], [0xA3, str("accept")], [0xA3, str("leave")])));
+    assert.deepEqual(u.distroKept, [true]);
+    assert.equal(u.status(id, m.own), "accepted", "the first GROUP_ACTION, as the classification read it");
+    await u.receiveDistro(lxmRaw(m.me, D, "beside an ext", rawMap([0xA0, str(id)], [0x77, "d40500"])));
+    assert.deepEqual(u.distroKept, [true, true]);
+    assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "beside an ext"), true, "stored in the group");
+});
+
+test("SPEC §17.14 \"Repeated keys\", the privacy filter's look: with the filter on, a post from a listed member who is not allowlisted, beside an unknown ext, reaches a pending group as the group's (the filter reads the entries from the bytes too)", async () => {
+    const c = groupClient(), m = groupClient(), u = groupClient({ filter: true });
+    const all = [c, m, u];
+    for (const x of all) for (const y of all) if (x !== y) x.reachable(y.own).know(y);
+    u.ContactStore.allow(c.own);
+    const net = network(...all);
+    const listed = [m.own, u.own];
+    const group = c.GroupStore.create("G", listed);
+    const id = group.groupId;
+    void c.self.sendGroupInvites(id, "G", listed);
+    await net.pump(c);
+    assert.equal(u.GroupStore.get(id)?.groupStatus, "pending");
+    assert.equal(u.PrivacyFilter.allows(m.own), false, "m is no allowlisted contact");
+    await u.receive(lxmRaw(m.me, u.own, "from a member", rawMap([0xA0, str(id)], [0x77, "d40500"])));
+    assert.equal(u.GroupMsgStore.get(id).some((x) => x.content === "from a member"), true, "kept in the pending group");
 });

@@ -2055,7 +2055,10 @@ const PrivacyFilter = {
             // takes only from a device the user added (James, 2026-09-30).
             accepted = this.knows(src);
         } else {
-            const group = LXMessage.extractGroupFields(lxmfMsg.fields);
+            // The group entries from the message's bytes (LXMessage.groupInfo:
+            // the first of a repeated key, an unknown ext skipped; RFed SPEC
+            // §17.14 "Repeated keys"), as the handler reads them.
+            const group = LXMessage.groupInfo(lxmfMsg);
             accepted = group?.groupId ? this.groupAccepts(group, src, lxmfMsg.signatureState ?? "invalid") : this.allows(src);
         }
         if (!accepted) Harness.event("privacy-drop", { src: src.slice(0, 12), path, at: "message" });
@@ -2994,8 +2997,13 @@ const RnsClient = {
 
             // ---- Group message detection ----
             // Check for group fields BEFORE the ticket/epty-content check,
-            // since group protocol messages carry content.
-            const groupInfo = LXMessage.extractGroupFields(lxmfMsg.fields);
+            // since group protocol messages carry content. Read from the
+            // message's bytes (LXMessage.groupInfo), never from msgpackr's
+            // map, which keeps the last of a repeated key and is empty when
+            // the fields hold an ext it does not know: until 2026-10-11 such
+            // a group message was another group message here than on the
+            // phones, or a DM (RFed SPEC §17.14 "Repeated keys").
+            const groupInfo = LXMessage.groupInfo(lxmfMsg);
             if (groupInfo && groupInfo.groupId) {
                 this._handleGroupMessage(lxmfMsg, srcHash, content, groupInfo);
                 return;
@@ -6478,7 +6486,7 @@ const RnsClient = {
         const bytes = Buffer.from(element);
         const message = LXMessage.fromBytes(bytes.subarray(16), bytes.subarray(0, 16));
         if (!message) return "not an LXMF message";
-        const info = LXMessage.extractGroupFields(message.fields);
+        const info = LXMessage.groupInfo(message);
         if (!info) return "no group id";
         if (info.groupId !== groupId) return "about another group";
         const action = info.groupAction;
@@ -8609,7 +8617,13 @@ const RnsClient = {
             return false;
         }
         const lxmfMsg = LXMessage.fromBytes(decrypted, destHash);
-        const info = lxmfMsg ? LXMessage.extractGroupFields(lxmfMsg.fields) : null;
+        // The entries the classification read (groupEntriesOfPayload), from
+        // the same bytes by the same rule (LXMessage.groupInfo; RFed SPEC
+        // §17.14 "Repeated keys"). Until 2026-10-11 they came from msgpackr's
+        // map: a repeated GROUP_ACTION was classified by its first entry and
+        // acted on by its last, and a group message beside an unknown ext
+        // was dropped here as unreadable.
+        const info = lxmfMsg ? LXMessage.groupInfo(lxmfMsg) : null;
         if (!lxmfMsg || !lxmfMsg.hash || !info) {
             console.log(`[distro] 👥 Dropped a group message for group ${entries.group_id.slice(0,8)} from ${srcHex.slice(0,12)}: it cannot be read`);
             return false;

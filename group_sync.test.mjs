@@ -380,3 +380,70 @@ test("the group entries read from the payload's bytes (GROUPS-DISTRO-DESIGN.md �
     assert.deepEqual(groupEntriesOfPayload(payloadWith("c0")), none);
     assert.deepEqual(groupEntriesOfPayload(payloadWith("82" + "cca0" + "d920" + ascii(id).slice(0, 20))), none);
 });
+
+// ── SPEC §17.14 "Repeated keys": every receive path reads the bytes ───────
+
+/** `payload` packed from member M to D, signed by M: destination | source |
+ *  signature | payload, the payload as given (so its fields map can repeat
+ *  a key or hold an ext, which no Map packs). */
+function signedByMember(payload) {
+    const dest = hex(D), src = hex(M);
+    const hash = Cryptography.fullHash(Buffer.concat([dest, src, payload]));
+    const signature = member.sign(Buffer.concat([dest, src, payload, hash]));
+    return Buffer.concat([dest, src, signature, payload]);
+}
+
+test("every receive path reads a message's group entries from its bytes, as the unwrap does (SPEC §17.14 \"Repeated keys\"): LXMessage.fromBytes's groupFields, the group handler's reading (LXMessage.groupInfo) and the router's look, for every group_entries vector", () => {
+    assert.equal(typeof LXMessage.groupFieldsOfPayload, "function");
+    assert.equal(typeof LXMessage.groupInfo, "function");
+    const recall = (h) => (Buffer.from(h).toString("hex") === M ? member : null);
+    const id = (s) => (typeof s === "string" && /^[0-9a-fA-F]{32}$/.test(s) ? s.toLowerCase() : null);
+    for (const v of V.group_entries) {
+        const { group_sync, ...entries } = v.expected;
+        const payload = payloadWith(v.fields_hex);
+        assert.deepEqual(groupEntriesOf(LXMessage.groupFieldsOfPayload(payload)), entries, `${v.name}: groupFieldsOfPayload`);
+        const packed = signedByMember(payload);
+        const message = LXMessage.fromBytes(packed.subarray(16), packed.subarray(0, 16), recall);
+        assert.ok(message, v.name);
+        assert.equal(message.signatureValidated, true, `${v.name}: signed by M`);
+        assert.deepEqual(groupEntriesOf(message.groupFields), entries, `${v.name}: fromBytes`);
+        // The group handler's reading, on the direct path and the distro
+        // path alike. The direct path knows no distro marker: a message that
+        // carries one is the distro path's, which classifies it first.
+        if (!entries.has_group_id) continue;
+        const info = LXMessage.groupInfo(message);
+        assert.equal(id(info?.groupId), entries.group_id, `${v.name}: the handler's group id`);
+        if (entries.group_id === null) continue;
+        assert.deepEqual([info.groupAction, info.groupName], [entries.group_action, entries.group_name], `${v.name}: the handler's action and name`);
+        assert.deepEqual(LXMessage.peekGroupFields(payload), { groupId: info.groupId, groupAction: entries.group_action }, `${v.name}: the router's look`);
+    }
+});
+
+test("LXMessage.groupInfo: a received message's group entries from its bytes (the first of a repeated key, an unknown ext skipped), a message built here from its fields", () => {
+    const id = "4".repeat(32);
+    const other = "5".repeat(32);
+    // { 0xA0: id, 0xA3: "accept", 0xA3: "leave", 0xA0: other }: msgpackr keeps the last of each.
+    const twice = payloadWith("84" + "cca0" + "d920" + ascii(id) + "cca3" + "a6" + ascii("accept") + "cca3" + "a5" + ascii("leave") + "cca0" + "d920" + ascii(other));
+    const recall = (h) => (Buffer.from(h).toString("hex") === M ? member : null);
+    const packed = signedByMember(twice);
+    const message = LXMessage.fromBytes(packed.subarray(16), packed.subarray(0, 16), recall);
+    assert.deepEqual([message.fields.get(0xA0), message.fields.get(0xA3)], [other, "leave"], "msgpackr's map: the last of each");
+    assert.deepEqual([LXMessage.groupInfo(message).groupId, LXMessage.groupInfo(message).groupAction], [id, "accept"], "the bytes: the first of each");
+    // An ext beside the group id: msgpackr refuses the whole map, the bytes do not.
+    const ext = signedByMember(payloadWith("83" + "cca0" + "d920" + ascii(id) + "cca3" + "a6" + ascii("accept") + "77" + "d40500"));
+    const withExt = LXMessage.fromBytes(ext.subarray(16), ext.subarray(0, 16), recall);
+    assert.ok(withExt.fieldsUnreadable, "msgpackr could not decode the fields");
+    assert.deepEqual([LXMessage.groupInfo(withExt)?.groupId, LXMessage.groupInfo(withExt)?.groupAction], [id, "accept"]);
+    // An accept's carried key is read from the same entries.
+    const keyed = new Map([[0xA0, id], [0xA3, "accept"], [0xA8, `${M}:${member.getPublicKey().toString("base64")}`]]);
+    const fieldsHex = Buffer.from(MsgPack.pack(keyed)).toString("hex");
+    // The same key entry first, then a forged one for another source: the first is read.
+    const twoKeys = signedByMember(payloadWith("84" + fieldsHex.slice(2) + "cca8" + "a1" + ascii("x")));
+    assert.equal(LXMessage.fromBytes(twoKeys.subarray(16), twoKeys.subarray(0, 16), () => null).senderKey?.toString("hex"), member.getPublicKey().toString("hex"),
+        "the first 0xA8 binds, and the unknown source's signature is checked under it");
+    // A message built here has no bytes yet: its fields are read.
+    const built = new LXMessage();
+    built.fields = keyed;
+    assert.equal(LXMessage.groupInfo(built).groupAction, "accept");
+    assert.equal(LXMessage.groupInfo({ fields: new Map() }), null);
+});

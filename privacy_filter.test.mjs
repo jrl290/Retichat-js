@@ -984,8 +984,13 @@ test("LXMessage.peekGroupFields reads the group id and action as the full parse 
     for (const v of fieldVectors.decode) {
         const want = v.group.group_id === null ? null : { groupId: v.group.group_id, groupAction: v.group.group_action };
         assert.deepEqual(LXMessage.peekGroupFields(payload(v.fields_msgpack_hex)), want, v.name);
-        const full = LXMessage.extractGroupFields(LXMessage.decodePayload(payload(v.fields_msgpack_hex)).fields);
-        assert.deepEqual(full ? { groupId: full.groupId, groupAction: full.groupAction } : null, want, `the full parse agrees: ${v.name}`);
+        // The full parse's group entries: read from the bytes (fromBytes's
+        // groupFields, RFed SPEC §17.14 "Repeated keys"), and for these
+        // vectors msgpackr's decoding too.
+        for (const fields of [LXMessage.groupFieldsOfPayload(payload(v.fields_msgpack_hex)), LXMessage.decodePayload(payload(v.fields_msgpack_hex)).fields]) {
+            const full = LXMessage.extractGroupFields(fields);
+            assert.deepEqual(full ? { groupId: full.groupId, groupAction: full.groupAction } : null, want, `the full parse agrees: ${v.name}`);
+        }
     }
     const G = "0123456789abcdef0123456789abcdef";
     const fieldsHex = (m) => MsgPack.pack(m).toString("hex");
