@@ -999,12 +999,15 @@ test("LXMessage.peekGroupFields reads the group id and action as the full parse 
     // the float 64 209.0 is none, as LXMF-rust (key_is), Android and iOS
     // read it, so the look and the full parse (groupFields) find no group.
     // msgpackr's own map reads it as 0xD1, which is why no received message
-    // is classified from that map (LXMessage.routingFields). Until
+    // is classified from that map (LXMessage.routingFields), and why
+    // decodePayload's fields are keyed from the bytes (msgpack_keys.js
+    // phoneKeyedFields: no entry under a float key, 2026-10-11). Until
     // 2026-10-11 this pinned msgpackr's reading for the look too.
     const floatD1 = payload("81cb406a200000000000" + MsgPack.pack(new Map([[1, G]])).toString("hex"));
     assert.equal(LXMessage.peekGroupFields(floatD1), null, "0xD1 as a float64 key: no group");
     assert.equal(LXMessage.extractGroupFields(LXMessage.groupFieldsOfPayload(floatD1)), null, "nor in the full parse's group entries");
-    assert.equal(LXMessage.extractGroupFields(LXMessage.decodePayload(floatD1).fields)?.groupId, G, "msgpackr's map alone reads it as 0xD1");
+    assert.equal(LXMessage.extractGroupFields(LXMessage.decodePayload(floatD1).fields), null, "nor in the full parse's fields");
+    assert.equal(LXMessage.extractGroupFields(MsgPack.unpack(floatD1)[3])?.groupId, G, "msgpackr's map alone reads it as 0xD1");
     // A big content and attachment are skipped, not read.
     assert.deepEqual(LXMessage.peekGroupFields(payload(fieldsHex(new Map([[0x05, [[Buffer.from("a"), Buffer.alloc(100000)]]], [0xA0, G]])),
         Buffer.alloc(200000))), { groupId: G, groupAction: null });
