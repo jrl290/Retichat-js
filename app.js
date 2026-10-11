@@ -6533,7 +6533,17 @@ const RnsClient = {
         if (!(element instanceof Uint8Array)) return "not a bin";
         if (element.length <= 96 || element.length > GroupStore.STATUS_PACKED_LIMIT) return `${element.length} bytes is not the size of an accept or leave`;
         const bytes = Buffer.from(element);
-        const message = LXMessage.fromBytes(bytes.subarray(16), bytes.subarray(0, 16));
+        // A payload Python refuses for its msgpack (a key repeated, a key it
+        // cannot hash, nesting past depth 493: decodePayload, which has said
+        // so once) is refused whole, as Android and iOS skip it.
+        let message;
+        try {
+            message = LXMessage.unpackFromBytes(bytes.subarray(16), bytes.subarray(0, 16));
+        } catch (e) {
+            if (LXMessage.isRefusal(e)) return "refused whole";
+            console.log("failed to parse lxmf message from bytes", e);
+            message = null;
+        }
         if (!message) return "not an LXMF message";
         const info = LXMessage.groupInfo(message);
         if (!info) return "no group id";

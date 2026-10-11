@@ -40,7 +40,9 @@ import Link from "./lib/rns/link.js";
 import * as RF from "./lib/retichat_field.js";
 import { senderKeyEntry, packedMessage, STATUS_PACKED_LIMIT } from "./lib/group_status.js";
 import { app, methodBody, objectLiteral } from "./test_app_source.mjs";
-import { groupClient, network, settle, lxm, lxmfHash, hex, oldFields, newFields, groupRule, LXMessage, Identity } from "./test_group_net.mjs";
+import { groupClient, network, settle, lxm, lxmfHash, hex, oldFields, newFields, groupRule, LXMessage, Identity, logLines } from "./test_group_net.mjs";
+import MsgPack from "./lib/rns/msgpack.js";
+import Cryptography from "./lib/rns/cryptography.js";
 
 const G = "9a".repeat(16);
 const keyOf = (identity) => senderKeyEntry(lxmfHash(identity), identity.getPublicKey().toString("hex"));
@@ -785,6 +787,42 @@ test("each element is checked on its own, as if it had arrived directly: a faili
     assert.deepEqual([tally.elements, tally.counted, tally.held, tally.skipped], [elements.length, 1, 0, elements.length - 1]);
     assert.equal(r.ContactStore.get(lxmfHash(x)), null, "a skipped element leaves nothing behind");
     assert.equal(r.ContactStore.get(B)?.publicKey ?? null, null, "not even the key a forged one carried");
+});
+
+/** An accept from `from` to `to` for G, signed by `from`, its old fields
+ *  followed by one more entry, `extraHex`, that no Map packs: a key
+ *  repeated, or a key Python cannot hash (RFed SPEC §17.14). */
+function acceptWith(from, to, extraHex) {
+    const fields = Buffer.from(MsgPack.pack(oldFields({ id: G, action: "accept", sender: lxmfHash(from), keys: keyOf(from) })));
+    assert.equal(fields[0] & 0xf0, 0x80, "a fixmap: one more entry is one more in its count");
+    const map = Buffer.concat([Buffer.from([fields[0] + 1]), fields.subarray(1), Buffer.from(extraHex, "hex")]);
+    const payload = Buffer.concat([Buffer.from([0x94]), Buffer.from(MsgPack.pack(Date.now() / 1000)), Buffer.from(MsgPack.pack(Buffer.alloc(0))),
+        Buffer.from(MsgPack.pack(Buffer.alloc(0))), map]);
+    const dest = Buffer.from(lxmfHash(to), "hex"), src = Buffer.from(lxmfHash(from), "hex");
+    const hash = Cryptography.fullHash(Buffer.concat([dest, src, payload]));
+    return Buffer.concat([dest, src, from.sign(Buffer.concat([dest, src, payload, hash])), payload]);
+}
+
+test("an element whose payload Python refuses whole (a key repeated, a key Python cannot hash, nesting past depth 493) is skipped as \"refused whole\", as Android and iOS skip it, and the rest apply", async () => {
+    const [a, b, d, e] = [1, 2, 3, 4].map(() => Identity.create());
+    const { r, creator } = joined({ members: [a, b, d, e] });
+    const [A, B, D, E] = [a, b, d, e].map(lxmfHash);
+    const action = Buffer.from(MsgPack.pack([...oldFields({ action: "accept" }).keys()][0])).toString("hex");
+    const deep = "91".repeat(494) + "c0";                                                            // 494 arrays deep, under key 7
+    const elements = [
+        acceptWith(a, creator, action + Buffer.from(MsgPack.pack("accept")).toString("hex")),    // a: its action key twice
+        acceptWith(b, creator, "80" + "c0"),                                                      // b: a map as a key
+        acceptWith(d, creator, "07" + deep),                                                      // d: too deep
+        control(e, creator, "accept", { groupId: G }),                                            // e: counts
+    ];
+    assert.ok(elements.every((x) => x.length > 96 && x.length <= STATUS_PACKED_LIMIT), "each is the size of an accept");
+    const lines = await logLines(() => r.receive(status(creator, r.me, elements, { raw: true })));
+    assert.deepEqual([A, B, D, E].map((h) => r.status(G, h)), ["invited", "invited", "invited", "accepted"]);
+    const tally = r.events.find((ev) => ev.kind === "group-status-received").detail;
+    assert.deepEqual([tally.counted, tally.held, tally.skipped], [1, 0, 3]);
+    const skips = lines.filter((l) => /Skipped element/.test(l)).map((l) => l.replace(/^.*Skipped element (\d+) of the status for group \w+: /, "$1 "));
+    assert.deepEqual(skips, ["0 refused whole", "1 refused whole", "2 refused whole"], lines.join("\n"));
+    assert.deepEqual(lines.filter((l) => /failed to parse/.test(l)), [], "a refusal is not a failure to parse");
 });
 
 test("an element is about this status's group and no other: one a member signed for another group the user also holds is skipped, and changes neither; a valid accept over the size limit is skipped, the same message arriving directly is not", async () => {
