@@ -10601,13 +10601,15 @@ const App = {
         // longer holds is read-only here: the composer, accept, decline and
         // leave give way to why, and "Delete from this device".
         const formerDistro = RnsClient.groupFormerDistroText(g);
-        // Greyed, with no text, until the start finishes (_groupActionsReady).
+        // Accept and Decline are greyed, with no text, until the start
+        // finishes (_groupActionsReady). "Delete from this device" never is:
+        // it is local only and needs no client (_deleteGroupFromDevice).
         const greyed = !this._groupActionsReady();
         const formerDistroBar = () => h("div", { className: "pending-invite-bar" },
             h("div", { className: "pending-icon" }, "🔒"),
             h("div", { className: "pending-text" }, formerDistro),
             h("div", { style: { display: "flex", gap: "8px" } },
-                h("button", { className: "btn btn-danger btn-sm", "data-group-action": "", disabled: greyed,
+                h("button", { className: "btn btn-danger btn-sm",
                     onClick: () => this._deleteGroupFromDevice(g.groupId) }, "Delete from this device"),
             ),
         );
@@ -11228,16 +11230,18 @@ const App = {
 
     /** Whether the start has finished: RnsClient.connect() has built the
      *  client (its router; disconnect() takes it down). Until then Accept,
-     *  Decline, Leave, Delete from this device and Create are greyed, with
-     *  no text, and do nothing, as on both phones (James, 2026-10-11): an
-     *  accept then threw halfway, at the first member's path request,
-     *  accepted here and told nobody. A post waits like a DM's, until the
-     *  exchange registers (RnsClient.sendGroupMessage, waitFor "init").
-     *  Once built, the acts work while the exchange is down, as they did
+     *  Decline, Leave and Create are greyed, with no text, and do nothing,
+     *  as on both phones (James, 2026-10-11): an accept then threw halfway,
+     *  at the first member's path request, accepted here and told nobody.
+     *  A post waits like a DM's, until the exchange registers
+     *  (RnsClient.sendGroupMessage, waitFor "init"). Once built, the acts
+     *  work while the exchange is down, as they did
      *  (exchange_url_at_load.test.mjs). The web holds its identity and its
      *  distro from the page's load, so its start never leaves a group's own
      *  address unknown: a D-group whose distro is gone says so
-     *  (groupFormerDistroText) from the first drawing. */
+     *  (groupFormerDistroText) from the first drawing, with "Delete from
+     *  this device", which is local only, needs no client, and is never
+     *  greyed (_deleteGroupFromDevice). */
     _groupActionsReady() {
         return RnsClient._lxmfRouter != null;
     },
@@ -11344,9 +11348,12 @@ const App = {
      *  (GroupStore.close, "deleted"), so a later invite or sync for its id
      *  does not bring it back here, as on every client (decided
      *  2026-10-11). Until then it was not recorded, and the next invite or
-     *  accept sync for the id held the group here again. */
+     *  accept sync for the id held the group here again. It touches this
+     *  device's stores only and needs no client, so it works before the
+     *  start finishes, unlike the acts _groupActionsReady greys: the web
+     *  holds its distro from the page's load, so a former D is known, and
+     *  its bar shown, from the first drawing (§8.7). */
     _deleteGroupFromDevice(groupId) {
-        if (!this._groupActionsReady()) return;
         if (!confirm("This removes the group from this device only. You stay in the group on your other devices and for the other members.")) return;
         console.log(`[retichat] 👥 Group ${groupId.slice(0,8)} deleted from this device only: no leave sent, no group sync owed; recorded closed here`);
         GroupMsgStore.remove(groupId);
@@ -12631,7 +12638,9 @@ const App = {
         // GROUPS-DISTRO-DESIGN.md §8.7: only "Delete from this device" in a
         // group whose D this device no longer holds.
         const formerDistro = RnsClient.groupFormerDistroText(g);
-        // Greyed, with no text, until the start finishes (_groupActionsReady).
+        // Accept, Decline and Leave are greyed, with no text, until the start
+        // finishes (_groupActionsReady). "Delete from this device" never is:
+        // it is local only and needs no client (_deleteGroupFromDevice).
         const greyed = !this._groupActionsReady();
 
         const overlay = h("div", { className: "modal-overlay",
@@ -12662,7 +12671,7 @@ const App = {
             body.appendChild(
                 h("div", { style: { marginBottom: "16px" } },
                     h("p", { style: { fontSize: "13px" } }, formerDistro),
-                    h("button", { className: "btn btn-danger btn-block", "data-group-action": "", disabled: greyed,
+                    h("button", { className: "btn btn-danger btn-block",
                         onClick: () => { this.state.showGroupInfo = false; this.render(); this._deleteGroupFromDevice(g.groupId); } },
                         "Delete from this device"),
                 ),

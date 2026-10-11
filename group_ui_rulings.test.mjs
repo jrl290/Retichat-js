@@ -5,9 +5,12 @@
  *   - UI text never describes an internal state, and the only new text is the
  *     former-distro text, word for word, shown with "Delete from this device";
  *   - while the start has not finished (RnsClient.connect() has not built
- *     the client), Accept, Decline, Leave, Delete from this device and
- *     Create are greyed, with no text, and a post waits like a DM's; once
- *     built they work while the exchange is down, as before;
+ *     the client), Accept, Decline, Leave and Create are greyed, with no
+ *     text, and a post waits like a DM's; once built they work while the
+ *     exchange is down, as before. "Delete from this device" is never
+ *     greyed: the web knows its distro from the page's load, so the
+ *     former-distro text is true from the first drawing, and that delete is
+ *     local only and needs no client;
  *   - a post refused after Send says nothing, and its draft stays in the
  *     composer; an accept, decline or leave refused says nothing either;
  *   - the distro changing (imported, generated, forgotten) draws an open
@@ -205,7 +208,7 @@ test("a post refused after Send (the group's distro is no longer here) says noth
 
 // ── the start-up: greyed, no text ──────────────────────────────────────────
 
-test("until the start finishes, Accept, Decline, Leave, Delete from this device and Create are greyed with no text, in the chat, the group info and the group form; once it finishes they are offered in place", () => {
+test("until the start finishes, Accept, Decline, Leave and Create are greyed with no text, in the chat, the group info and the group form; once it finishes they are offered in place; \"Delete from this device\" is offered throughout", () => {
     const pending = dGroup();
     const joined = dGroup({ joined: true });
     const former = dGroup({ joined: true });
@@ -228,11 +231,17 @@ test("until the start finishes, Accept, Decline, Leave, Delete from this device 
     const jChat = appOf(joined.u, joined.id);
     const jComposer = jChat.chat();
     assert.ok(buttons(jComposer).some((b) => b.className === "btn-send" && !b.disabled), "the composer stays: a post waits like a DM's");
+    // The former-distro bar is true from the first drawing (the web holds
+    // its distro from the page's load), and its one act, local only, is
+    // offered: not greyed, and not among the acts the start greys.
+    const formerViews = [];
     for (const view of ["chat", "info"]) {
         const f = appOf(former.u, former.id);
         const root = f[view]();
-        assert.deepEqual(offered(root).filter(([t]) => t === "Delete from this device"), [["Delete from this device", true]], view);
-        views.push([f, root, ["Delete from this device"]]);
+        assert.ok(root.textContent.includes(FORMER(former.D)), `${view}: the former-distro text from the first drawing`);
+        assert.deepEqual(offered(root).filter(([t]) => t === "Delete from this device"), [["Delete from this device", false]], view);
+        assert.equal(button(root, "Delete from this device").getAttribute("data-group-action"), null, `${view}: not one the start greys`);
+        formerViews.push([f, root]);
     }
     const c = appOf(joined.u, null);
     const { footer } = c.form();
@@ -259,9 +268,16 @@ test("until the start finishes, Accept, Decline, Leave, Delete from this device 
         page._syncGroupActions();
         for (const label of labels) assert.equal(button(root, label).disabled, true, `${label}: greyed again`);
     }
+    // "Delete from this device" stays offered through a restart.
+    for (const [page, root] of formerViews) {
+        page.root = root;
+        page._syncGroupActions();
+        assert.deepEqual(offered(root).filter(([t]) => t === "Delete from this device"), [["Delete from this device", false]],
+            "Delete from this device: offered while a restart has not finished");
+    }
 });
 
-test("until the start finishes the acts themselves do nothing and say nothing: accept, decline, leave, delete from this device, and create (the button or Enter in the name)", () => {
+test("until the start finishes the acts themselves do nothing and say nothing: accept, decline, leave, and create (the button or Enter in the name)", () => {
     const pending = dGroup();
     starting(pending.u);
     pending.u.page._acceptGroupInvite(pending.id);
@@ -273,13 +289,7 @@ test("until the start finishes the acts themselves do nothing and say nothing: a
     joined.u.page._leaveGroup(joined.id);
     assert.equal(joined.u.GroupStore.isClosed(joined.id), false);
 
-    const former = dGroup({ joined: true });
-    former.u.DistroManager.set(null);
-    starting(former.u);
-    former.u.page._deleteGroupFromDevice(former.id);
-    assert.ok(former.u.GroupStore.get(former.id), "still here");
-
-    for (const g of [pending, joined, former]) assert.deepEqual([g.u.alerts, g.u.confirms, g.u.sent.length], [[], [], 0], "no text, nothing sent");
+    for (const g of [pending, joined]) assert.deepEqual([g.u.alerts, g.u.confirms, g.u.sent.length], [[], [], 0], "no text, nothing sent");
 
     const c = appOf(joined.u, null);
     const contact = Identity.create();
@@ -295,6 +305,20 @@ test("until the start finishes the acts themselves do nothing and say nothing: a
     button(footer, "Create Group").fire("click");
     assert.equal(joined.u.GroupStore.getAll().length, groupsBefore, "no group created");
     assert.deepEqual(c.opened, []);
+});
+
+test("\"Delete from this device\" works before the start finishes: it needs no client, asks its question, and removes the group here only, recorded closed as a delete, sending nothing and owing nothing", async () => {
+    const former = dGroup({ joined: true });
+    former.u.GroupMsgStore.addSystem(former.id, "x");
+    former.u.DistroManager.set(null);
+    starting(former.u);
+    former.u.page._deleteGroupFromDevice(former.id);
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(former.u.confirms, ["This removes the group from this device only. You stay in the group on your other devices and for the other members."]);
+    assert.equal(former.u.GroupStore.get(former.id), null, "gone from this device");
+    assert.deepEqual(former.u.GroupMsgStore.get(former.id), []);
+    assert.equal(former.u.GroupStore._closed.get(former.id), "deleted");
+    assert.deepEqual([former.u.alerts, former.u.sent.length, former.u.propagated.length, former.u.owed], [[], 0, 0, []], "no text, nothing sent, nothing owed");
 });
 
 test("the start finishing is the client being built, not the exchange answering: connect() tells the page once it has built the client, and with the exchange down the acts are offered and work, as before", () => {
