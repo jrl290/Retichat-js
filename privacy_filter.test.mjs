@@ -995,11 +995,16 @@ test("LXMessage.peekGroupFields reads the group id and action as the full parse 
     }
     const G = "0123456789abcdef0123456789abcdef";
     const fieldsHex = (m) => MsgPack.pack(m).toString("hex");
-    // A float field number reads as that integer in msgpackr, so here too.
-    assert.deepEqual(LXMessage.peekGroupFields(payload("81cb406a200000000000" + MsgPack.pack(new Map([[1, G]])).toString("hex"))),
-        { groupId: G, groupAction: null }, "0xD1 as a float64 key");
-    assert.equal(LXMessage.extractGroupFields(LXMessage.decodePayload(
-        payload("81cb406a200000000000" + MsgPack.pack(new Map([[1, G]])).toString("hex"))).fields)?.groupId, G);
+    // A float field number is no field, even an integral one: 0xD1 sent as
+    // the float 64 209.0 is none, as LXMF-rust (key_is), Android and iOS
+    // read it, so the look and the full parse (groupFields) find no group.
+    // msgpackr's own map reads it as 0xD1, which is why no received message
+    // is classified from that map (LXMessage.routingFields). Until
+    // 2026-10-11 this pinned msgpackr's reading for the look too.
+    const floatD1 = payload("81cb406a200000000000" + MsgPack.pack(new Map([[1, G]])).toString("hex"));
+    assert.equal(LXMessage.peekGroupFields(floatD1), null, "0xD1 as a float64 key: no group");
+    assert.equal(LXMessage.extractGroupFields(LXMessage.groupFieldsOfPayload(floatD1)), null, "nor in the full parse's group entries");
+    assert.equal(LXMessage.extractGroupFields(LXMessage.decodePayload(floatD1).fields)?.groupId, G, "msgpackr's map alone reads it as 0xD1");
     // A big content and attachment are skipped, not read.
     assert.deepEqual(LXMessage.peekGroupFields(payload(fieldsHex(new Map([[0x05, [[Buffer.from("a"), Buffer.alloc(100000)]]], [0xA0, G]])),
         Buffer.alloc(200000))), { groupId: G, groupAction: null });
@@ -2993,4 +2998,89 @@ test("distro fan-out is never filtered: a stranger's message to the distro is st
     assert.deepEqual(MsgStore.get(S).map((x) => x.content), ["to your distro"]);
     assert.deepEqual([ContactStore.get(S).hidden, ContactStore.isContact(S), ContactStore.allowlisted(S)], [true, false, false],
         "a plain row, as iOS and Android make (ensureContact): hidden, no contact (James, 2026-10-02)");
+});
+
+// ── RFed SPEC §17.14: the direct path routes as both phones do ──────────────
+
+/** The full packing of a message from `from` to `to` whose fields map is
+ *  `fieldsHex` byte for byte (a float or uint 64 key, a 0xFC of any type:
+ *  no Map packs these), signed by `from`. */
+function rawLxm(from, to, content, fieldsHex) {
+    const dest = Buffer.from(lxmfHash(to), "hex"), src = Buffer.from(lxmfHash(from), "hex");
+    const head = Buffer.from(MsgPack.pack([(clock += 1), Buffer.alloc(0), Buffer.from(content)]));
+    assert.equal(head[0], 0x93);
+    const payload = Buffer.concat([Buffer.from([0x94]), head.subarray(1), Buffer.from(fieldsHex, "hex")]);
+    const hash = Cryptography.fullHash(Buffer.concat([dest, src, payload]));
+    return Buffer.concat([dest, src, from.sign(Buffer.concat([dest, src, payload, hash])), payload]);
+}
+
+test("the direct path routes a message as Android (DeliveryPolicy.directRoute) and iOS do, by integer keys and by a custom field that is a str or bin: a float key is no field, a uint 64 key is one, and a 0xFB/0xFC of another type is none, so a group message is never taken for a transfer or a sent copy; the privacy filter reads the same fields as the handler", async () => {
+    const r = recipient();
+    const friend = Identity.create(), member = Identity.create();
+    const F = lxmfHash(friend), M = lxmfHash(member);
+    r.ContactStore.add(F);
+    r.ContactStore.allow(F);
+    // A member of a group the user holds, not allowlisted: known (a
+    // transfer from it is offered), but its DM is dropped.
+    const G = r.GroupStore.create("G", [F, M]).groupId;
+    r.ContactStore.keep(M);
+    assert.deepEqual([r.PrivacyFilter.knows(M), r.PrivacyFilter.allows(M)], [true, false]);
+    const KEY = "ab".repeat(64), R = "0123456789abcdef".repeat(2);
+    const ascii = (s) => Buffer.from(s, "ascii").toString("hex");
+    const str = (s) => (s.length < 32 ? (0xa0 | s.length).toString(16) : "d9" + s.length.toString(16).padStart(2, "0")) + ascii(s);
+    const bin = (s) => "c4" + s.length.toString(16).padStart(2, "0") + ascii(s);
+    const f64 = (x) => { const b = Buffer.alloc(9); b[0] = 0xcb; b.writeDoubleBE(x, 1); return b.toString("hex"); };
+    const u64 = (n) => "cf" + n.toString(16).padStart(16, "0");
+    const A0 = "cca0", FB = "ccfb", FC = "ccfc";
+    const TRANSFER = LXMF.DISTRO_TRANSFER_TYPE, SENT = LXMF.DISTRO_SENT_TYPE;
+    const route = async (fieldsHex, from = friend) => {
+        const hash = lxmfHash(from);
+        const was = { groups: r.self.groups.length, transfers: r.self.transfers.length, dms: r.MsgStore.get(hash).length, events: r.events.length };
+        r.packet(rawLxm(from, r.me, "hi", fieldsHex));
+        await settle();
+        if (r.self.transfers.length > was.transfers) return `transfer:${r.self.transfers.at(-1)[2]}`;
+        if (r.self.groups.length > was.groups) return `group:${r.self.groups.at(-1)[3].groupId}`;
+        if (r.MsgStore.get(hash).length > was.dms) return "dm";
+        if (r.events.slice(was.events).some((e) => e.kind === "sent-copy-drop")) return "sentcopy-drop";
+        return "dropped";
+    };
+    // [what, fields map, the route Android and iOS take]
+    const cases = [
+        ["control: a group message", "81" + A0 + str(G), `group:${G}`],
+        ["control: a transfer, str", "82" + FB + str(TRANSFER) + FC + str(KEY), `transfer:${KEY}`],
+        ["control: a transfer, bin", "82" + FB + bin(TRANSFER) + FC + "c480" + ascii(KEY), `transfer:${KEY}`],
+        ["control: a sent copy", "82" + FB + str(SENT) + FC + str(R), "sentcopy-drop"],
+        ["float 64 160.0 for 0xA0, a valid id", "81" + f64(160) + str(G), "dm"],
+        ["float 64 160.0 for 0xA0, \"xyz\"", "81" + f64(160) + str("xyz"), "dm"],
+        ["float 64 1.0 for key 1 of 0xD1", "81" + "ccd1" + "81" + f64(1) + str(G), "dm"],
+        ["0xFC = 5 beside a group id", "83" + A0 + str(G) + FB + str(TRANSFER) + FC + "05", `group:${G}`],
+        ["0xFC = 5 alone", "82" + FB + str(TRANSFER) + FC + "05", "dm"],
+        ["0xFC = [key] beside a group id", "83" + A0 + str(G) + FB + str(TRANSFER) + FC + "91" + str(KEY), `group:${G}`],
+        ["0xFC = true beside a group id", "83" + A0 + str(G) + FB + str(TRANSFER) + FC + "c3", `group:${G}`],
+        ["0xFB = [transfer] beside a group id", "83" + A0 + str(G) + FB + "91" + str(TRANSFER) + FC + str(KEY), `group:${G}`],
+        ["0xFB = [sent] beside a group id", "83" + A0 + str(G) + FB + "91" + str(SENT) + FC + str(R), `group:${G}`],
+        ["0xFB = [sent] alone", "82" + FB + "91" + str(SENT) + FC + str(R), "dm"],
+        ["float 64 251.0 for 0xFB (transfer) beside a group id", "83" + A0 + str(G) + f64(251) + str(TRANSFER) + FC + str(KEY), `group:${G}`],
+        ["float 64 252.0 for 0xFC", "82" + FB + str(TRANSFER) + f64(252) + str(KEY), "dm"],
+        ["float 64 251.0 for 0xFB (sent) beside a group id", "83" + A0 + str(G) + f64(251) + str(SENT) + FC + str(R), `group:${G}`],
+        ["uint 64 0xFB (transfer)", "82" + u64(0xfb) + str(TRANSFER) + FC + str(KEY), `transfer:${KEY}`],
+        ["uint 64 0xFC (transfer)", "82" + FB + str(TRANSFER) + u64(0xfc) + str(KEY), `transfer:${KEY}`],
+        ["uint 64 0xFB (sent) beside a group id", "83" + A0 + str(G) + u64(0xfb) + str(SENT) + FC + str(R), "sentcopy-drop"],
+    ];
+    const got = [];
+    for (const [what, fieldsHex] of cases) got.push([what, await route(fieldsHex)]);
+    assert.deepEqual(got, cases.map(([what, , want]) => [what, want]));
+
+    // From the member: a transfer is offered (it is known), anything else
+    // that is no group message is its DM, dropped. So the filter's reading
+    // of a transfer shows, and it is the handler's.
+    const fromMember = [
+        ["a transfer", "82" + FB + str(TRANSFER) + FC + str(KEY), `transfer:${KEY}`],
+        ["0xFC = 5 alone: a DM", "82" + FB + str(TRANSFER) + FC + "05", "dropped"],
+        ["float 64 251.0 for 0xFB: a DM", "82" + f64(251) + str(TRANSFER) + FC + str(KEY), "dropped"],
+        ["uint 64 0xFB: a transfer", "82" + u64(0xfb) + str(TRANSFER) + FC + str(KEY), `transfer:${KEY}`],
+    ];
+    const gotM = [];
+    for (const [what, fieldsHex] of fromMember) gotM.push([what, await route(fieldsHex, member)]);
+    assert.deepEqual(gotM, fromMember.map(([what, , want]) => [what, want]));
 });

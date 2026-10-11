@@ -163,3 +163,17 @@ test("the identity transfer uses the custom field pair, never 0x0D", () => {
     assert.equal(LXMF.distroTransferKeyFromFields(new Map([[LXMF.FIELD_CUSTOM_TYPE, "other"], [LXMF.FIELD_CUSTOM_DATA, key]])), null);
     assert.equal(LXMF.distroTransferKeyFromFields(null), null);
 });
+
+test("a transfer is read only from a msgpack str or bin, as Android (getString) and iOS (readStringOrBin) read it: a 0xFB or 0xFC of any other type is none; the fields are found by integer value, a BigInt key (uint 64) included", () => {
+    const key = "ab".repeat(64);
+    const T = LXMF.FIELD_CUSTOM_TYPE, D = LXMF.FIELD_CUSTOM_DATA, TYPE = LXMF.DISTRO_TRANSFER_TYPE;
+    for (const bad of [5, 0, 1.5, true, false, [key], new Map([[1, key]]), { key }]) {
+        assert.equal(LXMF.distroTransferKeyFromFields(new Map([[T, TYPE], [D, bad]])), null, `0xFC = ${JSON.stringify(bad)}`);
+    }
+    assert.equal(LXMF.distroTransferKeyFromFields(new Map([[T, TYPE], [D, null]])), null, "0xFC nil");
+    for (const bad of [[TYPE], new Map([[0, TYPE]]), 7]) {
+        assert.equal(LXMF.distroTransferKeyFromFields(new Map([[T, bad], [D, key]])), null, `0xFB = ${String(bad)}`);
+    }
+    assert.equal(LXMF.distroTransferKeyFromFields(new Map([[251n, TYPE], [252n, key]])), key, "uint 64 keys, as msgpackr gives them");
+    assert.equal(LXMF.distroTransferKeyFromFields(new Map([[T, Buffer.from(TYPE)], [D, Buffer.from(key)]])), key, "bin");
+});

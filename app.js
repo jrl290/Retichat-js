@@ -2049,13 +2049,16 @@ const PrivacyFilter = {
         // outside fan-out"), and like every drop here, unproved, unnamed and
         // unstored. Android's onMessageReceived has no such check; this
         // follows iOS, since Android's way would show a false message.
-        if (LXMF.distroSentCopyFromFields(lxmfMsg.fields) !== null) {
+        // The custom triple is read from the message's bytes under integer
+        // keys only, a str or bin each (LXMessage.routingFields,
+        // LXMF.customText), as both phones read it.
+        if (LXMF.distroSentCopyFromFields(LXMessage.routingFields(lxmfMsg)) !== null) {
             console.log(`[retichat] ${path} message from ${src.slice(0, 12)}: DROPPED distro sent-copy marker outside fan-out (RFed SPEC §17.11)`);
             Harness.event("sent-copy-drop", { src: src.slice(0, 12), path });
             return false;
         }
         let accepted;
-        if (LXMF.distroTransferKeyFromFields(lxmfMsg.fields) !== null) {
+        if (LXMF.distroTransferKeyFromFields(LXMessage.routingFields(lxmfMsg)) !== null) {
             // An offer the user answers, checked before the allowlist on iOS
             // (handleIncomingMessage, ChatRepository.swift:1926-1933) and
             // Android (onMessageReceived, ChatRepository.kt:1365-1373) —
@@ -3000,7 +3003,12 @@ const RnsClient = {
             // FIELD_CUSTOM_TYPE == "rfed.distro.transfer", key in
             // FIELD_CUSTOM_DATA (RFed SPEC §17.9). Checked BEFORE the ticket
             // check. Field 0x0D is upstream FIELD_EVENT and is not read.
-            const distroKeyHex = LXMF.distroTransferKeyFromFields(lxmfMsg.fields);
+            // Read from the message's bytes, integer keys only, a str or bin
+            // each (LXMessage.routingFields, LXMF.customText), as both phones
+            // read it: until 2026-10-11 a 0xFC that was no str or bin (5)
+            // made a message with a group id a transfer here, lost for a
+            // wrong key length, and a group message on the phones.
+            const distroKeyHex = LXMF.distroTransferKeyFromFields(LXMessage.routingFields(lxmfMsg));
             if (distroKeyHex !== null) {
                 this._handleDistroIdentityTransfer(lxmfMsg, srcHash, distroKeyHex);
                 return;
@@ -8789,7 +8797,12 @@ const RnsClient = {
             // Dedupe above already recorded it (same src:ts key as every
             // fan-out message), so a copy that arrives by stream and by PULL
             // is stored once, and an own echo stays dropped on re-delivery.
-            const sentCopy = LXMF.distroSentCopyFromFields(fieldsMap);
+            // Read from the payload's bytes under integer keys only, a str
+            // or bin each (LXMessage.groupFieldsOfPayload, LXMF.customText),
+            // as distro.rs sent_marker_from_fields reads it for the phones
+            // (as_u64 keys), never from msgpackr's map: until 2026-10-11 an
+            // array [R] in 0xFC was R here, a float key 251.0 the marker.
+            const sentCopy = LXMF.distroSentCopyFromFields(LXMessage.groupFieldsOfPayload(payloadBytes));
             if (sentCopy) {
                 // SPEC §17.11 receive rules, in order; the first drop ends it.
                 // Rule 1, source.

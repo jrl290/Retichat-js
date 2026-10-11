@@ -1265,3 +1265,59 @@ test("a fan-out message without the marker keeps today's behaviour", () => {
     assert.equal(rx.stored[0].msg.dir, "in");
     assert.equal(rx.stored[0].msg.status, "delivered");
 });
+
+// ── the custom triple as distro.rs reads it: integer keys, str or bin ──────
+
+test("distroSentCopyFromFields reads 0xFB-0xFD only from a msgpack str or bin, found by integer value: an array holding the marker is no marker, one holding a hash no recipient and no sender", () => {
+    assert.equal(LXMF.distroSentCopyFromFields(new Map([[0xFB, ["rfed.distro.sent"]], [0xFC, R], [0xFD, OTHER_DEVICE]])), null, "0xFB an array");
+    assert.equal(LXMF.distroSentCopyFromFields(new Map([[0xFB, 7], [0xFC, R]])), null, "0xFB an int");
+    for (const bad of [[R], 5, 1.5, true, new Map([[0, R]])]) {
+        assert.deepEqual(LXMF.distroSentCopyFromFields(new Map([[0xFB, "rfed.distro.sent"], [0xFC, bad], [0xFD, OTHER_DEVICE]])),
+            { toHex: null, byHex: OTHER_DEVICE }, `0xFC = ${String(bad)}: a malformed copy`);
+    }
+    for (const bad of [[OTHER_DEVICE], 5, true]) {
+        assert.deepEqual(LXMF.distroSentCopyFromFields(new Map([[0xFB, "rfed.distro.sent"], [0xFC, R], [0xFD, bad]])),
+            { toHex: R, byHex: "" }, `0xFD = ${String(bad)}: no sender`);
+    }
+    assert.deepEqual(LXMF.distroSentCopyFromFields(new Map([[251n, "rfed.distro.sent"], [252n, R], [253n, OTHER_DEVICE]])),
+        { toHex: R, byHex: OTHER_DEVICE }, "uint 64 keys (BigInt), as rmpv's as_u64 reads them");
+});
+
+/** A blob from D whose fields map is `fieldsHex` byte for byte (a float or
+ *  uint 64 key, an array in 0xFC: no Map packs these), signed by D. */
+function rawBlobFor(distro, fieldsHex, { content = "sent on the phone", timestampMs = Date.now() } = {}) {
+    const D = Buffer.from(lxmfHash(distro), "hex");
+    const head = Buffer.from(MsgPack.pack([timestampMs / 1000, Buffer.alloc(0), Buffer.from(content)]));
+    assert.equal(head[0], 0x93);
+    const payload = Buffer.concat([Buffer.from([0x94]), head.subarray(1), Buffer.from(fieldsHex, "hex")]);
+    const hashed = Buffer.concat([D, D, payload]);
+    const signature = distro.sign(Buffer.concat([hashed, Cryptography.fullHash(hashed)]));
+    return Buffer.concat([D, distro.encrypt(Buffer.concat([D, signature, payload]))]);
+}
+
+test("the distro path reads a sent copy from the payload's bytes as distro.rs sent_marker_from_fields reads it for the phones: integer keys only (a float 251.0 is no 0xFB, a uint 64 251 is), a str or bin each (an array [R] in 0xFC is no recipient, an array [me] in 0xFD not this device)", () => {
+    const distro = Identity.create();
+    const ascii = (s) => Buffer.from(s, "ascii").toString("hex");
+    const str = (s) => (s.length < 32 ? (0xa0 | s.length).toString(16) : "d9" + s.length.toString(16).padStart(2, "0")) + ascii(s);
+    const f64 = (x) => { const b = Buffer.alloc(9); b[0] = 0xcb; b.writeDoubleBE(x, 1); return b.toString("hex"); };
+    const u64 = (n) => "cf" + n.toString(16).padStart(16, "0");
+    const SENT = str("rfed.distro.sent"), FB = "ccfb", FC = "ccfc", FD = "ccfd";
+    const outTo = (rx) => rx.stored.filter((s) => s.msg.dir === "out").map((s) => s.hash);
+    // [what, fields map, stored as this user's message to R?]
+    const cases = [
+        ["control", "83" + FB + SENT + FC + str(R) + FD + str(OTHER_DEVICE), [R]],
+        ["0xFC = [R]: a malformed copy, dropped (rule 4)", "83" + FB + SENT + FC + "91" + str(R) + FD + str(OTHER_DEVICE), []],
+        ["0xFD = [me]: not this device's echo", "83" + FB + SENT + FC + str(R) + FD + "91" + str(ME), [R]],
+        ["0xFB = [marker]: no copy", "83" + FB + "91" + SENT + FC + str(R) + FD + str(OTHER_DEVICE), []],
+        ["float 64 251.0 for 0xFB: no copy", "83" + f64(251) + SENT + FC + str(R) + FD + str(OTHER_DEVICE), []],
+        ["float 64 252.0 for 0xFC: no recipient", "83" + FB + SENT + f64(252) + str(R) + FD + str(OTHER_DEVICE), []],
+        ["uint 64 251 for 0xFB: a copy", "83" + u64(0xfb) + SENT + FC + str(R) + FD + str(OTHER_DEVICE), [R]],
+    ];
+    const got = [];
+    for (const [what, fieldsHex] of cases) {
+        const rx = makeReceiver(distro, ME);
+        rx.run(rawBlobFor(distro, fieldsHex));
+        got.push([what, outTo(rx)]);
+    }
+    assert.deepEqual(got, cases.map(([what, , want]) => [what, want]));
+});

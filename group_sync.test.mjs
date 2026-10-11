@@ -565,3 +565,36 @@ test("the direct path reads a group id as the distro path does (SPEC §17.14): a
     built.fields = new Map([[0x01, "x"]]);
     assert.equal(LXMessage.groupIdRefusal(built), null, "no GROUP_ID: nothing to refuse");
 });
+
+test("the direct path takes a field number only from a msgpack integer key, as LXMF-rust (key_is), Android (readMap), iOS (readKey) and the distro path (groupEntriesOfPayload) take one: a float 160.0 is no 0xA0 and a float 1.0 in 0xD1 no key 1, so the message is a DM, never a group or refused; a uint 64 or int 64 key is the field", () => {
+    const recall = (h) => (Buffer.from(h).toString("hex") === M ? member : null);
+    const id = V.group.group_id;
+    const f64 = (x) => { const b = Buffer.alloc(9); b[0] = 0xcb; b.writeDoubleBE(x, 1); return b.toString("hex"); };
+    const f32 = (x) => { const b = Buffer.alloc(5); b[0] = 0xca; b.writeFloatBE(x, 1); return b.toString("hex"); };
+    const wide = (type, n) => type + n.toString(16).padStart(16, "0");
+    const str = (s) => (s.length < 32 ? (0xa0 | s.length).toString(16) : "d9" + s.length.toString(16).padStart(2, "0")) + ascii(s);
+    // [what, fields map, the group id every client reads (null: a DM)]
+    const cases = [
+        ["float 64 160.0 for 0xA0, a valid id", "81" + f64(160) + str(id), null],
+        ["float 64 160.0 for 0xA0, \"xyz\"", "81" + f64(160) + str("xyz"), null],
+        ["float 32 160.0 for 0xA0", "81" + f32(160) + str(id), null],
+        ["float 64 1.0 for key 1 of 0xD1, a valid id", "81" + "ccd1" + "81" + f64(1) + str(id), null],
+        ["float 64 1.0 for key 1 of 0xD1, \"xyz\"", "81" + "ccd1" + "81" + f64(1) + str("xyz"), null],
+        ["float 64 1.0 for key 1 of 0xD1, beside an integer key 4 (the action)", "81" + "ccd1" + "82" + f64(1) + str(id) + "04" + str("accept"), null],
+        ["uint 64 0xA0", "81" + wide("cf", 0xa0) + str(id), id],
+        ["int 64 0xA0", "81" + wide("d3", 0xa0) + str(id), id],
+        ["uint 64 key 1 of 0xD1", "81" + "ccd1" + "81" + wide("cf", 1) + str(id), id],
+    ];
+    for (const [what, fieldsHex, want] of cases) {
+        const payload = payloadWith(fieldsHex);
+        const packed = signedByMember(payload);
+        const message = LXMessage.fromBytes(packed.subarray(16), packed.subarray(0, 16), recall);
+        assert.ok(message, `${what}: read`);
+        assert.equal(LXMessage.groupIdRefusal(message), null, `${what}: not refused (the router's check)`);
+        assert.equal(LXMessage.groupInfo(message)?.groupId ?? null, want, `${what}: the handler's group id`);
+        assert.equal(LXMessage.peekGroupFields(payload)?.groupId ?? null, want, `${what}: the router's look`);
+        const distro = GroupSync.groupEntriesOfPayload(payload);
+        assert.deepEqual([distro.has_group_id, distro.group_id], [want !== null, want], `${what}: the distro path reads it so`);
+        assert.equal(groupEntriesOf(message.groupFields).has_group_id, want !== null, `${what}: groupFields`);
+    }
+});
