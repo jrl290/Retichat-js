@@ -264,5 +264,11 @@ test("a livelocked test with no bound fails, and its file exits, instead of hang
     assert.equal(code, 1, out);
     assert.match(out, /⚠ test_virtual_time\.mjs: livelock: 1000 macrotasks ran one after another/, "said on stderr by default");
     assert.match(out, /✖ two ends that answer each other forever, with no bound/);
-    assert.match(out, /Promise resolution is still pending but the event loop has already resolved/);
+    // Failed by the clock once the livelock left it nothing to run and no
+    // timer: from Node 26 node:test waits for a test that never settles for
+    // good, so its own "Promise resolution is still pending but the event
+    // loop has already resolved" (Node 23) never comes, and this file hung.
+    assert.match(out, /Error: virtual time: a livelock: 1000 macrotasks ran one after another at 0 virtual ms without the clock moving, and the loop it stopped left no timer to wait for: the test can never settle, so it fails here/);
+    assert.doesNotMatch(out, /Promise resolution is still pending/, "the clock failed it first, on every Node");
+    assert.match(out, /✔ a test after it/, "and the file goes on with its next test");
 });

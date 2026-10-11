@@ -38,13 +38,19 @@
  * on stderr, and from then on drops every counted macrotask instead of
  * running it, until uninstall(): the loop stops, nothing is pending, and
  * the clock moves as it always does, so the test's bound is reached and
- * fails it. A test with no bound fails too: its promise can no longer
- * settle, and node:test fails a test whose event loop runs dry. uninstall()
- * then throws, so the test is red even if the loop would have ended by
- * itself, and the loop's macrotasks still queued are dropped as well, so it
- * does not outlive its test and keep the file's process alive. The count is
- * of macrotasks, not of milliseconds, so it does not depend on how loaded
- * the machine is.
+ * fails it. A test with no bound fails too: once the livelock has stopped
+ * the loop and no virtual timer is left, nothing the clock runs can settle
+ * it, and the clock fails it there, throwing from its own macrotask (an
+ * uncaught exception, which node:test charges to the test whose work
+ * scheduled it). Until 2026-10-11 node:test was left to fail a test whose
+ * event loop runs dry, as Node 23 does ("Promise resolution is still pending
+ * but the event loop has already resolved"); from Node 26 node:test keeps
+ * the process alive and waits for such a test for good, so the test, its
+ * file and npm test hung. uninstall() then throws, so the test is red even
+ * if the loop would have ended by itself, and the loop's macrotasks still
+ * queued are dropped as well, so it does not outlive its test and keep the
+ * file's process alive. The count is of macrotasks, not of milliseconds, so
+ * it does not depend on how loaded the machine is.
  *
  * Async work the clock cannot count (file I/O, worker threads, WebCrypto)
  * must not be in flight while it is installed: the clock would move past
@@ -103,6 +109,7 @@ export function installVirtualTime({ livelockTurns = LIVELOCK_TURNS, onLivelock 
         now: start, seq: 0, timers: [], pending: 0, checkQueued: false, live: true,
         turns: 0,         // counted macrotasks run since the clock last moved
         livelock: null,   // once declared: { at: virtual ms, dropped: macrotasks not run }
+        stopped: false,   // the livelock left nothing to run and no timer: the test was failed
     };
     const jobs = new WeakMap();   // real handle → counted job
 
@@ -115,7 +122,21 @@ export function installVirtualTime({ livelockTurns = LIVELOCK_TURNS, onLivelock 
     /** Runs as a real macrotask, after every microtask: the only place the clock moves. */
     function check() {
         state.checkQueued = false;
-        if (!state.live || state.pending > 0 || state.timers.length === 0) return;
+        if (!state.live || state.pending > 0) return;
+        if (state.timers.length === 0) {
+            // A livelock stopped the loop and no timer is left: nothing the
+            // clock runs can settle the test any more. Failed here, once, as
+            // an uncaught exception, which node:test charges to the test
+            // (from Node 26 it would otherwise wait for the test for good).
+            if (state.livelock && !state.stopped) {
+                state.stopped = true;
+                throw new Error(
+                    `virtual time: a livelock: ${livelockTurns} macrotasks ran one after another at ` +
+                    `${state.livelock.at} virtual ms without the clock moving, and the loop it stopped left no ` +
+                    "timer to wait for: the test can never settle, so it fails here");
+            }
+            return;
+        }
         let next = 0;
         for (let i = 1; i < state.timers.length; i++) {
             const t = state.timers[i];

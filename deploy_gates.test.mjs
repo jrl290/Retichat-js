@@ -917,17 +917,21 @@ describe("deploy gates", { concurrency: 2 }, () => {
 
         test("npm test and test:full bound each test at 10 minutes, a failure bound only: a hung test fails instead of hanging the run", async () => {
             const scripts = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts;
-            assert.equal(scripts.test, "node --test --test-timeout=600000 *.test.mjs");
-            assert.equal(scripts["test:full"], "RETICHAT_BOOT_TESTS=1 node --test --test-timeout=600000 *.test.mjs");
+            assert.equal(scripts.test, "node --test --test-timeout=600000 --test-force-exit *.test.mjs");
+            assert.equal(scripts["test:full"], "RETICHAT_BOOT_TESTS=1 node --test --test-timeout=600000 --test-force-exit *.test.mjs");
             assert.match(readFileSync(join(ROOT, "deploy.sh"), "utf8"), /RETICHAT_BOOT_TESTS=1 npm test 2>&1/, "the deploy runs npm test, so the bound");
 
-            // The flag, with a bound short enough to watch: a test that never
-            // settles (an interval keeps its process alive) is red, and the run ends.
+            // The flags, with a bound short enough to watch: a test that never
+            // settles (an interval keeps its process alive) is red, and the run
+            // ends. From Node 26 the bound cancels the test inside its file's
+            // process and leaves that process running while the interval does
+            // (Node 23 stopped the process): --test-force-exit ends it once its
+            // tests have finished. Without it this run never closes on Node 26.
             const dir = scratch("hung-test");
             write(join(dir, "hung.test.mjs"), `import test from "node:test";\ntest("never settles", () => new Promise(() => { setInterval(() => {}, 1000); }));\n`);
             const { NODE_TEST_CONTEXT, ...outside } = process.env;
             const flags = scripts.test.split(" ").filter((a) => a.startsWith("--")).map((a) => a.replace(/=600000$/, "=300"));
-            assert.deepEqual(flags, ["--test", "--test-timeout=300"]);
+            assert.deepEqual(flags, ["--test", "--test-timeout=300", "--test-force-exit"]);
             const r = await new Promise((ok) => {
                 const p = spawn(process.execPath, [...flags, "--test-reporter=spec", "hung.test.mjs"], { cwd: dir, env: outside });
                 let out = "";
