@@ -4,9 +4,10 @@
  *
  *   - UI text never describes an internal state, and the only new text is the
  *     former-distro text, word for word, shown with "Delete from this device";
- *   - while the start has not finished (RnsClient._initialized), Accept,
- *     Decline, Leave, Delete from this device and Create are greyed, with no
- *     text, and a post waits like a DM's;
+ *   - while the start has not finished (RnsClient.connect() has not built
+ *     the client), Accept, Decline, Leave, Delete from this device and
+ *     Create are greyed, with no text, and a post waits like a DM's; once
+ *     built they work while the exchange is down, as before;
  *   - a post refused after Send says nothing, and its draft stays in the
  *     composer; an accept, decline or leave refused says nothing either;
  *   - the distro changing (imported, generated, forgotten) draws an open
@@ -76,8 +77,10 @@ const offered = (root) => buttons(root).map((b) => [b.textContent, b.disabled ==
  *  M and D (its own address D): pending, or joined when `joined`. */
 function dGroup({ joined = false } = {}) {
     const Did = Identity.create(), D = lxmfHash(Did);
-    const C = lxmfHash(Identity.create()), M = lxmfHash(Identity.create());
+    const Cid = Identity.create(), Mid = Identity.create();
+    const C = lxmfHash(Cid), M = lxmfHash(Mid);
     const u = groupClient({ distro: Did });
+    u.know(Cid).know(Mid);                               // every member's key here: an accept can go
     const id = "5e".repeat(16);
     u.GroupStore.addPending(id, "G", C, [C, M, D], D);
     if (joined) u.GroupStore.accept(id);
@@ -125,6 +128,18 @@ function appOf(u, chat) {
     self.type = (text) => { composer.el = { value: text, style: {}, selectionStart: text.length, focus() {} }; return composer.el; };
     self.noComposer = () => { composer.el = null; };
     return Object.assign(self, { notices, composer });
+}
+
+/** The start not finished: connect() has not built the client (its router),
+ *  so the exchange has not registered either. */
+function starting(u) {
+    u.router ??= u.self._lxmfRouter;
+    u.self._lxmfRouter = null;
+    u.self._initialized = false;
+}
+/** The start finished: the client built (the exchange may still be down). */
+function started(u) {
+    u.self._lxmfRouter = u.router ?? u.self._lxmfRouter;
 }
 
 const FORMER = (D) => `This group uses your distro address ${D.slice(0, 8)}…, which is no longer on this device. ` +
@@ -195,7 +210,7 @@ test("until the start finishes, Accept, Decline, Leave, Delete from this device 
     const joined = dGroup({ joined: true });
     const former = dGroup({ joined: true });
     former.u.DistroManager.set(null);
-    for (const g of [pending, joined, former]) g.u.self._initialized = false;
+    for (const g of [pending, joined, former]) starting(g.u);
 
     const views = [];
     const p = appOf(pending.u, pending.id);
@@ -230,7 +245,7 @@ test("until the start finishes, Accept, Decline, Leave, Delete from this device 
     const texts = (root) => root.textContent;
     const greyedTexts = views.map(([, root]) => texts(root));
 
-    for (const g of [pending, joined, former]) g.u.self._initialized = true;
+    for (const g of [pending, joined, former]) started(g.u);         // the exchange not registered yet: no matter
     for (const [page, root, labels] of views) {
         page.root = root;
         page._syncGroupActions();
@@ -238,7 +253,7 @@ test("until the start finishes, Accept, Decline, Leave, Delete from this device 
     }
     assert.deepEqual(views.map(([, root]) => texts(root)), greyedTexts, "the same words greyed or not");
     // And greyed again while a restart has not finished.
-    for (const g of [pending, joined, former]) g.u.self._initialized = false;
+    for (const g of [pending, joined, former]) starting(g.u);
     for (const [page, root, labels] of views) {
         page.root = root;
         page._syncGroupActions();
@@ -248,19 +263,19 @@ test("until the start finishes, Accept, Decline, Leave, Delete from this device 
 
 test("until the start finishes the acts themselves do nothing and say nothing: accept, decline, leave, delete from this device, and create (the button or Enter in the name)", () => {
     const pending = dGroup();
-    pending.u.self._initialized = false;
+    starting(pending.u);
     pending.u.page._acceptGroupInvite(pending.id);
     pending.u.page._declineGroupInvite(pending.id);
     assert.equal(pending.u.GroupStore.get(pending.id).groupStatus, "pending");
 
     const joined = dGroup({ joined: true });
-    joined.u.self._initialized = false;
+    starting(joined.u);
     joined.u.page._leaveGroup(joined.id);
     assert.equal(joined.u.GroupStore.isClosed(joined.id), false);
 
     const former = dGroup({ joined: true });
     former.u.DistroManager.set(null);
-    former.u.self._initialized = false;
+    starting(former.u);
     former.u.page._deleteGroupFromDevice(former.id);
     assert.ok(former.u.GroupStore.get(former.id), "still here");
 
@@ -282,18 +297,24 @@ test("until the start finishes the acts themselves do nothing and say nothing: a
     assert.deepEqual(c.opened, []);
 });
 
-test("wiring: the start finishing (the first registration) tells the page, which offers what was greyed; RnsClient changes _initialized nowhere else", () => {
-    const told = [];
-    const self = {
-        _initialized: false, _status: "connecting", _onStatus: [(s) => told.push([s, self._initialized])], _cfg: {},
-        _announce() {}, _requestPropagationPath() {}, _dispatchQueued() { told.push("queued"); },
-    };
-    self._onExchangeRegistered = compile("_onExchangeRegistered()", { console: quiet })(self);
-    self._onExchangeRegistered();
-    assert.deepEqual(told, ["queued", ["connecting", true]], "after the queue goes, with the start finished");
-    self._onExchangeRegistered();
-    assert.deepEqual(told.length, 2, "a re-registration is no start");
+test("the start finishing is the client being built, not the exchange answering: connect() tells the page once it has built the client, and with the exchange down the acts are offered and work, as before", () => {
+    const connect = methodBody("async connect()");
+    const built = connect.indexOf("this._lxmfRouter = new LXMRouter(");
+    const hooked = connect.indexOf("this._hookPageLifecycle();", built);
+    const told = connect.indexOf("this._onStatus.forEach(fn => fn(this._status));", hooked);
+    const last = connect.indexOf("console.log(`[rns] Connecting via", told);
+    assert.ok(built > 0 && hooked > built && told > hooked && last > told, "told after the client is built, its last act before the closing line");
+    assert.doesNotMatch(connect.slice(connect.indexOf("this._lxmfRouter = new LXMRouter(")), /\bawait\b/, "nothing awaited after the router");
     assert.match(methodBody("_wire()"), /RnsClient\.onStatus\(\(\) => \{[^}]*this\._syncGroupActions\(\);/);
+    assert.match(methodBody("_groupActionsReady()"), /^\s*return RnsClient\._lxmfRouter != null;\s*$/);
+
+    // Built, the exchange down (never registered): offered, and the accept works.
+    const { u, id } = dGroup();
+    u.self._initialized = false;
+    const page = appOf(u, id);
+    assert.deepEqual(offered(page.chat()).filter(([t]) => t === "Accept" || t === "Decline"), [["Accept", false], ["Decline", false]]);
+    u.page._acceptGroupInvite(id);
+    assert.equal(u.GroupStore.get(id).groupStatus, "active");
 });
 
 // ── the distro changing draws an open group chat again, its draft kept ─────
@@ -320,7 +341,7 @@ test("the distro changing draws the open group chat again (and the group info wh
 
 test("a post written before the start finishes waits like a DM's (queued, the draft sent and cleared); when the start finishes and the group's distro is gone it is shown failed, as a DM that cannot go, and nothing is sent", async () => {
     const { u, id } = dGroup({ joined: true });
-    u.self._initialized = false;
+    starting(u);
     const page = appOf(u, id);
     const ta = page.type("early");
     page.sendMessage();
@@ -328,6 +349,7 @@ test("a post written before the start finishes waits like a DM's (queued, the dr
     const [queued] = u.GroupMsgStore.get(id).filter((m) => m.dir === "out");
     assert.deepEqual([queued.content, queued.status, queued.waitFor], ["early", "queued", "init"]);
     u.DistroManager.set(null);
+    started(u);
     u.self._initialized = true;
     await u.self._dispatchGroupMessage(id, queued);
     assert.equal(u.GroupMsgStore.get(id).find((m) => m.id === queued.id).status, "failed");

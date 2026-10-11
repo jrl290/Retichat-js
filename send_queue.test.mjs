@@ -137,7 +137,6 @@ function makeClient({ storage = makeStorage(), contacts = [], groups = [], metho
     const self = {
         _initialized: false,
         _onMsg: [],
-        _onStatus: [],          // told when the start finishes (the page's greyed group acts)
         _pendingTimeouts: new Map(),
         _pendingPacketHashes: new Map(),
         // The transfers a send waits on (lib/send_progress.js), on no clock.

@@ -3190,6 +3190,12 @@ const RnsClient = {
         // disconnect(), so a stopped or taken-over tab drives nothing.
         this._hookPageLifecycle();
 
+        // The client is built: the start has finished, and the page offers
+        // the group acts it greyed until now (App._groupActionsReady,
+        // _syncGroupActions: an onStatus listener). Whether the exchange
+        // answers is another matter, which they do not wait for.
+        this._onStatus.forEach(fn => fn(this._status));
+
         console.log(`[rns] Connecting via ${this._connType} (${(this._rns?.interfaces || []).length} interface(s))...`);
     },
 
@@ -7331,14 +7337,10 @@ const RnsClient = {
         // (§5): messages sent before it were stored "queued" and go now. A
         // 401 re-registration fires "registered" again; the flag keeps that
         // from re-running the queue.
-        const starting = !this._initialized;
         if (!this._initialized) {
             this._initialized = true;
             this._dispatchQueued();
         }
-        // The start has finished: the page offers what it greyed until now
-        // (App._syncGroupActions, an onStatus listener).
-        if (starting) this._onStatus.forEach(fn => fn(this._status));
         if (!this._cfg.rfedNodeHash) return;
         const rfedIdBytes = Buffer.from(this._cfg.rfedNodeHash, "hex");
         const nodeHash = Destination.hash({hash: rfedIdBytes}, "rfed", "node").toString("hex");
@@ -11224,21 +11226,26 @@ const App = {
         } catch(e) { alert("Send failed: " + e.message); }
     },
 
-    /** Whether the start has finished (RnsClient._initialized: the first
-     *  registration with the exchange since connect()). Until then Accept,
+    /** Whether the start has finished: RnsClient.connect() has built the
+     *  client (its router; disconnect() takes it down). Until then Accept,
      *  Decline, Leave, Delete from this device and Create are greyed, with
-     *  no text, and do nothing, as on both phones (James, 2026-10-11); a
-     *  post waits like a DM's (RnsClient.sendGroupMessage). The web holds
-     *  its identity and its distro from the page's load, so its start never
-     *  leaves a group's own address unknown: a D-group whose distro is gone
-     *  says so (groupFormerDistroText) from the first drawing. */
+     *  no text, and do nothing, as on both phones (James, 2026-10-11): an
+     *  accept then threw halfway, at the first member's path request,
+     *  accepted here and told nobody. A post waits like a DM's, until the
+     *  exchange registers (RnsClient.sendGroupMessage, waitFor "init").
+     *  Once built, the acts work while the exchange is down, as they did
+     *  (exchange_url_at_load.test.mjs). The web holds its identity and its
+     *  distro from the page's load, so its start never leaves a group's own
+     *  address unknown: a D-group whose distro is gone says so
+     *  (groupFormerDistroText) from the first drawing. */
     _groupActionsReady() {
-        return RnsClient._initialized === true;
+        return RnsClient._lxmfRouter != null;
     },
 
     /** The greyed group acts (each button marked data-group-action) follow
-     *  the start in place, when it finishes or a restart begins (RnsClient
-     *  onStatus): an open chat keeps its draft, an open form its input. */
+     *  the start in place, when it finishes or the client is taken down
+     *  (RnsClient onStatus): an open chat keeps its draft, an open form its
+     *  input. */
     _syncGroupActions() {
         const greyed = !this._groupActionsReady();
         for (const b of this.root.querySelectorAll("[data-group-action]")) b.disabled = greyed;
