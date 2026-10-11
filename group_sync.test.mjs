@@ -340,6 +340,12 @@ test("the group entries read from the payload's bytes (GROUPS-DISTRO-DESIGN.md Â
     assert.deepEqual(groupEntriesOfPayload(inD1), { has_group_id: true, group_id: id, group_action: "accept", group_name: null });
     // A distro marker (the last 0xFB) makes it none, as rmpv's reading does.
     assert.equal(groupEntriesOfPayload(payloadWith("83" + "cca0" + "d920" + ascii(id) + "ccfb" + "b1" + ascii("rfed.distro.group") + "77" + "d40500")).has_group_id, false);
+    // A GROUP_ID of another type still makes a group message, with no id;
+    // a group entry is a str only (GroupValue::from_value): a bin is none.
+    assert.deepEqual(groupEntriesOfPayload(payloadWith("82" + "cca0" + "c420" + ascii(id) + "cca3" + "c406" + ascii("accept"))),
+        { has_group_id: true, group_id: null, group_action: null, group_name: null });
+    assert.deepEqual(groupEntriesOfPayload(payloadWith("81" + "ccd1" + "81" + "01" + "c420" + ascii(id))),
+        { has_group_id: true, group_id: null, group_action: null, group_name: null }, "in the Retichat field too");
     // The first of a repeated key, as LXMF-rust top_level reads it.
     assert.deepEqual(groupEntriesOfPayload(payloadWith("82" + "cca0" + "a1" + ascii("x") + "cca0" + "d920" + ascii(id))),
         { has_group_id: true, group_id: null, group_action: null, group_name: null });
