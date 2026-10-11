@@ -88,7 +88,7 @@ function page(me) {
     const GroupStore = { getAll: () => [...groups.values()], get: (id) => groups.get(id) ?? null, memberStatus: () => undefined,
         isClosed: () => false, heldChanges: () => [], _save() {} };
     const self = {
-        _onMsg: [], _pendingTickets: new Map(), _onAttachmentState: [], ownHash: lxmfHash(me),
+        _onMsg: [], _pendingTickets: new Map(), _onAttachmentState: [], ownHash: lxmfHash(me), _learnDistroSibling() {},
         _handleDistroIdentityTransfer() {},
     };
     install(self, { MsgStore, GroupMsgStore, ContactStore, GroupStore, Attachments, attachmentKey, Cryptography, console: quiet }, [

@@ -54,6 +54,7 @@ import {
 import { DistroUploads } from "./lib/distro_upload.js";
 import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
 import { sealForSync } from "./lib/distro_sync.js";
+import { KnownSiblings } from "./lib/group_distro.js";
 import { app, build, compile, install, methodBody, memoryStorage } from "./test_app_source.mjs";
 
 const lxmfHash = (identity) => Destination.hash(identity, "lxmf", "delivery").toString("hex");
@@ -140,7 +141,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         MsgStore: { add: () => assert.fail("no direct message here"), get: () => [] },
         ChannelStore, ChannelMsgStore,
         ChannelSenderNamesStore: new ChannelSenderNames(names), ChannelPostNamesStore: new ChannelPostNames(names),
-        ChannelMembershipStore: new ChannelMembership(names),
+        ChannelMembershipStore: new ChannelMembership(names), KnownSiblingsStore: new KnownSiblings(names),
         DistroOutboxStore: new DistroOutbox(names), channelSyncEntryId, sentCopyEntryId, sealForSync, syncProofKept,
         channelIdentity, channelLxmPack, channelLxmUnpack, channelComputeStamp, channelSyncFields, channelSyncDisposition,
         CHANNEL_PUBLISH_PATH, OwnNames: { channel: ownName },
@@ -257,6 +258,7 @@ function device(distro, { label = "device", ownName = null, resubscribed = true,
         "_handleDistroBlob(distroHash, blob)",
         "_handleDistroChannelSync(marker, facts)",
         "_applyDistroChannelSync(change, byHex)",
+        "_learnDistroSibling(d, by, what)",
     ]);
     installPacketsLost(self, env);
     /** A new propagation link is up: what is owed goes on it, as the link's
@@ -3189,6 +3191,10 @@ test("a sibling applies C with its own key; the sender's echo changes nothing; n
     assert.deepEqual([a.channels(), b.channels(), c.channels()], [["public.tea"], ["public.tea"], ["public.tea"]]);
     assert.deepEqual(a.syncEvents(), ["echo"]);
     assert.deepEqual(b.syncEvents(), ["joined"]);
+    // GROUPS-DISTRO-DESIGN.md §9.1: a C's 0xFD is a device of D, learned by
+    // every other device that accepts it; never this device itself.
+    const D = lxmfHash(distro);
+    assert.deepEqual([b.env.KnownSiblingsStore.of(D), c.env.KnownSiblingsStore.of(D), a.env.KnownSiblingsStore.of(D)], [[a.hash], [a.hash], []]);
     const subscribe = b.requests.find(([path]) => path === "/rfed/subscribe");
     assert.equal(Buffer.from(subscribe[1][1]).toString("hex"), b.me.getPublicKey().toString("hex"), "B subscribes with its own key");
     assert.deepEqual(c.requests, [], "C, whose stored channels are not yet subscribed, leaves it to that subscription (no retry)");

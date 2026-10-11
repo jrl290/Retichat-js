@@ -147,7 +147,7 @@ function distroOf(p, distro = Identity.create()) {
         ContactStore: p.ContactStore, MsgStore: p.MsgStore, LXMF, Cryptography, LXMessage, decodeDisplayName: DN.decodePayload,
         ownLxmfDestinationHash: p.own, console: quiet, sentTimeMs,
         DISTRO_ATTACHMENT_PLACEHOLDER: constValue("DISTRO_ATTACHMENT_PLACEHOLDER"),
-    })({ ownHash: p.own(), _pendingTickets: new Map(), _onMsg: [] });
+    })({ ownHash: p.own(), _pendingTickets: new Map(), _onMsg: [], _learnDistroSibling() {} });
     const D = lxmfHash(distro);
     return { distro, D, deliver: (packed) => handle(null, Buffer.concat([Buffer.from(D, "hex"), distro.encrypt(packed.subarray(16))])) };
 }
@@ -371,7 +371,7 @@ test("a group invite and the user's accept keep every member by association: all
     // The user accepts (the real _acceptGroupInvite): every member allowed.
     compile("_acceptGroupInvite(groupId)", {
         GroupStore: p.GroupStore, ContactStore: p.ContactStore, GroupMsgStore: p.GroupMsgStore, console: quiet,
-        RnsClient: { ownHash: p.own(), _decideHeldGroupChanges() {}, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, sendGroupAccept: async () => {},
+        RnsClient: { ownHash: p.own(), _decideHeldGroupChanges() {}, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, sendGroupAccept: async () => {},
             _groupSelf: (g) => p.rns._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(m),
     })({ render() {} })(G);

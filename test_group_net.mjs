@@ -40,7 +40,7 @@ import { applyGroupFields } from "./lib/retichat_field.js";
 import { senderKeyEntry } from "./lib/group_status.js";
 import { NameLedger } from "./lib/name_ledger.js";
 import { KnownSiblings, HeldGroupArrivals, FilteredInvites, DistroLeftGroups } from "./lib/group_distro.js";
-import { app, build, compile, constValue, fn, memoryStorage, messageHandler, GROUP_STATUS_METHODS, groupStatusEnv, GROUP_SELF_METHODS, groupSelfEnv, GROUP_DISTRO_METHODS } from "./test_app_source.mjs";
+import { app, build, compile, constValue, fn, memoryStorage, messageHandler, GROUP_STATUS_METHODS, groupStatusEnv, GROUP_SELF_METHODS, groupSelfEnv, GROUP_DISTRO_METHODS, GROUP_SYNC_METHODS, groupSyncEnv } from "./test_app_source.mjs";
 import { settle } from "./test_link_pair.mjs";
 
 export { settle, GROUP_FIELDS, LXMessage, Identity, Destination };
@@ -239,6 +239,16 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
         "_markGroupPeerReady(memberHash)", "async _ensureGroupLink(memberHash, publicKeyHex)",
     ]) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, sendEnv)(self);
 
+    // The group sync (GROUPS-DISTRO-DESIGN.md §10, §11). What the user's
+    // action owes the distro is recorded (`owed`, as _oweDistro is given it:
+    // packed and signed by D), and carried to every device of D by
+    // network.syncs; the outbox and its proof are distro_sent_sync's.
+    const owed = [];
+    self._oweDistro = (entry) => { owed.push(entry); };
+    self._sealForDistroSync = () => ({});
+    const syncEnv = { ...receiveEnv, ...sendEnv, ...groupSyncEnv(), Harness };
+    for (const signature of GROUP_SYNC_METHODS) self[signature.replace(/^async /, "").split("(")[0]] = compile(signature, syncEnv)(self);
+
     // The user's own acts, as the page runs them.
     const alerts = [], confirms = [];
     const page = { state: { activeHash: null }, render() {} };
@@ -264,7 +274,7 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
         me, own, pubKey, storage, switched, filter, name,
         ContactStore, GroupStore, GroupMsgStore, PrivacyFilter, MsgStore, Harness, events,
         router, destination, self, page, alerts, confirms, paths, sent, proofs, relays, fallbacks, emitted, recall, propagated,
-        DistroManager, KnownSiblingsStore, NameLedgerStore, HeldGroupArrivalsStore, FilteredInvitesStore, DistroLeftStore, DistroSeen,
+        DistroManager, KnownSiblingsStore, NameLedgerStore, HeldGroupArrivalsStore, FilteredInvitesStore, DistroLeftStore, DistroSeen, owed,
         /** What the distro path returned for each blob given it, in order. */
         distroKept: [],
         /** Deliver `packed` (a full packing, destination first) as an
@@ -338,6 +348,7 @@ export function network(...clients) {
             cursor.set(from, cursor.get(from) + 1);
         }
     };
+    const syncCursor = new Map(clients.map((c) => [c, 0]));
     const wanted = (entry, to, skip) => (!to || entry.to === (to.own ?? to)) && !skip.some((s) => (s.own ?? s) === entry.to);
     return {
         byHash,
@@ -357,6 +368,23 @@ export function network(...clients) {
                 delivered.push([entry.to, entry.bytes]);
             }
             queued.set(from, rest);
+            await settle();
+            return delivered;
+        },
+        /** Deliver what `from` has owed its distro and not yet delivered
+         *  (its group syncs, `owed`), as RFed fans it out: to every device
+         *  holding that distro, `from` included (its echo), but those in
+         *  `skip`. Returns the entries delivered. */
+        async syncs(from, { skip = [] } = {}) {
+            await settle();
+            const delivered = [];
+            while (syncCursor.get(from) < from.owed.length) {
+                const entry = from.owed[syncCursor.get(from)];
+                syncCursor.set(from, syncCursor.get(from) + 1);
+                const bytes = Buffer.from(entry.packed, "base64");
+                for (const d of holders(entry.distro)) if (!skip.includes(d)) await d.receiveDistro(bytes);
+                delivered.push(entry);
+            }
             await settle();
             return delivered;
         },

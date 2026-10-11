@@ -1444,7 +1444,7 @@ test("accepting an invite allows every member of the group, whatever row it has;
     const sent = [];
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore, ContactStore, GroupMsgStore: { addSystem() {} }, console: quiet,
-        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges() {}, sendGroupAccept: async (id) => { sent.push(id); },
+        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges() {}, sendGroupAccept: async (id) => { sent.push(id); },
             _groupSelf: () => new Set([ME]), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
     })({ render() {} });
@@ -1569,7 +1569,7 @@ test("group trust rule: once the user accepts, every listed member is allowed (X
     const alerts = [];
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore: p.r.GroupStore, ContactStore: p.r.ContactStore, GroupMsgStore: p.posts, console: quiet,
-        RnsClient: { ownHash: p.ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => p.r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
+        RnsClient: { ownHash: p.ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges: () => p.r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
             _groupSelf: (g) => p.r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
     })({ render() {} });
@@ -1607,6 +1607,8 @@ function quittingPage({ GroupStore, GroupMsgStore, RnsClient }) {
     if (!("groupFormerDistroText" in RnsClient)) RnsClient.groupFormerDistroText = () => null;
     // Nothing reached a distro for it: nothing is held to forget (§6.5).
     if (!("_forgetHeldGroupArrivals" in RnsClient)) RnsClient._forgetHeldGroupArrivals = () => 0;
+    // Not a D-group: no group sync G is owed for the leave (§10.6).
+    if (!("_syncGroupAction" in RnsClient)) RnsClient._syncGroupAction = () => false;
     const env = { confirm: () => true, GroupStore, GroupMsgStore, RnsClient, console: quiet,
         document: { body: { classList: { remove() {} } } } };
     for (const signature of ["_quitGroup(groupId, how)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)"]) {
@@ -1636,7 +1638,7 @@ function answeringClient({ filter = true, switched = false } = {}) {
     const leaves = [];
     const acceptInvite = compile("_acceptGroupInvite(groupId)", {
         GroupStore: r.GroupStore, ContactStore: r.ContactStore, GroupMsgStore: posts, console: quiet,
-        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(),
+        RnsClient: { ownHash: ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(),
             _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: (g) => r.self.groupFormerDistroText(g),
             sendGroupAccept: async (id) => { accepts.push(id); } },
         alert: (m) => alerts.push(m),
@@ -2107,7 +2109,7 @@ test("group model, signatures: a held accept survives a reload and is decided wh
         const fannedTo = [];
         const accept = compile("_acceptGroupInvite(groupId)", {
             GroupStore: again.GroupStore, ContactStore: again.ContactStore, GroupMsgStore: posts, console: quiet,
-            RnsClient: { ownHash: lxmfHash(r.me), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => again.self._decideHeldGroupChanges(),
+            RnsClient: { ownHash: lxmfHash(r.me), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges: () => again.self._decideHeldGroupChanges(),
                 _groupSelf: (g) => again.self._groupSelf(g), groupFormerDistroText: () => null,
                 sendGroupAccept: async (id) => { fannedTo.push(...[...again.GroupStore.get(id).members.entries()].filter(([, s]) => s === "accepted").map(([h]) => h)); } },
             alert: (m) => assert.fail(m),
@@ -2978,7 +2980,7 @@ test("distro fan-out is never filtered: a stranger's message to the distro is st
         MsgPack, Buffer, DistroSeen: { check: () => false }, Harness: { event() {}, error() {} },
         ContactStore, MsgStore, LXMF, Cryptography, LXMessage, decodeDisplayName: DN.decodePayload,
         ownLxmfDestinationHash: () => lxmfHash(me), PrivacyFilter: trap, console: quiet, sentTimeMs,
-    })({ ownHash: lxmfHash(me), _pendingTickets: new Map(), _onMsg: [] });
+    })({ ownHash: lxmfHash(me), _pendingTickets: new Map(), _onMsg: [], _learnDistroSibling() {} });
     assert.equal(handleBlob(null, blob), true);
     assert.deepEqual(MsgStore.get(S).map((x) => x.content), ["to your distro"]);
     assert.deepEqual([ContactStore.get(S).hidden, ContactStore.isContact(S), ContactStore.allowlisted(S)], [true, false, false],

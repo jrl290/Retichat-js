@@ -255,6 +255,7 @@ test("a group message sent before initialization is queued and fanned out once w
     c.self._groupSigner = () => ({ identity: me, hash: OWN, isDistro: false });
     c.self._groupSelf = () => new Set([OWN]);
     c.self.groupFormerDistroText = () => null;
+    c.self._syncGroupAction = () => false;           // no distro here: nothing is owed to one
     const fanouts = [];
     c.self._fanoutGroupEnvelope = async (targets, content, fields) => {
         fanouts.push({ targets, content, fields });

@@ -11,6 +11,8 @@ import { addInOrder } from "./lib/message_order.js";
 import Cryptography from "./lib/rns/cryptography.js";
 import { statusChangeVerdict, packedMessage, packedHeld } from "./lib/group_status.js";
 import { GROUP_ENTRIES_IN_RETICHAT_FIELD } from "./lib/retichat_field.js";
+import { groupSyncFields, groupSyncDisposition, inviteMembers } from "./lib/group_sync.js";
+import { groupSyncEntryId } from "./lib/distro_outbox.js";
 
 export const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
@@ -190,6 +192,31 @@ export const GROUP_DISTRO_METHODS = [
     "_forgetHeldGroupArrivals(groupId, why)",
     "_handleDistroGroupMessage(data, destHash, decrypted, srcHex, entries)",
 ];
+
+/**
+ * The group sync G (GROUPS-DISTRO-DESIGN.md §10, §11; RFed SPEC §17.14): the
+ * user's action owed to the distro as a G, and a G received, its rules, the
+ * apply table and `left`, the known siblings and what giving D up forgets.
+ * Installed beside GROUP_DISTRO_METHODS over groupSyncEnv() and what the
+ * send and receive paths read.
+ */
+export const GROUP_SYNC_METHODS = [
+    "_syncGroupAction(op, groupId, extra = null)",
+    "_sendDistroGroupSync(op, group, extra = null)",
+    "_groupSyncKeys(listed, distroHash, deviceHash)",
+    "_handleDistroGroupSync(read, facts)",
+    "_applyGroupSync(sync, group, facts)",
+    "_joinedFromSync(group, sync, how)",
+    "_closeGroupFromSync(id, group, why)",
+    "_applyGroupSyncLeft(sync)",
+    "_learnDistroSibling(d, by, what)",
+    "_onDistroChangedForGroups()",
+];
+
+/** What GROUP_SYNC_METHODS import from lib/. */
+export function groupSyncEnv() {
+    return { groupSyncFields, groupSyncDisposition, inviteMembers, groupSyncEntryId };
+}
 
 /** What GROUP_SELF_METHODS read from the page: the distro this device holds
  *  (none unless `DistroManager` is given), its known siblings (none unless

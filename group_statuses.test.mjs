@@ -1081,8 +1081,8 @@ test("wiring: every accept and leave the page sends is built in one place each a
     assert.equal((app.match(/groupAction: "accept"/g) ?? []).length, 1, "no other accept is built");
     assert.equal((app.match(/groupAction: "leave"/g) ?? []).length, 1, "no other leave is built: a decline is this one");
     assert.match(methodBody("_quitGroup(groupId, how)"), /RnsClient\.sendGroupLeave\(groupId\)/, "a decline and a leave are one path");
-    assert.match(methodBody("create(groupName, memberHashes, ownMember = null)"), /lastActivity: Date\.now\(\), creator: ownHash, ownMember: ownMember \?\? null \};/);
-    assert.match(methodBody("addPending(groupId, groupName, senderHash, memberHashes, ownMember = null)"), /if \(existing\) return existing;[^]*?lastActivity: Date\.now\(\), creator: senderHash, ownMember: ownMember \?\? null \};/, "the invite's source, recorded once");
+    assert.match(methodBody("create(groupName, memberHashes, ownMember = null)"), /lastActivity: Date\.now\(\), creator: ownHash, ownMember: ownMember \?\? null, membersCsv \};/);
+    assert.match(methodBody("addPending(groupId, groupName, senderHash, memberHashes, ownMember = null, membersCsv = null)"), /if \(existing\) return existing;[^]*?lastActivity: Date\.now\(\), creator: senderHash, ownMember: ownMember \?\? null,\s*membersCsv: typeof membersCsv === "string" \? membersCsv : null \};/, "the invite's source, recorded once");
     assert.match(objectLiteral("GroupStore"), /creator: g\.creator \?\? null,/, "persisted with the group");
     assert.match(methodBody("remove(groupId)"), /if \(this\._statuses\.delete\(groupId\)\) this\._saveStatuses\(\);/);
     const filter = objectLiteral("PrivacyFilter");

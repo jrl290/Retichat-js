@@ -803,7 +803,7 @@ test("§5.2 a message unwrapped from the distro names its sender by the same tab
             ? (d, s, sig, p) => LXMessage.verify(d, s, sig, p, recall) : t[k]) }),
     };
     const run = new Function(...Object.keys(env), "self", "distroHash", "blob", body);
-    const self = { ownHash: "e".repeat(32), _pendingTickets: new Map(), _onMsg: [] };
+    const self = { ownHash: "e".repeat(32), _pendingTickets: new Map(), _onMsg: [], _learnDistroSibling() {} };
     const blob = (signer, name, timestamp = tick()) => {
         const m = new LXMessage();
         m.timestamp = timestamp;
@@ -1230,7 +1230,7 @@ function makeGroupReceiver(me, memberHashes, { switched = false } = {}) {
     /** The user pressing Accept on a pending invite (the real _acceptGroupInvite). */
     const acceptInvite = compile("_acceptGroupInvite(groupId)", {
         GroupStore, ContactStore: r.ContactStore, GroupMsgStore, console: quiet,
-        RnsClient: { ownHash: own(), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
+        RnsClient: { ownHash: own(), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
             _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(`the accept was held back: ${m}`),
     })({ render() {} });
@@ -1414,7 +1414,7 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
     const accept = compile("_acceptGroupInvite(groupId)", {
         GroupStore: { get: () => ({ groupName: "G", members: new Map([[B, "accepted"], [A, "invited"], [lxmfHash(me), "invited"]]) }), accept() {} },
         ContactStore: store, GroupMsgStore: { addSystem() {} }, console: quiet,
-        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _decideHeldGroupChanges() {}, sendGroupAccept: async () => {},
+        RnsClient: { ownHash: lxmfHash(me), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges() {}, sendGroupAccept: async () => {},
             _groupSelf: () => new Set([lxmfHash(me)]), groupFormerDistroText: () => null },
         alert: () => assert.fail("keys are all there"),
     });

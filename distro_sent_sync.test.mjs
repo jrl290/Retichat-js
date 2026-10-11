@@ -654,8 +654,8 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
 
     // Nothing else closes a propagation link, or fires a link's close or a loss report.
     assert.deepEqual([...code.matchAll(/([\w$]+(?:\.[\w$]+)*)\s*(?:\?\.|\.)\s*close\s*\(/g)].map((m) => m[1]),
-        ["existing.link", "link", "link", "entry.link", "propLink", "GroupStore"],
-        "today's closes: a group link, a refused rfed.link, disconnect()'s rfed.links, group links and the propagation link it let go of, and a group. "
+        ["GroupStore", "existing.link", "link", "link", "entry.link", "propLink", "GroupStore"],
+        "today's closes: a group left on another device of the distro (GROUPS-DISTRO-DESIGN.md §11.2), a group link, a refused rfed.link, disconnect()'s rfed.links, group links and the propagation link it let go of, and a group. "
         + "A close of a propagation link decides the uploads on it, and a newer link up sends them at once (the third ruling): only its own close may");
     assert.doesNotMatch(code, /_linkClosed/, "the page never runs a link's close for it");
     // And every place the page says close or lost, or fires an event, so that a close of a link or a loss report
@@ -663,7 +663,7 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     // read in the code (shape: its strings blanked), and the event names whole in its strings, so a log line that
     // says "emit" or "closed" is not one.
     const shape = withoutComments(code, true);
-    assert.deepEqual(sites(shape, "close", spans), ["GroupStore.close", "RnsClient._markGroupPeerReady",
+    assert.deepEqual(sites(shape, "close", spans), ["GroupStore.close", "RnsClient._closeGroupFromSync", "RnsClient._markGroupPeerReady",
         "RnsClient._closeRefusedRfedLink", "RnsClient.disconnect", "RnsClient.disconnect", "RnsClient.disconnect", "App._quitGroup",
         "App._renderSettingsModal", "App._renderSettingsModal", "App._renderIdentityModal", "App._renderIdentityModal"],
         "close in the page's code: the closes above, a group's close, and two dialogs' own close");
@@ -738,8 +738,8 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     }
 
     // The user's own action: _oweDistro owes a message packed in that same call, from the user's join, leave or DM.
-    assert.equal(count(code, /_oweDistro/g), 3, "the method and its two calls");
-    for (const signature of ["async _sendDistroSentCopy(recipientHex, title, content)", "_sendDistroChannelSync(op, ch, atMs)"]) {
+    assert.equal(count(code, /_oweDistro/g), 4, "the method and its three calls");
+    for (const signature of ["async _sendDistroSentCopy(recipientHex, title, content)", "_sendDistroChannelSync(op, ch, atMs)", "_sendDistroGroupSync(op, group, extra = null)"]) {
         const body = method(signature);
         assert.equal(count(body, /_oweDistro/g), 1, signature);
         assert.match(body, /const msg = new LXMessage\(\);[\s\S]*const packed = msg\.pack\(DistroManager\.identity, false\);\s*const label = `[^`\n]*`;\s*this\._oweDistro\(\{[^}]*\bpacked: Buffer\.from\(packed\)\.toString\("base64"\),\s*\.\.\.this\._sealForDistroSync\(packed, label\),/,
@@ -755,6 +755,11 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     assert.equal(count(code, /_syncChannelMembership/g), 3, "the user's join and leave");
     assert.equal(count(method("async joinChannel(channelName)"), /this\._syncChannelMembership\("join", ch\);/g), 1);
     assert.equal(count(method("async leaveChannel(channelName)"), /this\._syncChannelMembership\("leave", ch\);/g), 1);
+    // The group sync G (GROUPS-DISTRO-DESIGN.md §10.5-10.6): one per action of the user's, a create, an accept, a leave or a post.
+    assert.equal(count(code, /_sendDistroGroupSync/g), 2, "made for the user's own group action alone");
+    assert.equal(count(method("_syncGroupAction(op, groupId, extra = null)"), /this\._sendDistroGroupSync\(op, group, extra\);/g), 1);
+    assert.deepEqual(sites(code, "_syncGroupAction", members(code)), ["RnsClient._syncGroupAction", "RnsClient._dispatchGroupMessage", "RnsClient.createGroup",
+        "App._acceptGroupInvite", "App._quitGroup"], "the user's post, create, accept and leave, and nothing else");
 });
 
 test("the distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5): both kinds are sealed where they are packed, in the write that owes them; the upload is built from those bytes; the proof goes only where the client gate lets it, decided in one place", () => {
@@ -765,8 +770,8 @@ test("the distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5)
     const code = withoutComments(app);
     const method = (signature) => extractMethod(code, signature);
     const spans = members(code);
-    assert.deepEqual(sites(code, "_sealForDistroSync", spans), ["RnsClient._sendDistroSentCopy", "RnsClient._sealForDistroSync", "RnsClient._sendDistroChannelSync"],
-        "sealed where each kind is packed, the sent-copy and the membership message, and nowhere else");
+    assert.deepEqual(sites(code, "_sealForDistroSync", spans), ["RnsClient._sendDistroSentCopy", "RnsClient._sealForDistroSync", "RnsClient._sendDistroChannelSync", "RnsClient._sendDistroGroupSync"],
+        "sealed where each kind is packed, the sent-copy, the membership message and the group sync (GROUPS-DISTRO-DESIGN.md §10.5), and nowhere else");
     assert.deepEqual(sites(code, /\bsealForSync\(/g, spans), ["RnsClient._sealForDistroSync"], "one place seals");
     assert.match(method("_sealForDistroSync(packed, label)"),
         /try \{\s*const \{ sealed, sig \} = sealForSync\(DistroManager\.identity, packed\);\s*return \{ sealed: sealed\.toString\("base64"\), syncSig: sig\.toString\("base64"\) \};\s*\} catch \(error\) \{\s*console\.error\([^\n]*\);\s*Harness\.error\("distro-sync-proof", error\);\s*return \{\};\s*\}/,
@@ -1105,17 +1110,20 @@ function makeReceiver(distro, deviceHash) {
     const Harness = { event: (name, data) => harness.push({ name, data }), error() {} };
     const DistroManager = { identity: distro, lxmfDeliveryHash: lxmfHash(distro) };
     const events = [];
+    const siblings = [];
     const self = {
         ownHash: deviceHash,
         _pendingTickets: new Map(),
         _onMsg: [(m, peer) => events.push({ m, peer })],
+        // A copy's 0xFD is a device of D (GROUPS-DISTRO-DESIGN.md §9.1).
+        _learnDistroSibling: (d, by) => siblings.push(by),
     };
     const fn = new Function("DistroManager", "MsgPack", "Buffer", "DistroSeen", "Harness", "ContactStore", "MsgStore",
         "LXMF", "Cryptography", "ownLxmfDestinationHash", "LXMessage", "decodeDisplayName", "sentTimeMs", "self", "distroHash", "blob",
         `${body.replaceAll("this.", "self.")}`);
     const run = (blob) => fn(DistroManager, MsgPack, Buffer, DistroSeen, Harness, ContactStore, MsgStore,
         LXMF, Cryptography, () => deviceHash, LXMessage, decodeDisplayName, sentTimeMs, self, null, blob);
-    return { run, stored, contacts, events, seen, harness };
+    return { run, stored, contacts, events, seen, harness, siblings };
 }
 
 const marker = (to, by) => new Map([[0xFB, "rfed.distro.sent"], [0xFC, to], [0xFD, by]]);

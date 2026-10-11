@@ -414,7 +414,7 @@ test("a message for this device's distro, and a sibling device's sent-copy, keep
         ContactStore: s.ContactStore, MsgStore: s.MsgStore, LXMF, Cryptography, LXMessage,
         decodeDisplayName: DN.decodePayload, ownLxmfDestinationHash: () => hex(device), console: quiet,
         DISTRO_ATTACHMENT_PLACEHOLDER: constValue("DISTRO_ATTACHMENT_PLACEHOLDER"), sentTimeMs,
-    })({ ownHash: hex(device), _pendingTickets: new Map(), _onMsg: [] });
+    })({ ownHash: hex(device), _pendingTickets: new Map(), _onMsg: [], _learnDistroSibling() {} });
     const blob = (packed) => Buffer.concat([Buffer.from(D, "hex"), distro.encrypt(packed.subarray(16))]);
 
     assert.equal(handleBlob(null, blob(packedFrom(dave, D, RX))), true);

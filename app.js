@@ -64,7 +64,8 @@ import { AttachmentStore, attachmentKey, keysOf } from "./lib/attachment_store.j
 import { SendTransfers, propagationFailure } from "./lib/send_progress.js";
 import { ChannelPublishes, CHANNEL_PUBLISH_PATH } from "./lib/channel_publish.js";
 import { DistroUploads } from "./lib/distro_upload.js";
-import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, syncProofKept } from "./lib/distro_outbox.js";
+import { DistroOutbox, UnprovedUploads, channelSyncEntryId, sentCopyEntryId, groupSyncEntryId, syncProofKept } from "./lib/distro_outbox.js";
+import { groupSyncFields, groupSyncDisposition, inviteMembers } from "./lib/group_sync.js";
 import { sealForSync, syncClaimFor, buildSealedUpload } from "./lib/distro_sync.js";
 import { HeldGroupArrivals, FilteredInvites, DistroLeftGroups, KnownSiblings } from "./lib/group_distro.js";
 import { MAX_ATTACHMENTS, attachmentRefusal, estimatePackedSize, formatSize } from "./lib/attachment_limits.js";
@@ -1518,6 +1519,7 @@ const GroupStore = {
                     lastActivity: g.lastActivity || 0,
                     creator: typeof g.creator === "string" && /^[0-9a-f]{32}$/.test(g.creator) ? g.creator : null,
                     ownMember: typeof g.ownMember === "string" && /^[0-9a-f]{32}$/.test(g.ownMember) ? g.ownMember : null,
+                    membersCsv: typeof g.membersCsv === "string" ? g.membersCsv : null,
                 });
             }
         }
@@ -1635,7 +1637,10 @@ const GroupStore = {
         for (const h of memberHashes) {
             if (h !== ownHash) members.set(h, "invited");
         }
-        const group = { groupId, groupName, groupStatus: "active", members, lastActivity: Date.now(), creator: ownHash, ownMember: ownMember ?? null };
+        // The GROUP_MEMBERS csv its invites carry (RnsClient.sendGroupInvites),
+        // which a create sync carries too (GROUPS-DISTRO-DESIGN.md §10.2).
+        const membersCsv = [...new Set([...memberHashes, ownHash])].join(",");
+        const group = { groupId, groupName, groupStatus: "active", members, lastActivity: Date.now(), creator: ownHash, ownMember: ownMember ?? null, membersCsv };
         this._groups.set(groupId, group);
         this._save();
         this._notify();
@@ -1657,7 +1662,7 @@ const GroupStore = {
      *  for the device), and an invite whose list does not name it is not for
      *  this user: no group, and null is returned (the caller says so). Until
      *  2026-10-10 the device was added to every invite's list. */
-    addPending(groupId, groupName, senderHash, memberHashes, ownMember = null) {
+    addPending(groupId, groupName, senderHash, memberHashes, ownMember = null, membersCsv = null) {
         const existing = this._groups.get(groupId);
         if (existing) return existing;
         const own = ownMember ?? ownLxmfDestinationHash();
@@ -1667,7 +1672,26 @@ const GroupStore = {
             members.set(h, "invited");
         }
         members.set(senderHash, "accepted");
-        const group = { groupId, groupName, groupStatus: "pending", members, lastActivity: Date.now(), creator: senderHash, ownMember: ownMember ?? null };
+        const group = { groupId, groupName, groupStatus: "pending", members, lastActivity: Date.now(), creator: senderHash, ownMember: ownMember ?? null,
+            membersCsv: typeof membersCsv === "string" ? membersCsv : null };
+        this._groups.set(groupId, group);
+        this._save();
+        this._notify();
+        return group;
+    },
+
+    /** GROUPS-DISTRO-DESIGN.md §11.2, "hold the group from G": a group the
+     *  user created or accepted as `ownMember` (the distro D) on another of
+     *  the user's devices, held here joined: the list `memberHashes` (the
+     *  sync's, which names D), `creator` (D for a create, the invite's
+     *  source for an accept) and D accepted, every other member invited.
+     *  `membersCsv` is the csv the sync carried. Returns the group. */
+    holdFromSync(groupId, groupName, memberHashes, creator, ownMember, membersCsv = null) {
+        const members = new Map();
+        for (const h of memberHashes) members.set(h, "invited");
+        members.set(creator, "accepted");
+        members.set(ownMember, "accepted");
+        const group = { groupId, groupName, groupStatus: "active", members, lastActivity: Date.now(), creator, ownMember, membersCsv };
         this._groups.set(groupId, group);
         this._save();
         this._notify();
@@ -1781,6 +1805,7 @@ const GroupStore = {
                 lastActivity: g.lastActivity,
                 creator: g.creator ?? null,
                 ownMember: g.ownMember ?? null,
+                membersCsv: g.membersCsv ?? null,
             });
         }
         sSet("groups_v1", arr);
@@ -4749,7 +4774,7 @@ const RnsClient = {
             // the channel it replaced never goes (lib/distro_outbox.js put).
             // Said, never silent.
             console.error(`[distro] ✗ ${entry.label} could not be kept in storage: this page holds it, and it goes when the propagation link is up while the page is open; a reload or a closed tab loses it`);
-            Harness.error(entry.kind === "channel" ? "distro-channel-sync" : "distro-sent-copy",
+            Harness.error(entry.kind === "channel" ? "distro-channel-sync" : entry.kind === "group" ? "distro-group-sync" : "distro-sent-copy",
                 new Error(`${entry.label} could not be kept in storage`));
         }
         const link = this._propLink;
@@ -5214,10 +5239,13 @@ const RnsClient = {
                 + (goesNow
                     ? "the propagation link it went on was replaced, and the newer one is up, so it goes once on that one now (DESIGN_PRINCIPLES §3, the distro exception)"
                     : "it goes when the propagation link is next up (DESIGN_PRINCIPLES §3, the distro exception)"));
-            Harness.error(entry.kind === "channel" ? "distro-channel-sync" : "distro-sent-copy", error);
+            Harness.error(entry.kind === "channel" ? "distro-channel-sync" : entry.kind === "group" ? "distro-group-sync" : "distro-sent-copy", error);
             return;
         }
-        if (entry.kind === "channel") {
+        if (entry.kind === "group") {
+            console.log(`[distro] 📤 The ${entry.op} sync of group ${entry.groupId.slice(0,8)} propagated to the distro as a ${how}: the propagation node proved it (§17.14)`);
+            Harness.event("distro-group-sync-sent", { op: entry.op, group: entry.groupId.slice(0, 8), how });
+        } else if (entry.kind === "channel") {
             console.log(`[distro] 📤 The ${entry.op} of #${entry.name} (at ${entry.at}) propagated to the distro as a ${how}: the propagation node proved it (§17.12)`);
             Harness.event("distro-channel-sync-sent", { op: entry.op, channel: entry.name, at: entry.at, how });
         } else {
@@ -5395,6 +5423,326 @@ const RnsClient = {
     },
 
     /**
+     * GROUPS-DISTRO-DESIGN.md §10.6: the user's `op` ("create", "accept",
+     * "leave" or "post") in group `groupId` is owed to D's other devices as
+     * one group sync G (_sendDistroGroupSync), in a D-group only: its own
+     * address the D this device holds now. Nothing for a group whose own
+     * address is the device, on a device without D, or in a D-group whose D
+     * this device no longer holds (§8.7: such an action is refused before
+     * this). A leave goes on this device's own `left` list for D first
+     * (§10.2), so it travels on every later G too. A G that cannot be built
+     * is a failure said and recorded (a "distro-group-sync" Harness error),
+     * never thrown at the user's action: the action stands. `extra` is a
+     * post's { text, atMs }. Returns whether a G was owed.
+     */
+    _syncGroupAction(op, groupId, extra = null) {
+        const group = GroupStore.get(groupId);
+        const d = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
+        if (!group || !group.ownMember || !d || group.ownMember !== d) return false;
+        if (op === "leave") DistroLeftStore.record(d, groupId);
+        try {
+            this._sendDistroGroupSync(op, group, extra);
+            return true;
+        } catch (error) {
+            console.warn(`[distro] ⚠️ The ${op} sync of group ${groupId.slice(0,8)} was not owed to the distro (§17.14): ${error.message}`);
+            Harness.error("distro-group-sync", error);
+            return false;
+        }
+    },
+
+    /**
+     * The RFed SPEC §17.14 group sync G for the user's `op` in the D-group
+     * `group`: destination D, source D, signed with D's key, no title, no
+     * content, and the fields of lib/group_sync.js groupSyncFields (an empty
+     * 0x0C, 0xFB "rfed.distro.group", 0xFC [op, group_id, at_ms, ..., left]
+     * as a native array, 0xFD this device's own lxmf.delivery address), with
+     * no 0xD1. Owed to the distro as the §17.11 sent-copy is (_oweDistro),
+     * sealed for the §17.13 proof in the same write; each G is owed on its
+     * own, under its LXMF hash (§10.5), and is kept when this device gives D
+     * up. RFed fans it out to every device of D, this one included, and the
+     * echo is dropped by its 0xFD.
+     *   create, accept: the group's name, its members csv as the invites
+     *     carried it (GroupStore `membersCsv`), the keys of the listed
+     *     members this device holds; accept: the invite's source, the
+     *     recorded creator;
+     *   post: `extra.text`, at `extra.atMs` (the post's stored time).
+     */
+    _sendDistroGroupSync(op, group, extra = null) {
+        const distroHash = DistroManager.lxmfDeliveryHash;
+        if (!DistroManager.has || !distroHash) return;
+        const deviceHash = this.ownHash ?? ownLxmfDestinationHash();
+        if (!deviceHash) throw new Error("own lxmf.delivery address unavailable for 0xFD");
+        const sync = { op, group_id: group.groupId, at_ms: op === "post" ? extra?.atMs : Date.now(), left: DistroLeftStore.of(distroHash) };
+        if (op === "create" || op === "accept") {
+            const members = group.membersCsv ?? [...group.members.keys()].join(",");
+            sync.name = group.groupName ?? "";
+            sync.members = members;
+            sync.keys = this._groupSyncKeys(inviteMembers(members), distroHash, deviceHash);
+            if (op === "accept") sync.creator = group.creator;
+        } else if (op === "post") {
+            sync.text = extra?.text ?? "";
+        }
+        const msg = new LXMessage();
+        msg.sourceHash = Buffer.from(distroHash, "hex");
+        msg.destinationHash = Buffer.from(distroHash, "hex");
+        msg.title = "";
+        msg.content = "";
+        msg.fields = groupSyncFields(sync, distroHash, deviceHash);
+        const packed = msg.pack(DistroManager.identity, false);
+        const label = `the ${op} sync of group ${group.groupId.slice(0,8)} (§17.14)`;
+        this._oweDistro({
+            // Its id is its LXMF message hash (§10.5): dest | src | payload.
+            id: groupSyncEntryId(Cryptography.fullHash(Buffer.concat([packed.subarray(0, 32), LXMessage.signedPayload(packed.subarray(96))])).toString("hex")),
+            kind: "group", distro: distroHash, distroKey: DistroManager.pubKey, packed: Buffer.from(packed).toString("base64"),
+            ...this._sealForDistroSync(packed, label),
+            label, op, groupId: group.groupId,
+        });
+    },
+
+    /** The GROUP_MEMBER_KEYS entries a create or accept sync carries
+     *  (§10.2): one per listed member whose key this device holds (D's own
+     *  from the distro, the device's own, a member's from its row), any
+     *  order, possibly none. */
+    _groupSyncKeys(listed, distroHash, deviceHash) {
+        const keys = [];
+        for (const hash of [...listed].sort()) {
+            const publicKey = hash === distroHash ? DistroManager.pubKey
+                : hash === deviceHash ? IdMgr.pubKey : ContactStore.get(hash)?.publicKey;
+            if (publicKey && /^[0-9a-f]{128}$/i.test(publicKey)) keys.push(`${hash}:${Buffer.from(publicKey, "hex").toString("base64")}`);
+        }
+        return keys;
+    },
+
+    /**
+     * A group sync G unwrapped from the distro (GROUPS-DISTRO-DESIGN.md §11,
+     * SPEC §17.14): `read` is LXMF.distroGroupSyncFromPayload's; `facts`
+     * { hash (its LXMF hash), fromDistro, signedByDistro() (rule 2's check),
+     * signature (hex), blob (as received) }. Rule 0, the repeat, on
+     * gsync:<hash>; rules 1-4 (lib/group_sync.js groupSyncDisposition); the
+     * 0xFD of one that passes is a known sibling (§9.1); rule 5; the apply
+     * table (_applyGroupSync); then its `left` (_applyGroupSyncLeft).
+     * Applying sends nothing to anyone and owes no G. Returns true when it
+     * is kept (applied, ignored by rule 5, this device's own echo: each
+     * recorded as seen) or held (§6.5: not recorded, so its replay is judged
+     * anew), false when it is dropped (with a log line, not recorded).
+     */
+    _handleDistroGroupSync(read, facts) {
+        const key = `gsync:${facts.hash}`;
+        if (DistroSeen.check(key)) {
+            Harness.event("distro-dup", { group: (read.group_id ?? "?").slice(0, 8), sync: true });
+            return true;
+        }
+        const device = this.ownHash ?? ownLxmfDestinationHash();
+        const disposition = groupSyncDisposition(read, {
+            fromDistro: facts.fromDistro,
+            signedByDistro: facts.fromDistro && facts.signedByDistro(),
+            ownDeviceHex: device,
+        });
+        const tag = `${read.op ?? "?"} sync of group ${(read.group_id ?? "?").slice(0,8)} from device ${read.by ? read.by.slice(0,12) : "?"}`;
+        if (disposition.verdict === "drop") {
+            console.warn(`[distro] ⚠️ The ${tag} dropped: ${disposition.reason} (§17.14 rule ${disposition.rule})`);
+            Harness.event("distro-group-sync", { result: "dropped", rule: disposition.rule, reason: disposition.reason });
+            DistroSeen.forget(key);
+            return false;
+        }
+        // Rule 3: this device's own G, back from the fan-out: silently.
+        if (disposition.verdict === "echo") return true;
+        const { sync } = disposition;
+        const d = DistroManager.lxmfDeliveryHash;
+        this._learnDistroSibling(d, disposition.by, "a group sync");
+        const group = GroupStore.get(sync.group_id);
+        let verdict;
+        if (group && group.ownMember !== d) {
+            // Rule 5: held here as the device (§8.1): the user acts as the device there.
+            console.log(`[distro] 👥 The ${tag} ignored: this device holds that group under its own device address, and acts as the device there (§17.14 rule 5)`);
+            verdict = "kept";
+        } else {
+            verdict = this._applyGroupSync(sync, group, facts);
+        }
+        this._applyGroupSyncLeft(sync);
+        Harness.event("distro-group-sync", { result: verdict, op: sync.op, group: sync.group_id.slice(0, 8) });
+        if (verdict === "kept") return true;
+        DistroSeen.forget(key);
+        return verdict === "held";
+    },
+
+    /**
+     * §11.2, the apply table, for `sync` (rules 0-5 passed) and the group
+     * held here for its id (`group`, null when none). Returns "kept",
+     * "held" (a post for a group not joined here, §6.5) or "dropped" (a post
+     * for a group closed here, or one the held store refused), each with a
+     * log line. Asks nothing of the user and sends nothing.
+     */
+    _applyGroupSync(sync, group, facts) {
+        const d = DistroManager.lxmfDeliveryHash;
+        const id = sync.group_id;
+        const tag = `The ${sync.op} sync of group ${id.slice(0,8)}`;
+        const closed = GroupStore.isClosed(id);
+        if (sync.op === "create" || sync.op === "accept") {
+            if (closed) {
+                console.log(`[distro] 👥 ${tag}: the group is closed here, for good; nothing changes (§11.2)`);
+                return "kept";
+            }
+            if (group?.groupStatus === "active") {
+                console.log(`[distro] 👥 ${tag}: the group is joined here already; nothing changes (§11.2)`);
+                return "kept";
+            }
+            const listed = inviteMembers(sync.members);
+            const creator = sync.op === "create" ? d : sync.creator;
+            if (group) {
+                // Pending here: an accept that describes this very invite
+                // joins it as is; anything else replaces it (§11.2: the
+                // user's own sync outranks anyone else's invite for its id).
+                const same = sync.op === "accept" && group.creator === creator
+                    && group.members.size === listed.length && listed.every(h => group.members.has(h));
+                if (same) {
+                    this._joinedFromSync(group, sync, `accepted on device ${sync.by?.slice(0,12) ?? "?"}`);
+                    return "kept";
+                }
+                console.log(`[distro] 👥 ${tag}: the invite pending here, from ${group.creator ? group.creator.slice(0,12) : "?"}, is discarded without sending anything, and the group is held as the sync gives it (§11.2)`);
+                GroupMsgStore.remove(id);
+                GroupStore.remove(id);
+            }
+            const held = GroupStore.holdFromSync(id, sync.name || "Group", listed, creator, d, sync.members);
+            this._joinedFromSync(held, sync, sync.op === "create" ? `created on device ${sync.by?.slice(0,12) ?? "?"}` : `accepted on device ${sync.by?.slice(0,12) ?? "?"}`);
+            return "kept";
+        }
+        if (sync.op === "leave") {
+            if (closed) {
+                console.log(`[distro] 👥 ${tag}: the group is closed here already; nothing changes (§11.2)`);
+                return "kept";
+            }
+            this._closeGroupFromSync(id, group, `left on device ${sync.by?.slice(0,12) ?? "?"}`);
+            return "kept";
+        }
+        // post
+        if (closed) {
+            console.log(`[distro] 👥 ${tag} dropped: the group is closed here (§11.2)`);
+            return "dropped";
+        }
+        if (!group || group.groupStatus !== "active") {
+            // §6.5: held until the group is joined here.
+            if (FilteredInvitesStore.has(id)) {
+                console.log(`[distro] 👥 ${tag} dropped, not held: this device's privacy filter dropped the group's invite (§6.5)`);
+                return "dropped";
+            }
+            const result = HeldGroupArrivalsStore.hold({ blob: facts.blob, groupId: id, src: d, hash: facts.hash,
+                signature: facts.signature, validated: true, pending: !!group }, d);
+            for (const e of result.evicted) {
+                console.log(`[distro] 👥 Held blob of group ${e.groupId.slice(0,8)} from ${e.src.slice(0,12)} pushed out: the bound of ${e.bound}`);
+            }
+            if (!result.held) {
+                console.log(`[distro] 👥 ${tag} dropped, not held: ${result.why}`);
+                return "dropped";
+            }
+            console.log(`[distro] 👥 ${tag} held until the group is joined here (${group ? "pending here" : "not held here"}; §6.5)`);
+            return "held";
+        }
+        // The user's own post, from another device of D: outgoing, SENT
+        // (never delivered: nothing here saw it delivered), at its own time,
+        // under the sync's hash, and no notification (§17.11 rule 5).
+        const stored = GroupMsgStore.add(id, { id: facts.hash, dir: "out", content: sync.text || DISTRO_ATTACHMENT_PLACEHOLDER,
+            status: "sent", srcHash: d, lxmfHash: facts.hash, via: "distro", timestamp: sync.at_ms });
+        group.lastActivity = Date.now();
+        GroupStore._save();
+        console.log(`[distro] 📤 Synced the user's post in group ${id.slice(0,8)} from device ${sync.by?.slice(0,12) ?? "?"} (§17.14)`);
+        this._onMsg.forEach(fn => fn(stored, id));
+        return "kept";
+    },
+
+    /** §11.2: group `group` is joined here from a sync (held from it, or a
+     *  pending invite the accept describes): joined as the user's own
+     *  accept on this device makes it, without sending: the sync's keys
+     *  bound and remembered (never a self address's), held accepts and
+     *  leaves decided, D accepted, every other member passing the filter by
+     *  association, the id out of the filtered-invite set, and what is
+     *  held for it replayed (§6.5). `how` is for the log. */
+    _joinedFromSync(group, sync, how) {
+        const id = group.groupId;
+        const listed = inviteMembers(sync.members);
+        const mine = this._groupSelf(group);
+        const keys = new Map();
+        for (const entry of sync.keys ?? []) {
+            const at = entry.indexOf(":");
+            if (at < 0) continue;
+            const hash = entry.slice(0, at).toLowerCase();
+            const publicKey = entry.slice(at + 1);
+            if (/^[0-9a-f]{32}$/.test(hash) && listed.includes(hash) && /^[A-Za-z0-9+/]{86}==$/.test(publicKey)) keys.set(hash, publicKey);
+        }
+        this._rememberGroupMemberKeys(keys, mine);
+        this._decideHeldGroupChanges();
+        if (group.groupStatus !== "active") GroupStore.accept(id);
+        for (const hash of group.members.keys()) if (!mine.has(hash)) ContactStore.allow(hash);
+        if (FilteredInvitesStore.remove(id)) console.log(`[distro] 👥 Group ${id.slice(0,8)} left the filtered-invite set: the user joined it on another device (§6.5)`);
+        GroupMsgStore.addSystem(id, sync.op === "create" ? `Group "${group.groupName}" created` : `You joined "${group.groupName}"`);
+        console.log(`[distro] 👥 Group ${id.slice(0,8)} joined here: ${how} (§11.2); nothing is sent`);
+        this._onMsg.forEach(fn => fn(null, id));
+        this._replayHeldGroupArrivals(id);
+    },
+
+    /** §11.2, "closed as the local decline or leave closes it", minus the
+     *  send and the G: group `id` (held here as `group`, or null) is
+     *  recorded closed and its conversation removed; what is held for it
+     *  goes; the id goes on this device's own `left` list for D. */
+    _closeGroupFromSync(id, group, why) {
+        const d = DistroManager.lxmfDeliveryHash;
+        GroupMsgStore.remove(id);
+        GroupStore.close(id, group?.groupStatus === "pending" ? "rejected" : "left");
+        this._forgetHeldGroupArrivals(id, why);
+        if (d) DistroLeftStore.record(d, id);
+        console.log(`[distro] 👥 Group ${id.slice(0,8)} ${group ? "closed and removed here" : "recorded closed here (not held)"}: ${why}; nothing is sent (§11.2)`);
+        if (group) this._onMsg.forEach(fn => fn({ kind: "group-left", synced: true }, id));
+    },
+
+    /** §11.2: a sync's `left`, after its op: each id but its own, of a
+     *  group held here as D or not held here, is closed as a leave sync
+     *  closes it; one held here as the device is not touched. Each applied,
+     *  or closed already, is on this device's own `left` list for D after. */
+    _applyGroupSyncLeft(sync) {
+        const d = DistroManager.lxmfDeliveryHash;
+        const changed = [];
+        for (const id of sync.left ?? []) {
+            if (id === sync.group_id) continue;
+            const group = GroupStore.get(id);
+            if (group && group.ownMember !== d) continue;
+            if (GroupStore.isClosed(id)) {
+                if (!DistroLeftStore.of(d).includes(id)) DistroLeftStore.record(d, id);
+                continue;
+            }
+            this._closeGroupFromSync(id, group, "left on another device of the user's (a sync's left list)");
+            changed.push(id);
+        }
+        if (changed.length) console.log(`[distro] 👥 A ${sync.op} sync's left list closed ${changed.length} group(s) here: ${changed.map(id => id.slice(0,8)).join(", ")} (§11.2)`);
+    },
+
+    /** §9.1: `by`, the 0xFD of a D-signed sync this device accepted (a
+     *  §17.11 copy, a §17.12 message, a §17.14 group sync), is a known
+     *  sibling of D unless it is this device. `what` is for the log. */
+    _learnDistroSibling(d, by, what) {
+        if (!d || !by || by === (this.ownHash ?? ownLxmfDestinationHash())) return;
+        if (KnownSiblingsStore.add(d, by)) console.log(`[distro] Learned a device of distro ${d.slice(0,8)}: ${by.slice(0,12)}, from ${what} (§9.1)`);
+    },
+
+    /** The distro this device holds changed (given up, replaced, or once
+     *  at load): blobs held for a distro it no longer holds are forgotten
+     *  (§6.5), with one log line giving the count, and the known siblings
+     *  of a distro neither held nor any group's own address (§9.1). Owed
+     *  group syncs are not touched: they stay owed (§10.5). */
+    _onDistroChangedForGroups() {
+        const d = DistroManager.has ? DistroManager.lxmfDeliveryHash : null;
+        let forgot = 0;
+        for (const row of HeldGroupArrivalsStore.list()) {
+            if (d && Buffer.from(row.blob, "base64").subarray(0, 16).toString("hex") === d) continue;
+            if (HeldGroupArrivalsStore.release(row)) forgot++;
+        }
+        if (forgot) console.log(`[distro] 👥 Forgot ${forgot} held group arrival(s): they reached a distro this device no longer holds (§6.5)`);
+        const keep = [d, ...GroupStore.getAll().map(g => g.ownMember)].filter(Boolean);
+        for (const gone of KnownSiblingsStore.keepOnly(keep)) {
+            console.log(`[distro] The known devices of distro ${gone.slice(0,8)} are forgotten: this device no longer holds it, and no group here uses it (§9.1)`);
+        }
+    },
+
+    /**
      * A membership message C unwrapped from the distro (§17.12 "Receiving"):
      * `marker` is LXMF.distroChannelSyncFromPayload's; `facts` holds
      * `fromDistro` and `signedByDistro`, rules 1 and 2's facts. Rules 1-5
@@ -5422,6 +5770,8 @@ const RnsClient = {
             Harness.event("distro-channel-sync", { result: "echo", op: marker.sync?.op ?? null, channel: name });
             return true;
         }
+        // §9.1: a device of D that sent a message this device accepts.
+        this._learnDistroSibling(DistroManager.lxmfDeliveryHash, marker.byHex, "a channel membership message");
         if (verdict === "stale") {
             const r = disposition.recorded;
             console.log(`[distro] ↩︎ channel ${disposition.op} of #${name} at ${disposition.atMs} is older than the ${r.op} at ${r.at} held here — dropped (§17.12 rule 5)`);
@@ -5890,7 +6240,7 @@ const RnsClient = {
                 // notice is shown, through the contact resolver: its 0xD1
                 // was already taken under §5.2 above, and the raw field is
                 // never shown as it arrived (audit M14).
-                GroupStore.addPending(groupId, groupName || "Group", srcHash, listed, ownMember);
+                GroupStore.addPending(groupId, groupName || "Group", srcHash, listed, ownMember, groupInfo.membersCsv ?? null);
                 GroupMsgStore.addSystem(groupId, `invited you to "${groupName || "Group"}"`, srcHash);
                 this._onMsg.forEach(fn => fn(lxmfMsg, groupId));  // trigger UI refresh with groupId
                 break;
@@ -6227,11 +6577,17 @@ const RnsClient = {
         const targets = [...group.members.entries()]
             .filter(([hash, status]) => !mine.has(hash) && status === "accepted")
             .map(([hash]) => hash);
-        const delivery = await this._fanoutGroupEnvelope(targets, outMsg.content, {
+        const fanout = this._fanoutGroupEnvelope(targets, outMsg.content, {
             groupId,
             groupName: group.groupName,
             groupSender: ownHash,
         }, signer);
+        // GROUPS-DISTRO-DESIGN.md §10.6: a post in a D-group is owed to D's
+        // other devices as one post sync, once, now that its fan-out was
+        // submitted (with no accepted member, nothing to submit: now too),
+        // never for a send that threw before this, as a §17.11 copy.
+        this._syncGroupAction("post", groupId, { text: outMsg.content, atMs: outMsg.timestamp });
+        const delivery = await fanout;
 
         if (delivery.fulfilled === delivery.total) {
             GroupMsgStore.updateStatus(groupId, outMsg.id, "sent");
@@ -6258,6 +6614,9 @@ const RnsClient = {
         for (const hash of memberHashes) if (!mine.has(hash)) ContactStore.allow(hash);
         GroupMsgStore.addSystem(group.groupId, `Group "${groupName}" created`);
         const sending = this.sendGroupInvites(group.groupId, groupName, memberHashes);
+        // GROUPS-DISTRO-DESIGN.md §10.6: a group created as D is owed to D's
+        // other devices as a create sync, once its invite chunks are built.
+        this._syncGroupAction("create", group.groupId);
         return { group, sending };
     },
 
@@ -8223,6 +8582,21 @@ const RnsClient = {
             // group message goes to the group handler, never to the DM path
             // below (_handleDistroGroupMessage). One that carries a distro
             // marker is no group message (groupEntriesOf).
+            // RFed SPEC §17.14 group sync (GROUPS-DISTRO-DESIGN.md §6.1 step 1,
+            // §11), beside the §17.12 one and ahead of the src:ts key: judged
+            // on its LXMF hash (gsync:<hash>), its rules and its apply table
+            // (_handleDistroGroupSync).
+            const groupSync = channelSync ? null : LXMF.distroGroupSyncFromPayload(payloadBytes, myLxmfHash);
+            if (groupSync) {
+                const hashedPart = Buffer.concat([destHash, srcHash, LXMessage.signedPayload(payloadBytes)]);
+                return this._handleDistroGroupSync(groupSync, {
+                    hash: Cryptography.fullHash(hashedPart).toString("hex"),
+                    fromDistro: srcHashHex === myLxmfHash,
+                    signedByDistro: () => DistroManager.identity.validate(decrypted.slice(16, 80), Buffer.concat([hashedPart, Cryptography.fullHash(hashedPart)])),
+                    signature: decrypted.slice(16, 80).toString("hex"),
+                    blob: data,
+                });
+            }
             const groupEntries = channelSync ? null : LXMF.groupEntriesOf(fieldsMap);
             if (groupEntries?.has_group_id) return this._handleDistroGroupMessage(data, destHash, decrypted, srcHashHex, groupEntries);
 
@@ -8322,6 +8696,8 @@ const RnsClient = {
                     : record;
                 ContactStore.touch(recipientHex);
                 console.log(`[distro] 📤 Synced sent message to ${recipientHex.slice(0,12)} from device ${sentCopy.byHex.slice(0,12)}: "${content.slice(0,60)}"`);
+                // §9.1 (GROUPS-DISTRO-DESIGN.md): its 0xFD is a device of D.
+                this._learnDistroSibling(myLxmfHash, sentCopy.byHex, "a sent-copy");
                 Harness.event("distro-sent-sync", { to: recipientHex.slice(0, 12), by: sentCopy.byHex.slice(0, 12) });
                 this._onMsg.forEach(fn => fn(stored, recipientHex));
                 return true;
@@ -8900,6 +9276,10 @@ const RnsClient = {
 // what was left owed to a distro given up before this page
 // (_dropMembershipOwedToOtherDistros).
 DistroManager.onChange(() => RnsClient._dropMembershipOwedToOtherDistros());
+// GROUPS-DISTRO-DESIGN.md §6.5, §9.1: what is held for a distro given up or
+// replaced goes, and so do the known siblings of a distro no group here uses.
+// Its owed group syncs stay owed (§10.5, kept by the line above).
+DistroManager.onChange(() => RnsClient._onDistroChangedForGroups());
 
 // =========================================================================
 //  UI HELPERS
@@ -10663,6 +11043,9 @@ const App = {
         // group fans out to its accepted members.
         RnsClient._decideHeldGroupChanges();
         GroupStore.accept(groupId);
+        // GROUPS-DISTRO-DESIGN.md §10.6: in a D-group the accept is owed to
+        // D's other devices as an accept sync, in this same step.
+        RnsClient._syncGroupAction("accept", groupId);
         for (const memberHash of group.members.keys()) {
             if (mine.has(memberHash)) continue;
             // Members are kept (their key, their names), not listed as
@@ -10741,6 +11124,10 @@ const App = {
      *  pending group's members are sent it too, though opening that
      *  group's chat asks nothing of them (RnsClient.openGroupConversation). */
     _quitGroup(groupId, how) {
+        // GROUPS-DISTRO-DESIGN.md §10.6, §13: in a D-group the decline or
+        // leave is owed to D's other devices as a leave sync, in this same
+        // step, and they close the group too.
+        RnsClient._syncGroupAction("leave", groupId);
         RnsClient.sendGroupLeave(groupId).catch(e => console.warn("Group leave send failed:", e.message));
         GroupMsgStore.remove(groupId);
         GroupStore.close(groupId, how);
@@ -12295,7 +12682,9 @@ const App = {
             // A channel left on another device of the distro (RFed SPEC
             // §17.12): it is gone here too, so its chat closes if it is the
             // one open, as the user's own leave closes it (the Leave button).
-            if (msg.kind === "channel-left" && msg.synced) {
+            // A group left on another device of the distro (GROUPS-DISTRO-
+            // DESIGN.md §11.2) closes the same way.
+            if ((msg.kind === "channel-left" || msg.kind === "group-left") && msg.synced) {
                 if (inActiveChat) {
                     this.state.activeHash = null;
                     document.body.classList.remove("narrow-chat-open");
@@ -12511,7 +12900,7 @@ window.RetichatTest = {
      *  the propagation node proves it (lib/distro_outbox.js). */
     distroOwed() {
         return DistroOutboxStore.list().map(e => ({ id: e.id, kind: e.kind, distro: e.distro, label: e.label,
-            ...(e.kind === "channel" ? { op: e.op, name: e.name, at: e.at } : { to: e.to }) }));
+            ...(e.kind === "channel" ? { op: e.op, name: e.name, at: e.at } : e.kind === "group" ? { op: e.op, groupId: e.groupId } : { to: e.to }) }));
     },
 
     // ---- Attachments (test-harnesses/staging/lib/attach.mjs HOOK_CONTRACT) ----

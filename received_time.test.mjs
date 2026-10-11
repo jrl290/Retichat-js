@@ -175,7 +175,7 @@ test("a message pulled from the distro late, and a sibling's sent-copy, keep the
         ContactStore: p.ContactStore, MsgStore: p.MsgStore, LXMF, Cryptography, LXMessage,
         decodeDisplayName: DN.decodePayload, ownLxmfDestinationHash: () => lxmfHash(device), console: quiet,
         DISTRO_ATTACHMENT_PLACEHOLDER: constValue("DISTRO_ATTACHMENT_PLACEHOLDER"), sentTimeMs,
-    })({ ownHash: lxmfHash(device), _pendingTickets: new Map(), _onMsg: [] });
+    })({ ownHash: lxmfHash(device), _pendingTickets: new Map(), _onMsg: [], _learnDistroSibling() {} });
     const blob = (packed) => Buffer.concat([Buffer.from(D, "hex"), distro.encrypt(packed.subarray(16))]);
 
     const sent = twoDaysAgo();
