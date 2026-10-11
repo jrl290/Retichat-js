@@ -250,8 +250,8 @@ test("§19.2: groupSigner: with D given up or replaced by D', a D-group post, ac
     }
 });
 
-test("§19.2: \"Delete from this device\" in a former-D group sends no leave, closes nothing, and removes the group and its messages here only", async () => {
-    const { u, D, id } = await dPending();
+test("§19.2, §8.7: \"Delete from this device\" in a former-D group sends no leave and owes no G, removes the group and its messages here only, and records it closed on this device, so a later invite or sync for it does not bring it back here", async () => {
+    const { u, c, m, D, Did, id } = await dPending();
     u.GroupStore.accept(id);
     u.GroupMsgStore.addSystem(id, "x");
     u.DistroManager.set(null);
@@ -259,10 +259,20 @@ test("§19.2: \"Delete from this device\" in a former-D group sends no leave, cl
     assert.equal(u.confirms.at(-1), DELETE_HERE);
     await settle();
     assert.equal(u.GroupStore.get(id), null);
-    assert.equal(u.GroupStore.isClosed(id), false, "not a leave: the user stays in the group elsewhere");
     assert.deepEqual(u.GroupMsgStore.get(id), []);
     assert.equal(u.sent.length + u.propagated.length, 0, "no leave sent");
-    void D;
+    assert.equal(u.GroupStore.isClosed(id), true, "closed on this device (decided 2026-10-11)");
+    assert.equal(u.GroupStore._closed.get(id), "deleted", "as a delete from this device, not a leave");
+    assert.deepEqual([u.reload().GroupStore.isClosed(id), u.reload().GroupStore._closed.get(id)], [true, "deleted"], "persisted, and read back as a delete");
+    // D held again: an accept G and the invite for the id change nothing here.
+    u.DistroManager.set(Did);
+    assert.deepEqual(u.DistroLeftStore.of(D), [], "not on this device's left list: the user did not leave the group");
+    await u.receiveDistro(G(Did, "ab".repeat(16), { op: "accept", group_id: id, at_ms: 9000, name: "G", members: [c.own, m.own, D].join(","), keys: [], creator: c.own }));
+    assert.equal(u.GroupStore.get(id), null, "an accept sync does not bring it back");
+    await u.receiveDistro(lxm(c.me, D, "", oldFields({ id, members: [c.own, m.own, D].join(","), name: "G", action: "invite", sender: c.own })));
+    assert.equal(u.GroupStore.get(id), null, "nor does the invite");
+    await u.receiveDistro(lxm(m.me, D, "a member's post", oldFields({ id })));
+    assert.deepEqual([u.GroupMsgStore.get(id), u.HeldGroupArrivalsStore.forGroup(id)], [[], []], "nor a member's post, which is not held either");
 });
 
 test("§13: the decline and leave confirmations in a D-group say all your devices; in a device-listed group they stay as today", async () => {

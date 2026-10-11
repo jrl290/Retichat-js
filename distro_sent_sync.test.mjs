@@ -654,8 +654,8 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
 
     // Nothing else closes a propagation link, or fires a link's close or a loss report.
     assert.deepEqual([...code.matchAll(/([\w$]+(?:\.[\w$]+)*)\s*(?:\?\.|\.)\s*close\s*\(/g)].map((m) => m[1]),
-        ["GroupStore", "existing.link", "link", "link", "entry.link", "propLink", "GroupStore"],
-        "today's closes: a group left on another device of the distro (GROUPS-DISTRO-DESIGN.md §11.2), a group link, a refused rfed.link, disconnect()'s rfed.links, group links and the propagation link it let go of, and a group. "
+        ["GroupStore", "existing.link", "link", "link", "entry.link", "propLink", "GroupStore", "GroupStore"],
+        "today's closes: a group left on another device of the distro (GROUPS-DISTRO-DESIGN.md §11.2), a group link, a refused rfed.link, disconnect()'s rfed.links, group links and the propagation link it let go of, a group deleted from this device only (§8.7), and a group. "
         + "A close of a propagation link decides the uploads on it, and a newer link up sends them at once (the third ruling): only its own close may");
     assert.doesNotMatch(code, /_linkClosed/, "the page never runs a link's close for it");
     // And every place the page says close or lost, or fires an event, so that a close of a link or a loss report
@@ -664,9 +664,9 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     // says "emit" or "closed" is not one.
     const shape = withoutComments(code, true);
     assert.deepEqual(sites(shape, "close", spans), ["GroupStore.close", "RnsClient._closeGroupFromSync", "RnsClient._markGroupPeerReady",
-        "RnsClient._closeRefusedRfedLink", "RnsClient.disconnect", "RnsClient.disconnect", "RnsClient.disconnect", "App._quitGroup",
+        "RnsClient._closeRefusedRfedLink", "RnsClient.disconnect", "RnsClient.disconnect", "RnsClient.disconnect", "App._deleteGroupFromDevice", "App._quitGroup",
         "App._renderSettingsModal", "App._renderSettingsModal", "App._renderIdentityModal", "App._renderIdentityModal"],
-        "close in the page's code: the closes above, a group's close, and two dialogs' own close");
+        "close in the page's code: the closes above, a group's two closes, and two dialogs' own close");
     assert.deepEqual(sites(code, /(["'`])(?:close|lost)\1/g, spans), ["RnsClient._followExchange", "RnsClient._establishPropagationLink",
         "RnsClient._onPropagationLinkClosed", "RnsClient._uploadOwed", "RnsClient._ensureGroupLink", "RnsClient._ensureRfedLink", "RnsClient._onRfedLinkClosed"],
         "\"close\" and \"lost\": the links' close listeners, the loss report's listener, two re-drives' reasons and an upload's state");

@@ -1461,9 +1461,10 @@ OutboundTickets.init();
 //  group is rejected/left, that person cannot rejoin." A group's member list
 //  is the creator's (create, or the first invite: addPending) and nothing
 //  adds to it; a member's status moves from invited to accepted or left, and
-//  never back from left (updateMember). The groups the user declined or left
-//  are recorded (close, isClosed), so an invite to one is ignored
-//  (shouldProcessGroupMessage) and the user is never offered it again.
+//  never back from left (updateMember). The groups the user declined or left,
+//  or deleted from this device only (GROUPS-DISTRO-DESIGN.md §8.7), are
+//  recorded (close, isClosed), so an invite to one is ignored
+//  (shouldProcessGroupMessage) and the user is never offered it again here.
 //
 //  The creator (James, 2026-10-06, RFed-spec Group.md "Member statuses and
 //  keys"): a group records who started it, the invite's authenticated source
@@ -1484,9 +1485,11 @@ const GroupStore = {
     // (§8.7).
     _groups: new Map(),
     _listeners: [],
-    // groupId → "rejected" | "left": the groups the user declined or left,
-    // oldest first. Bounded: past CLOSED_LIMIT the oldest is forgotten, and
-    // an invite to that one would be shown again.
+    // groupId → "rejected" | "left" | "deleted": the groups the user
+    // declined or left, or deleted from this device only (a D-group whose D
+    // this device no longer holds, GROUPS-DISTRO-DESIGN.md §8.7), oldest
+    // first. Bounded: past CLOSED_LIMIT the oldest is forgotten, and an
+    // invite to that one would be shown again.
     _closed: new Map(),
     CLOSED_LIMIT: 500,
     // The accepts and leaves held until their source's key is here
@@ -1540,7 +1543,7 @@ const GroupStore = {
         const closed = sGet("groups_closed_v1");
         if (Array.isArray(closed)) {
             for (const entry of closed.slice(-this.CLOSED_LIMIT)) {
-                if (Array.isArray(entry) && typeof entry[0] === "string") this._closed.set(entry[0], entry[1] === "left" ? "left" : "rejected");
+                if (Array.isArray(entry) && typeof entry[0] === "string") this._closed.set(entry[0], this._closedHow(entry[1]));
             }
         }
         const held = sGet("groups_held_v1");
@@ -1749,12 +1752,19 @@ const GroupStore = {
         this._notify();
     },
 
+    /** How a group was closed, as recorded: "left", "deleted", else "rejected". */
+    _closedHow(how) {
+        return how === "left" || how === "deleted" ? how : "rejected";
+    },
+
     /** The user declined (`how` "rejected") or left ("left") group
-     *  `groupId`: it is removed, and recorded so that it is never offered
-     *  again (isClosed). Persisted, oldest forgotten past CLOSED_LIMIT. */
+     *  `groupId`, or deleted it from this device only ("deleted",
+     *  §8.7): it is removed, and recorded so that it is never offered or
+     *  held here again (isClosed). Persisted, oldest forgotten past
+     *  CLOSED_LIMIT. */
     close(groupId, how) {
         this._closed.delete(groupId);
-        this._closed.set(groupId, how === "left" ? "left" : "rejected");
+        this._closed.set(groupId, this._closedHow(how));
         for (const old of this._closed.keys()) {
             if (this._closed.size <= this.CLOSED_LIMIT) break;
             this._closed.delete(old);
@@ -1763,7 +1773,8 @@ const GroupStore = {
         this.remove(groupId);
     },
 
-    /** Whether the user declined or left group `groupId` (close). */
+    /** Whether the user declined or left group `groupId`, or deleted it
+     *  from this device (close). */
     isClosed(groupId) { return this._closed.has(groupId); },
 
     get(groupId) { return this._groups.get(groupId) ?? null; },
@@ -6189,7 +6200,7 @@ const RnsClient = {
             }
             const why = !group && groupAction !== "invite" ? "a group not held here"
                 : groupAction && signature === "invalid" ? "its signature does not verify: it is not the source's"
-                : groupAction === "invite" ? (GroupStore.isClosed(groupId) ? "a group the user declined or left" : "a source the privacy filter does not allow")
+                : groupAction === "invite" ? (GroupStore.isClosed(groupId) ? "a group closed here (the user declined or left it, or deleted it from this device)" : "a source the privacy filter does not allow")
                 : "a source that is not a member of the group (or left it), a member speaking for another, or a relay request from a member that has not accepted, or for a group the user has not joined, or not signed by a key held here";
             return dropped(why);
         }
@@ -11219,14 +11230,20 @@ const App = {
 
     /** GROUPS-DISTRO-DESIGN.md §8.7: "Delete from this device", the one act
      *  a D-group whose D this device no longer holds still offers. The group
-     *  and its messages go from this device only: no leave is sent, no group
-     *  sync is owed, and it is not recorded as closed, since the user stays
-     *  in the group on the other devices of D and for the other members. */
+     *  and its messages go from this device only: no leave is sent and no
+     *  group sync is owed, since the user stays in the group on the other
+     *  devices of D and for the other members; nor is it put on this
+     *  device's `left` list for D. It is recorded closed on this device
+     *  (GroupStore.close, "deleted"), so a later invite or sync for its id
+     *  does not bring it back here, as on every client (decided
+     *  2026-10-11). Until then it was not recorded, and the next invite or
+     *  accept sync for the id held the group here again. */
     _deleteGroupFromDevice(groupId) {
         if (!confirm("This removes the group from this device only. You stay in the group on your other devices and for the other members.")) return;
-        console.log(`[retichat] 👥 Group ${groupId.slice(0,8)} deleted from this device only: no leave sent, no group sync owed`);
+        console.log(`[retichat] 👥 Group ${groupId.slice(0,8)} deleted from this device only: no leave sent, no group sync owed; recorded closed here`);
         GroupMsgStore.remove(groupId);
-        GroupStore.remove(groupId);
+        GroupStore.close(groupId, "deleted");
+        RnsClient._forgetHeldGroupArrivals(groupId, "the user deleted it from this device");
         if (this.state.activeHash === groupId) this.state.activeHash = null;
         document.body.classList.remove("narrow-chat-open");
         this.render();
