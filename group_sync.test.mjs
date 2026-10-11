@@ -283,3 +283,15 @@ test("rules 1-4 in order: a G from another source, or not signed by D, is droppe
     assert.equal(apply.by, DEVICE);
     assert.equal(apply.sync.op, "create");
 });
+
+test("an invite's GROUP_MEMBERS is parsed on the web with the phones' invite parser (LXMessage.extractGroupFields), in either field form", async () => {
+    const { applyGroupFields } = await import("./lib/retichat_field.js");
+    const csv = `${M},\n${D}\n,${"E".repeat(32)}, ${"e1".repeat(16)}\t,${M}`;
+    for (const inRetichat of [false, true]) {
+        const fields = new Map();
+        applyGroupFields(fields, { groupId: "9f8e7d6c5b4a39281706f5e4d3c2b1a0", groupMembers: csv, groupAction: "invite" }, inRetichat);
+        const decoded = MsgPack.unpack(MsgPack.pack(fields));
+        assert.deepEqual(LXMessage.extractGroupFields(decoded).members, inviteMembers(csv), `0xD1: ${inRetichat}`);
+        assert.deepEqual(LXMessage.extractGroupFields(decoded).members, [M, "e1".repeat(16)]);
+    }
+});
