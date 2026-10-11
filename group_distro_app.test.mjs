@@ -28,7 +28,8 @@ import MsgPack from "./lib/rns/msgpack.js";
 const decodeFields = (m) => LXMessage.extractGroupFields(m.fields);
 const hex = (b) => Buffer.from(b).toString("hex");
 
-const FORMER_D = (d) => `This group uses your distro address ${shortHash(d)}, which this device no longer holds. You can read it here, but cannot post or change your membership from this device.`;
+// James's words (2026-10-11), the only text of this round; group_ui_rulings.test.mjs pins each character.
+const FORMER_D = (d) => `This group uses your distro address ${shortHash(d)}, which is no longer on this device. New messages in it don't reach this device, and you can't post, join or leave from here. Import that distro again to use the group here.`;
 const DELETE_HERE = "This removes the group from this device only. You stay in the group on your other devices and for the other members.";
 const DECLINE_D = "Decline this invitation? This declines it on all your devices, and you cannot join this group later.";
 const LEAVE_D = "Leave this group? You will leave it on all your devices, its messages are deleted from all of them, and you cannot rejoin.";
@@ -238,9 +239,12 @@ test("§19.2: groupSigner: with D given up or replaced by D', a D-group post, ac
         assert.equal(u.self.groupFormerDistroText(group), FORMER_D(D));
         await assert.rejects(u.self.sendGroupAccept(id), { message: FORMER_D(D) });
         await assert.rejects(u.self.sendGroupLeave(id), { message: FORMER_D(D) });
-        // The page refuses its own acts with the same text.
+        // The page refuses its own acts saying nothing (James, 2026-10-11),
+        // and draws the group again, which shows the text.
+        const renders = u.page.renders;
         u.page._acceptGroupInvite(id);
-        assert.equal(u.alerts.at(-1), FORMER_D(D));
+        assert.deepEqual(u.alerts, [], "no alert");
+        assert.equal(u.page.renders, renders + 1, "drawn again");
         assert.equal(u.GroupStore.get(id).groupStatus, "pending", "not accepted here either");
         u.GroupStore.accept(id);
         await assert.rejects(u.self.sendGroupMessage(id, "hi"), { message: FORMER_D(D) });

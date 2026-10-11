@@ -1083,6 +1083,8 @@ a.msg-file:hover { border-color: var(--primary); }
     white-space: nowrap;
 }
 .btn:active { transform: scale(0.97); }
+/* Greyed: a group act until the start finishes (app.js _groupActionsReady). */
+.btn:disabled { opacity: 0.5; cursor: default; pointer-events: none; }
 
 .btn-primary {
     background: var(--primary);

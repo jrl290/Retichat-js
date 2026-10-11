@@ -1461,7 +1461,7 @@ test("accepting an invite allows every member of the group, whatever row it has;
         RnsClient: { ownHash: ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges() {}, sendGroupAccept: async (id) => { sent.push(id); },
             _groupSelf: () => new Set([ME]), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
-    })({ render() {} });
+    })({ render() {}, _groupActionsReady: () => true });
 
     accept(G);
     assert.deepEqual([alerts.length, sent], [0, [G]], "accepted and announced");
@@ -1586,7 +1586,7 @@ test("group trust rule: once the user accepts, every listed member is allowed (X
         RnsClient: { ownHash: p.ME, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges: () => p.r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
             _groupSelf: (g) => p.r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => alerts.push(m),
-    })({ render() {} });
+    })({ render() {}, _groupActionsReady: () => true });
     accept(p.G);
     assert.deepEqual(alerts, [], "every member's key is here");
     assert.equal(p.r.GroupStore.get(p.G).groupStatus, "active");
@@ -1616,7 +1616,8 @@ test("group trust rule: once the user accepts, every listed member is allowed (X
  * real send path: leavingClient).
  */
 function quittingPage({ GroupStore, GroupMsgStore, RnsClient }) {
-    const page = { state: { activeHash: null }, render() {} };
+    // Started (App._groupActionsReady): the acts run.
+    const page = { state: { activeHash: null }, render() {}, _groupActionsReady: () => true };
     // A device-listed group: never a former distro's (GROUPS-DISTRO-DESIGN.md §8.7).
     if (!("groupFormerDistroText" in RnsClient)) RnsClient.groupFormerDistroText = () => null;
     // Nothing reached a distro for it: nothing is held to forget (§6.5).
@@ -1656,7 +1657,7 @@ function answeringClient({ filter = true, switched = false } = {}) {
             _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: (g) => r.self.groupFormerDistroText(g),
             sendGroupAccept: async (id) => { accepts.push(id); } },
         alert: (m) => alerts.push(m),
-    })({ render() {} });
+    })({ render() {}, _groupActionsReady: () => true });
     const { _declineGroupInvite: declineInvite, _leaveGroup: leaveGroup } = quittingPage({
         GroupStore: r.GroupStore, GroupMsgStore: posts, RnsClient: { sendGroupLeave: async (id) => { leaves.push(id); } } });
     /** `from`'s invite to group `groupId` listing `members` (identities),
@@ -2127,7 +2128,7 @@ test("group model, signatures: a held accept survives a reload and is decided wh
                 _groupSelf: (g) => again.self._groupSelf(g), groupFormerDistroText: () => null,
                 sendGroupAccept: async (id) => { fannedTo.push(...[...again.GroupStore.get(id).members.entries()].filter(([, s]) => s === "accepted").map(([h]) => h)); } },
             alert: (m) => assert.fail(m),
-        })({ render() {} });
+        })({ render() {}, _groupActionsReady: () => true });
         accept(G);
         assert.equal(again.GroupStore.get(G).groupStatus, "active", on);
         assert.equal(again.GroupStore.get(G).members.get(B), "accepted", `${on}: B's held accept counted`);
@@ -2624,7 +2625,7 @@ function groupInfoRows(r, G) {
     }
     const document = { createElement: (tag) => new Node_(tag), createTextNode: (text) => ({ textContent: text }) };
     const root = new Node_("div");
-    const page = { state: { groupInfoId: G, showGroupInfo: true }, root, render() {},
+    const page = { state: { groupInfoId: G, showGroupInfo: true }, root, render() {}, _groupActionsReady: () => true,
         _groupMemberLabel: (hash) => r.ContactStore.name(hash), _paintMemberAvatar() {} };
     compile("_renderGroupInfoModal()", { GroupStore: r.GroupStore, RnsClient: { groupFormerDistroText: () => null }, h: fn("h", "tag, a={}, ...kids", { document }) })(page)();
     const rows = new Map();

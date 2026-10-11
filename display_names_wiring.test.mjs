@@ -1267,7 +1267,7 @@ function makeGroupReceiver(me, memberHashes, { switched = false } = {}) {
         RnsClient: { ownHash: own(), _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, _decideHeldGroupChanges: () => r.self._decideHeldGroupChanges(), sendGroupAccept: async () => {},
             _groupSelf: (g) => r.self._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(`the accept was held back: ${m}`),
-    })({ render() {} });
+    })({ render() {}, _groupActionsReady: () => true });
     return { ...r, groups, notices, posts, systemText, groupLabel, PrivacyFilter, acceptInvite };
 }
 const groupFields = (name, action = null, extra = []) => new Map([
@@ -1453,7 +1453,7 @@ test("audit L4: group members and channel posters are kept as hidden rows, never
         alert: () => assert.fail("keys are all there"),
     });
     store.keep(A, alice.getPublicKey().toString("hex"));
-    accept({ render() {} })(GROUP);
+    accept({ render() {}, _groupActionsReady: () => true })(GROUP);
     assert.deepEqual([store.get(A).hidden, store.get(B).hidden], [true, true]);
     assert.deepEqual([store.allowlisted(A), store.allowlisted(B)], [true, true],
         "and allowlisted: every member passes the privacy filter (iOS acceptGroupInvite, Android)");

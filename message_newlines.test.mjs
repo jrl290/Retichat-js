@@ -190,11 +190,12 @@ function sendFrom(value, kind) {
         alert: (m) => { throw new Error(m); },
         console,
         GROUP_ATTACHMENT_REFUSAL: "no",
-        GroupStore: { isGroupChat: () => kind === "group" },
+        GroupStore: { isGroupChat: () => kind === "group", get: (id) => ({ groupId: id }) },
         ChannelStore: { get: () => (kind === "channel" ? { channelName: "c" } : null) },
         ContactStore: { get: () => ({ destHash: "d" }) },
         RnsClient: {
             attachmentRefusal: () => null,
+            _groupSigner: (group) => (group ? { hash: "s" } : null),          // a group this device signs for
             sendMessage: (c, content) => calls.push(["dm", content]),
             sendGroupMessage: (g, content) => { calls.push(["group", content]); return pending(); },
             sendChannelMessage: (c, content) => { calls.push(["channel", content]); return pending(); },

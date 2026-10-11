@@ -236,7 +236,7 @@ function screens(p) {
     };
     const self = {
         state: { searchQuery: "", activeHash: null, showContactInfo: false, contactInfoHash: null, showAddContact: false, showNewConversation: false },
-        root: new El("div"), paths, render() {}, openChat() {},
+        root: new El("div"), paths, render() {}, openChat() {}, _groupActionsReady: () => true,
         _requestPathForContact: (hash) => paths.push(hash),
         _buildGroupItem: (g) => h("div", { className: "group-item" }, g.groupName),
         _buildChannelItem: () => h("div", { className: "channel-item" }),
@@ -374,7 +374,7 @@ test("a group invite and the user's accept keep every member by association: all
         RnsClient: { ownHash: p.own(), _decideHeldGroupChanges() {}, _requestGroupPeer() {}, _replayHeldGroupArrivals: () => 0, _syncGroupAction: () => false, sendGroupAccept: async () => {},
             _groupSelf: (g) => p.rns._groupSelf(g), groupFormerDistroText: () => null },
         alert: (m) => assert.fail(m),
-    })({ render() {} })(G);
+    })({ render() {}, _groupActionsReady: () => true })(G);
     assert.equal(p.GroupStore.get(G).groupStatus, "active");
     assert.deepEqual([p.ContactStore.allowlisted(B), p.ContactStore.get(B).hidden], [true, true], "allowed, still hidden");
 

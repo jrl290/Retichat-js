@@ -462,7 +462,7 @@ test("the line under the status dot: while the status is \"blocked\" it says so 
     const header = sidebar.indexOf('h("div", { className: "sidebar-header" },');
     const line = sidebar.indexOf('frag.appendChild(h("div", { id: "exchange-blocked", className: "conn-banner none", role: "status" }));');
     assert.ok(header > 0 && line > header && line < sidebar.indexOf("// Search bar"), "between the header and the search bar");
-    assert.match(methodBody("_wire()"), /RnsClient\.onStatus\(\(\) => \{\n\s+this\._checkDayTurn\(\);\n\s+this\._applyStatusDot\(\);\n\s+\}\);/);
+    assert.match(methodBody("_wire()"), /RnsClient\.onStatus\(\(\) => \{\n\s+this\._checkDayTurn\(\);\n\s+this\._applyStatusDot\(\);\n\s+this\._syncGroupActions\(\);\n\s+\}\);/);
     assert.match(methodBody("render()"), /this\._applyStatusDot\(\);/);
     const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
     assert.match(css, /#exchange-blocked:empty \{ display: none; \}/, "empty, it takes no room");

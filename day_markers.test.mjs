@@ -523,6 +523,7 @@ test("an idle tab left open across midnight relabels on the announce interval's 
     compile("_wire()", {
         RnsClient: new Proxy({}, { get: (_, name) => (name === "onTick" ? (f) => rns._onTick.push(f) : recorder("RnsClient")[name]) }),
         ContactStore: recorder("ContactStore"), GroupStore: recorder("GroupStore"), ChannelStore: recorder("ChannelStore"),
+        DistroManager: recorder("DistroManager"),
     })(self)();
     assert.equal(rns._onTick.length, 1, "_wire() listens to the tick");
 

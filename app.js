@@ -2519,9 +2519,6 @@ const RnsClient = {
         return signer?.isDistro && signer.hash === group.ownMember ? signer : null;
     },
 
-    /** §8.7: the text a D-group shows when this device can no longer sign
-     *  for its own address (D given up or replaced); null when it can, and
-     *  for a group whose own address is the device. */
     /** The own address an invite listing `listed` is admitted with
      *  (GROUPS-DISTRO-DESIGN.md §8.1, either path): the D this device holds
      *  now when the list names it (a list naming the device too gives D: the
@@ -2550,9 +2547,14 @@ const RnsClient = {
         return distros.some(d => d && KnownSiblingsStore.has(d, hash));
     },
 
+    /** §8.7: the text a D-group shows when this device can no longer sign
+     *  for its own address (D given up or replaced), shown with "Delete from
+     *  this device"; null when it can, and for a group whose own address is
+     *  the device. The words are James's (2026-10-11), the address its first
+     *  8 hex characters and "…", as on both phones. */
     groupFormerDistroText(group) {
         if (!group?.ownMember || this._groupSigner(group)) return null;
-        return `This group uses your distro address ${shortHash(group.ownMember)}, which this device no longer holds. You can read it here, but cannot post or change your membership from this device.`;
+        return `This group uses your distro address ${shortHash(group.ownMember)}, which is no longer on this device. New messages in it don't reach this device, and you can't post, join or leave from here. Import that distro again to use the group here.`;
     },
     get cfg() { return this._cfg || DEFAULT_CONFIG; },
 
@@ -7329,10 +7331,14 @@ const RnsClient = {
         // (§5): messages sent before it were stored "queued" and go now. A
         // 401 re-registration fires "registered" again; the flag keeps that
         // from re-running the queue.
+        const starting = !this._initialized;
         if (!this._initialized) {
             this._initialized = true;
             this._dispatchQueued();
         }
+        // The start has finished: the page offers what it greyed until now
+        // (App._syncGroupActions, an onStatus listener).
+        if (starting) this._onStatus.forEach(fn => fn(this._status));
         if (!this._cfg.rfedNodeHash) return;
         const rfedIdBytes = Buffer.from(this._cfg.rfedNodeHash, "hex");
         const nodeHash = Destination.hash({hash: rfedIdBytes}, "rfed", "node").toString("hex");
@@ -9710,6 +9716,10 @@ const App = {
     _savedFocus: null,  // { activeHash, cursorPos, value } for focus restoration
     // chat id -> attachments picked for the next message there: [{name, bytes, mime}]
     _pendingAttachments: new Map(),
+    // Drafts whose composer gave way while they were typed (a D-group whose
+    // distro left this device): chat id -> text, back in the composer when
+    // it is (_restoreComposerFocus). Page memory, as the draft itself.
+    _keptDrafts: new Map(),
     _fileInput: null,
     // The day, time zone and locale the date markers on screen were labelled
     // in (dayStamp): set by render(), moved by _checkDayTurn().
@@ -9816,10 +9826,23 @@ const App = {
     _restoreComposerFocus() {
         const sf = this._savedFocus;
         this._savedFocus = null;
+        const ta = document.getElementById("composer-input");
+        // A draft whose composer gave way (a D-group whose distro is no
+        // longer on this device shows why instead) is kept for its chat, and
+        // is back in the composer when the composer is: a post's draft stays
+        // (James, 2026-10-11).
+        if (sf?.value && !ta && this.state.activeHash === sf.activeHash) {
+            this._keptDrafts.set(sf.activeHash, sf.value);
+            return;
+        }
+        if (!sf && ta && this._keptDrafts.has(this.state.activeHash)) {
+            ta.value = this._keptDrafts.get(this.state.activeHash);
+            this._keptDrafts.delete(this.state.activeHash);
+            return;
+        }
         if (!sf) return;
         // Only restore if we're still in the same chat
         if (this.state.activeHash !== sf.activeHash) return;
-        const ta = document.getElementById("composer-input");
         if (!ta) return;
         // Restore the in-flight text and cursor position
         if (sf.value && ta.value !== sf.value) {
@@ -10576,11 +10599,13 @@ const App = {
         // longer holds is read-only here: the composer, accept, decline and
         // leave give way to why, and "Delete from this device".
         const formerDistro = RnsClient.groupFormerDistroText(g);
+        // Greyed, with no text, until the start finishes (_groupActionsReady).
+        const greyed = !this._groupActionsReady();
         const formerDistroBar = () => h("div", { className: "pending-invite-bar" },
             h("div", { className: "pending-icon" }, "🔒"),
             h("div", { className: "pending-text" }, formerDistro),
             h("div", { style: { display: "flex", gap: "8px" } },
-                h("button", { className: "btn btn-danger btn-sm",
+                h("button", { className: "btn btn-danger btn-sm", "data-group-action": "", disabled: greyed,
                     onClick: () => this._deleteGroupFromDevice(g.groupId) }, "Delete from this device"),
             ),
         );
@@ -10612,9 +10637,9 @@ const App = {
                     h("div", { className: "pending-icon" }, "📩"),
                     h("div", { className: "pending-text" }, "You've been invited to this group"),
                     h("div", { style: { display: "flex", gap: "8px" } },
-                        h("button", { className: "btn btn-primary btn-sm",
+                        h("button", { className: "btn btn-primary btn-sm", "data-group-action": "", disabled: greyed,
                             onClick: () => this._acceptGroupInvite(g.groupId) }, "Accept"),
-                        h("button", { className: "btn btn-danger btn-sm",
+                        h("button", { className: "btn btn-danger btn-sm", "data-group-action": "", disabled: greyed,
                             onClick: () => this._declineGroupInvite(g.groupId) }, "Decline"),
                     ),
                 ),
@@ -11158,6 +11183,12 @@ const App = {
             }
             // Check if this is a group chat
             if (GroupStore.isGroupChat(this.state.activeHash)) {
+                // A post this device cannot sign now (a D-group whose distro
+                // is no longer here, RnsClient._groupSigner) is refused with
+                // no notice, and the draft stays in the composer (James,
+                // 2026-10-11). Before the start finishes it is no refusal:
+                // the post waits like a DM's (sendGroupMessage).
+                if (!RnsClient._groupSigner(GroupStore.get(chatId))) return;
                 RnsClient.sendGroupMessage(this.state.activeHash, content).catch(e => {
                     console.warn("Group send failed:", e.message);
                 });
@@ -11193,13 +11224,35 @@ const App = {
         } catch(e) { alert("Send failed: " + e.message); }
     },
 
+    /** Whether the start has finished (RnsClient._initialized: the first
+     *  registration with the exchange since connect()). Until then Accept,
+     *  Decline, Leave, Delete from this device and Create are greyed, with
+     *  no text, and do nothing, as on both phones (James, 2026-10-11); a
+     *  post waits like a DM's (RnsClient.sendGroupMessage). The web holds
+     *  its identity and its distro from the page's load, so its start never
+     *  leaves a group's own address unknown: a D-group whose distro is gone
+     *  says so (groupFormerDistroText) from the first drawing. */
+    _groupActionsReady() {
+        return RnsClient._initialized === true;
+    },
+
+    /** The greyed group acts (each button marked data-group-action) follow
+     *  the start in place, when it finishes or a restart begins (RnsClient
+     *  onStatus): an open chat keeps its draft, an open form its input. */
+    _syncGroupActions() {
+        const greyed = !this._groupActionsReady();
+        for (const b of this.root.querySelectorAll("[data-group-action]")) b.disabled = greyed;
+    },
+
     _acceptGroupInvite(groupId) {
+        if (!this._groupActionsReady()) return;
         const group = GroupStore.get(groupId);
         if (!group) return;
         // GROUPS-DISTRO-DESIGN.md §8.7: a D-group whose D this device no
-        // longer holds cannot be accepted here; nothing changes or is sent.
-        const refusal = RnsClient.groupFormerDistroText(group);
-        if (refusal) { alert(refusal); return; }
+        // longer holds cannot be accepted here; nothing changes or is sent,
+        // nothing is said (James, 2026-10-11), and the group is drawn
+        // again, so it shows why (groupFormerDistroText).
+        if (RnsClient.groupFormerDistroText(group)) { this.render(); return; }
         // The user's own addresses (§9.2, §9.4: the device, and in a group
         // listing the user's D, D and its known siblings) need no key and
         // are never allowed: D is never a contact.
@@ -11247,10 +11300,11 @@ const App = {
      *  nothing (iOS and Android still send nothing), so only this device
      *  knew. */
     _declineGroupInvite(groupId) {
+        if (!this._groupActionsReady()) return;
         // GROUPS-DISTRO-DESIGN.md §8.7: not from a device that no longer
-        // holds the group's D (the decline would be signed by nobody).
-        const refusal = RnsClient.groupFormerDistroText(GroupStore.get(groupId));
-        if (refusal) { alert(refusal); return; }
+        // holds the group's D (the decline would be signed by nobody):
+        // nothing said, and drawn again, as the accept (_acceptGroupInvite).
+        if (RnsClient.groupFormerDistroText(GroupStore.get(groupId))) { this.render(); return; }
         // §13: in a D-group the decline is D's, final on all the user's
         // devices; in a device-listed group it is this device's alone.
         const text = GroupStore.get(groupId)?.ownMember
@@ -11263,8 +11317,9 @@ const App = {
     /** The user leaves a joined group: the user's leave to its members,
      *  and for good, as a decline (_quitGroup). */
     _leaveGroup(groupId) {
-        const refusal = RnsClient.groupFormerDistroText(GroupStore.get(groupId));
-        if (refusal) { alert(refusal); return; }
+        if (!this._groupActionsReady()) return;
+        // §8.7, as the decline.
+        if (RnsClient.groupFormerDistroText(GroupStore.get(groupId))) { this.render(); return; }
         // §13, as the decline.
         const text = GroupStore.get(groupId)?.ownMember
             ? "Leave this group? You will leave it on all your devices, its messages are deleted from all of them, and you cannot rejoin."
@@ -11284,6 +11339,7 @@ const App = {
      *  2026-10-11). Until then it was not recorded, and the next invite or
      *  accept sync for the id held the group here again. */
     _deleteGroupFromDevice(groupId) {
+        if (!this._groupActionsReady()) return;
         if (!confirm("This removes the group from this device only. You stay in the group on your other devices and for the other members.")) return;
         console.log(`[retichat] 👥 Group ${groupId.slice(0,8)} deleted from this device only: no leave sent, no group sync owed; recorded closed here`);
         GroupMsgStore.remove(groupId);
@@ -12328,6 +12384,9 @@ const App = {
         let groupNameInput = "";
 
         const doCreate = () => {
+            // Greyed until the start finishes, Enter in the name too
+            // (_groupActionsReady).
+            if (!this._groupActionsReady()) return;
             const name = groupNameInput.trim();
             if (!name) { alert("Enter a group name."); return; }
             const selected = [];
@@ -12373,7 +12432,7 @@ const App = {
         );
 
         footer.appendChild(
-            h("button", { className: "btn btn-primary btn-block", onClick: doCreate }, "Create Group"),
+            h("button", { className: "btn btn-primary btn-block", "data-group-action": "", disabled: !this._groupActionsReady(), onClick: doCreate }, "Create Group"),
         );
     },
 
@@ -12565,6 +12624,8 @@ const App = {
         // GROUPS-DISTRO-DESIGN.md §8.7: only "Delete from this device" in a
         // group whose D this device no longer holds.
         const formerDistro = RnsClient.groupFormerDistroText(g);
+        // Greyed, with no text, until the start finishes (_groupActionsReady).
+        const greyed = !this._groupActionsReady();
 
         const overlay = h("div", { className: "modal-overlay",
             onClick: (e) => { if (e.target === overlay) { this.state.showGroupInfo = false; this.render(); } },
@@ -12594,7 +12655,7 @@ const App = {
             body.appendChild(
                 h("div", { style: { marginBottom: "16px" } },
                     h("p", { style: { fontSize: "13px" } }, formerDistro),
-                    h("button", { className: "btn btn-danger btn-block",
+                    h("button", { className: "btn btn-danger btn-block", "data-group-action": "", disabled: greyed,
                         onClick: () => { this.state.showGroupInfo = false; this.render(); this._deleteGroupFromDevice(g.groupId); } },
                         "Delete from this device"),
                 ),
@@ -12605,10 +12666,10 @@ const App = {
         if (isPending && !formerDistro) {
             body.appendChild(
                 h("div", { className: "btn-row", style: { marginBottom: "16px" } },
-                    h("button", { className: "btn btn-primary",
+                    h("button", { className: "btn btn-primary", "data-group-action": "", disabled: greyed,
                         onClick: () => { this.state.showGroupInfo = false; this.render(); this._acceptGroupInvite(g.groupId); } },
                         "✅ Accept Invite"),
-                    h("button", { className: "btn btn-danger",
+                    h("button", { className: "btn btn-danger", "data-group-action": "", disabled: greyed,
                         onClick: () => { this.state.showGroupInfo = false; this.render(); this._declineGroupInvite(g.groupId); } },
                         "❌ Decline"),
                 ),
@@ -12647,7 +12708,7 @@ const App = {
         if (!isPending && !formerDistro) {
             body.appendChild(
                 h("div", { style: { marginTop: "16px" } },
-                    h("button", { className: "btn btn-danger btn-block",
+                    h("button", { className: "btn btn-danger btn-block", "data-group-action": "", disabled: greyed,
                         onClick: () => { this.state.showGroupInfo = false; this.render(); this._leaveGroup(g.groupId); } },
                         "🚪 Leave Group"),
                 ),
@@ -12821,6 +12882,7 @@ const App = {
         RnsClient.onStatus(() => {
             this._checkDayTurn();
             this._applyStatusDot();
+            this._syncGroupActions();
         });
 
         // Incoming messages & proofs. Everything here is a targeted DOM patch:
@@ -12933,6 +12995,17 @@ const App = {
             if (this.state.activeHash && GroupStore.isGroupChat(this.state.activeHash)) {
                 this._rebuildDetail();
             }
+        });
+
+        // The distro held here changes (generated, imported, forgotten): a
+        // D-group's state follows it (RnsClient.groupFormerDistroText), so
+        // an open group chat is drawn again (its draft kept, even when the
+        // composer gives way: _restoreComposerFocus), and the group info
+        // when it is open.
+        DistroManager.onChange(() => {
+            if (this.state.view !== "main") return;
+            if (this.state.showGroupInfo) this.render();
+            else if (this.state.activeHash && GroupStore.isGroupChat(this.state.activeHash)) this._rebuildDetail();
         });
 
         // Channel list changes — same logic

@@ -276,14 +276,14 @@ export function groupClient({ me = Identity.create(), storage = memoryStorage(),
 
     // The user's own acts, as the page runs them.
     const alerts = [], confirms = [];
-    const page = { state: { activeHash: null }, render() {} };
+    const page = { state: { activeHash: null }, renders: 0, render() { page.renders++; } };
     const pageEnv = {
         GroupStore, ContactStore, GroupMsgStore, console: appLog, RnsClient: self, confirm: (text) => { confirms.push(text); return true; },
         HeldGroupArrivalsStore,
         alert: (m) => alerts.push(m), document: { body: { classList: { remove() {} } } },
     };
     for (const signature of ["_acceptGroupInvite(groupId)", "_declineGroupInvite(groupId)", "_leaveGroup(groupId)", "_quitGroup(groupId, how)",
-        "_deleteGroupFromDevice(groupId)"]) {
+        "_deleteGroupFromDevice(groupId)", "_groupActionsReady()"]) {
         page[signature.slice(0, signature.indexOf("("))] = compile(signature, pageEnv)(page);
     }
 
