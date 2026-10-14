@@ -45,22 +45,35 @@ test("goodbye sends the interface credentials as a text/plain beacon", async () 
     assert.deepEqual(JSON.parse(await sent[0].blob.text()), { interface_id: "iface1", session_token: "tok1" });
 });
 
-test("goodbye is a no-op before registration and falls back to a keepalive fetch, whose answer is timed", async () => {
+test("goodbye is a no-op before registration and falls back to a keepalive fetch, which is watched from its send and whose answer is timed", async () => {
     const calls = [];
-    const fetch = (url, opts) => { calls.push({ url, opts }); return Promise.resolve({ status: 200 }); };
+    let answer = Promise.resolve({ status: 200 });
+    const fetch = (url, opts) => { calls.push({ url, opts }); return answer; };
     const unregistered = { isRegistered: false, _baseUrl: "https://n/r", _interfaceId: null, _sessionToken: null };
     assert.equal(makeGoodbye(unregistered, { navigator: {}, fetch })(), false);
     assert.equal(calls.length, 0);
     const answered = [];
+    const watched = [];
     const registered = { isRegistered: true, _baseUrl: "https://n/r", _interfaceId: "i", _sessionToken: "t",
-        _clock: () => 7, _answered: (what, sentAt, status) => answered.push({ what, sentAt, status }) };
+        _clock: () => 7, _answered: (what, sentAt, status) => answered.push({ what, sentAt, status }),
+        _watch: (what) => { const watch = { what, ended: false }; watched.push(watch); return watch; },
+        _unwatch: (watch) => { watch.ended = true; } };
     assert.equal(makeGoodbye(registered, { navigator: {}, fetch })(), true);
     assert.equal(calls[0].opts.keepalive, true, "the fallback must outlive the page");
+    assert.deepEqual(watched, [{ what: "goodbye", ended: false }], "watched from its send");
     await new Promise((resolve) => setTimeout(resolve, 0));
     // DESIGN_PRINCIPLES §1, REGISTRATION-STAGE1.md §6: a beacon has no answer
-    // to time; the keepalive fetch has, and is timed like every other request
-    // (driven for real in post_interface_signed.test.mjs).
+    // to time; the keepalive fetch has, and is watched and timed like every
+    // other request (driven for real in post_interface_answer_rule.test.mjs).
     assert.deepEqual(answered, [{ what: "goodbye", sentAt: 7, status: 200 }]);
+    assert.deepEqual(watched, [{ what: "goodbye", ended: true }], "its answer ends the watch");
+
+    // A goodbye that fails on the network: its own failure ends the watch, and nothing is timed.
+    answer = Promise.reject(new TypeError("Failed to fetch"));
+    assert.equal(makeGoodbye(registered, { navigator: {}, fetch })(), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(watched.map((w) => w.ended), [true, true]);
+    assert.equal(answered.length, 1);
 });
 
 test("connect hooks goodbye to pagehide once, and disconnect sends it", () => {

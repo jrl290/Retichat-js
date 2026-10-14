@@ -39,24 +39,42 @@ export async function eventually(probe, what) {
     throw new Error(`never happened: ${what}`);
 }
 
-/** Timers of 0 ms (the EventEmitter's deferral) run for real; every other timer is captured and fired by hand. */
+/**
+ * Timers of 0 ms (the EventEmitter's deferral) run for real; every other
+ * timer is captured and fired by hand. The §1 watch's timers
+ * (PostInterface.watchTimers) are captured apart, in `watches`: they pace
+ * nothing, so live() and armed() are the attempts' alone (the poll, the
+ * backoff). post_interface_answer_rule.test.mjs runs the watch on virtual
+ * time.
+ */
 export function fakeTimers(t) {
     const timers = [];
-    globalThis.setTimeout = (fn, ms, ...args) => {
-        if (!ms) return realSetTimeout(fn, 0, ...args);
+    const watches = [];
+    const capture = (list) => (fn, ms) => {
         const timer = { fn, ms, cleared: false, fired: false };
-        timers.push(timer);
+        list.push(timer);
         return timer;
     };
-    globalThis.clearTimeout = (timer) => {
+    const clear = (timer) => {
         if (timer && typeof timer === "object" && "cleared" in timer) timer.cleared = true;
         else realClearTimeout(timer);
     };
-    t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; });
+    const captureTimer = capture(timers);
+    globalThis.setTimeout = (fn, ms, ...args) => (ms ? captureTimer(fn, ms) : realSetTimeout(fn, 0, ...args));
+    globalThis.clearTimeout = clear;
+    const watchTimers = PostInterface.watchTimers;
+    PostInterface.watchTimers = { set: capture(watches), clear };
+    t.after(() => {
+        globalThis.setTimeout = realSetTimeout;
+        globalThis.clearTimeout = realClearTimeout;
+        PostInterface.watchTimers = watchTimers;
+    });
     const live = () => timers.filter((x) => !x.cleared && !x.fired);
     return {
         timers,
         live,
+        /** The §1 watches still armed: each a request to the PHP node not yet answered. */
+        watches: () => watches.filter((x) => !x.cleared && !x.fired),
         /** The one armed timer. */
         armed() {
             assert.equal(live().length, 1, `one armed timer, got ${live().map((x) => x.ms)}`);
@@ -135,8 +153,10 @@ export function signedBytesOf(body) {
  * `stage1` (default true): a node with Stage 1; false answers the challenge 404.
  * `auto`: the paths (without /v1/interfaces/) served at once, or true for all.
  * `honourAbort` (default true): false lets an aborted request still be served, as when its answer was on its way.
+ * `onRequest(request)`: called as each request arrives, in place of `auto`, so that a test on virtual time
+ * answers by its own timers (post_interface_answer_rule.test.mjs).
  */
-export function stage1Node(t, { stage1 = true, auto = [], honourAbort = true } = {}) {
+export function stage1Node(t, { stage1 = true, auto = [], honourAbort = true, onRequest = null } = {}) {
     const secret = randomBytes(32);
     const rows = new Map();          // identity hash (hex) → { count, interfaceId, token, signed }
     const byInterface = new Map();   // interface id → row
@@ -275,7 +295,8 @@ export function stage1Node(t, { stage1 = true, auto = [], honourAbort = true } =
             reject(new DOMException("The operation was aborted.", "AbortError"));
         });
         requests.push(request);
-        if (node.isAuto(request.path.replace("/v1/interfaces/", ""))) node.serve(request);
+        if (onRequest) onRequest(request);
+        else if (node.isAuto(request.path.replace("/v1/interfaces/", ""))) node.serve(request);
     });
     t.after(() => { delete globalThis.fetch; });
 

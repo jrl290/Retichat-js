@@ -89,7 +89,16 @@ function fakeTimers(t) {
         if (timer && typeof timer === "object" && "cleared" in timer) timer.cleared = true;
         else realClearTimeout(timer);
     };
-    t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; });
+    // The §1 watch on each request to the PHP node (PostInterface._watch)
+    // paces nothing: its timers are kept apart and never run here
+    // (post_interface_answer_rule.test.mjs runs them on virtual time).
+    const watchTimers = PostInterface.watchTimers;
+    PostInterface.watchTimers = { set: (fn, ms) => ({ fn, ms, cleared: false }), clear: (watch) => { if (watch) watch.cleared = true; } };
+    t.after(() => {
+        globalThis.setTimeout = realSetTimeout;
+        globalThis.clearTimeout = realClearTimeout;
+        PostInterface.watchTimers = watchTimers;
+    });
     return {
         timers,
         /** The one armed timer. */

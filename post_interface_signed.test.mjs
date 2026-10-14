@@ -497,7 +497,7 @@ test("a page that gives only an identity hash registers the legacy way on a chal
 
 // ── §6: every request held to DESIGN_PRINCIPLES §1 ─────────────────────────
 
-test("§6's assertions: an answer later than 5 s is a §1 violation, said once per request with no secret, and still decides; the keepalive goodbye included", async (t) => {
+test("§6's assertions: an answer later than 5 s is a §1 violation, said once per request with its time and no secret, and still decides; the keepalive goodbye included", async (t) => {
     const lines = captureConsole(t);
     const clock = fakeTimers(t);
     const time = testClock(t);
@@ -506,7 +506,11 @@ test("§6's assertions: an answer later than 5 s is a §1 violation, said once p
     const iface = signingInterface(identity);
     const seen = record(iface);
     t.after(() => iface.disconnect());
-    const violations = () => lines.filter((line) => line.level === "error" && line.text.includes("§1 VIOLATION"));
+    // The watch's own line (no answer 5 s after the send) runs on virtual
+    // time in post_interface_answer_rule.test.mjs; here its timers are
+    // captured apart (fakeTimers) and only the late answer's line is said.
+    const violations = () => lines.filter((line) => line.level === "error" && line.text.startsWith("[§1] VIOLATION"));
+    const late = (what, status, ms) => new RegExp(`^\\[§1\\] VIOLATION the ${what} request to the PHP node: answered \\(HTTP ${status}\\) ${ms} ms after it was sent \\(a late success is a failure\\)$`);
 
     iface.connect();
     const asked = await node.pending("challenge");
@@ -519,17 +523,19 @@ test("§6's assertions: an answer later than 5 s is a §1 violation, said once p
     time.advance(5_000); // exactly 5 s: in time
     node.serve(exchanging);
     await eventually(() => iface.isUp, "each late answer still decided: up");
-    assert.deepEqual(violations().map((line) => line.text.match(/answered the (\w+)/)[1]), ["challenge", "registration"]);
-    assert.match(violations()[0].text, /HTTP 200\) 5001 ms after it was sent/);
+    assert.equal(violations().length, 2);
+    assert.match(violations()[0].text, late("challenge", 200, 5001));
+    assert.match(violations()[1].text, late("registration", 200, 6000));
+    assert.deepEqual(clock.watches(), [], "each answer ended its request's watch");
 
     // A late failure is said, and decides: down.
     clock.fire(clock.armed());
-    const late = await node.pending("exchange");
+    const slow = await node.pending("exchange");
     time.advance(7_000);
-    late.respond(503, { error: "busy", message: "Busy." });
+    slow.respond(503, { error: "busy", message: "Busy." });
     await eventually(() => iface.isDown, "down");
     assert.equal(violations().length, 3);
-    assert.match(violations()[2].text, /answered the exchange \(HTTP 503\) 7000 ms/);
+    assert.match(violations()[2].text, late("exchange", 503, 7000));
     clock.fire(await clock.next());
     node.serve(await node.pending("exchange"));
     await eventually(() => iface.isUp, "up again");
@@ -542,7 +548,8 @@ test("§6's assertions: an answer later than 5 s is a §1 violation, said once p
     time.advance(9_000);
     assert.equal(node.serve(goodbye).status, 200, "the goodbye is answered, late");
     await eventually(() => violations().length === 4, "the goodbye's violation");
-    assert.match(violations()[3].text, /answered the goodbye \(HTTP 200\) 9000 ms/);
+    assert.match(violations()[3].text, late("goodbye", 200, 9000));
+    assert.deepEqual(clock.watches(), [], "the goodbye's answer ended its watch");
 
     const row = node.rows.get(identity.hash.toString("hex"));
     for (const secret of [row.token, challenge.challenge, registering.body.registration.signature]) {
@@ -550,10 +557,15 @@ test("§6's assertions: an answer later than 5 s is a §1 violation, said once p
     }
     assert.deepEqual(seen.stopped(), []);
 
-    // The assertion line carries the principles' comment, and every request goes through it.
-    assert.match(source, /\/\/ NEVER REMOVE EVER — see DESIGN_PRINCIPLES\.md §1\n\s+console\.error\(`\[http-exchange\] §1 VIOLATION/);
+    // Both §1 lines (the watch's and the late answer's) carry the
+    // principles' comment, and every request goes through both.
+    const marked = source.match(/\/\/ NEVER REMOVE EVER — see DESIGN_PRINCIPLES\.md §1\n\s+console\.error\(`\[§1\] VIOLATION/g) ?? [];
+    assert.equal(marked.length, 2, "the watch's line and the late answer's");
+    assert.equal((source.match(/console\.error\(`\[§1\] VIOLATION/g) ?? []).length, 2, "every §1 line is marked");
     assert.equal([...source.matchAll(/\bawait fetch\(|\bfetch\(url/g)].length, 2, "one fetch for every request, and the keepalive goodbye's");
-    assert.match(source, /\.then\(\(resp\) => this\._answered\('goodbye', sentAt, resp\?\.status\)/);
+    assert.match(source, /const watch = this\._watch\(what\);\n\s+let resp;/, "every request is watched from its send");
+    assert.match(source, /const watch = this\._watch\('goodbye'\);\n\s+sent\.then\(\(resp\) => \{\n\s+this\._unwatch\(watch\);\n\s+this\._answered\('goodbye', sentAt, resp\?\.status\);\n\s+\}, \(\) => this\._unwatch\(watch\)\);/,
+        "the keepalive goodbye too");
 });
 
 test("a beacon goodbye has no answer to time: the stale sweep is its backstop", async (t) => {
