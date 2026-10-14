@@ -9298,6 +9298,9 @@ const RnsClient = {
                 // rfed holds it: the packet went, or the request Resource
                 // was proved. The §1 clock starts.
                 onDelivered: () => this._channelPublishes.left(tracked),
+                // That clock is this request's §1 watch: the link keeps none
+                // of its own for it (one line per silence).
+                responseWatch: false,
                 // A lost packet fails the post here (_onPacketsLost), and
                 // the request waits on for rfed's answer, which outranks
                 // that failure should rfed have taken the batch: the link
