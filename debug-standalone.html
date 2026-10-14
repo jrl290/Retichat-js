@@ -91,12 +91,16 @@ async function init(exchangeUrl) {
     if (pt !== 1) log('📦 RX PACKET type=' + pt + ' dest=' + dh, 'rx');
   });
 
-  var iface = new PostInterface('debug', exchangeUrl, identHash, 1);
+  // The identity itself, which signs the registration and decrypts its
+  // session token (REGISTRATION-STAGE1.md §4, §5); given only its hash, the
+  // interface stops at a PHP node with Stage 1 ("out of date").
+  var iface = new PostInterface('debug', exchangeUrl, ident, 1);
   // addInterface() connects it; a second connect() would clear the
   // registration in flight. The interface id arrives with the registration.
   iface.on('registered', function() { log('Interface: ' + iface._interfaceId); });
   iface.on('up', function() { log('Exchange up', 'ok'); });
   iface.on('down', function(reason) { log('Exchange down: ' + reason, 'err'); });
+  iface.on('stopped', function(reason) { log('Exchange stopped: ' + reason, 'err'); });
   rns.addInterface(iface);
 
   // Set up LXMF router for receiving messages

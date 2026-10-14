@@ -307,7 +307,7 @@ test("connect(): an allowed saved URL is left connected; the node's own URL is n
     assert.ok(connect.indexOf("this._rns.addInterface(iface);") < check && check < connect.indexOf("new LXMRouter("));
     assert.equal(own.listenersAtAdd, 1, "the browser's refusal is heard from before the interface's first request");
     assert.doesNotMatch(connect, /\bawait\s+[^;]*(_checkSavedExchange|PagePolicy|_exchangeCheck)/);
-    assert.match(methodBody("disconnect()"), /this\._exchangeRefusalWatch\?\.\(\);\n\s+this\._exchangeRefusalWatch = null;\n\s+this\.exchangeBlocked = null;\n\s+this\._exchangeCheck = null;\n\s+this\._setStatus\("offline"\);/);
+    assert.match(methodBody("disconnect()"), /this\._exchangeRefusalWatch\?\.\(\);\n\s+this\._exchangeRefusalWatch = null;\n\s+this\.exchangeBlocked = null;\n\s+this\.exchangeStopped = null;\n\s+this\._exchangeCheck = null;\n\s+this\._setStatus\("offline"\);/);
 });
 
 test("connect(): the browser's refusal of the exchange, a securitypolicyviolation on the document, stops its interface and says so while the policy read is never answered; nothing else does, and it counts once", async () => {

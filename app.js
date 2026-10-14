@@ -2311,6 +2311,13 @@ const RnsClient = {
     // browser's refusal, _watchExchangeRefusal), which stopped its
     // interface; the status is then "blocked". null otherwise.
     exchangeBlocked: null,
+    // Why the PHP node's answer stopped this connection's interface
+    // (PostInterface "stopped", REGISTRATION-STAGE1.md §10: superseded by
+    // another tab or device, refused, out of date): a sentence for the
+    // person, shown under the status dot (App._applyStatusDot) while the
+    // status is "stopped". Never kept in exchangeBlocked, which Settings
+    // shows as the policy error on the exchange URL. null otherwise.
+    exchangeStopped: null,
     _exchangeCheck: null,     // that check, for this connection's saved URL (a promise that never rejects); null for the node's own
     _exchangeRefusalWatch: null, // unhooks this connection's securitypolicyviolation listener (_watchExchangeRefusal)
     _annTimer: null,
@@ -2770,7 +2777,9 @@ const RnsClient = {
         //
         // Neither moves the status once this connection's exchange is found
         // blocked by the page's policy (exchangeBlocked, _exchangeIsBlocked):
-        // it stays "blocked". The interface's events are heard on a later
+        // it stays "blocked"; nor once the PHP node's answer stopped it
+        // (exchangeStopped, _exchangeIsStopped): it stays "stopped", its
+        // reason under the status dot. The interface's events are heard on a later
         // task (EventEmitter.emit), so the "down" of the first request the
         // browser refused can be heard after the refusal's
         // securitypolicyviolation has stopped the interface; until
@@ -2779,7 +2788,7 @@ const RnsClient = {
         let wasUp = false;
         let wentDown = false;
         iface.on("up", () => {
-            if (!current() || this.exchangeBlocked) return;
+            if (!current() || this.exchangeBlocked || this.exchangeStopped) return;
             this._setStatus("online");
             const back = wasUp && wentDown;
             wasUp = true;
@@ -2790,12 +2799,15 @@ const RnsClient = {
             }
         });
         iface.on("down", () => {
-            if (!current() || this.exchangeBlocked) return;
+            if (!current() || this.exchangeBlocked || this.exchangeStopped) return;
             this._setStatus("offline");
             wentDown = true;
         });
         iface.on("lost", (lost) => {
             if (current()) this._onPacketsLost(lost);
+        });
+        iface.on("stopped", (reason) => {
+            if (current()) this._exchangeIsStopped(iface, reason);
         });
     },
 
@@ -2876,6 +2888,25 @@ const RnsClient = {
         this._setStatus("blocked");
     },
 
+    /**
+     * Connection `iface`'s interface stopped on the PHP node's answer
+     * (PostInterface "stopped", REGISTRATION-STAGE1.md §10): another tab or
+     * device of this identity connected after it (§8), the PHP node refused
+     * the registration, or this page is out of date. Nothing is asked of the
+     * PHP node again until a reload or a reconnect. `reason` is the sentence
+     * the person reads, kept as this connection's own state and shown under
+     * the status dot (App._applyStatusDot), with the status "stopped"; from
+     * here on the interface's "up" and "down" move nothing (_followExchange).
+     * Once per connection, and only while `iface` is this connection's.
+     */
+    _exchangeIsStopped(iface, reason) {
+        if (this.exchangeStopped || this.exchangeBlocked || !this._rns?.interfaces?.includes(iface)) return;
+        this.exchangeStopped = reason;
+        console.warn(`[retichat] The PHP node's answer stopped this connection: ${reason}`);
+        Harness.event("exchange-stopped", { reason });
+        this._setStatus("stopped");
+    },
+
     async connect() {
         if (!IdMgr.has) throw new Error("No identity");
         // D11: only the tab holding this identity's lock registers with the
@@ -2887,6 +2918,7 @@ const RnsClient = {
         // and the lock is gone, so this connection must not start.
         if (!ActiveTab.held) return;
         this.exchangeBlocked = null;
+        this.exchangeStopped = null;
 
         // Resolve propagation node hash: explicit override, or derive from RFed.
         if (this._cfg.lxmfPropagationOverride) {
@@ -2911,10 +2943,12 @@ const RnsClient = {
         }
 
         console.log("[rns] HTTP exchange →", this._cfg.exchangeUrl);
+        // The identity itself, which signs the registration and decrypts
+        // its session token (REGISTRATION-STAGE1.md §4, §5).
         const iface = new PostInterface(
             this._cfg.interfaceName,
             this._cfg.exchangeUrl,
-            IdMgr.hash
+            IdMgr.id
         );
         // The browser's refusal of this exchange under the page's policy, a
         // definite event, heard from the interface's first request on.
@@ -9453,6 +9487,7 @@ const RnsClient = {
         this._exchangeRefusalWatch?.();
         this._exchangeRefusalWatch = null;
         this.exchangeBlocked = null;
+        this.exchangeStopped = null;
         this._exchangeCheck = null;
         this._setStatus("offline");
     },
@@ -9921,13 +9956,17 @@ const App = {
      *  by the page's own Content-Security-Policy (status "blocked",
      *  RnsClient._exchangeIsBlocked), the line under it that says so and
      *  opens Settings. Until 2026-10-01 such a page sat offline, the dot red, with
-     *  nothing to say why. */
+     *  nothing to say why. While the PHP node's answer has stopped the
+     *  connection (status "stopped", RnsClient._exchangeIsStopped), that
+     *  line is the stop's reason, as the interface said it
+     *  (REGISTRATION-STAGE1.md §10). */
     _applyStatusDot() {
         const status = RnsClient._status;
+        const stopped = status === "stopped" ? RnsClient.exchangeStopped : null;
         const dot = document.getElementById("status-dot");
         if (dot && status) {
             dot.className = `status-dot ${status}`;
-            dot.title = status === "blocked" ? EXCHANGE_BLOCKED_NOTICE : `RNS: ${status}`;
+            dot.title = status === "blocked" ? EXCHANGE_BLOCKED_NOTICE : stopped ?? `RNS: ${status}`;
         }
         const banner = document.getElementById("exchange-blocked");
         if (banner) {
@@ -9937,6 +9976,8 @@ const App = {
                 // Settings opens on the exchange field, whose reason says why.
                 banner.appendChild(h("button", { className: "conn-banner-action",
                     onClick: () => { this.state.showSettings = true; this.state.settingsFocus = "cfg-exchange"; this.render(); } }, "Open Settings"));
+            } else if (stopped) {
+                banner.appendChild(document.createTextNode(stopped));
             }
         }
     },
@@ -13228,6 +13269,7 @@ Harness (headless):
         const s = {
             status: RnsClient.status,
             exchangeBlocked: RnsClient.exchangeBlocked,
+            exchangeStopped: RnsClient.exchangeStopped,
             connType: RnsClient.connType,
             ownHash: RnsClient.ownHash,
             lxmfDest: RnsClient._lxmfRouter?.destination?.hash?.toString("hex"),
