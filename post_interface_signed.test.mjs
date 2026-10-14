@@ -556,6 +556,31 @@ test("a page that gives only an identity hash registers the legacy way on a chal
     await assertStopped(seen, iface, clock, node, PostInterface.STOP_OUT_OF_DATE, "no identity at all");
 });
 
+test("a page with only a hash behind a captive portal: a 2xx that is not JSON is no answer, so it backs off, and is not stopped", async (t) => {
+    // Until the review of stage1-sign (2026-10-14) the portal's page stopped
+    // it for good, "out of date".
+    captureConsole(t);
+    const clock = fakeTimers(t);
+    const node = stage1Node(t, { stage1: false });
+    const iface = new PostInterface("Retichat Web", URL_BASE, "ab".repeat(16));
+    const seen = record(iface);
+    t.after(() => iface.disconnect());
+    iface.connect();
+    (await node.pending("challenge")).respondText(200, "<html><body>Sign in to use this Wi-Fi.</body></html>");
+    const wait = await clock.next("the backoff armed");
+    assert.equal(wait.ms, PostInterface.BACKOFF_FIRST_MS, "the backoff, as for any 2xx that is not JSON");
+    assert.deepEqual(seen.stopped(), [], "not stopped: the portal is not the PHP node");
+    assert.equal(iface.isDown, true, "down while it lasts");
+
+    // Past the portal, the PHP node itself (without Stage 1) answers the challenge 404.
+    clock.fire(wait);
+    assert.equal(node.serve(await node.pending("challenge")).status, 404);
+    node.serve(await node.pending("register"));
+    node.serve(await node.pending("exchange"));
+    await eventually(() => iface.isUp, "up, registered the legacy way");
+    assert.deepEqual(seen.stopped(), []);
+});
+
 // ── §6: every request held to DESIGN_PRINCIPLES §1 ─────────────────────────
 
 test("§6's assertions: an answer later than 5 s is a §1 violation, said once per request with its time and no secret, and still decides; the keepalive goodbye included", async (t) => {
