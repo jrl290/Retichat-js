@@ -172,6 +172,67 @@ test("409 stale_challenge twice: the interface stops with its own text, with no 
     assert.deepEqual([node.count("challenge"), node.count("register"), node.count("exchange")], [2, 2, 0]);
 });
 
+test("the extra round is the interface's until a registration succeeds: 409, then a 503 or an abort, then the next attempt's 409 stops", async (t) => {
+    // Until the review of stage1-sign (2026-10-14) the extra round was one
+    // attempt's: a 503 or an abort in it, then the next attempt's 409,
+    // earned a second, and so on for every failure in between.
+    const STALE = { error: "stale_challenge", message: "The challenge is no longer valid; ask for a new one." };
+    const ends = [
+        ["a 503", async (iface, node, clock) => {
+            (await node.pending("challenge")).respond(503, { error: "busy", message: "Busy." });
+            const wait = await clock.next("the backoff armed");
+            assert.equal(wait.ms, PostInterface.BACKOFF_FIRST_MS, "a 503 in the extra round backs off");
+            clock.fire(wait);
+        }],
+        ["an abort", async (iface, node) => {
+            await node.pending("challenge");
+            iface.check("online");   // aborts it; the next attempt is at once
+        }],
+    ];
+    for (const [label, end] of ends) {
+        await t.test(label, async (t) => {
+            captureConsole(t);
+            const clock = fakeTimers(t);
+            const node = stage1Node(t);
+            const iface = signingInterface();
+            const seen = record(iface);
+            iface.connect();
+            node.serve(await node.pending("challenge"));
+            (await node.pending("register")).respond(409, STALE);   // the extra round is taken
+            await end(iface, node, clock);
+            node.serve(await node.pending("challenge"));
+            (await node.pending("register")).respond(409, STALE);
+            await assertStopped(seen, iface, clock, node, PostInterface.STOP_STALE_CHALLENGE, `409, ${label}, 409`);
+            assert.deepEqual([node.count("challenge"), node.count("register")], [3, 2], "one extra round in all");
+        });
+    }
+});
+
+test("a registration that succeeds gives the extra round back: a 409 after it, and after a 401, earns its own", async (t) => {
+    captureConsole(t);
+    const clock = fakeTimers(t);
+    const node = stage1Node(t, { auto: ["challenge", "exchange"] });
+    const identity = Identity.create();
+    const hash = identity.hash.toString("hex");
+    const iface = signingInterface(identity);
+    const seen = record(iface);
+    t.after(() => iface.disconnect());
+    iface.connect();
+    for (const round of ["the first registration", "the registration after a 401"]) {
+        const registering = await node.pending("register");
+        node.supersede(hash);
+        assert.equal(node.serve(registering).json.error, "stale_challenge", round);
+        assert.equal(node.serve(await node.pending("register")).status, 200, `${round}: its extra round connects`);
+        await eventually(() => iface.isUp, `${round}: up`);
+        if (round === "the first registration") {
+            node.forget(hash);   // the next exchange is answered 401: it registers again, at once
+            clock.fire(await clock.next("the poll armed"));
+        }
+    }
+    assert.deepEqual(seen.stopped(), []);
+    assert.equal(node.count("register"), 4);
+});
+
 test("a registration abandoned by check() that binds between the new challenge and the new registration still connects, with no stop", async (t) => {
     // §4.3: the page gave up on it, the PHP node completed it anyway, after
     // the page's next challenge was made: that registration's 409 earns the
