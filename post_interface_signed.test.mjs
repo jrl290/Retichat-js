@@ -283,7 +283,9 @@ test("Superseded: the interface stops with §8's message, reports what it held l
     assert.equal(PostInterface.STOP_SUPERSEDED, SUPERSEDED_MESSAGE, "§8's message");
     assert.deepEqual(events.lost()[0], { packetHashes: [a.hash, b.hash], reason: SUPERSEDED_MESSAGE, abandoned: false, unsent: [b.hash] },
         "the batch it carried and the queue behind it, saying why; only the queue went into no request");
-    assert.deepEqual(events.kinds(), ["registered", "up", "stopped", "lost"], "stopped, then what it lost; no down");
+    assert.deepEqual(events.kinds(), ["registered", "up", "down", "stopped", "lost"],
+        "down (which an app.js older than Stage 1 shows as offline), then stopped, then what it lost");
+    assert.equal(events.events.find((e) => e.kind === "down").detail, SUPERSEDED_MESSAGE, "the down says the stop's reason");
 
     const c = rawPacket(0xc3);
     const asked = node.requests.length;
@@ -338,7 +340,8 @@ test("terminal codes stop with no backoff, each saying the PHP node's message, n
         const message = `The PHP node says no (${label}).`;
         (await node.pending(where)).respond(status, { error: code, message });
         await assertStopped(seen, iface, clock, node, message, label);
-        assert.equal(seen.kinds().includes("down"), false, `${label}: a stop is no down`);
+        assert.deepEqual(seen.kinds().slice(-2), ["down", "stopped"], `${label}: down, then stopped`);
+        assert.equal(seen.kinds().filter((kind) => kind === "down").length, 1, `${label}: one down`);
         assert.equal(node.count("exchange"), 0, label);
         assert.equal(node.count("register"), where === "register" ? 1 : 0, `${label}: never the legacy registration`);
     }
@@ -382,6 +385,37 @@ test("each stop emits \"stopped\" once: after a network failure then 409 Superse
     }
     await assertStopped(up.events, up.iface, clock, node, PostInterface.STOP_STALE_CHALLENGE, "401, then two stale challenges");
     assert.deepEqual(up.events.kinds(), ["registered", "up", "down", "stopped"]);
+});
+
+test("a stop sets its state, then emits down, unless already down, then stopped: a check() or a connect() in a down handler does nothing", async (t) => {
+    // An app.js older than Stage 1 served with this lib (deploy.sh copies
+    // lib before app.js; a cached app.js) hears "down" and not "stopped":
+    // with the down first its tab shows offline, as §13's watch expects,
+    // not "connecting" for good (the review of stage1-sign, 2026-10-14).
+    captureConsole(t);
+    const clock = fakeTimers(t);
+    const node = stage1Node(t);
+    const { iface, events, hash } = await upSigned(t, node, clock);
+    const inDown = [];
+    iface.on("down", (reason) => {
+        inDown.push({ reason, stopped: iface.stoppedReason, down: iface.isDown });
+        iface.check("online");
+        iface.connect();
+    });
+
+    node.supersede(hash);
+    clock.fire(clock.armed());
+    const exchanging = await node.pending("exchange");
+    const asked = node.requests.length;
+    assert.equal(node.serve(exchanging).json.error, "session_superseded");
+    await eventually(() => events.stopped().length === 1, "stopped");
+    await tick(); await tick();
+    assert.deepEqual(events.kinds(), ["registered", "up", "down", "stopped"], "down, once, then stopped");
+    assert.deepEqual(inDown, [{ reason: PostInterface.STOP_SUPERSEDED, stopped: PostInterface.STOP_SUPERSEDED, down: true }],
+        "the down handler finds the interface stopped already, and the down says why");
+    assert.equal(node.requests.length, asked, "its check() and connect() asked nothing of the PHP node");
+    assert.equal(clock.live().length, 0, "and armed nothing");
+    assert.deepEqual(events.stopped(), [PostInterface.STOP_SUPERSEDED], "stopped once");
 });
 
 // ── The legacy registration, only after a challenge 404 ───────────────────

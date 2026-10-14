@@ -195,7 +195,8 @@ test("a stop's reason shows under the status dot, survives a re-render, and is n
     await tick(); await tick();
     assert.equal(RnsClient._status, "stopped");
     assert.equal(page.line.textContent, REASON);
-    assert.deepEqual(statuses, ["online", "stopped"]);
+    assert.deepEqual(statuses, ["online", "offline", "stopped"],
+        "the stop's own down first (what an app.js older than Stage 1 shows), then stopped");
 
     // And so does a second stop: the first reason stays.
     iface.emit("stopped", "Something else.");
