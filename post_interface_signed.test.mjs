@@ -674,6 +674,55 @@ test("an answer that is not JSON is logged with its hex runs cut out before the 
     assert.doesNotMatch(logged[0].text, /[0-9a-fA-F]{8,}/, "no hex of the run");
 });
 
+// ── The session stays in memory ─────────────────────────────────────────────
+
+/** A localStorage for the test: its items, and every key written. */
+function fakeStorage(t) {
+    const items = new Map();
+    const writes = [];
+    const storage = {
+        getItem: (key) => (items.has(key) ? items.get(key) : null),
+        setItem: (key, value) => { writes.push(key); items.set(key, String(value)); },
+        removeItem: (key) => { items.delete(key); },
+        clear: () => items.clear(),
+        key: (i) => [...items.keys()][i] ?? null,
+        get length() { return items.size; },
+    };
+    const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    Object.defineProperty(globalThis, "localStorage", { value: storage, configurable: true, writable: true });
+    t.after(() => {
+        if (original) Object.defineProperty(globalThis, "localStorage", original);
+        else delete globalThis.localStorage;
+    });
+    return { items, writes };
+}
+
+test("the session token stays in memory: after a registration and an exchange storage holds no token, and an entry an earlier build wrote goes at connect()", async (t) => {
+    // Until the review of stage1-sign (2026-10-14) the registration, and an
+    // exchange that changed the poll interval, wrote the session, its
+    // decrypted token in plain text, to localStorage, and nothing read it.
+    captureConsole(t);
+    const clock = fakeTimers(t);
+    const { items, writes } = fakeStorage(t);
+    const node = stage1Node(t, { auto: ["challenge"] });
+    const identity = Identity.create();
+    const hash = identity.hash.toString("hex");
+    const key = `rns_exchange_creds_${hash.slice(0, 16)}`;
+    items.set(key, JSON.stringify({ interfaceId: "1".repeat(32), sessionToken: "2".repeat(64), baseUrl: URL_BASE, pollIntervalMs: 1000 }));
+    const iface = signingInterface(identity);
+    t.after(() => iface.disconnect());
+    iface.connect();
+    assert.equal(items.has(key), false, "connect() removes the entry an earlier build wrote");
+    node.serve(await node.pending("register"));
+    (await node.pending("exchange")).respond(200, { delivery_packets: [], idle_exchange_interval_ms: 2000 });
+    await eventually(() => iface.isUp, "up");
+    assert.equal((await clock.next("the poll armed")).ms, 2000, "the new poll interval");
+    const token = node.rows.get(hash).token;
+    assert.equal(iface._sessionToken, token, "the session, in memory");
+    assert.deepEqual(writes, [], "nothing written to storage");
+    assert.equal(items.size, 0, "storage holds no token");
+});
+
 test("a beacon goodbye has no answer to time: the stale sweep is its backstop", async (t) => {
     captureConsole(t);
     const clock = fakeTimers(t);
