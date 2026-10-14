@@ -654,6 +654,26 @@ test("§6's assertions: an answer later than 5 s is a §1 violation, said once p
         "the keepalive goodbye too");
 });
 
+test("an answer that is not JSON is logged with its hex runs cut out before the excerpt is cut: a run crossing the 200th character logs no hex", async (t) => {
+    // §11: no token, challenge or signature an error page echoes reaches the
+    // log. Cut to 200 characters first (until the review of stage1-sign,
+    // 2026-10-14), this run's first 10 digits were logged: too short, by
+    // then, to be cut out.
+    const lines = captureConsole(t);
+    const clock = fakeTimers(t);
+    const node = stage1Node(t);
+    const iface = signingInterface();
+    t.after(() => iface.disconnect());
+    iface.connect();
+    const page = `${"x".repeat(190)}${"a1".repeat(32)}${"y".repeat(40)}`;   // 64 hex digits from the 191st character
+    (await node.pending("challenge")).respondText(200, page);
+    assert.equal((await clock.next("the backoff armed")).ms, PostInterface.BACKOFF_FIRST_MS);
+    const logged = lines.filter((line) => line.text.includes("is not JSON (HTTP"));
+    assert.equal(logged.length, 1, "the one line with the excerpt");
+    assert.match(logged[0].text, /\(HTTP 200, 294 bytes\): x{190}\[hex\]y{5}$/, "the run cut out, then the first 200 characters");
+    assert.doesNotMatch(logged[0].text, /[0-9a-fA-F]{8,}/, "no hex of the run");
+});
+
 test("a beacon goodbye has no answer to time: the stale sweep is its backstop", async (t) => {
     captureConsole(t);
     const clock = fakeTimers(t);
