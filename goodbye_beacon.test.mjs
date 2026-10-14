@@ -45,15 +45,22 @@ test("goodbye sends the interface credentials as a text/plain beacon", async () 
     assert.deepEqual(JSON.parse(await sent[0].blob.text()), { interface_id: "iface1", session_token: "tok1" });
 });
 
-test("goodbye is a no-op before registration and falls back to a keepalive fetch", () => {
+test("goodbye is a no-op before registration and falls back to a keepalive fetch, whose answer is timed", async () => {
     const calls = [];
-    const fetch = (url, opts) => { calls.push({ url, opts }); return Promise.resolve(); };
+    const fetch = (url, opts) => { calls.push({ url, opts }); return Promise.resolve({ status: 200 }); };
     const unregistered = { isRegistered: false, _baseUrl: "https://n/r", _interfaceId: null, _sessionToken: null };
     assert.equal(makeGoodbye(unregistered, { navigator: {}, fetch })(), false);
     assert.equal(calls.length, 0);
-    const registered = { isRegistered: true, _baseUrl: "https://n/r", _interfaceId: "i", _sessionToken: "t" };
+    const answered = [];
+    const registered = { isRegistered: true, _baseUrl: "https://n/r", _interfaceId: "i", _sessionToken: "t",
+        _clock: () => 7, _answered: (what, sentAt, status) => answered.push({ what, sentAt, status }) };
     assert.equal(makeGoodbye(registered, { navigator: {}, fetch })(), true);
     assert.equal(calls[0].opts.keepalive, true, "the fallback must outlive the page");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // DESIGN_PRINCIPLES §1, REGISTRATION-STAGE1.md §6: a beacon has no answer
+    // to time; the keepalive fetch has, and is timed like every other request
+    // (driven for real in post_interface_signed.test.mjs).
+    assert.deepEqual(answered, [{ what: "goodbye", sentAt: 7, status: 200 }]);
 });
 
 test("connect hooks goodbye to pagehide once, and disconnect sends it", () => {

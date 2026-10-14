@@ -105,7 +105,10 @@ function fakeTimers(t) {
 /**
  * A scripted Reticulum-php node: every request waits for the test to answer
  * it. With `honourAbort: false` an abort does not end the request, as when
- * the answer was already on its way.
+ * the answer was already on its way. It is a PHP node without Stage 1: it
+ * answers the challenge 404 at once, the one answer on which a page
+ * registers the legacy way (REGISTRATION-STAGE1.md §10), so these tests run
+ * the legacy registration; the signed one is post_interface_signed.test.mjs's.
  */
 function fakeNode(t, { honourAbort = true } = {}) {
     const requests = [];
@@ -132,6 +135,7 @@ function fakeNode(t, { honourAbort = true } = {}) {
             reject(new DOMException("The operation was aborted.", "AbortError"));
         });
         requests.push(request);
+        if (request.path === "/v1/interfaces/challenge") request.respond(404, { error: "not_found" });
     });
     t.after(() => { delete globalThis.fetch; });
     return {
@@ -203,14 +207,15 @@ test("a rejected exchange emits one down, and the next 200 one up", async (t) =>
     await eventually(() => seen.kinds().includes("down"), "down");
     assert.match(seen.events.find((e) => e.kind === "down").detail, /Failed to fetch/, "down carries its reason");
     assert.equal(iface.isDown, true);
-    assert.equal(clock.armed().ms, PostInterface.RECONNECT_WAIT_MS, "after a failure, the reference's reconnect wait");
-    assert.equal(PostInterface.RECONNECT_WAIT_MS, 5000, "TCPInterface.py RECONNECT_WAIT");
+    assert.equal(clock.armed().ms, PostInterface.BACKOFF_FIRST_MS, "after a failure, the backoff's first step");
+    assert.equal(PostInterface.BACKOFF_FIRST_MS, 2000, "REGISTRATION-STAGE1.md §10: 2 s, doubling, capped at 5 min");
 
     // Still down: no second down.
     clock.fire(clock.armed());
     (await node.pending("exchange")).respond(503, { error: "busy" });
     await eventually(() => clock.timers.some((x) => !x.cleared && !x.fired), "the next attempt armed");
     assert.equal(seen.kinds().filter((k) => k === "down").length, 1, "one down per failure run, not one per attempt");
+    assert.equal(clock.armed().ms, 2 * PostInterface.BACKOFF_FIRST_MS, "the backoff's next step");
 
     clock.fire(clock.armed());
     (await node.pending("exchange")).respond(200, {});
@@ -234,16 +239,16 @@ test("a failed first registration leaves the interface down, and it registers ag
     await eventually(() => seen.kinds().includes("down"), "down");
     assert.equal(iface.isDown, true);
     const wait = clock.armed();
-    assert.equal(wait.ms, PostInterface.RECONNECT_WAIT_MS);
+    assert.equal(wait.ms, PostInterface.BACKOFF_FIRST_MS);
 
-    // After the reconnect wait it registers again, and fails again quietly.
+    // After the backoff it registers again, and fails again quietly.
     clock.fire(wait);
     (await node.pending("register")).fail();
     await eventually(() => clock.timers.some((x) => !x.cleared && !x.fired), "the next attempt armed");
 
     // The network comes back: "online" does not wait out the timer.
     iface.check("online");
-    assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0, "the reconnect wait is cut short");
+    assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0, "the backoff is cut short");
     (await node.pending("register")).respond(200, REGISTERED);
     (await node.pending("exchange")).respond(200, {});
     await eventually(() => seen.kinds().at(-1) === "up", "up");
@@ -273,19 +278,33 @@ test("a 401 whose re-registration fails keeps the interface going", async (t) =>
     assert.deepEqual(seen.kinds(), ["registered", "up", "down", "registered", "up"]);
 });
 
-test("a 401 re-registers once per run, so two sessions fighting cannot spin", async (t) => {
+test("a 401 registers again once, and a 401 on the new session's first exchange stops, so two sessions fighting cannot spin", async (t) => {
+    // REGISTRATION-STAGE1.md §7 and §10: at most one registration per 401.
+    // Until Stage 1 the second 401 waited the reconnect wait and the two
+    // sessions went on evicting each other.
     quiet(t);
     const clock = fakeTimers(t);
     const node = fakeNode(t);
-    await upInterface(t, node, clock);
+    const { iface, seen } = await upInterface(t, node, clock);
+    const stopped = [];
+    iface.on("stopped", (reason) => stopped.push(reason));
 
     clock.fire(clock.armed());
-    (await node.pending("exchange")).respond(401, {});
+    (await node.pending("exchange")).respond(401, { error: "unauthorized" });
     (await node.pending("register")).respond(200, REGISTERED);
-    (await node.pending("exchange")).respond(401, {});
-    await eventually(() => clock.timers.some((x) => !x.cleared && !x.fired), "the next attempt armed");
-    assert.equal(node.count("register"), 2, "one re-registration, then the reconnect wait");
-    assert.equal(clock.armed().ms, PostInterface.RECONNECT_WAIT_MS);
+    (await node.pending("exchange")).respond(401, { error: "unauthorized" });
+    await eventually(() => stopped.length === 1, "stopped");
+    await tick(); await tick();
+    assert.deepEqual(stopped, [PostInterface.STOP_DROPPED], "stopped once, saying why");
+    assert.equal(PostInterface.STOP_DROPPED, "The PHP node dropped this connection as soon as it was made. Reload to connect.");
+    assert.equal(node.count("register"), 2, "one re-registration, and no other");
+    assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0, "no backoff: nothing is attempted again");
+    assert.equal(iface.isDown, true);
+    assert.equal(iface.isRegistered, false, "the refused session is no one's");
+    assert.deepEqual(seen.kinds(), ["registered", "up", "down", "registered"]);
+    iface.check("online");
+    await tick(); await tick();
+    assert.equal(node.count("exchange"), 3, "a check asks nothing of it again");
 });
 
 test("a 401, a new session, then a failed exchange: one down until an up", async (t) => {
@@ -524,7 +543,7 @@ test("block(): an exchange the page's policy blocks is never asked again, and wh
             // The browser's refusal lands before the check's answer.
             registering.fail();
             await eventually(() => seen.kinds().includes("down"), "down");
-            assert.equal(clock.armed().ms, PostInterface.RECONNECT_WAIT_MS, "the next attempt was armed");
+            assert.equal(clock.armed().ms, PostInterface.BACKOFF_FIRST_MS, "the next attempt was armed");
             iface.block(REASON);
         } else {
             iface.block(REASON);
@@ -544,7 +563,8 @@ test("block(): an exchange the page's policy blocks is never asked again, and wh
         iface.check("online");
         iface.check("visible");
         await tick(); await tick();
-        assert.equal(node.requests.length, 1, `${label}: nothing is asked of it again, a check included`);
+        assert.deepEqual([node.count("challenge"), node.count("register"), node.count("exchange")], [1, 1, 0],
+            `${label}: nothing is asked of it again, a check included`);
         assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0);
     }
 });
@@ -1024,7 +1044,7 @@ async function dropExchange(c, iface, node, clock) {
     await eventually(() => iface.isDown && c.self._status === "offline", "down");
 }
 
-/** The network is back: the next attempt (the reconnect wait is cut short by check() on the browser's "online") is answered, and the page hears "up". */
+/** The network is back: the next attempt (the backoff is cut short by check() on the browser's "online") is answered, and the page hears "up". */
 async function returnExchange(c, iface, node, clock, { check = false } = {}) {
     if (check) iface.check("online");
     else clock.fire(clock.armed());
@@ -1284,8 +1304,8 @@ test("the staging case for a Resource upload: its first advertisement never left
         "its rejection is no loss and no failure");
     assert.equal(c.self._distroUploads._open.size, 0, "the upload is decided");
     assert.deepEqual(received, [], "nothing reached the node");
-    assert.deepEqual(clock.timers.filter((x) => !x.cleared && !x.fired).map((x) => x.ms), [PostInterface.RECONNECT_WAIT_MS],
-        "the Resource's own timers went with it: only the exchange's reconnect wait is armed");
+    assert.deepEqual(clock.timers.filter((x) => !x.cleared && !x.fired).map((x) => x.ms), [PostInterface.BACKOFF_FIRST_MS],
+        "the Resource's own timers went with it: only the exchange's backoff is armed");
 
     // The exchange answers again: that is the event. The upload goes in the next exchange, before any timer fires: no 35 s wait.
     await returnExchange(c, iface, node, clock);

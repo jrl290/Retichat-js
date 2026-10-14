@@ -80,6 +80,7 @@ function fakeTimers(t) {
     };
 }
 
+/** A scripted PHP node without Stage 1: it answers the challenge 404 at once, so the page registers the legacy way (REGISTRATION-STAGE1.md §10). */
 function fakeNode(t) {
     const requests = [];
     globalThis.fetch = (url, options) => new Promise((resolve, reject) => {
@@ -104,6 +105,7 @@ function fakeNode(t) {
             reject(new DOMException("The operation was aborted.", "AbortError"));
         });
         requests.push(request);
+        if (request.path === "/v1/interfaces/challenge") request.respond(404, { error: "not_found" });
     });
     t.after(() => { delete globalThis.fetch; });
     return {
@@ -355,8 +357,8 @@ test("the exchange's return is not swallowed by an attempt whose LINKREQUEST the
     assert.equal(self._rfedLinkPromises.has("link"), false, "nothing is coming up any more");
     assert.equal(clock.armed(ESTABLISHMENT_MS).length, 0, "and no establishment timeout is left to wait out");
 
-    // The exchange comes back (the reconnect wait, then a 200).
-    const [reconnect] = clock.armed(PostInterface.RECONNECT_WAIT_MS);
+    // The exchange comes back (the backoff, then a 200).
+    const [reconnect] = clock.armed(PostInterface.BACKOFF_FIRST_MS);
     clock.fire(reconnect);
     (await node.pending("exchange")).respond(200, {});
     await eventually(() => node.linkRequests().length === 2, "the return re-drove the link");
@@ -410,7 +412,7 @@ test("the propagation link too: the attempt fails on its lost LINKREQUEST, waits
     assert.equal(clock.armed(ESTABLISHMENT_MS).length, 0, "no establishment timeout left to wait out");
 
     // The exchange comes back: one new attempt.
-    clock.fire(clock.armed(PostInterface.RECONNECT_WAIT_MS)[0]);
+    clock.fire(clock.armed(PostInterface.BACKOFF_FIRST_MS)[0]);
     (await node.pending("exchange")).respond(200, {});
     await eventually(() => node.linkRequests().length === 2, "the return re-drove the propagation link");
     assert.notEqual(self._propLink, doomed);

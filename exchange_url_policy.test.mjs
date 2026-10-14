@@ -105,6 +105,19 @@ test("the requests checked are the ones PostInterface makes: the base without a 
     }
 });
 
+test("the challenge every registration asks first is an exchange request, and the nodes' policy allows it on both nodes (REGISTRATION-STAGE1.md §3, §14)", () => {
+    assert.ok(EXCHANGE_PATHS.includes("/v1/interfaces/challenge"), "EXCHANGE_PATHS has the challenge");
+    const [connect] = connectSourceLists(POLICY);
+    const exchanges = connect.filter((s) => /^https:\/\/[^/]+\/.+\/$/.test(s));
+    assert.deepEqual(exchanges.map((e) => new URL(e).host).sort(), ["retichat.com", "selectivesubconscious.com"], "both nodes' exchanges");
+    for (const page of PAGES) {
+        for (const exchange of [...exchanges, DEFAULT_EXCHANGE]) {
+            const challenge = new URL(exchange.replace(/\/$/, "") + "/v1/interfaces/challenge");
+            assert.equal(sourceListAllows(connect, challenge, page), true, `${challenge.href} from ${page}`);
+        }
+    }
+});
+
 test("a securitypolicyviolation names the exchange when its URL is one of the requests PostInterface makes there, as fetch resolves it and CSP reports it", () => {
     const page = "https://p.example/retichat/";
     for (const base of ["https://n.example/reticulum", "https://n.example/reticulum/", "  https://n.example/reticulum/  "]) {
