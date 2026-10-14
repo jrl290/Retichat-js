@@ -227,3 +227,23 @@ test("a stop heard from an interface that is no longer this connection's changes
     const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
     assert.match(css, /\.status-dot\.stopped \{ background: var\(--danger\); \}/);
 });
+
+test("the debug page writes what the exchange reports as text: a stop reason, which can be the PHP node's own message, is never parsed as HTML", () => {
+    const page = readFileSync(new URL("./debug-standalone.html", import.meta.url), "utf8");
+    assert.match(page, /iface\.on\('stopped', function\(reason\) \{ logText\('Exchange stopped: ' \+ reason, 'err'\); \}\);/);
+    assert.match(page, /iface\.on\('down', function\(reason\) \{ logText\('Exchange down: ' \+ reason, 'err'\); \}\);/);
+
+    // logText itself, over stand-ins: the reason goes in as text, and nothing is set as HTML.
+    const start = page.indexOf("function logText(");
+    const source = page.slice(start, page.indexOf("\n}\n", start) + 2);
+    assert.doesNotMatch(source, /innerHTML/);
+    const appended = [];
+    const document = { createElement: (tag) => ({ tag, className: "", textContent: "" }) };
+    const $el = { append: (...nodes) => appended.push(...nodes), scrollTop: 0, scrollHeight: 0,
+        set innerHTML(html) { throw new Error(`set as HTML: ${html}`); } };
+    const logText = new Function("document", "$el", `${source}\nreturn logText;`)(document, $el);
+    const reason = '<img src=x onerror="alert(1)">The PHP node says no.';
+    logText(`Exchange stopped: ${reason}`, "err");
+    const line = appended.find((node) => node?.tag === "span" && node.className === "err");
+    assert.equal(line.textContent, `Exchange stopped: ${reason}`, "set as text");
+});

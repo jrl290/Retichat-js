@@ -68,6 +68,19 @@ function log(msg, cls) {
   $el.scrollTop = $el.scrollHeight;
 }
 
+// A line set as text, never parsed as HTML: for what the exchange reports,
+// whose stop reason can be the PHP node's own message.
+function logText(msg, cls) {
+  var ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = new Date().toISOString().slice(11, 23);
+  var line = document.createElement('span');
+  line.className = cls || 'info';
+  line.textContent = msg;
+  $el.append(ts, ' ', line, '\n');
+  $el.scrollTop = $el.scrollHeight;
+}
+
 var rns = null;
 var ident = null;
 var identHash = null;
@@ -101,8 +114,8 @@ async function init(exchangeUrl) {
   // registration in flight. The interface id arrives with the registration.
   iface.on('registered', function() { log('Interface: ' + iface._interfaceId); });
   iface.on('up', function() { log('Exchange up', 'ok'); });
-  iface.on('down', function(reason) { log('Exchange down: ' + reason, 'err'); });
-  iface.on('stopped', function(reason) { log('Exchange stopped: ' + reason, 'err'); });
+  iface.on('down', function(reason) { logText('Exchange down: ' + reason, 'err'); });
+  iface.on('stopped', function(reason) { logText('Exchange stopped: ' + reason, 'err'); });
   rns.addInterface(iface);
 
   // Set up LXMF router for receiving messages
