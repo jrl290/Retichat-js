@@ -287,10 +287,14 @@ test("a 401 whose re-registration fails keeps the interface going", async (t) =>
     assert.deepEqual(seen.kinds(), ["registered", "up", "down", "registered", "up"]);
 });
 
-test("a 401 registers again once, and a 401 on the new session's first exchange stops, so two sessions fighting cannot spin", async (t) => {
-    // REGISTRATION-STAGE1.md §7 and §10: at most one registration per 401.
-    // Until Stage 1 the second 401 waited the reconnect wait and the two
-    // sessions went on evicting each other.
+test("a legacy session: a 401 registers again at once, once per run, and a second 401 in the run waits the backoff, so two sessions fighting cannot spin; nothing stops it", async (t) => {
+    // REGISTRATION-STAGE1.md §8: a page that registered the legacy way is in
+    // the same position at its PHP node as a page older than Stage 1, and
+    // such pages keep evicting each other with every 401, as before Stage 1
+    // (f54d7cd: once per run at once, then the reconnect wait, which the
+    // backoff replaced). The stop on a 401 to a new session's first
+    // exchange is a signed session's alone (post_interface_signed.test.mjs;
+    // the review of stage1-sign, 2026-10-14).
     quiet(t);
     const clock = fakeTimers(t);
     const node = fakeNode(t);
@@ -301,19 +305,28 @@ test("a 401 registers again once, and a 401 on the new session's first exchange 
     clock.fire(clock.armed());
     (await node.pending("exchange")).respond(401, { error: "unauthorized" });
     (await node.pending("register")).respond(200, REGISTERED);
-    (await node.pending("exchange")).respond(401, { error: "unauthorized" });
-    await eventually(() => stopped.length === 1, "stopped");
-    await tick(); await tick();
-    assert.deepEqual(stopped, [PostInterface.STOP_DROPPED], "stopped once, saying why");
-    assert.equal(PostInterface.STOP_DROPPED, "The PHP node dropped this connection as soon as it was made. Reload to connect.");
-    assert.equal(node.count("register"), 2, "one re-registration, and no other");
-    assert.equal(clock.timers.filter((x) => !x.cleared && !x.fired).length, 0, "no backoff: nothing is attempted again");
+    (await node.pending("exchange")).respond(401, { error: "unauthorized" });   // the new session's first exchange
+    await eventually(() => clock.timers.some((x) => !x.cleared && !x.fired), "the next attempt armed");
+    const wait = clock.armed();
+    assert.equal(wait.ms, PostInterface.BACKOFF_FIRST_MS, "the run's second 401 waits the backoff");
+    assert.equal(node.count("register"), 2, "one re-registration in the run");
     assert.equal(iface.isDown, true);
-    assert.equal(iface.isRegistered, false, "the refused session is no one's");
-    assert.deepEqual(seen.kinds(), ["registered", "up", "down", "registered"]);
-    iface.check("online");
-    await tick(); await tick();
-    assert.equal(node.count("exchange"), 3, "a check asks nothing of it again");
+
+    // The next run registers again, and its session is up.
+    clock.fire(wait);
+    (await node.pending("register")).respond(200, REGISTERED);
+    (await node.pending("exchange")).respond(200, {});
+    await eventually(() => seen.kinds().at(-1) === "up", "up");
+
+    // Every later 401 registers again at once, as before Stage 1.
+    clock.fire(clock.armed());
+    (await node.pending("exchange")).respond(401, { error: "unauthorized" });
+    (await node.pending("register")).respond(200, REGISTERED);
+    (await node.pending("exchange")).respond(200, {});
+    await eventually(() => seen.kinds().at(-1) === "up", "up again");
+    assert.equal(node.count("register"), 4);
+    assert.deepEqual(stopped, [], "never stopped");
+    assert.deepEqual(seen.kinds(), ["registered", "up", "down", "registered", "registered", "up", "down", "registered", "up"]);
 });
 
 test("a 401, a new session, then a failed exchange: one down until an up", async (t) => {

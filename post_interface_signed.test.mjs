@@ -436,6 +436,42 @@ test("a 401 registers again, signed, at once; a 401 on that new session's first 
     assert.deepEqual(events.kinds(), ["registered", "up", "down", "registered", "stopped"]);
 });
 
+test("a page that signs but registered the legacy way (its challenge answered 404) is a page older than Stage 1 there: a 401 on its new session's first exchange does not stop it (§8)", async (t) => {
+    // §8: such a page is in the same position at that PHP node as old
+    // pages, which keep evicting each other with every 401, as before Stage
+    // 1. Until the review of stage1-sign (2026-10-14) it stopped, so a
+    // stranger's legacy registration of its identity hash could stop it.
+    captureConsole(t);
+    const clock = fakeTimers(t);
+    const node = stage1Node(t, { stage1: false, auto: ["challenge"] });
+    const identity = Identity.create();
+    const hash = identity.hash.toString("hex");
+    const iface = signingInterface(identity);
+    const events = record(iface);
+    t.after(() => iface.disconnect());
+    iface.connect();
+    assert.deepEqual((await node.pending("register")).body.metadata, LEGACY_METADATA(hash), "the legacy registration");
+    await node.serveNext("register");
+    await node.serveNext("exchange");
+    await eventually(() => iface.isUp, "up");
+
+    node.forget(hash);
+    clock.fire(clock.armed());
+    assert.equal(node.serve(await node.pending("exchange")).status, 401);
+    await node.serveNext("register");   // at once
+    (await node.pending("exchange")).respond(401, { error: "unauthorized" });   // the new session's first exchange
+    const wait = await clock.next("the next attempt armed");
+    assert.equal(wait.ms, PostInterface.BACKOFF_FIRST_MS, "the run's second 401 waits the backoff, as before Stage 1");
+    assert.deepEqual(events.stopped(), [], "not stopped");
+
+    clock.fire(wait);
+    await node.serveNext("register");
+    await node.serveNext("exchange");
+    await eventually(() => iface.isUp, "up again");
+    assert.deepEqual(events.stopped(), []);
+    assert.deepEqual([node.count("challenge"), node.count("register")], [3, 3], "each registration after its own challenge 404");
+});
+
 test("a 401 acts on the status alone, whatever the answer's text", async (t) => {
     captureConsole(t);
     const clock = fakeTimers(t);
