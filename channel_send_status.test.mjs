@@ -247,6 +247,10 @@ test("an exchange that lost the request packet fails the post at once; rfed's an
     await c.rfed.took(0);
     const request = c.wire.a.find((p) => p.context === Packet.REQUEST);
     c.self._onPacketsLost({ packetHashes: [request.getHash().toString("hex")], reason: "HTTP 502" });
+    // Reticulum hands the link the same report (Link.requestPacketsLost),
+    // which fails any other request it names: the publish, sent with
+    // keepWhenLost, waits on there for rfed's answer.
+    c.a.requestPacketsLost(c.a.attachedInterface, new Set([request.getHash().toString("hex")]), "HTTP 502");
     assert.equal(c.record().status, "failed", "a definite failure: not the ceiling");
     assert.equal(c.events.at(-1).kind, "status", "the failure is shown");
     assert.equal(await sending, "failed: its packet was lost (HTTP 502)");

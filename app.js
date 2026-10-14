@@ -4547,8 +4547,11 @@ const RnsClient = {
      * A channel post whose publish request went as one packet and was lost
      * fails now the same way, and rfed's answer or echo, should rfed have
      * taken the batch after all, outranks that failure
-     * (lib/channel_publish.js). Link keepalives, proofs and other requests
-     * are left to the link protocol.
+     * (lib/channel_publish.js); its request stays pending on the link for
+     * that answer (keepWhenLost). Every other request that went as one
+     * packet is failed by its link on the same report
+     * (Link.requestPacketsLost). Link keepalives and proofs are left to the
+     * link protocol.
      *
      * `unsent` is the part of `packetHashes` the exchange says went into no
      * request (PostInterface "lost": refused while it was down or blocked,
@@ -9295,6 +9298,11 @@ const RnsClient = {
                 // rfed holds it: the packet went, or the request Resource
                 // was proved. The §1 clock starts.
                 onDelivered: () => this._channelPublishes.left(tracked),
+                // A lost packet fails the post here (_onPacketsLost), and
+                // the request waits on for rfed's answer, which outranks
+                // that failure should rfed have taken the batch: the link
+                // must not fail it on the same report.
+                keepWhenLost: true,
             });
             // A request that fits one packet is that packet, and its id is
             // the packet's hash: an exchange that loses it fails the post now

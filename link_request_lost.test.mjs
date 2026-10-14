@@ -19,6 +19,14 @@
  * exchange a check abandoned: its batch may have reached the node, so that
  * attempt waits for its LRPROOF or its timeout, as in RNS.
  *
+ * A request on an established link, the same (2026-10-13): one sent as a
+ * packet was decided only by its timeout, about 14.5 s, and on the staging
+ * chain a /channel/subscribe failed 14.4 s after the 503 that took its
+ * packet was reported lost (RFed-rust SPEC.md, faults that no stage
+ * judges). Now the link fails it on the report (Link.requestPacketsLost),
+ * with the same exception for an abandoned exchange, and leaves a request
+ * sent with keepWhenLost (a channel post's publish) to its sender.
+ *
  * The real PostInterface runs against a scripted node (a fake fetch) inside
  * a real Reticulum, with real Links. The app test runs the real shipped
  * method bodies from app.js. Timers of 0 ms (the EventEmitter's deferral)
@@ -32,7 +40,8 @@ import { Buffer } from "node:buffer";
 import { Reticulum, Identity, Destination, Link, Packet } from "./lib/rns/reticulum.js";
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
 import Interface from "./lib/rns/interfaces/interface.js";
-import { compile, constValue, methodName } from "./test_app_source.mjs";
+import MsgPack from "./lib/rns/msgpack.js";
+import { compile, constValue, fn, methodName } from "./test_app_source.mjs";
 import { DistroUploads } from "./lib/distro_upload.js";
 
 // ── Harness (as exchange_truth.test.mjs) ───────────────────────────────────
@@ -409,4 +418,203 @@ test("the propagation link too: the attempt fails on its lost LINKREQUEST, waits
     await tick(); await tick();
     assert.equal(node.linkRequests().length, 2, "exactly one");
     assert.deepEqual(calls, []);
+});
+
+// ── Requests on an established link ─────────────────────────────────────────
+
+/** How a request ended, as one string. */
+const outcome = (promise) => promise.then(() => "answered", (e) => `failed: ${e.message}`);
+
+/** The REQUEST packets an exchange carried, as the interface names them (full packet hash, hex). */
+const requestsIn = (exchange) => (exchange.body.packets ?? [])
+    .map((b64) => Packet.fromBytes(Buffer.from(b64, "base64")))
+    .filter((p) => p.context === Packet.REQUEST)
+    .map((p) => p.packetHash.toString("hex"));
+
+/**
+ * rfed's end of rfed.link, kept (lrproofFor builds one and lets it go): it
+ * proves the LINKREQUEST, takes what an exchange hands the node, records
+ * each request, and answers one as rfed does.
+ */
+function rfedEnd() {
+    class Capture extends Interface {
+        constructor() { super("rfed side"); this.sent = []; }
+        connect() {}
+        sendData(data) { this.sent.push(Buffer.from(data)); }
+    }
+    const rfed = new Reticulum();
+    const wire = new Capture();
+    rfed.addInterface(wire);
+    const destination = rfed.registerDestination(rfedNode, Destination.IN, Destination.SINGLE, "rfed", "link");
+    const requests = [];
+    let link = null;
+    destination.on("link_request", (l) => {
+        link = l;
+        l.on("request", (request) => requests.push(request));
+        l.accept();
+    });
+    const take = (b64) => rfed.onPacketReceived(Packet.fromBytes(Buffer.from(b64, "base64")), wire);
+    return {
+        requests,
+        /** rfed's LRPROOF for the LINKREQUEST an exchange carried, as the exchange delivers it. */
+        async prove(request) {
+            take(request);
+            const [proof] = await eventually(() => wire.sent.length && wire.sent, "rfed's LRPROOF");
+            return proof.toString("base64");
+        },
+        /** The node hands rfed what an exchange carried. */
+        async take(packets) {
+            for (const b64 of packets) take(b64);
+            await tick(); await tick();
+        },
+        /** rfed's answer to its `i`th request, as the next exchange delivers it. */
+        answer(i, value) {
+            const before = wire.sent.length;
+            link.sendResponse(requests[i].requestId, value);
+            return wire.sent.slice(before).map((raw) => raw.toString("base64"));
+        },
+    };
+}
+
+/**
+ * rfed.link over `rns`, established through the exchange as the page
+ * establishes it: rfed proves the LINKREQUEST, the exchange brings the
+ * LRPROOF back, and the next one takes the RTT packet to rfed.
+ */
+async function establishedLink(rns, node) {
+    const rfed = rfedEnd();
+    const { link } = attempt(rns);
+    const carrying = await node.pending("exchange");
+    carrying.respond(200, { delivery_packets: [await rfed.prove(carrying.body.packets[0])] });
+    await eventually(() => link.status === Link.ACTIVE, "the link is up");
+    const rtt = await node.pending("exchange");
+    await rfed.take(rtt.body.packets);
+    rtt.respond(200, {});
+    await tick(); await tick();
+    return { link, rfed };
+}
+
+test("a request whose packet a failed exchange takes with it fails at once, not on its timeout", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { rns } = await upExchange(t, node);
+    const { link } = await establishedLink(rns, node);
+
+    const timeoutMs = Link.requestTimeoutMs(link.rtt);
+    const id = link.sendRequestPacked("/channel/subscribe", MsgPack.pack(null), { timeoutMs });
+    const [budget] = clock.armed(timeoutMs);
+    assert.ok(budget, "its timeout runs, as RNS's does");
+    const carrying = await node.pending("exchange");
+    assert.deepEqual(requestsIn(carrying), [link.pendingRequests[0].packetHash], "the request is in this batch, under the hash the interface reports");
+
+    carrying.fail();
+    assert.equal(await outcome(link.responseFor(id)), "failed: its packet was lost (Failed to fetch)");
+    assert.equal(budget.fired, false, "no clock decided it");
+    assert.equal(budget.cleared, true, "and none is left running");
+    assert.equal(link.status, Link.ACTIVE, "the request failed, not the link");
+});
+
+test("a 503 fails the request it carried at once, and one sent while the exchange is down fails as it is sent; neither leaves the browser again", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { rns, iface } = await upExchange(t, node);
+    const { link } = await establishedLink(rns, node);
+
+    const subscribe = link.sendRequestPacked("/channel/subscribe", MsgPack.pack(null));
+    const carrying = await node.pending("exchange");
+    assert.equal(requestsIn(carrying).length, 1);
+    carrying.respond(503, {});
+    assert.match(await outcome(link.responseFor(subscribe)), /^failed: its packet was lost \(HTTP 503/);
+    await eventually(() => iface.isDown, "down");
+
+    const sent = node.requests.length;
+    const pull = link.sendRequestPacked("/distro/pull", MsgPack.pack(null));
+    assert.equal(await outcome(link.responseFor(pull)), "failed: its packet was lost (the exchange is down)");
+    assert.equal(clock.armed(Link.requestTimeoutMs(link.rtt)).length, 0, "no timeout is left to run out");
+    assert.equal(node.requests.length, sent, "nothing was sent: not the request, and not the first one again");
+});
+
+test("an exchange a check abandoned does not fail the request: the node may have taken it, and the answer the next exchange brings decides it", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { rns, iface } = await upExchange(t, node);
+    const { link, rfed } = await establishedLink(rns, node);
+
+    const timeoutMs = Link.requestTimeoutMs(link.rtt);
+    const id = link.sendRequestPacked("/distro/pull", MsgPack.pack(null), { timeoutMs });
+    const [budget] = clock.armed(timeoutMs);
+    const carrying = await node.pending("exchange");
+    iface.check("visible"); // the fetch may hang on a dead connection: abandoned
+    const next = await node.pending("exchange");
+    assert.notEqual(next, carrying);
+    await tick(); await tick();
+    assert.equal(link.pendingRequests.length, 1, "an abandoned exchange is no proof that the request never left");
+    assert.equal(budget.cleared || budget.fired, false, "it waits for its answer or its timeout, as RNS waits");
+
+    // The node had taken the batch: rfed's answer comes in the next exchange.
+    await rfed.take(carrying.body.packets);
+    assert.equal(rfed.requests.length, 1);
+    next.respond(200, { delivery_packets: rfed.answer(0, [true, null]) });
+    assert.deepEqual(await link.responseFor(id), [true, null]);
+    assert.equal(budget.fired, false);
+    assert.deepEqual(requestsIn(carrying), node.requests.flatMap(requestsIn), "nothing was sent again");
+});
+
+test("only a report of the request's own packet, from every interface it went to, before its response begins, fails it; one sent with keepWhenLost is left to its sender", async (t) => {
+    quiet(t);
+    fakeTimers(t);
+    const node = fakeNode(t);
+    const { rns, iface } = await upExchange(t, node);
+    const { link } = await establishedLink(rns, node);
+    const out = [];
+    const send = iface.sendData.bind(iface);
+    iface.sendData = (data) => { out.push(Buffer.from(data)); send(data); };
+    const lost = (packetHashes, more = {}) => rns.onPacketsLost(iface, { packetHashes, reason: "test", ...more });
+
+    const id = link.sendRequestPacked("/distro/pull", MsgPack.pack(null));
+    const [receipt] = link.pendingRequests;
+    assert.equal(receipt.packetHash, Packet.fromBytes(out.at(-1)).packetHash.toString("hex"));
+    lost(["ff".repeat(32)]);
+    assert.equal(link.pendingRequests.length, 1, "another packet's loss");
+    lost([receipt.packetHash], { abandoned: true });
+    assert.equal(link.pendingRequests.length, 1, "an abandoned exchange");
+    rns.onPacketsLost(new Interface("elsewhere"), { packetHashes: [receipt.packetHash], reason: "test" });
+    assert.equal(link.pendingRequests.length, 1, "an interface it did not go to");
+    receipt.status = Link.REQUEST_RECEIVING;
+    lost([receipt.packetHash]);
+    assert.equal(link.pendingRequests.length, 1, "its response is arriving: it no longer depends on its packet");
+    receipt.status = Link.REQUEST_DELIVERED;
+    lost([receipt.packetHash]);
+    assert.equal(await outcome(link.responseFor(id)), "failed: its packet was lost (test)");
+
+    const kept = link.sendRequestPacked("/channel/publish", MsgPack.pack(null), { keepWhenLost: true });
+    lost([Packet.fromBytes(out.at(-1)).packetHash.toString("hex")]);
+    assert.equal(link.pendingRequests.length, 1, "its sender decides the loss, and its answer may still come");
+    assert.equal(link.pendingRequests[0].requestId.toString("hex"), Buffer.from(kept).toString("hex"));
+});
+
+test("app.js _rfedRequest: /rfed/subscribe fails at the 503 that loses its packet, not at its timeout", async (t) => {
+    quiet(t);
+    const clock = fakeTimers(t);
+    const node = fakeNode(t);
+    const { rns } = await upExchange(t, node);
+    const { link } = await establishedLink(rns, node);
+    const rfedRequestTimeoutMs = fn("rfedRequestTimeoutMs", "link", {
+        TRAFFIC_TIMEOUT_FACTOR: constValue("TRAFFIC_TIMEOUT_FACTOR"), RESPONSE_MAX_GRACE_MS: constValue("RESPONSE_MAX_GRACE_MS"),
+    });
+    const self = { _rfedLinkAvailable: () => true, _ensureRfedLink: async () => link };
+    const rfedRequest = compile("async _rfedRequest(aspects, path, packedValue)", {
+        RFED_LINK_PATHS: constValue("RFED_LINK_PATHS"), rfedRequestTimeoutMs, Date, console,
+    })(self);
+
+    const subscribing = outcome(rfedRequest(["channel"], "/rfed/subscribe", MsgPack.pack(null)));
+    const carrying = await node.pending("exchange");
+    assert.equal(requestsIn(carrying).length, 1, "the request went as one packet");
+    const [budget] = clock.armed(rfedRequestTimeoutMs(link));
+    carrying.respond(503, {});
+    assert.match(await subscribing, /^failed: \/channel\/subscribe: its packet was lost \(HTTP 503/);
+    assert.equal(budget.fired, false, "not its timeout");
 });
