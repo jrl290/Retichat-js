@@ -318,9 +318,18 @@ export function stage1Node(t, { stage1 = true, auto = [], honourAbort = true } =
     return node;
 }
 
+/**
+ * A PostInterface that signs, made as app.js makes it: the identity's hash
+ * third, a string (a lib older than Stage 1 sends that argument to the PHP
+ * node), and the identity in the options.
+ */
+export function signingInterface(identity = Identity.create(), { name = "Retichat Web", url = "https://node.example/reticulum", mode } = {}) {
+    return new PostInterface(name, url, identity.hash.toString("hex"), mode, { identity });
+}
+
 /** connect() a signing PostInterface over `node` and serve it until its first exchange is answered: an interface that is up. */
 export async function upSigned(t, node, clock, { identity = Identity.create(), name = "Retichat Web" } = {}) {
-    const iface = new PostInterface(name, "https://node.example/reticulum", identity);
+    const iface = signingInterface(identity, { name });
     const events = record(iface);
     t.after(() => iface.disconnect());
     iface.connect();

@@ -2943,12 +2943,19 @@ const RnsClient = {
         }
 
         console.log("[rns] HTTP exchange →", this._cfg.exchangeUrl);
-        // The identity itself, which signs the registration and decrypts
-        // its session token (REGISTRATION-STAGE1.md §4, §5).
+        // The third argument stays the identity's hash, a string: a lib
+        // older than Stage 1 (a rollback, deploy.sh copying lib before
+        // app.js, a cached module) sends it to the PHP node as
+        // metadata.identity_hash, so the identity there would carry its
+        // private keys. The identity, which signs the registration and
+        // decrypts its session token (REGISTRATION-STAGE1.md §4, §5), goes
+        // in the options, which such a lib ignores.
         const iface = new PostInterface(
             this._cfg.interfaceName,
             this._cfg.exchangeUrl,
-            IdMgr.id
+            IdMgr.hash,
+            undefined,
+            { identity: IdMgr.id }
         );
         // The browser's refusal of this exchange under the page's policy, a
         // definite event, heard from the interface's first request on.

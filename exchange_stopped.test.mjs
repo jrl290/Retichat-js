@@ -2,9 +2,12 @@
  * REGRESSION GUARD — the page says why the PHP node stopped its connection.
  *
  * Reticulum-post REGISTRATION-STAGE1.md §10 and §17.2, §14's page test.
- * app.js gives PostInterface the identity itself (IdMgr.id), which signs the
- * registration and decrypts its session token; until Stage 1 it gave only
- * the hash (IdMgr.hash). When the PHP node's answer stops the interface
+ * app.js gives PostInterface the identity's hash third, a string, as it
+ * always did (IdMgr.hash), and the identity itself (IdMgr.id), which signs
+ * the registration and decrypts its session token, in the options: a lib
+ * older than Stage 1 sends the third argument to the PHP node, so the
+ * identity there would carry its private keys (2026-10-14, the review of
+ * stage1-sign), and it ignores the options. When the PHP node's answer stops the interface
  * ("stopped": superseded by another tab or device, refused, out of date),
  * the page keeps the reason as its own state (RnsClient.exchangeStopped,
  * never exchangeBlocked, which Settings shows as the policy error on the
@@ -27,7 +30,7 @@ import { Identity } from "./lib/rns/reticulum.js";
 import EventEmitter from "./lib/rns/utils/events.js";
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
 import { build, compile, constValue, fn, methodBody } from "./test_app_source.mjs";
-import { captureConsole, eventually, fakeTimers, stage1Node, tick } from "./test_stage1_node.mjs";
+import { captureConsole, eventually, fakeTimers, signingInterface, stage1Node, tick } from "./test_stage1_node.mjs";
 
 class El {
     constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.listeners = {}; this.style = {}; this.className = ""; this.title = ""; }
@@ -73,16 +76,68 @@ function connection(iface) {
     return { RnsClient, statuses, harness };
 }
 
-test("app.js gives the interface IdMgr.id, the identity itself, which signs the registration", async (t) => {
-    assert.match(methodBody("async connect()"), /new PostInterface\(\s*this\._cfg\.interfaceName,\s*this\._cfg\.exchangeUrl,\s*IdMgr\.id\s*\);/);
-    assert.doesNotMatch(methodBody("async connect()"), /IdMgr\.hash/, "not its hash, which cannot sign");
+/**
+ * The arguments of every `new PostInterface(` in `text`, as source text: a
+ * scan to the matching parenthesis that splits at the top-level commas,
+ * past strings and nested brackets.
+ */
+function constructions(text) {
+    const calls = [];
+    for (let at = text.indexOf("new PostInterface("); at !== -1; at = text.indexOf("new PostInterface(", at + 1)) {
+        const args = [];
+        let depth = 0, quote = null, arg = "";
+        for (let i = at + "new PostInterface(".length; i < text.length; i++) {
+            const c = text[i];
+            if (quote) {
+                arg += c;
+                if (c === "\\") arg += text[++i];
+                else if (c === quote) quote = null;
+                continue;
+            }
+            if (c === "'" || c === '"' || c === "`") quote = c;
+            else if ("([{".includes(c)) depth++;
+            else if (")]}".includes(c)) {
+                if (depth === 0) { args.push(arg.trim()); break; }
+                depth--;
+            } else if (c === "," && depth === 0) { args.push(arg.trim()); arg = ""; continue; }
+            arg += c;
+        }
+        calls.push(args.filter((a) => a !== ""));
+    }
+    return calls;
+}
 
+test("every page passes the identity's hash third, a string, and the identity in the options: a lib older than Stage 1 never sends its keys", async (t) => {
+    // A PostInterface older than Stage 1 (f54d7cd) sends its third argument
+    // to the PHP node as metadata.identity_hash, through JSON.stringify: an
+    // Identity there would carry its private keys. So the third argument
+    // stays the hash, a string, on every page, and the identity goes in the
+    // options, which such a lib ignores.
+    const pages = {
+        "app.js": { hash: "IdMgr.hash", options: "{ identity: IdMgr.id }" },
+        "debug-standalone.html": { hash: "identHash", options: "{ identity: ident }" },
+    };
+    for (const [file, expected] of Object.entries(pages)) {
+        const calls = constructions(readFileSync(new URL(`./${file}`, import.meta.url), "utf8"));
+        assert.equal(calls.length, 1, `${file} makes one PostInterface`);
+        for (const args of calls) {
+            assert.equal(args[2], expected.hash, `${file}: the third argument is the identity's hash, a string, never the identity`);
+            assert.equal(args[4], expected.options, `${file}: the identity goes in the options`);
+            assert.equal(args.length, 5, file);
+        }
+    }
+    const debugPage = readFileSync(new URL("./debug-standalone.html", import.meta.url), "utf8");
+    assert.match(debugPage, /identHash = ident\.hash\.toString\('hex'\);/, "the debug page's identHash is the hex string");
+
+    // IdMgr.hash is that string, and the interface made as app.js makes it signs as IdMgr.id.
     captureConsole(t);
     const clock = fakeTimers(t);
     const node = stage1Node(t, { auto: ["challenge", "exchange"] });
     const IdMgr = build("IdMgr", { Identity, Buffer, sGet: () => null, sSet: () => {}, ID_KEY: "identity" });
     IdMgr.create();
-    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", IdMgr.id);
+    assert.equal(typeof IdMgr.hash, "string");
+    assert.equal(IdMgr.hash, IdMgr.id.hash.toString("hex"));
+    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", IdMgr.hash, undefined, { identity: IdMgr.id });
     t.after(() => iface.disconnect());
     iface.connect();
     const registering = await node.pending("register");
@@ -97,7 +152,7 @@ test("a stop's reason shows under the status dot, survives a re-render, and is n
     const clock = fakeTimers(t);
     const node = stage1Node(t, { auto: ["challenge", "register"] });
     const identity = Identity.create();
-    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", identity);
+    const iface = signingInterface(identity);
     t.after(() => iface.disconnect());
     const { RnsClient, statuses, harness } = connection(iface);
 

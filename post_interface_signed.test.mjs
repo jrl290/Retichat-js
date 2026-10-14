@@ -28,7 +28,7 @@ import { Identity } from "./lib/rns/reticulum.js";
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
 import {
     SUPERSEDED_MESSAGE, captureConsole, eventually, fakePage, fakeTimers, rawPacket, record, signedBytesOf,
-    stage1Node, testClock, tick, upSigned,
+    signingInterface, stage1Node, testClock, tick, upSigned,
 } from "./test_stage1_node.mjs";
 
 const source = await readFile(new URL("./lib/rns/interfaces/post_interface.js", import.meta.url), "utf8");
@@ -52,6 +52,33 @@ async function assertStopped(seen, iface, clock, node, reason, label) {
     assert.deepEqual(seen.stopped(), [reason], `${label}: still once`);
 }
 
+// ── The constructor: the hash third, the identity in the options ───────────
+
+test("the third argument is the identity's hash, a string, or null, never the identity; an options.identity of another hash throws", () => {
+    // A PostInterface older than Stage 1 sends its third argument to the PHP
+    // node (metadata.identity_hash): an identity there carries its private
+    // keys, so a page that passes one must fail here, at once.
+    const identity = Identity.create();
+    const hash = identity.hash.toString("hex");
+    const make = (third, mode, options) => () => new PostInterface("Retichat Web", URL_BASE, third, mode, options);
+    for (const [third, label] of [[identity, "the identity"], [identity.hash, "its hash as bytes"], [undefined, "undefined"], [42, "a number"]]) {
+        assert.throws(make(third), TypeError, `${label} third throws`);
+        assert.throws(make(third, undefined, { identity }), TypeError, `${label} third throws, even with options.identity`);
+    }
+    assert.throws(make("ab".repeat(16), undefined, { identity }), /options\.identity's hash is not the identity hash/, "another identity's hash");
+    assert.throws(make(null, undefined, { identity }), /options\.identity's hash is not the identity hash/, "no hash, with an identity");
+    assert.throws(make(hash, undefined, { identity: { hash: identity.hash } }), /not an RNS identity that signs/, "not an identity");
+
+    // Accepted: a hash alone (an app.js older than Stage 1), null, and the hash with its identity.
+    assert.equal(make(hash)()._identity, null);
+    assert.equal(make(hash)()._identityHash, hash);
+    assert.equal(make(null)()._identityHash, null);
+    const signing = make(hash, undefined, { identity })();
+    assert.equal(signing._identity, identity);
+    assert.equal(signing._identityHash, hash);
+    assert.equal(make(hash, 1, {})()._identity, null);
+});
+
 // ── Challenge, sign, decrypt ───────────────────────────────────────────────
 
 test("challenge, sign, decrypt: the registration is signed over §4.2's bytes, the token is the one the PHP node encrypted, and no secret is logged", async (t) => {
@@ -60,7 +87,7 @@ test("challenge, sign, decrypt: the registration is signed over §4.2's bytes, t
     const node = stage1Node(t);
     const identity = Identity.create();
     const hash = identity.hash.toString("hex");
-    const iface = new PostInterface("Retichat Web", URL_BASE, identity);
+    const iface = signingInterface(identity);
     const seen = record(iface);
     t.after(() => iface.disconnect());
     iface.connect();
@@ -107,7 +134,7 @@ test("409 stale_challenge: one new challenge and one more registration, which co
     const clock = fakeTimers(t);
     const node = stage1Node(t, { auto: ["challenge", "exchange"] });
     const identity = Identity.create();
-    const iface = new PostInterface("Retichat Web", URL_BASE, identity);
+    const iface = signingInterface(identity);
     const seen = record(iface);
     t.after(() => iface.disconnect());
     iface.connect();
@@ -131,7 +158,7 @@ test("409 stale_challenge twice: the interface stops with its own text, with no 
     const node = stage1Node(t, { auto: ["challenge"] });
     const identity = Identity.create();
     const hash = identity.hash.toString("hex");
-    const iface = new PostInterface("Retichat Web", URL_BASE, identity);
+    const iface = signingInterface(identity);
     const seen = record(iface);
     iface.connect();
 
@@ -153,7 +180,7 @@ test("a registration abandoned by check() that binds between the new challenge a
     const clock = fakeTimers(t);
     const node = stage1Node(t, { auto: ["challenge", "exchange"] });
     const identity = Identity.create();
-    const iface = new PostInterface("Retichat Web", URL_BASE, identity);
+    const iface = signingInterface(identity);
     const seen = record(iface);
     t.after(() => iface.disconnect());
     iface.connect();
@@ -244,7 +271,7 @@ test("terminal codes stop with no backoff, each saying the PHP node's message, n
     for (const [where, status, code] of cases) {
         const label = `${where} ${status} ${code}`;
         const node = stage1Node(t, { auto: where === "register" ? ["challenge"] : [] });
-        const iface = new PostInterface("Retichat Web", URL_BASE, Identity.create());
+        const iface = signingInterface();
         const seen = record(iface);
         iface.connect();
         const message = `The PHP node says no (${label}).`;
@@ -257,7 +284,7 @@ test("terminal codes stop with no backoff, each saying the PHP node's message, n
 
     // A refusal without a message for a person: the interface's own sentence, never the code.
     const node = stage1Node(t, { auto: ["challenge"] });
-    const iface = new PostInterface("Retichat Web", URL_BASE, Identity.create());
+    const iface = signingInterface();
     const seen = record(iface);
     iface.connect();
     (await node.pending("register")).respond(400, { error: "bad_registration" });
@@ -304,7 +331,7 @@ test("a challenge answered 404 (a PHP node without Stage 1) leads to the legacy 
     const node = stage1Node(t, { stage1: false });
     const identity = Identity.create();
     const hash = identity.hash.toString("hex");
-    const iface = new PostInterface("Retichat Web", URL_BASE, identity);
+    const iface = signingInterface(identity);
     const seen = record(iface);
     t.after(() => iface.disconnect());
     iface.connect();
@@ -388,7 +415,7 @@ test("a token that does not decrypt to this identity, or an answer naming anothe
     for (const [label, alter] of cases) {
         const node = stage1Node(t, { auto: ["challenge"] });
         const identity = Identity.create();
-        const iface = new PostInterface("Retichat Web", URL_BASE, identity);
+        const iface = signingInterface(identity);
         const seen = record(iface);
         iface.connect();
         const registering = await node.pending("register");
@@ -401,7 +428,7 @@ test("a token that does not decrypt to this identity, or an answer naming anothe
 
     // A challenge for another identity is no challenge for this one.
     const node = stage1Node(t);
-    const iface = new PostInterface("Retichat Web", URL_BASE, Identity.create());
+    const iface = signingInterface();
     const seen = record(iface);
     iface.connect();
     (await node.pending("challenge")).respond(200, { status: "challenge", version: 1, identity_hash: stranger.hash.toString("hex"), challenge: "c".repeat(96) });
@@ -461,7 +488,7 @@ test("a page that gives only an identity hash registers the legacy way on a chal
 
     // No hash at all: the same.
     node = stage1Node(t);
-    iface = new PostInterface("Retichat Web", URL_BASE, undefined);
+    iface = new PostInterface("Retichat Web", URL_BASE, null);
     seen = record(iface);
     iface.connect();
     assert.equal(node.serve(await node.pending("challenge")).status, 400);
@@ -476,7 +503,7 @@ test("§6's assertions: an answer later than 5 s is a §1 violation, said once p
     const time = testClock(t);
     const node = stage1Node(t);
     const identity = Identity.create();
-    const iface = new PostInterface("Retichat Web", URL_BASE, identity);
+    const iface = signingInterface(identity);
     const seen = record(iface);
     t.after(() => iface.disconnect());
     const violations = () => lines.filter((line) => line.level === "error" && line.text.includes("§1 VIOLATION"));

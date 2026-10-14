@@ -91,10 +91,12 @@ async function init(exchangeUrl) {
     if (pt !== 1) log('📦 RX PACKET type=' + pt + ' dest=' + dh, 'rx');
   });
 
-  // The identity itself, which signs the registration and decrypts its
-  // session token (REGISTRATION-STAGE1.md §4, §5); given only its hash, the
-  // interface stops at a PHP node with Stage 1 ("out of date").
-  var iface = new PostInterface('debug', exchangeUrl, ident, 1);
+  // The third argument stays the hash, a string: a lib older than Stage 1
+  // sends it to the PHP node. The identity, which signs the registration
+  // and decrypts its session token (REGISTRATION-STAGE1.md §4, §5), goes in
+  // the options; given only the hash, the interface stops at a PHP node
+  // with Stage 1 ("out of date").
+  var iface = new PostInterface('debug', exchangeUrl, identHash, 1, { identity: ident });
   // addInterface() connects it; a second connect() would clear the
   // registration in flight. The interface id arrives with the registration.
   iface.on('registered', function() { log('Interface: ' + iface._interfaceId); });

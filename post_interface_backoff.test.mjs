@@ -23,7 +23,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Identity } from "./lib/rns/reticulum.js";
 import PostInterface from "./lib/rns/interfaces/post_interface.js";
-import { captureConsole, eventually, fakePage, fakeTimers, record, stage1Node, tick, upSigned } from "./test_stage1_node.mjs";
+import { captureConsole, eventually, fakePage, fakeTimers, record, signingInterface, stage1Node, tick, upSigned } from "./test_stage1_node.mjs";
 
 const S = 1000;
 const STEPS = [2, 4, 8, 16, 32, 64, 128, 256, 300, 300].map((s) => s * S);
@@ -36,7 +36,7 @@ async function waitsThenFires(clock, ms, label) {
 }
 
 function signing(t) {
-    const iface = new PostInterface("Retichat Web", "https://node.example/reticulum", Identity.create());
+    const iface = signingInterface();
     t.after(() => iface.disconnect());
     return { iface, seen: record(iface) };
 }
