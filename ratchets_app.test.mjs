@@ -499,3 +499,10 @@ test("app.js over a lib older than ratchets (cached, or restored by a rollback):
     assert.deepEqual(page.sGet("ratchets_known_v1"), stored, "left as it was");
     fresh();
 });
+
+test("the key backup says what it does not bring back: what senders sealed to this browser's ratchets before a restore elsewhere (James, 2026-10-17)", () => {
+    const body = methodBody("_buildDeviceIdentitySection()");
+    const shown = body.slice(body.indexOf("if (this.state.revealDeviceKey) {"));
+    assert.match(shown, /"A restored key opens new messages\. Messages sent to you before you restore it may not open\."/);
+    assert.ok(shown.indexOf("A restored key") < shown.indexOf("\"secret-value\""), "with the warning, above the key itself");
+});

@@ -11947,6 +11947,11 @@ const App = {
             const priv = IdMgr.privKey ?? "";
             section.appendChild(h("div", { className: "secret-warning" },
                 "⚠️ Anyone holding this key is this device. Store it somewhere safe; never share it."));
+            // The key is the identity only: the delivery ratchets (OwnRatchets)
+            // stay in this browser, and what senders sealed to them before a
+            // restore elsewhere does not open there (James, 2026-10-17).
+            section.appendChild(h("div", { className: "secret-warning" },
+                "A restored key opens new messages. Messages sent to you before you restore it may not open."));
             section.appendChild(h("div", { className: "secret-value" }, priv || "unavailable"));
             if (priv) {
                 section.appendChild(
