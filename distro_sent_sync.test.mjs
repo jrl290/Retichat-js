@@ -865,8 +865,20 @@ test("what reaches the user's own action (_oweDistro) begins with the user and n
             "RnsClient._unprovedSince", "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._uploadOwed", "RnsClient._uploadOwed",
             "RnsClient._dropMembershipOwedToOtherDistros"],
         _sendDistroNeverLeft: ["RnsClient._followExchange", "RnsClient._sendDistroNeverLeft"],
+        // A DM reaction (REACTIONS-DESIGN.md §2) and a Group reaction (§4): the user's tap on a quick reaction in a
+        // message's menu, or on a reaction chip, and nothing else.
+        sendReaction: ["RnsClient.sendReaction", "App._react"],
+        sendGroupReaction: ["RnsClient.sendGroupReaction", "App._react"],
+        _react: ["App._toggleMessageMenu", "App._tapReactionChip", "App._react"],
+        _toggleMessageMenu: ["App._buildMessageActions", "App._toggleMessageMenu"],
+        _tapReactionChip: ["App._buildReactionChips", "App._tapReactionChip"],
     };
     for (const [name, where] of Object.entries(places)) assert.deepEqual(at(name), where, `${name}: written where it is today, and nowhere else`);
+
+    // A reaction: the react button's click opens the menu, whose quick reactions are clicks; a chip is a click.
+    assert.match(member("App._buildMessageActions"), /onClick: \(e\) => this\._toggleMessageMenu\(e, m\.id, text\),/);
+    assert.match(member("App._toggleMessageMenu"), /onClick: \(ev\) => \{ ev\.stopPropagation\(\); this\._react\(msgId, emoji === held \? "" : emoji\); \},/);
+    assert.match(member("App._buildReactionChips"), /onClick: \(e\) => \{ e\.stopPropagation\(\); this\._tapReactionChip\(m\.id, chip\.emoji\); \},/);
 
     // A DM: the composer's Enter key and send button in each chat view, the harness's send, and App.sendMessage's
     // one call, with what the composer holds, to the open chat's contact.
@@ -922,7 +934,7 @@ test("what reaches the user's own action (_oweDistro) begins with the user and n
     // Nor does a script under lib/ or a page: lib/ reaches no object of the page, index.html loads app.js and
     // nothing else, debug-standalone.html not even that (its console has its own stack), and debug.html reads the
     // harness alone.
-    const named = /_sendDistroSentCopy|_sendDistroChannelSync|_dispatchMessage|_dispatchQueued|_onExchangeRegistered|_followExchange|_composerKeydown|\bsendMessage\b|\bjoinChannel\b|\bleaveChannel\b|_syncChannelMembership|DistroOutboxStore|_distroOutboxInFlight|_distroUnproved|_sendDistroNeverLeft/;
+    const named = /\bsendReaction\b|\bsendGroupReaction\b|_sendDistroSentCopy|_sendDistroChannelSync|_dispatchMessage|_dispatchQueued|_onExchangeRegistered|_followExchange|_composerKeydown|\bsendMessage\b|\bjoinChannel\b|\bleaveChannel\b|_syncChannelMembership|DistroOutboxStore|_distroOutboxInFlight|_distroUnproved|_sendDistroNeverLeft/;
     const lib = new URL("./lib/", import.meta.url);
     const scripts = (await readdir(lib, { recursive: true })).filter((f) => f.endsWith(".js"));
     assert.ok(scripts.includes("distro_outbox.js") && scripts.includes("message_text.js"));

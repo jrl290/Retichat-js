@@ -616,13 +616,22 @@ html, body {
     gap: 6px;
 }
 
-/* Message row */
+/* Message row: the bubble beside its react button (.msg-line), its
+   reaction chips under it (App._buildMsgBubble, REACTIONS-DESIGN.md §7). */
 .msg-row {
     display: flex;
+    flex-direction: column;
     max-width: 75%;
 }
-.msg-row.own  { align-self: flex-end; }
-.msg-row.their { align-self: flex-start; }
+.msg-row.own  { align-self: flex-end; align-items: flex-end; }
+.msg-row.their { align-self: flex-start; align-items: flex-start; }
+.msg-line {
+    position: relative;
+    display: flex;
+    max-width: 100%;
+    min-width: 0;
+}
+.msg-line > .msg-bubble { min-width: 0; }
 
 /* Date marker (App._setDayMarker): above the first message of each day,
    inside that message's row, never a row of its own. Such a row spans the
@@ -635,7 +644,7 @@ html, body {
 .msg-row.has-day-marker.own   { align-items: flex-end; }
 .msg-row.has-day-marker.their { align-items: flex-start; }
 .msg-row.has-day-marker.system { align-items: center; }
-.msg-row.has-day-marker > .msg-bubble { max-width: 75%; }
+.msg-row.has-day-marker > .msg-line { max-width: 75%; }
 .day-marker {
     align-self: center;
     font-size: 11px;
@@ -687,6 +696,109 @@ html, body {
     gap: 4px;
     align-items: center;
 }
+
+/* The react button beside a bubble (App._buildMessageActions): outside
+   the bubble, on its inner side, shown while the row is hovered, and on a
+   touch screen once the bubble is tapped (.show-actions). It stays a
+   moment after the pointer leaves, so the pointer can cross to it. */
+.msg-react-btn {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid var(--glass-border);
+    background: var(--surface);
+    color: var(--text-secondary);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 0.12s ease, visibility 0s linear 0.25s;
+}
+.msg-row.own .msg-react-btn   { right: 100%; margin-right: 6px; }
+.msg-row.their .msg-react-btn { left: 100%; margin-left: 6px; }
+.msg-row:hover .msg-react-btn,
+.msg-row.show-actions .msg-react-btn,
+.msg-react-btn:focus-visible {
+    visibility: visible;
+    opacity: 1;
+    transition: opacity 0.12s ease, visibility 0s;
+}
+@media (hover: none) {
+    .msg-row:hover .msg-react-btn { visibility: hidden; opacity: 0; }
+    .msg-row.show-actions .msg-react-btn { visibility: visible; opacity: 1; }
+}
+
+/* The menu the react button opens (App._toggleMessageMenu): the six quick
+   reactions, then Copy. Above the bubble, below it at the list's top. */
+.msg-menu {
+    position: absolute;
+    bottom: calc(100% + 4px);
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px;
+    border-radius: 18px;
+    border: 1px solid var(--glass-border);
+    background: var(--surface);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    white-space: nowrap;
+}
+.msg-menu.below { bottom: auto; top: calc(100% + 4px); }
+.msg-row.own .msg-menu   { right: 0; }
+.msg-row.their .msg-menu { left: 0; }
+.msg-menu button {
+    border: none;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    border-radius: 14px;
+}
+.msg-menu-emoji {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+}
+.msg-menu-emoji:hover, .msg-menu-copy:hover { background: var(--glass-bg); }
+.msg-menu-emoji.mine { background: var(--primary-bg); }
+.msg-menu-copy {
+    padding: 6px 10px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+/* Reaction chips under a bubble (App._buildReactionChips): one per
+   reaction with how many hold it; the user's highlighted. */
+.msg-reactions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 3px;
+    max-width: 100%;
+}
+.msg-reaction {
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: pointer;
+}
+.msg-reaction.mine {
+    border-color: var(--primary);
+    background: var(--primary-bg);
+    color: var(--text);
+}
+.msg-reaction:disabled { cursor: default; }
 
 /* Message delivery status icons */
 .msg-status {

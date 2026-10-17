@@ -90,6 +90,7 @@ function view() {
     }, [
         "_buildMsgBubble(m, sender = null)", "_buildAttachments(m)", "_attachmentLink(a)", "_loadAttachment(el, a)",
         "_buildProgressBar(progress)", "_buildSenderLabel(sender)",
+        "_buildMessageActions(m, text)", "_reactable(m)", "_buildReactionChips(m)",
     ]);
     /** Build a bubble and put it on the page, as the chat list does. */
     const show = (m) => {

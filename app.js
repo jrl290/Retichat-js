@@ -10228,8 +10228,9 @@ const App = {
             }
         });
 
-        // Escape key closes any open modal
+        // Escape closes an open message menu, else any open modal
         window.addEventListener("keydown", (e) => {
+            if (e.key === "Escape" && this._closeMessageMenu()) return;
             if (e.key === "Escape" && this._closeAllModals()) this.render();
         });
     },
@@ -11189,19 +11190,218 @@ const App = {
         // The text in an element of its own, whose white-space keeps its
         // line breaks (.msg-text; lib/message_text.js).
         const text = bubbleText(m.content);
-        return h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": m.id },
-            h("div", { className: "msg-bubble" },
-                (!isOwn && sender) ? this._buildSenderLabel(sender) : null,
-                this._buildAttachments(m),
-                text ? h("div", { className: "msg-text" }, text) : null,
-                progress !== null ? this._buildProgressBar(progress) : null,
-                isOwn && m.status === "failed" && m.sendError ? h("div", { className: "msg-attach-note" }, `Not sent: ${m.sendError}`) : null,
-                h("div", { className: "msg-meta" },
-                    h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
-                    statusIcon ? h("span", { className: `msg-status ${m.status}`, "data-msg-status": m.status }, statusIcon) : null,
+        // REACTIONS-DESIGN.md §7: the bubble and its react button side by
+        // side (.msg-line), its reaction chips under it. The text stays
+        // natively selectable; a tap on a touch screen shows the button
+        // (_messageRowClick).
+        return h("div", { className: `msg-row ${isOwn ? "own" : "their"}`, "data-msg-id": m.id, onClick: (e) => this._messageRowClick(e) },
+            h("div", { className: "msg-line" },
+                h("div", { className: "msg-bubble" },
+                    (!isOwn && sender) ? this._buildSenderLabel(sender) : null,
+                    this._buildAttachments(m),
+                    text ? h("div", { className: "msg-text" }, text) : null,
+                    progress !== null ? this._buildProgressBar(progress) : null,
+                    isOwn && m.status === "failed" && m.sendError ? h("div", { className: "msg-attach-note" }, `Not sent: ${m.sendError}`) : null,
+                    h("div", { className: "msg-meta" },
+                        h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
+                        statusIcon ? h("span", { className: `msg-status ${m.status}`, "data-msg-status": m.status }, statusIcon) : null,
+                    ),
                 ),
+                this._buildMessageActions(m, text),
             ),
+            this._buildReactionChips(m),
         );
+    },
+
+    // ===== REACTIONS AND COPY (REACTIONS-DESIGN.md §3, §7) =====
+
+    /** The small button beside a bubble: shown on hover, and on a touch
+     *  screen once the bubble is tapped (_messageRowClick). It opens the
+     *  six quick reactions and Copy (_toggleMessageMenu). None when the
+     *  message offers neither: no text and no reaction (_reactable).
+     *  `text` is what the bubble shows. */
+    _buildMessageActions(m, text) {
+        const reactable = this._reactable(m);
+        if (!text && !reactable) return null;
+        const label = reactable ? (text ? "React or copy" : "React") : "Copy";
+        return h("button", {
+            className: "msg-react-btn", type: "button", title: label, "aria-label": label,
+            onClick: (e) => this._toggleMessageMenu(e, m.id, text),
+        }, reactable ? "🙂" : "⧉");
+    },
+
+    /** Whether `m`, a message of the open chat, takes a reaction (§7): in a
+     *  direct chat one whose LXMF hash is known, in a Group joined here a
+     *  post with its post id (one from a client older than reactions has
+     *  none); never a channel post or a system message. */
+    _reactable(m) {
+        const conv = this.state?.activeHash;
+        if (!conv || !m || m.dir === "system") return false;
+        if (GroupStore.isGroupChat(conv)) return GroupStore.get(conv)?.groupStatus === "active" && /^[0-9a-f]{32}$/.test(m.postId ?? "");
+        if (ChannelStore.get(conv)) return false;
+        return /^[0-9a-f]{64}$/.test(m.lxmfHash ?? "");
+    },
+
+    /** The chips under a bubble (§3 display): one per reaction someone
+     *  holds, with how many hold it, highlighted when one of them is the
+     *  user (any address the user has in this chat, _reactionSelf). A tap
+     *  sets that reaction as the user's, or takes the user's back when it
+     *  is that one already. null when nobody holds a reaction. */
+    _buildReactionChips(m) {
+        if (!m.reactions) return null;
+        const conv = this.state?.activeHash;
+        const mine = conv ? this._reactionSelf(conv) : new Set();
+        const chips = reactionChips(m.reactions, (reactor) => mine.has(reactor));
+        if (!chips.length) return null;
+        const tappable = this._reactable(m);
+        return h("div", { className: "msg-reactions" },
+            ...chips.map(chip => h("button", {
+                className: `msg-reaction${chip.mine ? " mine" : ""}`, type: "button", disabled: !tappable,
+                title: `${chip.count} ${chip.count === 1 ? "reaction" : "reactions"}${chip.mine ? ", yours among them" : ""}`,
+                onClick: (e) => { e.stopPropagation(); this._tapReactionChip(m.id, chip.emoji); },
+            }, `${chip.emoji} ${chip.count}`)),
+        );
+    },
+
+    /** The addresses the user has in chat `conv`, for the chips: a Group's
+     *  self set (RnsClient._groupSelf), else this device and the distro it
+     *  holds with its known siblings. */
+    _reactionSelf(conv) {
+        if (GroupStore.isGroupChat(conv)) return RnsClient._groupSelf(GroupStore.get(conv));
+        return new Set([RnsClient.ownHash ?? ownLxmfDestinationHash(), ...RnsClient._distroSelf()].filter(Boolean));
+    },
+
+    /** The address a reaction of the user's in chat `conv` goes as: a
+     *  Group's signer, else whoever sends now (null when a Group has none). */
+    _reactionSender(conv) {
+        if (GroupStore.isGroupChat(conv)) return RnsClient._groupSigner(GroupStore.get(conv))?.hash ?? null;
+        return RnsClient.sendingIdentity().hash;
+    },
+
+    /** Message `id` of chat `conv` as stored now, or null. */
+    _storedMessage(conv, id) {
+        const store = GroupStore.isGroupChat(conv) ? GroupMsgStore : ChannelStore.get(conv) ? ChannelMsgStore : MsgStore;
+        return store.get(conv).find(x => x.id === id) ?? null;
+    },
+
+    /** The react button: opens its message's menu above the bubble (below
+     *  it when the list would hide it), the six quick reactions (when the
+     *  message takes one, read from the store now) and Copy (when it has
+     *  text); a second press closes it. One menu is open at a time. */
+    _toggleMessageMenu(e, msgId, text) {
+        e.stopPropagation();
+        const line = e.currentTarget.parentNode;
+        const wasOpen = !!this._messageMenu && this._messageMenu.parentNode === line;
+        this._closeMessageMenu();
+        if (wasOpen) return;
+        const conv = this.state.activeHash;
+        const record = conv ? this._storedMessage(conv, msgId) : null;
+        const reactable = !!record && this._reactable(record);
+        const held = reactable ? reactionOf(record.reactions, this._reactionSender(conv)) : "";
+        const menu = h("div", { className: "msg-menu", role: "menu" },
+            ...(reactable ? QUICK_REACTIONS.map(emoji => h("button", {
+                className: `msg-menu-emoji${emoji === held ? " mine" : ""}`, type: "button", role: "menuitem",
+                title: emoji === held ? "Take your reaction back" : `React ${emoji}`,
+                onClick: (ev) => { ev.stopPropagation(); this._react(msgId, emoji === held ? "" : emoji); },
+            }, emoji)) : []),
+            text ? h("button", {
+                className: "msg-menu-copy", type: "button", role: "menuitem",
+                onClick: (ev) => { ev.stopPropagation(); this._copyMessageText(text); },
+            }, "Copy") : null,
+        );
+        line.appendChild(menu);
+        this._messageMenu = menu;
+        const list = document.getElementById("msg-list");
+        if (list && menu.getBoundingClientRect().top < list.getBoundingClientRect().top) menu.classList.add("below");
+    },
+
+    /** Close the open message menu; whether one was open. */
+    _closeMessageMenu() {
+        const menu = this._messageMenu;
+        this._messageMenu = null;
+        if (!menu?.isConnected) return false;
+        menu.remove();
+        return true;
+    },
+
+    /** A tap on a reaction chip: that reaction as the user's, or the
+     *  user's taken back when it is that one already. */
+    _tapReactionChip(msgId, emoji) {
+        const conv = this.state.activeHash;
+        const record = conv ? this._storedMessage(conv, msgId) : null;
+        const me = conv ? this._reactionSender(conv) : null;
+        const held = record && me ? reactionOf(record.reactions, me) : "";
+        this._react(msgId, held === emoji ? "" : emoji);
+    },
+
+    /** The user's reaction `emoji` ("" takes theirs back) to message
+     *  `msgId` of the open chat, as stored now: RnsClient.sendReaction in a
+     *  direct chat, sendGroupReaction in a Group. Applied there at once;
+     *  why it could not go is said above the composer. */
+    _react(msgId, emoji) {
+        this._closeMessageMenu();
+        const conv = this.state.activeHash;
+        if (!conv) return;
+        const fail = (error) => {
+            console.warn(`[retichat] Reaction not sent: ${error?.message || error}`);
+            this._composerNotice(`Reaction not sent: ${error?.message || error}`);
+        };
+        try {
+            const record = this._storedMessage(conv, msgId);
+            if (!record) throw new Error("the message is no longer here");
+            if (GroupStore.isGroupChat(conv)) RnsClient.sendGroupReaction(conv, record, emoji).catch(fail);
+            else RnsClient.sendReaction(ContactStore.get(conv), record, emoji);
+        } catch (error) {
+            fail(error);
+        }
+    },
+
+    /** Copy: the whole text the bubble shows, to the clipboard. Part of it
+     *  is copied by selecting it, as any text on the page. */
+    _copyMessageText(text) {
+        this._closeMessageMenu();
+        if (!navigator.clipboard?.writeText) {
+            this._composerNotice("This browser does not let the page copy: select the text instead.");
+            return;
+        }
+        navigator.clipboard.writeText(text).then(
+            () => console.log(`[retichat] Copied a message's text (${text.length} characters)`),
+            (error) => this._composerNotice(`Not copied: ${error?.message || error}`),
+        );
+    },
+
+    /** A click on a message row: closes a message menu open elsewhere, and
+     *  on a touch screen (no hover) shows that message's react button, or
+     *  hides it again; one row shows it at a time. A click on a link or a
+     *  button in the row is that control's. */
+    _messageRowClick(e) {
+        if (this._messageMenu && !this._messageMenu.contains(e.target)) this._closeMessageMenu();
+        if (!(window.matchMedia?.(TOUCH_FIRST).matches ?? false)) return;
+        if (e.target.closest?.("a, button")) return;
+        const row = e.currentTarget;
+        const shown = row.classList.contains("show-actions");
+        for (const other of document.querySelectorAll(".msg-row.show-actions")) other.classList.remove("show-actions");
+        if (!shown) row.classList.add("show-actions");
+    },
+
+    /** A reaction changed message `msgId` of chat `convHash` (RnsClient
+     *  "reaction" event): in the open chat its chips are rebuilt, in place,
+     *  and what the reader is looking at stays where it is (_holdView).
+     *  Nothing else changes: no row, no unread, the chat list's order. */
+    _repaintReactions(convHash, msgId) {
+        if (this.state.activeHash !== convHash) return;
+        const list = document.getElementById("msg-list");
+        const row = list ? [...list.querySelectorAll(".msg-row[data-msg-id]")].find(r => r.getAttribute("data-msg-id") === msgId) : null;
+        if (!row) return;
+        const m = this._storedMessage(convHash, msgId);
+        if (!m) return;
+        const held = this._holdView(list, [...list.querySelectorAll("[data-msg-id]")]);
+        const next = this._buildReactionChips(m);
+        const old = [...row.children].find(c => c.classList?.contains("msg-reactions"));
+        if (old && next) old.replaceWith(next);
+        else if (old) old.remove();
+        else if (next) row.appendChild(next);
+        held?.();
     },
 
     // ===== ATTACHMENTS =====
@@ -13410,6 +13610,14 @@ const App = {
                     document.body.classList.remove("narrow-chat-open");
                     this.render();
                 }
+                return;
+            }
+
+            // A reaction (REACTIONS-DESIGN.md §3): the chips of the bubble it
+            // changed, in the open chat, and nothing else: no new row, no
+            // unread, the chat list's order unchanged.
+            if (msg.kind === "reaction") {
+                if (inActiveChat) this._repaintReactions(peerHash, msg.id);
                 return;
             }
 
