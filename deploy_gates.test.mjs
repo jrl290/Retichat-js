@@ -664,6 +664,7 @@ describe("deploy gates", { concurrency: 2 }, () => {
             const probes = block.replace("STRAY_PROBES=(", "").split(/\s+/).filter(Boolean);
             assert.ok(probes.length >= 30, `probes: ${probes.length}`);
             for (const must of ["debug.html", "debug-standalone.html", "packet.js", "post_interface.js",
+                "destination.js", "link.js", "reticulum.js",
                 "app.js.bak-bug135", "app.js.bak-sendas-20260816", "index.html.bak", "style.css.bak"]) {
                 assert.ok(probes.includes(must), `verify-deploy.sh probes ${must}`);
             }

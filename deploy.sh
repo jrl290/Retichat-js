@@ -139,10 +139,12 @@ EXCLUDE=(config.json config.local.json)
 # could be the host's or another site's on a shared docroot, so it is reported
 # there as not ours and never flagged or moved.
 OWNED_NAMES=(debug.html debug-standalone.html packet.js post_interface.js
+             destination.js link.js reticulum.js
              config.local.json config.template.json selectiv-snapshot
              deploy.sh verify-deploy.sh deploy.env deploy.env.example .deploy.log)
 OWNED_BASES=(index.html app.js style.css retichat-icon.png config.json lib
-             debug.html debug-standalone.html packet.js post_interface.js)
+             debug.html debug-standalone.html packet.js post_interface.js
+             destination.js link.js reticulum.js)
 BACKUP_SUFFIXES=('.bak*' '.orig*' '.old*' '.save*' '~')
 
 # Moved strays go here, relative to the node account's home: outside every

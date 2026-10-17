@@ -65,7 +65,7 @@ PAYLOAD=(index.html app.js style.css retichat-icon.png lib)
 # together). Add a name here when one turns up.
 STRAY_PROBES=(
   debug.html debug-standalone.html debug.html.bak debug.html.bak-bug135
-  packet.js post_interface.js
+  packet.js post_interface.js destination.js link.js reticulum.js
   app.js.bak app.js.orig app.js.old app.js~
   app.js.bak-bug135 app.js.bak-preannounce app.js.bak-20260808-112804 app.js.bak2-20260808-120601
   app.js.bak-sendas-20260816 app.js.bak-stamp-parity-20260816 app.js.bak-predistro-ui-20260816
