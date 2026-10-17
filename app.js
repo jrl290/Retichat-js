@@ -11363,11 +11363,11 @@ const App = {
                     h("div", { className: "msg-meta" },
                         h("span", { className: "msg-time" }, fmtTime(m.timestamp)),
                         statusIcon ? h("span", { className: `msg-status ${m.status}`, "data-msg-status": m.status }, statusIcon) : null,
+                        this._buildReactionMarks(m),
                     ),
                 ),
                 this._buildMessageActions(m, text),
             ),
-            this._buildReactionChips(m),
         );
     },
 
@@ -11400,25 +11400,22 @@ const App = {
         return /^[0-9a-f]{64}$/.test(m.lxmfHash ?? "");
     },
 
-    /** The chips under a bubble (§3 display): one per reaction someone
-     *  holds, with how many hold it, highlighted when one of them is the
-     *  user (any address the user has in this chat, _reactionSelf). A tap
-     *  sets that reaction as the user's, or takes the user's back when it
-     *  is that one already. null when nobody holds a reaction. */
-    _buildReactionChips(m) {
+    /** The reactions in a bubble's footer, in the checkmark's place (§3
+     *  display, §7; James, 2026-10-17): each one someone holds, once, with
+     *  no count and no chip. Beside them the sent and delivered checkmarks
+     *  are hidden (style.css); queued, sending and failed stay. Reacting
+     *  and taking one back are in the message's menu. The title says how
+     *  many hold each and whether the user (any address the user has in
+     *  this chat, _reactionSelf) is among them. null when nobody holds a
+     *  reaction. */
+    _buildReactionMarks(m) {
         if (!m.reactions) return null;
         const conv = this.state?.activeHash;
         const mine = conv ? this._reactionSelf(conv) : new Set();
         const chips = reactionChips(m.reactions, (reactor) => mine.has(reactor));
         if (!chips.length) return null;
-        const tappable = this._reactable(m);
-        return h("div", { className: "msg-reactions" },
-            ...chips.map(chip => h("button", {
-                className: `msg-reaction${chip.mine ? " mine" : ""}`, type: "button", disabled: !tappable,
-                title: `${chip.count} ${chip.count === 1 ? "reaction" : "reactions"}${chip.mine ? ", yours among them" : ""}`,
-                onClick: (e) => { e.stopPropagation(); this._tapReactionChip(m.id, chip.emoji); },
-            }, `${chip.emoji} ${chip.count}`)),
-        );
+        const label = chips.map(chip => `${chip.emoji} ${chip.count}${chip.mine ? ", yours among them" : ""}`).join("; ");
+        return h("span", { className: "msg-reactions", title: label, "aria-label": label }, chips.map(chip => chip.emoji).join(""));
     },
 
     /** The addresses the user has in chat `conv`, for the chips: a Group's
@@ -11482,16 +11479,6 @@ const App = {
         return true;
     },
 
-    /** A tap on a reaction chip: that reaction as the user's, or the
-     *  user's taken back when it is that one already. */
-    _tapReactionChip(msgId, emoji) {
-        const conv = this.state.activeHash;
-        const record = conv ? this._storedMessage(conv, msgId) : null;
-        const me = conv ? this._reactionSender(conv) : null;
-        const held = record && me ? reactionOf(record.reactions, me) : "";
-        this._react(msgId, held === emoji ? "" : emoji);
-    },
-
     /** The user's reaction `emoji` ("" takes theirs back) to message
      *  `msgId` of the open chat, as stored now: RnsClient.sendReaction in a
      *  direct chat, sendGroupReaction in a Group. Applied there at once;
@@ -11543,22 +11530,24 @@ const App = {
     },
 
     /** A reaction changed message `msgId` of chat `convHash` (RnsClient
-     *  "reaction" event): in the open chat its chips are rebuilt, in place,
-     *  and what the reader is looking at stays where it is (_holdView).
-     *  Nothing else changes: no row, no unread, the chat list's order. */
+     *  "reaction" event): in the open chat the reactions in its footer are
+     *  redrawn, in place, and what the reader is looking at stays where it
+     *  is (_holdView). Nothing else changes: no row, no unread, the chat
+     *  list's order. */
     _repaintReactions(convHash, msgId) {
         if (this.state.activeHash !== convHash) return;
         const list = document.getElementById("msg-list");
         const row = list ? [...list.querySelectorAll(".msg-row[data-msg-id]")].find(r => r.getAttribute("data-msg-id") === msgId) : null;
-        if (!row) return;
+        const meta = row?.querySelector(".msg-meta");
+        if (!meta) return;
         const m = this._storedMessage(convHash, msgId);
         if (!m) return;
         const held = this._holdView(list, [...list.querySelectorAll("[data-msg-id]")]);
-        const next = this._buildReactionChips(m);
-        const old = [...row.children].find(c => c.classList?.contains("msg-reactions"));
+        const next = this._buildReactionMarks(m);
+        const old = meta.querySelector(".msg-reactions");
         if (old && next) old.replaceWith(next);
         else if (old) old.remove();
-        else if (next) row.appendChild(next);
+        else if (next) meta.appendChild(next);
         held?.();
     },
 

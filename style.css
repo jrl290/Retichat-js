@@ -690,11 +690,15 @@ html, body {
 
 .msg-meta {
     font-size: 10px;
-    opacity: 0.65;
     margin-top: 3px;
     display: flex;
     gap: 4px;
     align-items: center;
+}
+/* The time and status dimmed, the reactions not: a filter, so a status
+   icon's own opacity counts on top as it did when the row was dimmed. */
+.msg-meta > :not(.msg-reactions) {
+    filter: opacity(0.65);
 }
 
 /* The react button beside a bubble (App._buildMessageActions): outside
@@ -774,31 +778,18 @@ html, body {
     font-weight: 600;
 }
 
-/* Reaction chips under a bubble (App._buildReactionChips): one per
-   reaction with how many hold it; the user's highlighted. */
+/* The reactions in a bubble's footer (App._buildReactionMarks), in the
+   checkmark's place: each one held, once, no count (James, 2026-10-17).
+   Last in the row, whatever order a status change added its icon in; the
+   sent and delivered checkmarks hide beside them. */
 .msg-reactions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin-top: 3px;
-    max-width: 100%;
+    order: 1;
+    font-size: 13px;
+    line-height: 1;
 }
-.msg-reaction {
-    padding: 2px 8px;
-    border-radius: 12px;
-    border: 1px solid var(--border-strong);
-    background: var(--surface);
-    color: var(--text-secondary);
-    font-size: 12px;
-    line-height: 1.4;
-    cursor: pointer;
+.msg-meta:has(.msg-reactions) .msg-status:is(.sent, .propagated, .proved) {
+    display: none;
 }
-.msg-reaction.mine {
-    border-color: var(--primary);
-    background: var(--primary-bg);
-    color: var(--text);
-}
-.msg-reaction:disabled { cursor: default; }
 
 /* Message delivery status icons */
 .msg-status {

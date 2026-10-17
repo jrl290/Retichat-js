@@ -832,15 +832,15 @@ test("every receive path checks for a reaction before it stores, notifies or reo
     assert.doesNotMatch(methodText("_repaintReactions(convHash, msgId)"), /_refreshSidebar|render\(\)/);
 });
 
-test("the page: no inline style attributes and no user-select: none on messages; the react button, its menu and the chips are h() elements wired by onClick", async () => {
+test("the page: no inline style attributes and no user-select: none on messages; the react button and its menu are h() elements wired by onClick, the reactions an h() span in the footer", async () => {
     const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
     for (const rule of css.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
         if (/msg-|message-list/.test(rule[1])) assert.doesNotMatch(rule[2], /user-select:\s*none/, rule[1].trim());
     }
-    for (const sel of [".msg-react-btn", ".msg-menu", ".msg-reactions", ".msg-reaction.mine", ".msg-row.show-actions .msg-react-btn", ".msg-line"]) {
+    for (const sel of [".msg-react-btn", ".msg-menu", ".msg-reactions", ".msg-meta:has(.msg-reactions) .msg-status:is(.sent, .propagated, .proved)", ".msg-row.show-actions .msg-react-btn", ".msg-line"]) {
         assert.ok(css.includes(sel), sel);
     }
-    const ui = ["_buildMessageActions(m, text)", "_buildReactionChips(m)", "_toggleMessageMenu(e, msgId, text)", "_messageRowClick(e)", "_copyMessageText(text)"]
+    const ui = ["_buildMessageActions(m, text)", "_buildReactionMarks(m)", "_toggleMessageMenu(e, msgId, text)", "_messageRowClick(e)", "_copyMessageText(text)"]
         .map((sig) => { const at = app.indexOf(`\n    ${sig} {`); assert.notEqual(at, -1, sig); return app.slice(at, app.indexOf("\n    },\n", at)); }).join("\n");
     assert.doesNotMatch(ui, /setAttribute\("style"|style:\s*"|innerHTML|addEventListener/);
     assert.match(ui, /navigator\.clipboard\.writeText\(text\)/);

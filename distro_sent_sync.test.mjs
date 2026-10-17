@@ -868,19 +868,19 @@ test("what reaches the user's own action (_oweDistro) begins with the user and n
             "RnsClient._dropMembershipOwedToOtherDistros"],
         _sendDistroNeverLeft: ["RnsClient._followExchange", "RnsClient._sendDistroNeverLeft"],
         // A DM reaction (REACTIONS-DESIGN.md §2) and a Group reaction (§4): the user's tap on a quick reaction in a
-        // message's menu, or on a reaction chip, and nothing else.
+        // message's menu, and nothing else.
         sendReaction: ["RnsClient.sendReaction", "App._react"],
         sendGroupReaction: ["RnsClient.sendGroupReaction", "App._react"],
-        _react: ["App._toggleMessageMenu", "App._tapReactionChip", "App._react"],
+        _react: ["App._toggleMessageMenu", "App._react"],
         _toggleMessageMenu: ["App._buildMessageActions", "App._toggleMessageMenu"],
-        _tapReactionChip: ["App._buildReactionChips", "App._tapReactionChip"],
     };
     for (const [name, where] of Object.entries(places)) assert.deepEqual(at(name), where, `${name}: written where it is today, and nowhere else`);
 
-    // A reaction: the react button's click opens the menu, whose quick reactions are clicks; a chip is a click.
+    // A reaction: the react button's click opens the menu, whose quick reactions are clicks; the reactions in a
+    // bubble's footer take none.
     assert.match(member("App._buildMessageActions"), /onClick: \(e\) => this\._toggleMessageMenu\(e, m\.id, text\),/);
     assert.match(member("App._toggleMessageMenu"), /onClick: \(ev\) => \{ ev\.stopPropagation\(\); this\._react\(msgId, emoji === held \? "" : emoji\); \},/);
-    assert.match(member("App._buildReactionChips"), /onClick: \(e\) => \{ e\.stopPropagation\(\); this\._tapReactionChip\(m\.id, chip\.emoji\); \},/);
+    assert.doesNotMatch(member("App._buildReactionMarks"), /onClick/);
 
     // A DM: the composer's Enter key and send button in each chat view, the harness's send, and App.sendMessage's
     // one call, with what the composer holds, to the open chat's contact.

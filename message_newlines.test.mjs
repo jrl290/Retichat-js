@@ -105,7 +105,7 @@ function bubbles() {
     return install(self, {
         h, bubbleText, fmtTime: () => "12:00", RnsClient: { _sendTransfers: { progressOf: () => null } },
     }, ["_buildMsgBubble(m, sender = null)", "_buildSenderLabel(sender)", "_buildProgressBar(progress)",
-        "_buildMessageActions(m, text)", "_reactable(m)", "_buildReactionChips(m)"]);
+        "_buildMessageActions(m, text)", "_reactable(m)", "_buildReactionMarks(m)"]);
 }
 
 test("the bubble holds the text in a .msg-text element of its own, line breaks in it, between the sender label and the meta line; the record is not touched", () => {
