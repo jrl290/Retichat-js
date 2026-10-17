@@ -85,6 +85,13 @@ function asUint64AtMs(bytes, pos) {
     return out;
 }
 
+/** A vector's §7 group_sync object as this reader reports it: the vectors
+ *  predate reactions (REACTIONS-DESIGN.md §5.3), and the reading now has
+ *  `content` (a react's) and `post_id` (a post's or a react's) too, null in
+ *  every one of them: no vector's post carries an element after left. The
+ *  vectors themselves are LXMF-rust's and stay as they are. */
+const withReactionKeys = (expected) => (expected === null ? null : { ...expected, content: null, post_id: null });
+
 /** A G as the web packs it: D to D, empty title and content, `timestamp`. */
 function packG(sync, timestamp) {
     const m = new LXMessage();
@@ -149,8 +156,8 @@ test("each op, with an empty and a full left: read exactly as the vector expects
     assert.equal(V.ops.length, 8);
     for (const v of V.ops) {
         const packed = hex(v.packed_hex);
-        assert.deepEqual(readGroupSync(packed.subarray(96), D), v.expected, v.name);
-        assert.deepEqual(readGroupSyncFields(hex(v.fields_hex), 0, D), v.expected, v.name);
+        assert.deepEqual(readGroupSync(packed.subarray(96), D), withReactionKeys(v.expected), v.name);
+        assert.deepEqual(readGroupSyncFields(hex(v.fields_hex), 0, D), withReactionKeys(v.expected), v.name);
     }
 });
 
@@ -167,7 +174,7 @@ test("each op, with an empty and a full left: the web writes the vector's bytes,
         const check = LXMessage.verify(hex(D), hex(D), packed.subarray(32, 96), payload, () => distro);
         assert.equal(check.validated, true, `${v.name}: D's signature`);
         assert.equal(check.hash.toString("hex"), Cryptography.fullHash(Buffer.concat([hex(D), hex(D), payload])).toString("hex"));
-        assert.deepEqual(readGroupSync(payload, D), { ...v.expected, by: DEVICE }, `${v.name}: read back`);
+        assert.deepEqual(readGroupSync(payload, D), { ...withReactionKeys(v.expected), by: DEVICE }, `${v.name}: read back`);
     }
 });
 
@@ -185,8 +192,8 @@ test("the web's form is the vectors' accept_web_form_int64_at_ms byte for byte: 
 test("every variant a Rust writer does not make is read as the vector expects", () => {
     assert.equal(V.variants.length, 15);
     for (const v of V.variants) {
-        assert.deepEqual(readGroupSyncFields(hex(v.fields_hex), 0, D), v.expected, v.name);
-        assert.deepEqual(readGroupSync(hex(v.packed_hex).subarray(96), D), v.expected, v.name);
+        assert.deepEqual(readGroupSyncFields(hex(v.fields_hex), 0, D), withReactionKeys(v.expected), v.name);
+        assert.deepEqual(readGroupSync(hex(v.packed_hex).subarray(96), D), withReactionKeys(v.expected), v.name);
     }
 });
 
@@ -207,7 +214,8 @@ test("at_ms in every integer encoding is read by value; 2^53, negatives, floats,
 
 test("every rule-4 failure has a problem and nothing else: by as sent, every other key null", () => {
     assert.equal(V.rejects.length, 53);
-    const nulls = { op: null, group_id: null, at_ms: null, name: null, members: null, keys: null, creator: null, text: null, left: null };
+    const nulls = { op: null, group_id: null, at_ms: null, name: null, members: null, keys: null, creator: null, text: null, left: null,
+        content: null, post_id: null };
     for (const v of V.rejects) {
         const r = readGroupSyncFields(hex(v.fields_hex), 0, D);
         assert.notEqual(r, null, `${v.name}: still a group sync`);
@@ -285,7 +293,7 @@ test("the sealed blobs: the web's unwrap gives the vector's hash (LXMF.py's, ove
         const entries = groupEntriesOf(message.fields);
         assert.deepEqual(entries, { has_group_id: e.has_group_id, group_id: e.group_id, group_action: e.group_action, group_name: e.group_name }, s.name);
         const read = readGroupSync(plaintext.subarray(80), D);
-        assert.deepEqual(read, e.group_sync, `${s.name}: group_sync`);
+        assert.deepEqual(read, withReactionKeys(e.group_sync), `${s.name}: group_sync`);
         assert.equal(message.signatureValidated, e.signature_validated, `${s.name}: validated`);
         assert.equal(message.signatureValidated ? 0 : message.unverifiedReason, e.unverified_reason, `${s.name}: unverified_reason`);
         assert.equal(message.senderKey ? Buffer.from(message.senderKey).toString("hex") : null, e.sender_key_hex, `${s.name}: sender_key`);
