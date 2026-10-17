@@ -378,46 +378,37 @@ test("LXMRouter enables ratchets on lxmf.delivery with the store it is given, an
     assert.equal(old.destination.buildAnnounceData(APP_DATA).contextFlag, Packet.FLAG_UNSET, "and its announce carries none");
 });
 
-test("the delivery destination rotates every DELIVERY_RATCHET_INTERVAL, so at the web's 5-minute announces the ratchet a sender heard last is still held the 30 days the sender uses it (RNS's 30 minutes held about 12 days)", (t) => {
+test("the delivery destination rotates at RNS's 30 minutes, as LXMF leaves it (James, 2026-10-17: parity), so at the web's 5-minute announces a ratchet is held about 12 days", (t) => {
     fresh();
     let now = 1_800_000_000 * SECOND;
     t.mock.method(Date, "now", () => now);
-    assert.equal(LXMRouter.DELIVERY_RATCHET_INTERVAL, Math.ceil(Identity.RATCHET_EXPIRY / (Destination.RATCHET_COUNT - 1)));
-    const router = new LXMRouter(new Reticulum(), Identity.create(), { ratchets: Destination.memoryRatchetStore() });
-    const destination = router.destination;
-    assert.equal(destination.ratchetInterval, LXMRouter.DELIVERY_RATCHET_INTERVAL);
+    const destination = new LXMRouter(new Reticulum(), Identity.create(), { ratchets: Destination.memoryRatchetStore() }).destination;
+    assert.equal(Destination.RATCHET_INTERVAL, 30 * 60);
+    assert.equal(destination.ratchetInterval, Destination.RATCHET_INTERVAL, "LXMRouter.py register_delivery_identity sets no interval");
+    // RNS Destination.set_ratchet_interval, which LXMF does not call: only a
+    // whole number above 0 is taken.
+    const other = new LXMRouter(new Reticulum(), Identity.create(), { ratchets: Destination.memoryRatchetStore() }).destination;
+    for (const bad of [0, -1, 1.5, "60", null]) assert.equal(other.setRatchetInterval(bad), false, String(bad));
+    assert.equal(other.ratchetInterval, Destination.RATCHET_INTERVAL);
+    assert.equal(other.setRatchetInterval(60), true);
+    assert.equal(other.ratchetInterval, 60);
 
     // The page announcing every 5 minutes (announceIntervalMs); each
-    // announce rotates when due (rotateRatchets, as buildAnnounceData calls it).
+    // announce rotates when due (rotateRatchets, as buildAnnounceData calls
+    // it), so every 35 minutes, at the first announce past the 30. A
+    // ratchet is dropped once 512 newer ones are kept, about 12 days in,
+    // although a sender that heard it last may use it for 30
+    // (Identity.get_ratchet): what it sends after that is not opened here.
     const ANNOUNCE = 300;
     destination.rotateRatchets();
     const first = destination.ratchets[0];
-    while (destination.ratchets[0].equals(first)) {
-        now += ANNOUNCE * SECOND;
-        destination.rotateRatchets();
-    }
-    // A sender that heard `first` in the last announce before it was
-    // replaced uses it until RATCHET_EXPIRY after that (Identity.get_ratchet).
-    const lastUse = now / SECOND + Identity.RATCHET_EXPIRY;
-    while (now / SECOND < lastUse) {
-        now += ANNOUNCE * SECOND;
-        destination.rotateRatchets();
-    }
-    assert.ok(destination.ratchets.some((r) => r.equals(first)), `still held after ${destination.ratchets.length} ratchets`);
-
-    // At RNS's 30 minutes (a rotation every 35 at these announces) it is
-    // dropped about 12 days in.
-    const quick = new LXMRouter(new Reticulum(), Identity.create(), { ratchets: Destination.memoryRatchetStore() }).destination;
-    assert.equal(quick.setRatchetInterval(Destination.RATCHET_INTERVAL), true);
-    quick.rotateRatchets();
-    const dropped = quick.ratchets[0];
     const start = now / SECOND;
-    while (quick.ratchets.some((r) => r.equals(dropped))) {
+    while (destination.ratchets.some((r) => r.equals(first))) {
         now += ANNOUNCE * SECOND;
-        quick.rotateRatchets();
+        destination.rotateRatchets();
     }
     const days = (now / SECOND - start) / (24 * 60 * 60);
-    assert.ok(days < 13, `dropped ${days.toFixed(1)} days in`);
+    assert.ok(days > 11 && days < 13, `dropped ${days.toFixed(1)} days in`);
 });
 
 test("an opportunistic packet encrypted to the delivery destination's ratchet is decrypted and handed on, and says which key opened it", async (t) => {
