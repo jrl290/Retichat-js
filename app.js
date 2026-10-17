@@ -589,17 +589,34 @@ const IdMgr = {
         return false;
     },
     create() {
+        const previous = this._id;
         this._id = Identity.create();
         const fullKey = Buffer.concat([this._id.privateKeyBytes, this._id.signaturePrivateKeyBytes]);
         sSet(ID_KEY, fullKey.toString("hex"));
+        this._dropRatchets(previous);
         return this._id;
     },
     importHex(hex) {
+        const previous = this._id;
         this._id = Identity.fromPrivateKey(Buffer.from(hex,"hex"));
         sSet(ID_KEY, hex);
+        this._dropRatchets(previous);
         return this._id;
     },
-    forget() { this._id = null; sSet(ID_KEY, null); },
+    forget() {
+        const previous = this._id;
+        this._id = null;
+        sSet(ID_KEY, null);
+        this._dropRatchets(previous);
+    },
+    /** The stored ratchets go with the identity they were kept for
+     *  (OwnRatchets, PeerRatchets): when it is forgotten or replaced by
+     *  another, not when the same one is imported again. */
+    _dropRatchets(previous) {
+        if (!previous || (this._id && this._id.hash.equals(previous.hash))) return;
+        OwnRatchets.forget(Destination.hash(previous, "lxmf", "delivery").toString("hex"));
+        PeerRatchets.forget();
+    },
 };
 
 function ownLxmfDestinationHash() {
@@ -951,6 +968,7 @@ const ContactStore = {
                 if (!c) {
                     c = this._row(hash, null, true, false);
                     this._contacts.set(hash, c);
+                    PeerRatchets.rowAdded(hash);
                     changed = true;
                 }
                 if (c.nameOnly) { c.nameOnly = false; changed = true; }
@@ -995,6 +1013,8 @@ const ContactStore = {
         const contact = this._row(destHash, publicKey, hidden, nameOnly, isDistro);
         this._contacts.set(destHash, contact);
         this._save();
+        // the ratchet it announced before it had a row, kept from now on
+        PeerRatchets.rowAdded(destHash);
         this._notify();
         return contact;
     },
@@ -1451,6 +1471,111 @@ const OutboundTickets = {
     _save() { sSet("outbound_tickets", Object.fromEntries(this._entries)); },
 };
 OutboundTickets.init();
+
+// =========================================================================
+//  RATCHETS
+//
+//  PeerRatchets: the ratchets other destinations announced, as Identity
+//  remembers them (Identity.rememberRatchet; RNS Identity._remember_ratchet),
+//  kept across page loads for some destinations. Identity holds every
+//  announced ratchet in memory, as RNS does. RNS also writes every one to
+//  disk; here that would be one entry per announcer heard, in the
+//  localStorage the messages share, whose writes sSet drops silently once it
+//  is full. So only these are kept: a destination this page encrypted to
+//  with its ratchet, a peer ContactStore has a row for (listed or hidden;
+//  a row made after the announce keeps the ratchet then, rowAdded), and one
+//  kept already. One key, {destination hash (hex): [ratchet (hex),
+//  received (s)]}, written only when it changes; an entry received more
+//  than Identity.RATCHET_EXPIRY ago is dropped when the page loads (RNS
+//  Identity._clean_ratchets). Which ones are kept is this page's own
+//  choice: nothing on the wire shows it.
+//
+//  OwnRatchets: the ratchet keys of this identity's lxmf.delivery
+//  (LXMRouter enables them on it), RNS 1.5.2's ratchet file byte for byte
+//  (Destination.packRatchets) as base64, one key per destination,
+//  `ratchets_<destination hash (hex)>`. A stored blob that is not one, or
+//  not signed by the identity, is refused and left in place
+//  (Destination.reloadRatchets).
+//
+//  IdMgr removes both when the identity is forgotten or replaced.
+// =========================================================================
+const PeerRatchets = {
+    KEY: "ratchets_known_v1",
+    _entries: new Map(), // destination hash (hex) → [ratchet (hex), received (s)]
+
+    init() {
+        // An Identity older than ratchets (a cached or restored lib) has no
+        // RATCHET_EXPIRY: every entry would look expired, and the map be
+        // written back empty. Nothing reads it there; it is left as it is.
+        if (typeof Identity.RATCHET_EXPIRY !== "number") return;
+        const stored = sGet(this.KEY);
+        const now = Date.now() / 1000;
+        let dropped = false;
+        if (stored && typeof stored === "object") {
+            for (const [dest, entry] of Object.entries(stored)) {
+                if (Array.isArray(entry) && typeof entry[0] === "string" && entry[0].length === 2 * Identity.RATCHETSIZE_IN_BYTES
+                    && typeof entry[1] === "number" && now < entry[1] + Identity.RATCHET_EXPIRY) {
+                    this._entries.set(dest, entry);
+                } else {
+                    dropped = true;
+                }
+            }
+        }
+        if (dropped) this._save();
+    },
+    load(dest) {
+        const entry = this._entries.get(dest);
+        return entry ? { ratchet: Buffer.from(entry[0], "hex"), received: entry[1] } : null;
+    },
+    /** A destination announced a new ratchet: kept if the destination is. */
+    remembered(dest, entry) {
+        if (this._entries.has(dest) || ContactStore.known(dest)) this._keep(dest, entry);
+    },
+    /** ContactStore made a row for `dest`: the ratchet it announced before
+     *  that, held in memory only until now, is kept as a contact's is. */
+    rowAdded(dest) {
+        const entry = Identity.knownRatchets?.get(dest);
+        if (entry) this._keep(dest, entry);
+    },
+    /** This page encrypted to that ratchet. */
+    encryptedTo(dest, entry) { this._keep(dest, entry); },
+    _keep(dest, { ratchet, received }) {
+        const hex = Buffer.from(ratchet).toString("hex");
+        const kept = this._entries.get(dest);
+        if (kept && kept[0] === hex && kept[1] === received) return;
+        this._entries.set(dest, [hex, received]);
+        this._save();
+    },
+    forget() {
+        this._entries.clear();
+        try { localStorage.removeItem(PFX + this.KEY); } catch (e) {}
+    },
+    _save() { sSet(this.KEY, Object.fromEntries(this._entries)); },
+};
+PeerRatchets.init();
+Identity.ratchetStore = PeerRatchets;
+
+const OwnRatchets = {
+    key(dest) { return `ratchets_${dest}`; },
+    /** The store LXMRouter enables the delivery destination's ratchets with
+     *  (Destination.enableRatchets): load() is null when none is stored, and
+     *  throws on something stored that is not a blob. */
+    store(dest) {
+        return {
+            load: () => {
+                const raw = localStorage.getItem(PFX + this.key(dest));
+                if (raw === null) return null;
+                const blob = JSON.parse(raw);
+                if (typeof blob !== "string") throw new Error("what is stored is not a ratchet blob");
+                return Buffer.from(blob, "base64");
+            },
+            save: (blob) => sSetKept(this.key(dest), Buffer.from(blob).toString("base64")),
+        };
+    },
+    forget(dest) {
+        try { localStorage.removeItem(PFX + this.key(dest)); } catch (e) {}
+    },
+};
 
 // =========================================================================
 //  GROUP STORE — group chat state matching iOS GroupChatManager + ChatRepository
@@ -2986,7 +3111,9 @@ const RnsClient = {
         // (PrivacyFilter). Given to the constructor, so no message can reach
         // the router before the filter is in place. The tickets senders give
         // this client are remembered in OutboundTickets (rememberTicket).
-        this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id, { filter: PrivacyFilter, tickets: OutboundTickets });
+        // The delivery destination's ratchet keys are kept in OwnRatchets
+        // (LXMRouter enables ratchets on it).
+        this._lxmfRouter = new LXMRouter(this._rns, IdMgr.id, { filter: PrivacyFilter, tickets: OutboundTickets, ratchets: OwnRatchets.store(ownLxmfDestinationHash()) });
         this._lxmfRouter.setAnnounceName(OwnNames.announce);
         this._lxmfRouter.on("message", (lxmfMsg) => {
             const srcHash = lxmfMsg.sourceHash?.toString("hex");
@@ -3399,7 +3526,13 @@ const RnsClient = {
         const destHash = lxmfPacked.slice(0, 16);
         const rest = lxmfPacked.slice(16);  // source_hash | sig | payload
         const peerIdentity = Identity.fromPublicKey(Buffer.from(peerPublicKeyHex, "hex"));
-        const encrypted = peerIdentity.encrypt(rest);
+        // To the ratchet the recipient announced last, when one is known, as
+        // LXMessage.py pack encrypts a propagated message (dest.encrypt). An
+        // Identity older than ratchets (a cached or restored lib) knows no
+        // ratchet and encrypts to the identity key.
+        const encrypted = typeof peerIdentity.encryptFor === "function"
+            ? peerIdentity.encryptFor(destHash, rest)
+            : peerIdentity.encrypt(rest);
         let lxmfData = Buffer.concat([destHash, encrypted]);
 
         // Compute propagation stamp (PoW proof-of-work, matching iOS)
@@ -3913,7 +4046,9 @@ const RnsClient = {
                 // decrypted, or whose payload could not be read stayed on the
                 // node and was downloaded again on every fetch, for ever. One
                 // purged unread says so here and in step 4.
-                const { unread: why } = this._ingestPropagatedBlob(lxmfData, `📬 [3/4] ${tidHex}`);
+                let taken = this._ingestPropagatedBlob(lxmfData, `📬 [3/4] ${tidHex}`);
+                if (taken instanceof Promise) taken = await taken;
+                const { unread: why } = taken;
                 if (why !== null) {
                     console.log(`[retichat] 📬 [3/4] ${tidHex} ${why}: purged unread`);
                     unread.push(`${tidHex} ${why}`);
@@ -3946,8 +4081,10 @@ const RnsClient = {
      * (_onPropagatedPush). Both are taken the same way, as LXMF takes both
      * (LXMRouter.py lxmf_propagation; LXMF-rust ingest_propagated_lxmf, which
      * Android's PropagationStream and iOS's configurePropagationStream call
-     * for a push to the device's own address): decrypted with this device's
-     * identity; the privacy filter on the decrypted bytes (source | signature
+     * for a push to the device's own address): decrypted for this device's
+     * delivery destination, with its ratchets (LXMRouter.decryptPropagated,
+     * LXMRouter.py delivery_destination.decrypt); the privacy filter on the
+     * decrypted bytes (source | signature
      * | payload), before any parse, as the router applies it on every direct
      * path (LXMRouter.acceptsSource): a stranger's message was downloaded
      * (its source is inside the ciphertext) but costs nothing more, unless it
@@ -3961,7 +4098,9 @@ const RnsClient = {
      * pre-parse here threw on such a map first, so the message was lost,
      * never purged, and downloaded again on every fetch.
      *
-     * `label` names it in the log. Returns { kept, unread, refused }:
+     * `label` names it in the log. Returns { kept, unread, refused }, or a
+     * promise of it when the older ratchets had to be tried (the newest and
+     * the identity key are tried at once: Destination.decryptSoon):
      * `kept` is true when it was handed to the listeners (one already
      * received included: the handler drops that copy), false when the
      * privacy filter dropped it, it was refused, or it could not be read;
@@ -3981,30 +4120,40 @@ const RnsClient = {
 
         let decrypted;
         try {
-            decrypted = IdMgr.id.decrypt(lxmfData.slice(16));
+            // with the delivery destination's ratchets (LXMRouter.decryptPropagated);
+            // a router older than ratchets (a cached or restored lib) has
+            // none to try, and this identity's key is all it can use
+            decrypted = typeof this._lxmfRouter.decryptPropagated === "function"
+                ? this._lxmfRouter.decryptPropagated(lxmfData.slice(16))
+                : IdMgr.id.decrypt(lxmfData.slice(16));
         } catch (e) {
             return { kept: false, unread: `decrypt failed (${e.message})` };
         }
-        if (!decrypted || decrypted.length < 80) return { kept: false, unread: "decrypt failed" };
-        try {
-            if (!this._lxmfRouter.acceptsSource(decrypted, "propagated")) return { kept: false, unread: null };
-            let message;
+        const take = (decrypted) => {
+            if (!decrypted || decrypted.length < 80) return { kept: false, unread: "decrypt failed" };
             try {
-                message = LXMessage.unpackFromBytes(decrypted, destHash);
+                if (!this._lxmfRouter.acceptsSource(decrypted, "propagated")) return { kept: false, unread: null };
+                let message;
+                try {
+                    message = LXMessage.unpackFromBytes(decrypted, destHash);
+                } catch (e) {
+                    if (LXMessage.isRefusal(e)) return { kept: false, unread: null, refused: true };
+                    console.log("failed to parse lxmf message from bytes", e);
+                    return { kept: false, unread: "bad payload" };
+                }
+                if (!this._lxmfRouter.acceptsMessage(message, "propagated")) {
+                    return { kept: false, unread: null, refused: LXMessage.groupIdRefusal(message) !== null };
+                }
+                console.log(`[retichat] ${label} ✅ from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
+                this._lxmfRouter.emit("message", message);
+                return { kept: true, unread: null };
             } catch (e) {
-                if (LXMessage.isRefusal(e)) return { kept: false, unread: null, refused: true };
-                console.log("failed to parse lxmf message from bytes", e);
-                return { kept: false, unread: "bad payload" };
+                return { kept: false, unread: `exception (${e.message})` };
             }
-            if (!this._lxmfRouter.acceptsMessage(message, "propagated")) {
-                return { kept: false, unread: null, refused: LXMessage.groupIdRefusal(message) !== null };
-            }
-            console.log(`[retichat] ${label} ✅ from ${message.sourceHash.toString("hex").slice(0,12)}: "${message.content.slice(0,60)}"`);
-            this._lxmfRouter.emit("message", message);
-            return { kept: true, unread: null };
-        } catch (e) {
-            return { kept: false, unread: `exception (${e.message})` };
-        }
+        };
+        // A promise when the older ratchets had to be tried
+        // (Destination.decryptSoon): taken once they were.
+        return decrypted instanceof Promise ? decrypted.then(take) : take(decrypted);
     },
 
     /**
@@ -4033,7 +4182,8 @@ const RnsClient = {
      * push_request): the sender is shown nothing either way. False when it
      * could not be read at all: rfed logs the refusal, the message stays in
      * its messagestore, and the next /get downloads it and purges it
-     * unread, as it does any unreadable message.
+     * unread, as it does any unreadable message. A promise of the answer
+     * when the older ratchets had to be tried (_ingestPropagatedBlob).
      */
     _onPropagatedPush(lxmfData) {
         const tid = Cryptography.fullHash(lxmfData).toString("hex");
@@ -4042,16 +4192,21 @@ const RnsClient = {
             console.log(`[retichat] rfed.link push ${tidHex}: already held here — not read again`);
             return true;
         }
-        const { kept, unread, refused } = this._ingestPropagatedBlob(lxmfData, `rfed.link push ${tidHex}`);
-        if (unread !== null) {
-            console.warn(`[retichat] rfed.link push ${tidHex} ${unread}: refused, left to the next /get`);
-            return false;
-        }
-        PropagatedHeld.add(tid);
-        // A refused message was said where it was refused; taken, as the
-        // filter's drop is, and purged by the next /get.
-        if (!kept && !refused) console.log(`[retichat] rfed.link push ${tidHex} dropped by the privacy filter: answered as taken, purged by the next /get`);
-        return true;
+        const answer = ({ kept, unread, refused }) => {
+            if (unread !== null) {
+                console.warn(`[retichat] rfed.link push ${tidHex} ${unread}: refused, left to the next /get`);
+                return false;
+            }
+            PropagatedHeld.add(tid);
+            // A refused message was said where it was refused; taken, as the
+            // filter's drop is, and purged by the next /get.
+            if (!kept && !refused) console.log(`[retichat] rfed.link push ${tidHex} dropped by the privacy filter: answered as taken, purged by the next /get`);
+            return true;
+        };
+        // A promise when the older ratchets had to be tried
+        // (Destination.decryptSoon): answered once they were.
+        const taken = this._ingestPropagatedBlob(lxmfData, `rfed.link push ${tidHex}`);
+        return taken instanceof Promise ? taken.then(answer) : answer(taken);
     },
 
     /** Wait for the response to a request sent on the given link; null if
@@ -7919,7 +8074,10 @@ const RnsClient = {
                 link.sendResponse(requestId, this._handleDistroBlob(payload.slice(0, 16), payload) === true);
             } else if (ownHex && destHex === ownHex) {
                 Harness.event("propagated-link-push", { bytes: payload.length });
-                link.sendResponse(requestId, this._onPropagatedPush(payload) === true);
+                // answered once the older ratchets were tried, when they had to be
+                const held = this._onPropagatedPush(payload);
+                if (held instanceof Promise) held.then((h) => link.sendResponse(requestId, h === true), () => link.sendResponse(requestId, false));
+                else link.sendResponse(requestId, held === true);
             } else {
                 console.log(`[retichat] rfed.link /lxmf push for ${destHex.slice(0, 12)}, neither this device's address nor its distro's — refused`);
                 link.sendResponse(requestId, false);

@@ -120,6 +120,7 @@ function contactStore(storage) {
         sGet: storage.sGet, sSet: storage.sSet, LXMF, Date,
         migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
         cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
+        PeerRatchets: { rowAdded() {} },
     });
     store.init();
     return store;
@@ -1061,6 +1062,7 @@ test("§5.2 a message fetched from the propagation node is verified and named by
             _propLink: link,
             _lxmfRouter: {
                 destination: { hash: myHash }, emit: (event, message) => handle(message),
+                decryptPropagated: (ciphertext) => me.decrypt(ciphertext),
                 acceptsSource: () => true, acceptsMessage: () => true,   // no privacy filter here
             },
             async _waitForResponse(l, request) {

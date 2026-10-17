@@ -77,6 +77,7 @@ function page(me) {
         sGet: storage.sGet, sSet: storage.sSet, LXMF, Date,
         migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
         cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
+        PeerRatchets: { rowAdded() {} },
     });
     ContactStore.init();
     const MsgStore = build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });
@@ -115,6 +116,7 @@ function recipient() {
     const p = page(me);
     const destination = new EventEmitter();
     destination.hash = Destination.hash(me, "lxmf", "delivery");
+    destination.decryptSoon = (ciphertext) => me.decrypt(ciphertext);
     const router = new LXMRouter({ registerDestination: () => destination }, me);
     const handle = messageHandler({
         Buffer, LxmfSeen: { check: () => false }, Harness: { event() {} }, console: quiet,

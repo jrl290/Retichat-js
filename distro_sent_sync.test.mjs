@@ -690,6 +690,7 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     }
     assert.deepEqual(closesAndLosses, {
         "distro_upload.js": ["DistroUploads.proved", "DistroUploads.lost"],
+        "rns/destination.js": ["Destination.nextTask"],
         "rns/interfaces/direct_sockets_interface.js": ["DirectSocketsInterface._cleanup"],
         "rns/interfaces/post_interface.js": ["PostInterface._lose"],
         "rns/interfaces/tcp_client_interface.js": ["TCPClientInterface.connect"],
@@ -699,7 +700,8 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
         "rns/reticulum.js": ["Reticulum.addInterface"],
     }, "lib/ says close, lost, established and recovered only where it does today: a socket's close and the close events of the sockets "
         + "it reads, the Link's own close(), and the close, coming-up and recovery it fires, the exchange's loss report and Reticulum's "
-        + "listener of it, the LXMF router's listener of a link's coming-up, and an upload's state. So no script under lib/ closes a link, "
+        + "listener of it, the LXMF router's listener of a link's coming-up, an upload's state, and the MessageChannel port "
+        + "Destination.nextTask lets go of once it has yielded (no link, no socket). So no script under lib/ closes a link, "
         + "or fires a link's close or coming-up or a loss report anew, however it is written");
     const linkSource = withoutComments(await readFile(new URL("rns/link.js", lib), "utf8"));
     assert.equal(count(linkSource, /\bemit\s*\(\s*["'`]close["'`]/g), 1, "a Link fires its close once in its code");

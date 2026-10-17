@@ -29,7 +29,8 @@ function extractMethod(signature) {
     const start = source.indexOf(`\n    ${signature} {`);
     assert.notEqual(start, -1, `${signature} is missing from destination.js`);
 
-    const bodyStart = source.indexOf("{", start);
+    // the body's brace, after the signature (whose parameters may hold braces)
+    const bodyStart = source.indexOf("{", start + `\n    ${signature}`.length);
     let depth = 0;
     for (let i = bodyStart; i < source.length; i++) {
         if (source[i] === "{") depth++;
@@ -82,12 +83,12 @@ const announce = new Function(
 
 // announce() delegates the signing to buildAnnounceData(), so the payload under
 // test lives there; both are lifted and attached to the same stub destination.
-const buildBody = extractMethod("buildAnnounceData(appDataBytes = null)");
+const buildBody = extractMethod("buildAnnounceData(appDataBytes = null, { randomHash = null, newRatchet = null } = {})");
 const buildAnnounceData = new Function(
     "Cryptography",
     "Packet",
     "Transport",
-    `return function buildAnnounceData(appDataBytes = null) {${buildBody}};`,
+    `return function buildAnnounceData(appDataBytes = null, { randomHash = null, newRatchet = null } = {}) {${buildBody}};`,
 )(CryptographyStub, PacketStub, TransportStub);
 
 /** A destination that captures the announce it would have transmitted. */

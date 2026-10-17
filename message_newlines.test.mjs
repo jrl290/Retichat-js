@@ -299,6 +299,7 @@ function stores() {
         sGet: storage.sGet, sSet: storage.sSet, LXMF, Date,
         migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
         cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
+        PeerRatchets: { rowAdded() {} },
     });
     ContactStore.init();
     const make = (name) => build(name, { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });

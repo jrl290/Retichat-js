@@ -213,6 +213,8 @@ async function runConnect({ exchangeUrl, saved, serve = servedWithPolicy, during
         LXMRouter: class { constructor() { made.push("LXMRouter"); throw STOP; } },
         PrivacyFilter: {},
         OutboundTickets: {},
+        OwnRatchets: { store: () => null },
+        ownLxmfDestinationHash: () => null,
     };
     self = { exchangeBlocked: "stale", _setStatus(s) { statuses.push(s); }, _followExchange() {} };
     self._checkSavedExchange = compile("async _checkSavedExchange(iface, exchangeUrl)", { PagePolicy: p.PagePolicy })(self);

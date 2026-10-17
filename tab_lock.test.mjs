@@ -501,6 +501,8 @@ async function runConnect({ held, takenOverWhileLoading = false }) {
         LXMRouter: class { constructor() { throw STOP; } },
         PrivacyFilter: {},
         OutboundTickets: {},
+        OwnRatchets: { store: () => null },
+        ownLxmfDestinationHash: () => null,
     };
     const self = { _setStatus() {}, _followExchange() {}, _watchExchangeRefusal() {} };
     let outcome;

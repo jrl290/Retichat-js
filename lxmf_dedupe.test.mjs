@@ -314,6 +314,7 @@ function makeRecipient({ me, storage = makeStorage() }) {
     };
     const destination = new EventEmitter();
     destination.hash = Destination.hash(me, "lxmf", "delivery");
+    destination.decryptSoon = (ciphertext) => me.decrypt(ciphertext);
     const router = new LXMRouter({ registerDestination: () => destination }, me);
     const self = {
         _onMsg: [],

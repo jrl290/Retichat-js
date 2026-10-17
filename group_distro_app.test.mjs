@@ -1253,7 +1253,7 @@ const rawMap = (...entries) => (0x80 | entries.length).toString(16) + entries.ma
 const REFUSAL_LINE = /^\[LXMF\] .* refused whole: a map at depth \d+ repeats a key \(.+\), as Python LXMF refuses it/;
 /** What was said about a message's fate: every line logged but the router's
  *  trace of each packet's arrival ("📨 Opportunistic packet: N bytes"). */
-const said = (lines) => lines.filter((l) => !/^\[lxmf-router\] 📨 /.test(l));
+const said = (lines) => lines.filter((l) => !/^\[lxmf-router\] 📨 |^\[RATCHET\] /.test(l));
 
 /** Everything a client keeps (its storage, byte for byte), what it handed
  *  the page, proved and sent: a refused message changes none of it. */
