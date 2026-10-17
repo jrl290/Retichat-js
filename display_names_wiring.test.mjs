@@ -682,7 +682,7 @@ test("§4.1 with no Message Display Name nothing is sent, and a name once delive
 });
 
 test("§4.1 messages to one's own devices never carry a name", () => {
-    for (const sig of ["async _sendDistroSentCopy(recipientHex, title, content)", "_sendDistroViaLxmf()"]) {
+    for (const sig of ["async _sendDistroSentCopy(recipientHex, title, content, sent = null)", "_sendDistroViaLxmf()"]) {
         assert.doesNotMatch(methodBody(sig), /applyDisplayName|_decideMessageName|0xD1/, sig);
     }
 });

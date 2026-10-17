@@ -38,12 +38,14 @@ function uploadSites() {
     return sites;
 }
 
-test("all three propagation upload sites exist", () => {
+test("all four propagation upload sites exist", () => {
     // The live send path and the deferred flush both upload a DM's copy
     // through _propagateMessage, so one site covers both; the distro's two
-    // uploads are both built in _uploadOwed.
-    assert.equal(uploadSites().length, 3, "the DM propagated copy (_propagateMessage), the group fallback, and what the distro "
-        + "is owed (_uploadOwed: the RFed SPEC §17.11 sent-copy and the §17.12 channel membership message)");
+    // uploads are both built in _uploadOwed. A DM reaction's propagated copy
+    // (_dispatchReaction, REACTIONS-DESIGN.md §2) is the fourth.
+    assert.equal(uploadSites().length, 4, "a DM reaction's propagated copy (_dispatchReaction), the DM propagated copy "
+        + "(_propagateMessage), the group fallback, and what the distro is owed (_uploadOwed: the RFed SPEC §17.11 "
+        + "sent-copy and the §17.12 channel membership message)");
 });
 
 /** Where a packet of the upload is built or sent, or the upload is handed

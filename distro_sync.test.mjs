@@ -201,7 +201,7 @@ const CHANNEL = { channelName: "public.sync", channelHash: "cd".repeat(16) };
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 const METHODS = [
-    "async _sendDistroSentCopy(recipientHex, title, content)", "_sendDistroChannelSync(op, ch, atMs)",
+    "async _sendDistroSentCopy(recipientHex, title, content, sent = null)", "_sendDistroChannelSync(op, ch, atMs)",
     "_sealForDistroSync(packed, label)", "_distroSyncProofGoes(link)", "_oweDistro(entry)",
     "async _sendDistroOutbox(link, trigger)", "_distroAttemptOpen(entry, link)", "_unprovedSince(entry, comingUp)",
     "async _uploadOwed(link, entry, comingUp = null)", "_stillOwed(entry)", "_dropMembershipOwedToOtherDistros()",

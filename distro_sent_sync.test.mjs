@@ -101,7 +101,8 @@ test("a DM's dispatch sends the copy once, only when sending as the distro to so
     const body = extractMethod(app, "_dispatchMessage(contact, outMsg)");
     const calls = body.match(/_sendDistroSentCopy\(/g) || [];
     assert.equal(calls.length, 1, "exactly one call site in _dispatchMessage");
-    assert.match(body, /if \(sender\.isDistro && contact\.destHash !== sender\.hash\) \{\s*this\._sendDistroSentCopy\(contact\.destHash, "", content\)/);
+    // It names M by its LXMF hash (key 12, REACTIONS-DESIGN.md §5.2).
+    assert.match(body, /if \(sender\.isDistro && contact\.destHash !== sender\.hash\) \{\s*this\._sendDistroSentCopy\(contact\.destHash, "", content, \{ hash: this\._sentHashFor\(contact, outMsg\) \}\)/);
     const copyAt = body.indexOf("_sendDistroSentCopy(");
     assert.ok(copyAt < body.indexOf("setTimeout("), "sent before, not inside, the propagation fallback timer");
     // After, not before, M's dispatch: a _sendPacket that throws ends
@@ -118,7 +119,10 @@ test("a DM's dispatch sends the copy once, only when sending as the distro to so
         "_sendOverPeerLink(contactHash, publicKeyHex, packed, representation, messageId, onProof, onError)", "_sendDistroViaLxmf()"]) {
         assert.doesNotMatch(extractMethod(app, sig), /_sendDistroSentCopy|DISTRO_SENT_TYPE/, `${sig} must not copy`);
     }
-    assert.equal((app.match(/_sendDistroSentCopy\(/g) || []).length, 2, "one definition, one call");
+    // The other call is a DM reaction's (sendReaction, REACTIONS-DESIGN.md
+    // §2), which has no record and no re-send path of its own.
+    assert.equal((app.match(/_sendDistroSentCopy\(/g) || []).length, 3, "one definition, a DM's call and a DM reaction's");
+    assert.equal((extractMethod(app, "sendReaction(contact, record, emoji)").match(/_sendDistroSentCopy\(/g) || []).length, 1, "a DM reaction copies once");
 });
 
 /** Every macrotask queued before this one has run. */
@@ -183,7 +187,7 @@ function makeSend({ distro, deviceHash, proofs = "auto", linkUp = true }) {
         sealForSync, syncProofKept, Destination,
     };
     install(self, env, [
-        "async _sendDistroSentCopy(recipientHex, title, content)", "_sealForDistroSync(packed, label)", "_distroSyncProofGoes(link)",
+        "async _sendDistroSentCopy(recipientHex, title, content, sent = null)", "_sealForDistroSync(packed, label)", "_distroSyncProofGoes(link)",
         "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
         "_distroAttemptOpen(entry, link)", "_unprovedSince(entry, comingUp)", "async _uploadOwed(link, entry, comingUp = null)", "_stillOwed(entry)",
         "_dropMembershipOwedToOtherDistros()", "_distroOwedOutcome(entry, how, error, goesNow = false)", "_uploadForDistro(link, propagationPacked, label)",
@@ -256,11 +260,11 @@ test("the copy waits for the propagation link and never starts it: the link's ow
     // When M's propagation link comes up is M's own fallback timer's call.
     // (Starting it once meant a flush that re-propagated M inside its direct
     // window; _flushPropagation now uploads only parked copies.)
-    for (const sig of ["async _sendDistroSentCopy(recipientHex, title, content)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
+    for (const sig of ["async _sendDistroSentCopy(recipientHex, title, content, sent = null)", "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
         "async _uploadOwed(link, entry, comingUp = null)", "_uploadForDistro(link, propagationPacked, label)"]) {
         assert.doesNotMatch(extractMethod(app, sig), /_ensurePropagationLink|_establishPropagationLink/, sig);
     }
-    assert.match(extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content)"), /this\._oweDistro\(\{/);
+    assert.match(extractMethod(app, "async _sendDistroSentCopy(recipientHex, title, content, sent = null)"), /this\._oweDistro\(\{/);
     assert.doesNotMatch(app, /_whenPropagationLinkUp|_propLinkUpWaiters/, "nothing waits in memory for the link any more");
     // "established": after identify, with the parked DM copies.
     assert.match(extractMethod(app, "async _onPropagationLinkEstablished(link)"),
@@ -743,13 +747,14 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
 
     // The user's own action: _oweDistro owes a message packed in that same call, from the user's join, leave or DM.
     assert.equal(count(code, /_oweDistro/g), 4, "the method and its three calls");
-    for (const signature of ["async _sendDistroSentCopy(recipientHex, title, content)", "_sendDistroChannelSync(op, ch, atMs)", "_sendDistroGroupSync(op, group, extra = null)"]) {
+    for (const signature of ["async _sendDistroSentCopy(recipientHex, title, content, sent = null)", "_sendDistroChannelSync(op, ch, atMs)", "_sendDistroGroupSync(op, group, extra = null)"]) {
         const body = method(signature);
         assert.equal(count(body, /_oweDistro/g), 1, signature);
         assert.match(body, /const msg = new LXMessage\(\);[\s\S]*const packed = msg\.pack\(DistroManager\.identity, false\);\s*const label = `[^`\n]*`;\s*this\._oweDistro\(\{[^}]*\bpacked: Buffer\.from\(packed\)\.toString\("base64"\),\s*\.\.\.this\._sealForDistroSync\(packed, label\),/,
             `${signature} owes the message it has just packed, sealed for the distro sync proof in the same write (both kinds: James, 2026-10-10, Q1)`);
     }
-    assert.equal(count(code, /_sendDistroSentCopy/g), 2, "made in a DM's dispatch alone");
+    assert.equal(count(code, /_sendDistroSentCopy/g), 3, "made in a DM's dispatch and a DM reaction alone");
+    assert.equal(count(method("sendReaction(contact, record, emoji)"), /_sendDistroSentCopy/g), 1);
     assert.equal(count(method("_dispatchMessage(contact, outMsg)"), /_sendDistroSentCopy/g), 1);
     assert.equal(count(code, /_sendDistroChannelSync/g), 2, "made for the user's own join or leave alone");
     const membership = method("_syncChannelMembership(op, ch)");
@@ -759,11 +764,11 @@ test("the per-entry upload (_uploadOwed) has today's four callers and no other, 
     assert.equal(count(code, /_syncChannelMembership/g), 3, "the user's join and leave");
     assert.equal(count(method("async joinChannel(channelName)"), /this\._syncChannelMembership\("join", ch\);/g), 1);
     assert.equal(count(method("async leaveChannel(channelName)"), /this\._syncChannelMembership\("leave", ch\);/g), 1);
-    // The group sync G (GROUPS-DISTRO-DESIGN.md §10.5-10.6): one per action of the user's, a create, an accept, a leave or a post.
+    // The group sync G (GROUPS-DISTRO-DESIGN.md §10.5-10.6): one per action of the user's, a create, an accept, a leave, a post or a reaction (REACTIONS-DESIGN.md §5.3).
     assert.equal(count(code, /_sendDistroGroupSync/g), 2, "made for the user's own group action alone");
     assert.equal(count(method("_syncGroupAction(op, groupId, extra = null)"), /this\._sendDistroGroupSync\(op, group, extra\);/g), 1);
-    assert.deepEqual(sites(code, "_syncGroupAction", members(code)), ["RnsClient._syncGroupAction", "RnsClient._dispatchGroupMessage", "RnsClient.createGroup",
-        "App._acceptGroupInvite", "App._quitGroup"], "the user's post, create, accept and leave, and nothing else");
+    assert.deepEqual(sites(code, "_syncGroupAction", members(code)), ["RnsClient.sendGroupReaction", "RnsClient._syncGroupAction", "RnsClient._dispatchGroupMessage", "RnsClient.createGroup",
+        "App._acceptGroupInvite", "App._quitGroup"], "the user's reaction, post, create, accept and leave, and nothing else");
 });
 
 test("the distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5): both kinds are sealed where they are packed, in the write that owes them; the upload is built from those bytes; the proof goes only where the client gate lets it, decided in one place", () => {
@@ -836,7 +841,7 @@ test("what reaches the user's own action (_oweDistro) begins with the user and n
 
     // Every place each name is written, in the code or in a string.
     const places = {
-        _sendDistroSentCopy: ["RnsClient._dispatchMessage", "RnsClient._sendDistroSentCopy"],
+        _sendDistroSentCopy: ["RnsClient.sendReaction", "RnsClient._dispatchMessage", "RnsClient._sendDistroSentCopy"],
         _sendDistroChannelSync: ["RnsClient._syncChannelMembership", "RnsClient._sendDistroChannelSync"],
         _dispatchMessage: ["RnsClient.sendMessage", "RnsClient._dispatchMessage", "RnsClient._dispatchQueued"],
         sendMessage: ["RnsClient.sendMessage", "App._buildDmChatView", "App._buildGroupChatView", "App._buildChannelChatView",

@@ -300,6 +300,7 @@ test("every attachment passes withoutLocation in RnsClient.sendMessage, before i
     // are kept is this method's.
     assert.equal((app.match(/_keepAttachments\(MsgStore, contact\.destHash,/g) || []).length, 1);
     assert.deepEqual(app.match(/fields\.set\(FIELD_FILE_ATTACHMENTS, [^;]*;/g), [
+        "fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));",        // _sentHashFor: M packed for its Distro Sync's key 12
         "fields.set(FIELD_FILE_ATTACHMENTS, field);",                                   // _propagateMessage: field = await this._attachmentField(record)
         "fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));",        // _sendPacket
     ]);

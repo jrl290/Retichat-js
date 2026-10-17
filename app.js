@@ -74,6 +74,7 @@ import { ObjectUrls } from "./lib/object_urls.js";
 import { dayMarkers, dayStamp, deviceDayContext, lastMessageTime, sentTimeMs } from "./lib/day_markers.js";
 import { addInOrder } from "./lib/message_order.js";
 import { bubbleText, enterSends, TOUCH_FIRST } from "./lib/message_text.js";
+import { QUICK_REACTIONS, applyReaction, reactionChips, reactionOf } from "./lib/reactions.js";
 import { exchangeUrlRefusal, exchangeRefusalFromViolation } from "./lib/connect_policy.js";
 import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
 import {
@@ -2571,6 +2572,213 @@ const RnsClient = {
     onAttachmentState(fn) { this._onAttachmentState.push(fn); },
     onTick(fn) { this._onTick.push(fn); },
 
+    // =========================================================================
+    //  REACTIONS — REACTIONS-DESIGN.md
+    // =========================================================================
+
+    /**
+     * §3 apply_reaction: reactor `reactor`'s reaction `emoji` ("" taken
+     * back), made at `at` (ms), on `record` of conversation `convHash` in
+     * `store` (MsgStore or GroupMsgStore). A reaction as new as the one the
+     * reactor holds there, or older, is ignored (lib/reactions.js
+     * applyReaction). The open chat is told with a "reaction" event, which
+     * repaints the record's chips and nothing else: no bubble, no
+     * notification, no unread, the chat list's order unchanged. Returns
+     * whether the record changed.
+     */
+    _applyReaction(store, convHash, record, reactor, emoji, at) {
+        const next = applyReaction(record.reactions, reactor, emoji, at);
+        const tag = `${emoji ? `reaction ${emoji}` : "reaction taken back"} by ${reactor.slice(0, 12)} on ${record.id} in ${convHash.slice(0, 12)}`;
+        if (!next) {
+            console.log(`[retichat] ${tag} ignored: the reaction held from it is as new or newer`);
+            return false;
+        }
+        store.update(convHash, record.id, { reactions: next });
+        record.reactions = next;
+        console.log(`[retichat] ${tag} applied`);
+        Harness.event("reaction", { conv: convHash.slice(0, 12), id: record.id, by: reactor.slice(0, 12), emoji });
+        this._onMsg.forEach(fn => fn({ kind: "reaction", id: record.id }, convHash));
+        return true;
+    },
+
+    /**
+     * §3, every receive path: a received reaction (lib/rns/lxmf/lxmf.js
+     * readReaction's reading, not null and not `notAMap`) applied, or dropped with one
+     * line. `chat` says where it arrived: { store, convHash, reactor, at
+     * (ms), where (for the log), byPostId (a Group: REACTION_TO is the 16
+     * bytes of the post's id, else the 32 of a message's LXMF hash) }. The
+     * target is looked for in that conversation only (find_target): a
+     * reactor reaches only messages of a chat they are part of, and nothing
+     * here makes a chat or a contact. Returns whether it was applied.
+     */
+    _takeReaction(reaction, chat) {
+        if (reaction.problem) {
+            console.log(`[retichat] reaction dropped: ${reaction.problem} (${chat.where})`);
+            return false;
+        }
+        const to = Buffer.from(reaction.to).toString("hex");
+        const records = chat.store.get(chat.convHash);
+        const target = chat.byPostId
+            ? (to.length === 32 ? records.find(m => m.postId === to && m.dir !== "system") : null)
+            : (to.length === 64 ? records.find(m => m.lxmfHash === to && m.dir !== "system") : null);
+        if (!target) {
+            console.log(`[retichat] reaction dropped: target ${to.slice(0, 16) || "(empty)"} not in ${chat.where}`);
+            return false;
+        }
+        this._applyReaction(chat.store, chat.convHash, target, chat.reactor, reaction.content, chat.at);
+        return true;
+    },
+
+    /**
+     * §2: the user's reaction `emoji` ("" takes theirs back) to `record`,
+     * a message of the direct chat with `contact`, by its LXMF hash. An
+     * otherwise-empty LXMF message (no title, no content) carrying only
+     * FIELD_REACTION, signed as whoever sends now, sent the way a text
+     * message goes (_dispatchReaction: direct, the propagated copy as its
+     * fallback; no retry, no wait), and applied here at once with its own
+     * time. Sending as the distro, the Distro Sync of this send is owed too
+     * (RFed SPEC §17.11, REACTIONS-DESIGN.md §5.2), carrying its 0x40 and
+     * its hash. No bubble, no record of its own. Throws, with why, when it
+     * cannot go now: nothing is then applied or sent.
+     */
+    sendReaction(contact, record, emoji) {
+        if (!record?.lxmfHash || !/^[0-9a-f]{64}$/.test(record.lxmfHash)) throw new Error("This message cannot be reacted to: its LXMF hash is not known here.");
+        if (!contact?.publicKey) throw new Error("No public key for this contact yet.");
+        if (!this._initialized || this._exchangeIsDown()) throw new Error("Not connected: the reaction was not sent.");
+        const sender = this.sendingIdentity();
+        const peerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
+        const dest = this._rns.registerDestination(peerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+        const to = Buffer.from(record.lxmfHash, "hex");
+        const msg = new LXMessage();
+        msg.sourceHash = Buffer.from(sender.hash, "hex");
+        msg.destinationHash = dest.hash;
+        msg.title = "";
+        msg.content = "";
+        msg.fields = new Map([[LXMF.FIELD_REACTION, LXMF.reactionField(to, emoji)]]);
+        // Non-opportunistic, as _sendPacket packs a DM: the propagated copy
+        // reads the destination at offset 0.
+        const packed = msg.pack(sender.identity, false);
+        const hash = Buffer.from(msg.hash).toString("hex");
+        console.log(`[retichat] ${emoji ? `Reaction ${emoji}` : "Reaction taken back"} on ${record.lxmfHash.slice(0, 12)} to ${contact.destHash.slice(0, 12)} as ${sender.hash.slice(0, 12)} (${hash.slice(0, 12)})`);
+        this._applyReaction(MsgStore, contact.destHash, record, sender.hash, emoji, sentTimeMs(msg.timestamp));
+        this._dispatchReaction(contact, dest, packed, hash);
+        if (sender.isDistro && contact.destHash !== sender.hash) {
+            this._sendDistroSentCopy(contact.destHash, "", "", { hash, reaction: { to, content: emoji } }).catch(error => {
+                console.warn(`[distro] ⚠️ Sent-copy of a reaction to the distro for ${contact.destHash.slice(0,8)} failed:`, error.message);
+                Harness.error("distro-sent-copy", error);
+            });
+        }
+        return hash;
+    },
+
+    /**
+     * A reaction's LXMF message `packed` (its full packing) to `contact`
+     * (`dest` its lxmf.delivery destination), the way a text message goes
+     * (_dispatchMessage, _sendPacket): directly (one packet, or over the
+     * peer's link when LXMF's plan says so), and its propagated copy, the
+     * same bytes, when the direct attempt fails or nothing proved it within
+     * the contact's propagation delay; to a distro address only propagated,
+     * at once (ContactStore.propagationDelay). Nothing is retried and
+     * nothing waits for it; each outcome is said in one line.
+     */
+    _dispatchReaction(contact, dest, packed, hash) {
+        const peer = contact.destHash;
+        const tag = `reaction ${hash.slice(0, 12)} to ${peer.slice(0, 8)}`;
+        let proved = false;
+        let propagated = false;
+        const onProof = () => {
+            if (proved) return;
+            proved = true;
+            console.log(`[retichat] ✅ ${tag}: delivered`);
+        };
+        const propagate = (why) => {
+            if (proved || propagated) return;
+            propagated = true;
+            console.log(`[retichat] 📡 ${tag}: its propagated copy goes (${why})`);
+            this._ensurePropagationLink().then(async (link) => {
+                const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
+                if (proved) return;
+                if (link.status !== Link.ACTIVE) throw new Error("the propagation link closed while it was built");
+                const tookIt = () => console.log(`[retichat] ✓ ${tag}: the propagation node took it`);
+                // As _propagateMessage uploads a DM's copy: over the link MDU
+                // a Resource (a reaction never is, with its 64-byte limit),
+                // else a packet, the proof's entry first (DESIGN_PRINCIPLES
+                // §5), then through the link.
+                if (propagationPacked.length > Link.MDU) {
+                    await link.sendResource(propagationPacked);
+                    tookIt();
+                    return;
+                }
+                const pkt = link.newLinkPacket(Packet.NONE, propagationPacked);
+                const raw = pkt.pack();
+                const key = pkt.packetHash.slice(0, 16).toString("hex");
+                this._pendingPacketHashes.set(key, { contactHash: peer, messageId: hash, reaction: tag, onProof: tookIt });
+                if (link._transmit(raw) === null) {
+                    this._pendingPacketHashes.delete(key);
+                    throw new Error("the propagation link closed before the upload");
+                }
+            }).catch(error => console.warn(`[retichat] ✗ ${tag}: its propagated copy did not go: ${error.message}`));
+        };
+        if (!contact.isDistro) {
+            try {
+                const plan = LXMessage.deliveryPlan(packed);
+                if (plan.method === LXMessage.DIRECT) {
+                    this._sendOverPeerLink(peer, contact.publicKey, packed, plan.representation, hash, onProof,
+                        () => propagate("its direct attempt failed"));
+                } else {
+                    const sent = dest.send(packed.subarray(LXMessage.DESTINATION_LENGTH));
+                    if (sent) this._pendingPacketHashes.set(sent.slice(0, 16).toString("hex"), { contactHash: peer, messageId: hash, reaction: tag, onProof });
+                }
+            } catch (error) {
+                console.warn(`[retichat] ⚠️ ${tag}: its direct attempt failed: ${error.message}`);
+                propagate("its direct attempt failed");
+                return;
+            }
+        }
+        setTimeout(() => propagate(contact.isDistro ? "a distro address" : "no direct proof"),
+            ContactStore.propagationDelay(peer) * 1000);
+    },
+
+    /**
+     * §4: the user's reaction `emoji` ("" takes theirs back) to `record`, a
+     * post of Group `groupId`, by its post id: the usual Group envelope
+     * (GROUP_ID, GROUP_SENDER the group signer, no action), no content, and
+     * FIELD_REACTION whose REACTION_TO is the 16 bytes of the post's id,
+     * Group Fanned out like a post (same members, signed by the group
+     * signer), applied here at once. Taking part as the distro, the Distro
+     * Sync of Group actions owes its `react` (§5.3) once its first member
+     * envelope was handed on, or at once with no member to send to, as a
+     * post's is. A post without an id (from a client older than reactions)
+     * is not offered. Throws, with why, when it cannot go now.
+     */
+    async sendGroupReaction(groupId, record, emoji) {
+        const group = GroupStore.get(groupId);
+        if (!group || group.groupStatus !== "active") throw new Error("Reactions go only to a group joined here.");
+        if (!record?.postId || !/^[0-9a-f]{32}$/.test(record.postId)) throw new Error("This post cannot be reacted to: it came without a post id.");
+        const signer = this._groupSigner(group);
+        if (!signer) throw new Error(this.groupFormerDistroText(group) ?? "This device's identity is not loaded");
+        if (!this._initialized || this._exchangeIsDown()) throw new Error("Not connected: the reaction was not sent.");
+        const to = Buffer.from(record.postId, "hex");
+        LXMF.reactionField(to, emoji); // a content no receiver would take throws here, before anything is applied
+        const at = Date.now();
+        this._applyReaction(GroupMsgStore, groupId, record, signer.hash, emoji, at);
+        const mine = this._groupSelf(group);
+        const targets = [...group.members.entries()]
+            .filter(([hash, status]) => !mine.has(hash) && status === "accepted")
+            .map(([hash]) => hash);
+        const oweReact = () => this._syncGroupAction("react", groupId, { content: emoji, atMs: at, postId: record.postId });
+        const fanout = this._fanoutGroupEnvelope(targets, "", {
+            groupId,
+            groupName: group.groupName,
+            groupSender: signer.hash,
+            reaction: { to, content: emoji },
+        }, signer, oweReact);
+        if (targets.length === 0) oweReact();
+        const delivery = await fanout;
+        console.log(`[retichat] 👥 ${emoji ? `Reaction ${emoji}` : "Reaction taken back"} on post ${record.postId.slice(0, 8)} of group ${groupId.slice(0, 8)} delivered to ${delivery.fulfilled} of ${delivery.total} member(s)`);
+        return delivery;
+    },
+
     /**
      * Keep the attachments a received (or sent) message carries: each one's
      * bytes go to the attachment store under "<msgId>:<index>", and the record
@@ -3068,6 +3276,28 @@ const RnsClient = {
             const groupInfo = LXMessage.groupInfo(lxmfMsg);
             if (groupInfo && groupInfo.groupId) {
                 this._handleGroupMessage(lxmfMsg, srcHash, content, groupInfo);
+                return;
+            }
+
+            // ---- Reaction (REACTIONS-DESIGN.md §3) ----
+            // Before anything that stores a bubble, makes a row or proves a
+            // ticket: a reaction carries no content, so the delivery
+            // notification test below would take one that has a ticket. It
+            // is applied to the message of this chat it names, or dropped
+            // with one line; never a bubble, a contact or a chat. A
+            // reaction whose signature fails is not its source's, and is
+            // dropped. A 0x40 that is no map is no reaction: the message
+            // goes on as it always did.
+            const reaction = lxmfMsg.reaction ?? null;
+            if (reaction?.notAMap) {
+                console.log(`[retichat] RX message from ${srcHash.slice(0,12)}: ${reaction.problem}; read as a message, not a reaction`);
+            } else if (reaction) {
+                if (signatureState === "invalid") {
+                    console.log(`[retichat] reaction dropped: its signature does not verify, so it is not ${srcHash.slice(0,12)}'s (direct)`);
+                } else {
+                    this._takeReaction(reaction, { store: MsgStore, convHash: srcHash, reactor: srcHash,
+                        at: sentTimeMs(lxmfMsg.timestamp), where: `the chat with ${srcHash.slice(0,12)}`, byPostId: false });
+                }
                 return;
             }
 
@@ -4252,10 +4482,13 @@ const RnsClient = {
         // propagation fallback below nor _flushPropagation() comes back
         // through it, so a DIRECT attempt plus a propagated fallback of the
         // same message still yields ONE copy.
-        // Fire-and-forget: the copy never touches outMsg's status.
+        // Fire-and-forget: the copy never touches outMsg's status. It names
+        // M by its LXMF hash (key 12, REACTIONS-DESIGN.md §5.2), known by
+        // now: the direct attempt packed M above, and a message with none
+        // is packed here first as its propagated copy will be (_sentHashFor).
         const sender = this.sendingIdentity();
         if (sender.isDistro && contact.destHash !== sender.hash) {
-            this._sendDistroSentCopy(contact.destHash, "", content).catch(error => {
+            this._sendDistroSentCopy(contact.destHash, "", content, { hash: this._sentHashFor(contact, outMsg) }).catch(error => {
                 console.warn(`[distro] ⚠️ Sent-copy to the distro for ${contact.destHash.slice(0,8)} failed:`, error.message);
                 Harness.error("distro-sent-copy", error);
             });
@@ -4283,6 +4516,43 @@ const RnsClient = {
         // The 30 s ceiling: failed if nothing proved or propagated it, unless
         // a transfer of it is still in flight (_armSendCeiling).
         this._armSendCeiling(contact.destHash, outMsg.id);
+    },
+
+    /**
+     * The LXMF hash of the outgoing DM `outMsg` to `contact`, for its Distro
+     * Sync of a send (REACTIONS-DESIGN.md §5.2): the record's, when the
+     * direct attempt packed it (_sendPacket); otherwise M is packed here as
+     * _propagateMessage will pack it, and its timestamp, ticket and hash are
+     * kept on the record, so the copy that goes later is this very message.
+     * null, said, when it cannot be packed now (its attachments' bytes are
+     * not in this tab): the copy then goes without the hash, as before.
+     */
+    _sentHashFor(contact, outMsg) {
+        const record = MsgStore.get(contact.destHash).find(m => m.id === outMsg.id);
+        if (!record) return null;
+        if (record.lxmfHash) return record.lxmfHash;
+        try {
+            const sender = this._signerFor(record.srcHash) ?? this.sendingIdentity();
+            const peerId = Identity.fromPublicKey(Buffer.from(contact.publicKey, "hex"));
+            const contactDest = this._rns.registerDestination(peerId, Destination.OUT, Destination.SINGLE, "lxmf", "delivery");
+            const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
+            const msg = new LXMessage();
+            msg.sourceHash = Buffer.from(sender.hash, "hex");
+            msg.destinationHash = contactDest.hash;
+            msg.title = "";
+            msg.content = record.content;
+            msg.fields = new Map();
+            msg.fields.set(LXMF.FIELD_TICKET, ticket);
+            applyDisplayName(msg.fields, record.lxmfName);
+            if (record.attachments?.length) msg.fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));
+            msg.pack(sender.identity, false);
+            const lxmfHash = Buffer.from(msg.hash).toString("hex");
+            MsgStore.update(contact.destHash, outMsg.id, { lxmfTimestamp: msg.timestamp, lxmfTicket: ticket, lxmfHash });
+            return lxmfHash;
+        } catch (error) {
+            console.warn(`[distro] ⚠️ The sent-copy for ${contact.destHash.slice(0,8)} goes without its message's hash: ${error.message}`);
+            return null;
+        }
     },
 
     /**
@@ -4390,6 +4660,10 @@ const RnsClient = {
         // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
         // to identify the final recipient.
         const packed = msg.pack(sender.identity, false);
+        // A message no direct attempt packed (to a distro address) is named
+        // by this copy's hash from now on (REACTIONS-DESIGN.md §2); one the
+        // direct attempt packed keeps the hash it went with.
+        if (!record.lxmfHash) MsgStore.update(contact.destHash, outMsg.id, { lxmfHash: Buffer.from(msg.hash).toString("hex") });
 
         // Build propagation_packed: msgpack([timestamp, [[dest_hash | EC_encrypted(rest) | stamp]]])
         const propagationPacked = await this._buildPropagationPacked(packed, contact.publicKey);
@@ -4643,6 +4917,13 @@ const RnsClient = {
                 this._channelPublishes.failed(pending.channelPost, `its packet was lost (${reason})`);
                 continue;
             }
+            if (pending?.reaction) {
+                // A reaction's packet (_dispatchReaction): lost, said. Its
+                // propagated copy still goes after the contact's delay
+                // unless one already went.
+                console.warn(`[retichat] ✗ ${pending.reaction}: its packet was lost (${reason})`);
+                continue;
+            }
             if (!pending?.dm) continue;
             const { contactHash, messageId } = pending;
             const msg = MsgStore.get(contactHash).find(m => m.id === messageId);
@@ -4752,8 +5033,15 @@ const RnsClient = {
      * The entry keeps D's public key, so the copy is still uploaded to D,
      * the same bytes, if this device gives D up before the node proves it
      * (James, 2026-10-03; _dropMembershipOwedToOtherDistros).
+     *
+     * `sent` (REACTIONS-DESIGN.md §5.2) is what the copy says of M: `hash`,
+     * M's LXMF hash (64 hex), goes in key 12 of the copy's Retichat field,
+     * so the other devices file M under it and a reaction to M finds it
+     * there; `reaction`, M's own { to, content } when M is a reaction, goes
+     * in the copy's 0x40 unchanged, and the other devices apply it as the
+     * distro's reaction instead of filing a bubble.
      */
-    async _sendDistroSentCopy(recipientHex, title, content) {
+    async _sendDistroSentCopy(recipientHex, title, content, sent = null) {
         const distroHash = DistroManager.lxmfDeliveryHash;
         const deviceHash = this.ownHash;
         if (!DistroManager.has || !distroHash) return;
@@ -4771,6 +5059,8 @@ const RnsClient = {
         msg.fields.set(LXMF.FIELD_CUSTOM_TYPE, LXMF.DISTRO_SENT_TYPE);
         msg.fields.set(LXMF.FIELD_CUSTOM_DATA, to);
         msg.fields.set(LXMF.FIELD_CUSTOM_META, deviceHash.toLowerCase());
+        if (sent?.hash) LXMF.setSentHash(msg.fields, sent.hash);
+        if (sent?.reaction) msg.fields.set(LXMF.FIELD_REACTION, LXMF.reactionField(sent.reaction.to, sent.reaction.content));
         // Non-opportunistic: the propagation node reads dest_hash (D) in
         // cleartext from offset 0 — that is how RFed recognises a distro.
         const packed = msg.pack(DistroManager.identity, false);
@@ -5573,14 +5863,18 @@ const RnsClient = {
      *     carried it (GroupStore `membersCsv`), the keys of the listed
      *     members this device holds; accept: the invite's source, the
      *     recorded creator;
-     *   post: `extra.text`, at `extra.atMs` (the post's stored time).
+     *   post: `extra.text`, at `extra.atMs` (the post's stored time), and
+     *     its post id `extra.postId` after left (REACTIONS-DESIGN.md §5.3);
+     *   react: the reaction `extra.content` ("" takes it back) to the post
+     *     with id `extra.postId`, at `extra.atMs` (when it was applied).
      */
     _sendDistroGroupSync(op, group, extra = null) {
         const distroHash = DistroManager.lxmfDeliveryHash;
         if (!DistroManager.has || !distroHash) return;
         const deviceHash = this.ownHash ?? ownLxmfDestinationHash();
         if (!deviceHash) throw new Error("own lxmf.delivery address unavailable for 0xFD");
-        const sync = { op, group_id: group.groupId, at_ms: op === "post" ? extra?.atMs : Date.now(), left: DistroLeftStore.of(distroHash) };
+        const timed = op === "post" || op === "react";
+        const sync = { op, group_id: group.groupId, at_ms: timed ? extra?.atMs : Date.now(), left: DistroLeftStore.of(distroHash) };
         if (op === "create" || op === "accept") {
             const members = group.membersCsv ?? [...group.members.keys()].join(",");
             sync.name = group.groupName ?? "";
@@ -5589,6 +5883,10 @@ const RnsClient = {
             if (op === "accept") sync.creator = group.creator;
         } else if (op === "post") {
             sync.text = extra?.text ?? "";
+            if (extra?.postId) sync.post_id = extra.postId;
+        } else if (op === "react") {
+            sync.content = extra?.content ?? "";
+            sync.post_id = extra?.postId;
         }
         const msg = new LXMessage();
         msg.sourceHash = Buffer.from(distroHash, "hex");
@@ -5683,7 +5981,8 @@ const RnsClient = {
      * §11.2, the apply table, for `sync` (rules 0-5 passed) and the group
      * held here for its id (`group`, null when none). Returns "kept",
      * "held" (a post for a group not joined here, §6.5) or "dropped" (a post
-     * for a group closed here, or one the held store refused), each with a
+     * for a group closed here, or one the held store refused; a reaction
+     * for a group not joined here, or whose post is not here), each with a
      * log line. Asks nothing of the user and sends nothing.
      */
     _applyGroupSync(sync, group, facts) {
@@ -5728,6 +6027,22 @@ const RnsClient = {
             this._closeGroupFromSync(id, group, `left on device ${sync.by?.slice(0,12) ?? "?"}`);
             return "kept";
         }
+        if (sync.op === "react") {
+            // REACTIONS-DESIGN.md §5.3: the user's reaction from another
+            // device of D, applied as §3 with the reactor the address the
+            // user takes part in the group as, to the post with its id in
+            // this group only. Never held: a reaction for a group not
+            // joined here has no post to land on.
+            if (closed || !group || group.groupStatus !== "active") {
+                console.log(`[distro] 👥 ${tag} dropped: the group is not joined here (REACTIONS-DESIGN.md §5.3)`);
+                return "dropped";
+            }
+            const reaction = new TextEncoder().encode(sync.content).length > LXMF.REACTION_CONTENT_MAX
+                ? { problem: `its content is over ${LXMF.REACTION_CONTENT_MAX} bytes` }
+                : { to: Buffer.from(sync.post_id, "hex"), content: sync.content };
+            return this._takeReaction(reaction, { store: GroupMsgStore, convHash: id, reactor: group.ownMember ?? d,
+                at: sync.at_ms, where: `the react sync of group ${id.slice(0,8)}`, byPostId: true }) ? "kept" : "dropped";
+        }
         // post
         if (closed) {
             console.log(`[distro] 👥 ${tag} dropped: the group is closed here (§11.2)`);
@@ -5755,7 +6070,8 @@ const RnsClient = {
         // (never delivered: nothing here saw it delivered), at its own time,
         // under the sync's hash, and no notification (§17.11 rule 5).
         const stored = GroupMsgStore.add(id, { id: facts.hash, dir: "out", content: sync.text || DISTRO_ATTACHMENT_PLACEHOLDER,
-            status: "sent", srcHash: d, lxmfHash: facts.hash, via: "distro", timestamp: sync.at_ms });
+            status: "sent", srcHash: d, lxmfHash: facts.hash, via: "distro", timestamp: sync.at_ms,
+            ...(sync.post_id ? { postId: sync.post_id } : {}) });
         group.lastActivity = Date.now();
         GroupStore._save();
         console.log(`[distro] 📤 Synced the user's post in group ${id.slice(0,8)} from device ${sync.by?.slice(0,12) ?? "?"} (§17.14)`);
@@ -5990,7 +6306,9 @@ const RnsClient = {
         // Kept on the record, so the propagated copy (_propagateMessage) —
         // one parked across a reload too — is rebuilt as this same message
         // with this same hash, and a recipient that gets both keeps one.
-        MsgStore.update(contactHash, messageId, { lxmfTimestamp: msg.timestamp, lxmfTicket: ticket });
+        // Its LXMF hash too: a reaction to it names it by that hash
+        // (REACTIONS-DESIGN.md §2), and so does the Distro Sync of a send.
+        MsgStore.update(contactHash, messageId, { lxmfTimestamp: msg.timestamp, lxmfTicket: ticket, lxmfHash: Buffer.from(msg.hash).toString("hex") });
 
         this._pendingTickets.set(ticket, { contactHash, messageId, onProof });
 
@@ -6296,6 +6614,24 @@ const RnsClient = {
         if (this._groupSeenIds.size > 2000) {
             this._groupSeenIds = new Set([...this._groupSeenIds].slice(-1000));
         }
+        // REACTIONS-DESIGN.md §4: a reaction is an envelope with no action
+        // whose FIELD_REACTION names a post of this Group by its post id.
+        // Attributed as a post is, under the same rules above: to
+        // GROUP_SENDER when the group trusts the source (a relayed copy),
+        // else to its source; a known sibling's is the user's own. Applied
+        // to the post of this Group with that id, or dropped with one line;
+        // never a bubble, a row or a notice, and the Group's order in the
+        // chat list stays. A 0x40 that is no map is no reaction.
+        const reaction = groupAction ? null : (lxmfMsg.reaction ?? null);
+        if (reaction?.notAMap) {
+            console.log(`[retichat] 👥 Message for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: ${reaction.problem}; read as a post, not a reaction`);
+        } else if (reaction) {
+            if (!group) return dropped("a reaction for a group not held here");
+            const own = fromSibling && signature === "validated";
+            const applied = this._takeReaction(reaction, { store: GroupMsgStore, convHash: groupId, reactor: own ? srcHash : actualSender,
+                at: sentTimeMs(lxmfMsg.timestamp), where: `group ${groupId.slice(0,8)}`, byPostId: true });
+            return applied ? "kept" : "dropped";
+        }
         // An accept or leave carries its sender's own key (RFed-spec Group.md,
         // "Member statuses and keys"; LXMessage.fromBytes bound it, and
         // checked the signature under it when no key was held). It is
@@ -6407,12 +6743,18 @@ const RnsClient = {
             }
             case "relay_req": {
                 if (!group) return dropped("a group not held here");
+                // A relay request carries what is relayed: a post's id (key
+                // 11) and a reaction's 0x40 go onto each relayed copy
+                // (REACTIONS-DESIGN.md §4).
+                const relayed = lxmfMsg.reaction ?? null;
+                if (relayed?.problem) console.log(`[retichat] 👥 Relay request for group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}: its 0x40 is not carried on: ${relayed.problem}`);
                 this._performGroupRelay(
                     group,
                     content,
                     actualSender,
                     relaySeen || [],
-                    srcHash
+                    srcHash,
+                    { postId: groupInfo.postId ?? null, reaction: relayed && !relayed.problem ? { to: relayed.to, content: relayed.content } : null },
                 );
                 break;
             }
@@ -6442,12 +6784,15 @@ const RnsClient = {
                 // post, SENT (nothing here saw it delivered), with no
                 // notification, as a §17.11 copy is.
                 const own = fromSibling && signature === "validated";
+                // Its post id (key 11), which reactions to it name (§4):
+                // none on a post from a client older than reactions.
+                const postId = groupInfo.postId ? { postId: groupInfo.postId } : {};
                 const stored = GroupMsgStore.add(groupId, own
                     ? { dir: "out", content: displayContent, status: "sent", srcHash,
-                        lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null, timestamp: sentTimeMs(lxmfMsg.timestamp) }
+                        lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null, timestamp: sentTimeMs(lxmfMsg.timestamp), ...postId }
                     : { dir: "in", content: displayContent, status: "delivered", srcHash: actualSender,
                         lxmfHash: lxmfMsg.hash ? Buffer.from(lxmfMsg.hash).toString("hex") : null,
-                        timestamp: sentTimeMs(lxmfMsg.timestamp) });
+                        timestamp: sentTimeMs(lxmfMsg.timestamp), ...postId });
                 if (own) console.log(`[retichat] 👥 Post in group ${groupId.slice(0,8)} from ${srcHash.slice(0,12)}, a device of the user's: stored as the user's own`);
                 if (found.length || unreadable) this._keepAttachments(GroupMsgStore, groupId, stored, found, lxmfMsg.fieldsUnreadable);
                 // Update group last activity
@@ -6684,9 +7029,12 @@ const RnsClient = {
         // D3: outside the initialization hold, a send with the exchange down
         // fails now and is never sent (see sendMessage).
         const down = !queued && this._exchangeIsDown();
+        // Its post id (REACTIONS-DESIGN.md §4): 16 random bytes, the name
+        // every member's copy gives it, for a reaction to reach it.
+        const postId = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("hex");
         const outMsg = GroupMsgStore.add(groupId, queued
-            ? { dir: "out", content, status: "queued", waitFor: "init", srcHash: signer.hash }
-            : { dir: "out", content, status: down ? "failed" : "sending", srcHash: signer.hash });
+            ? { dir: "out", content, status: "queued", waitFor: "init", srcHash: signer.hash, postId }
+            : { dir: "out", content, status: down ? "failed" : "sending", srcHash: signer.hash, postId });
         group.lastActivity = Date.now();
         GroupStore._save();
         if (queued) {
@@ -6718,7 +7066,10 @@ const RnsClient = {
             return outMsg;
         }
         const ownHash = signer.hash;
-        GroupMsgStore.update(groupId, outMsg.id, { status: "sending", srcHash: ownHash });
+        // A post queued by an app.js older than reactions has no id: it
+        // gets one now, before any copy goes (REACTIONS-DESIGN.md §4).
+        const postId = outMsg.postId ?? Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("hex");
+        GroupMsgStore.update(groupId, outMsg.id, { status: "sending", srcHash: ownHash, postId });
         if (outMsg.status !== "sending") this._onMsg.forEach(fn => fn(null, groupId));
 
         const mine = this._groupSelf(group);
@@ -6735,11 +7086,12 @@ const RnsClient = {
         // siblings must not show it. Until the review of 96fffd9 it was
         // owed once the fan-out was called, which never throws, so a post
         // this device showed failed showed as sent on every sibling.
-        const owePost = () => this._syncGroupAction("post", groupId, { text: outMsg.content, atMs: outMsg.timestamp });
+        const owePost = () => this._syncGroupAction("post", groupId, { text: outMsg.content, atMs: outMsg.timestamp, postId });
         const fanout = this._fanoutGroupEnvelope(targets, outMsg.content, {
             groupId,
             groupName: group.groupName,
             groupSender: ownHash,
+            groupPostId: postId,
         }, signer, owePost);
         if (targets.length === 0) owePost();
         const delivery = await fanout;
@@ -6969,17 +7321,27 @@ const RnsClient = {
         return delivery;
     },
 
-    async sendGroupRelayRequest(groupId, content, originalSender, alreadySeen, relayerHash) {
+    /** A relay request to `relayerHash` for `content` from `originalSender`.
+     *  It carries what is relayed (REACTIONS-DESIGN.md §4): `carried`, when
+     *  given, { postId, reaction } — the post's id (key 11) and a reaction's
+     *  0x40 — which the relayer copies onto each relayed copy. */
+    async sendGroupRelayRequest(groupId, content, originalSender, alreadySeen, relayerHash, carried = null) {
         return this._sendGroupEnvelope(relayerHash, content, {
             groupId,
             groupAction: "relay_req",
             groupSender: originalSender,
             groupRelayFor: originalSender,
             groupRelaySeen: [...new Set(alreadySeen)].join(","),
+            groupPostId: carried?.postId ?? null,
+            reaction: carried?.reaction ?? null,
         });
     },
 
-    async _performGroupRelay(group, content, originalSender, alreadySeen, requester) {
+    /** The relay for `requester` (a relay_req): `content` from
+     *  `originalSender` to each accepted member not yet reached, then
+     *  relay_done to the requester. `carried` { postId, reaction }, from
+     *  the request, goes onto each relayed copy (REACTIONS-DESIGN.md §4). */
+    async _performGroupRelay(group, content, originalSender, alreadySeen, requester, carried = null) {
         // Never for a group the user has not joined, and only for a member
         // that accepted it (GROUP_ACTIONS_THAT_RELAY): the group rule
         // already drops any other request, and this send path holds the
@@ -7010,6 +7372,8 @@ const RnsClient = {
             groupSender: originalSender,
             groupRelayFor: originalSender,
             groupRelaySeen: [...seen].join(","),
+            groupPostId: carried?.postId ?? null,
+            reaction: carried?.reaction ?? null,
         }, signer);
         await this._sendGroupEnvelope(requester, "", {
             groupId: group.groupId,
@@ -7088,6 +7452,9 @@ const RnsClient = {
         // fields 0xA0-0xA8 or in the Retichat field 0xD1 beside the name, as
         // GROUP_ENTRIES_IN_RETICHAT_FIELD selects (false until the switch).
         applyGroupFields(msg.fields, fields);
+        // A reaction (REACTIONS-DESIGN.md §4): its 0x40, whose REACTION_TO is
+        // the 16 bytes of the post's id.
+        if (fields.reaction) msg.fields.set(LXMF.FIELD_REACTION, LXMF.reactionField(fields.reaction.to, fields.reaction.content));
         const packed = msg.pack(by.identity, true);
         const delivery = this._deliverGroupEnvelope(
             memberHash,
@@ -8865,7 +9232,8 @@ const RnsClient = {
             // as distro.rs sent_marker_from_fields reads it for the phones
             // (as_u64 keys), never from msgpackr's map: until 2026-10-11 an
             // array [R] in 0xFC was R here, a float key 251.0 the marker.
-            const sentCopy = LXMF.distroSentCopyFromFields(LXMessage.groupFieldsOfPayload(payloadBytes));
+            const entryFields = LXMessage.groupFieldsOfPayload(payloadBytes);
+            const sentCopy = LXMF.distroSentCopyFromFields(entryFields);
             if (sentCopy) {
                 // SPEC §17.11 receive rules, in order; the first drop ends it.
                 // Rule 1, source.
@@ -8894,6 +9262,17 @@ const RnsClient = {
                     return dropped();
                 }
                 const recipientHex = sentCopy.toHex;
+                // REACTIONS-DESIGN.md §5.2: the copy of a reaction the user
+                // made as the distro, in the chat with the recipient: applied
+                // there as the distro's reaction, by M's REACTION_TO, and no
+                // bubble, row or chat is made for it.
+                const reaction = LXMF.reactionOfPayload(payloadBytes);
+                if (reaction && !reaction.notAMap) {
+                    this._learnDistroSibling(myLxmfHash, sentCopy.byHex, "a sent-copy");
+                    const applied = this._takeReaction(reaction, { store: MsgStore, convHash: recipientHex, reactor: myLxmfHash,
+                        at: sentTimeMs(ts), where: `the chat with ${recipientHex.slice(0,12)} (a sent-copy from device ${sentCopy.byHex.slice(0,12) || "?"})`, byPostId: false });
+                    return applied ? true : dropped();
+                }
                 // No contact request and no stranger filter: this device's own
                 // side of a conversation opens it. No notification either —
                 // nobody is told about their own message. The recipient is
@@ -8910,10 +9289,14 @@ const RnsClient = {
                 // handleDistroSentCopy), not an empty bubble. Attachments a
                 // copy does carry are kept like any other.
                 const placeholder = !content.trim() && !found.length && !unreadable;
+                // M's LXMF hash, when the copy names it (key 12): a
+                // reaction to M then finds it here (§5.2).
+                const sentHash = LXMF.sentHashFromFields(entryFields);
                 const record = MsgStore.add(recipientHex, {
                     dir: "out", content: placeholder ? DISTRO_ATTACHMENT_PLACEHOLDER : content, status: "sent",
                     srcHash: myLxmfHash, destHash: recipientHex, via: "distro",
                     timestamp: sentTimeMs(ts),
+                    ...(sentHash ? { lxmfHash: sentHash } : {}),
                 });
                 const stored = found.length || unreadable
                     ? this._keepAttachments(MsgStore, recipientHex, record, found, payload.fieldsUnreadable)
@@ -8936,6 +9319,27 @@ const RnsClient = {
                     fromDistro: srcHashHex === myLxmfHash,
                     signedByDistro: srcHashHex === myLxmfHash && signedByDistro(),
                 }) ? true : dropped();
+            }
+
+            // REACTIONS-DESIGN.md §3 on Distro Fanout: a reaction to a
+            // message of the chat with its source, applied there by the
+            // message's LXMF hash, or dropped with one line; never a bubble,
+            // a row or a chat. Ahead of the delivery notification test,
+            // which a ticketed reaction (no content) would pass. One whose
+            // signature fails is not its source's. A 0x40 that is no map is
+            // no reaction: the message goes on as it always did.
+            const reaction = LXMF.reactionOfPayload(payloadBytes);
+            if (reaction?.notAMap) {
+                console.log(`[distro] Message from ${srcHashHex.slice(0,12)}: ${reaction.problem}; read as a message, not a reaction`);
+            } else if (reaction) {
+                const verified = LXMessage.verify(destHash, srcHash, decrypted.slice(16, 80), payloadBytes);
+                if (!verified.validated && verified.unverifiedReason !== LXMessage.SOURCE_UNKNOWN) {
+                    console.log(`[retichat] reaction dropped: its signature does not verify, so it is not ${srcHashHex.slice(0,12)}'s (Distro Fanout)`);
+                    return dropped();
+                }
+                const applied = this._takeReaction(reaction, { store: MsgStore, convHash: srcHashHex, reactor: srcHashHex,
+                    at: sentTimeMs(ts), where: `the chat with ${srcHashHex.slice(0,12)} (Distro Fanout)`, byPostId: false });
+                return applied ? true : dropped();
             }
 
             // Delivery notifications now arrive here too. Since we send as the

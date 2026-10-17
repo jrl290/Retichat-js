@@ -1903,7 +1903,7 @@ test("_performGroupRelay sends nothing for a group the user has not joined, whoe
         _groupSigner: () => ({ identity: null, hash: "0".repeat(32), isDistro: false }),
         _groupSelf: () => new Set(["0".repeat(32)]),
     };
-    const relay = compile("async _performGroupRelay(group, content, originalSender, alreadySeen, requester)", { console: quiet })(self);
+    const relay = compile("async _performGroupRelay(group, content, originalSender, alreadySeen, requester, carried = null)", { console: quiet })(self);
     const [A, B, R] = ["a", "b", "c"].map((x) => x.repeat(32));
     const group = (groupStatus) => ({ groupId: "9".repeat(32), groupName: "G", groupStatus,
         members: new Map([[self.ownHash, groupStatus === "active" ? "accepted" : "invited"], [A, "accepted"], [B, "accepted"], [R, "accepted"]]) });

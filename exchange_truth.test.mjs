@@ -965,7 +965,7 @@ test("the app follows the exchange: the dot on up and down, lost packets to the 
 
 const DISTRO_METHODS = [
     "_followExchange(iface)", "_setStatus(s, type)", "_exchangeIsDown()", "_onPacketsLost({ packetHashes, reason, unsent = [] })",
-    "async _sendDistroSentCopy(recipientHex, title, content)", "_sealForDistroSync(packed, label)", "_distroSyncProofGoes(link)",
+    "async _sendDistroSentCopy(recipientHex, title, content, sent = null)", "_sealForDistroSync(packed, label)", "_distroSyncProofGoes(link)",
     "_oweDistro(entry)", "async _sendDistroOutbox(link, trigger)",
     "async _sendDistroNeverLeft(trigger)", "_distroAttemptOpen(entry, link)", "_unprovedSince(entry, comingUp)",
     "async _uploadOwed(link, entry, comingUp = null)", "_stillOwed(entry)", "_dropMembershipOwedToOtherDistros()",

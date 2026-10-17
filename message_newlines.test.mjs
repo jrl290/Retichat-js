@@ -339,7 +339,7 @@ function recipient({ groups = new Map(), relayed = [] } = {}) {
         // The group rule is not what this tests (privacy_filter.test.mjs pins it).
         PrivacyFilter: { groupAccepts: () => true, groupMember: (group, src) => src },
     }, ["_handleGroupMessage(lxmfMsg, srcHash, content, groupInfo, arrival = null)",
-        "async _performGroupRelay(group, content, originalSender, alreadySeen, requester)"]);
+        "async _performGroupRelay(group, content, originalSender, alreadySeen, requester, carried = null)"]);
     const destination = new EventEmitter();
     destination.hash = lxmfHash(me);
     const router = new LXMRouter({ registerDestination: () => destination }, me);
