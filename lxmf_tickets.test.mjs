@@ -214,5 +214,5 @@ test("OutboundTickets persists what the router remembers and drops expired ticke
     const r2 = recipient({ tickets: reloaded });
     assert.equal(hex(r2.router.getOutboundTicket(source)), hex(Buffer.alloc(16, 6)), "the router reads it after a reload");
 
-    assert.match(methodBody("async connect()"), /new LXMRouter\(this\._rns, IdMgr\.id, \{ filter: PrivacyFilter, tickets: OutboundTickets \}\)/);
+    assert.match(methodBody("async connect()"), /new LXMRouter\(this\._rns, IdMgr\.id, \{ filter: PrivacyFilter, tickets: OutboundTickets, ratchets: OwnRatchets\.store\(ownLxmfDestinationHash\(\)\) \}\)/);
 });

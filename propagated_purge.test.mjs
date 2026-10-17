@@ -52,6 +52,8 @@ const blobFor = (encryptTo, dest, rest) => Buffer.concat([Buffer.from(dest), enc
 async function fetchFrom(me, node, { decrypt = null, routerPatch = null } = {}) {
     const destination = new EventEmitter();
     destination.hash = lxmfHashOf(me);
+    // the delivery destination decrypts (LXMRouter.decryptPropagated)
+    destination.decryptSoon = decrypt ?? ((ciphertext) => me.decrypt(ciphertext));
     const router = new LXMRouter({ registerDestination: () => destination }, me);
     routerPatch?.(router);
     const emitted = [];
@@ -71,8 +73,7 @@ async function fetchFrom(me, node, { decrypt = null, routerPatch = null } = {}) 
             return [...node.keys()].map((k) => Buffer.from(k, "hex"));
         },
     };
-    const IdMgr = { id: decrypt ? { decrypt } : me };
-    await installPropagated(self, { Link, Buffer, LXMessage, MsgPack, IdMgr, console: capture })._fetchPropagatedMessages();
+    await installPropagated(self, { Link, Buffer, LXMessage, MsgPack, console: capture })._fetchPropagatedMessages();
     await settle();
     return { purged, emitted, logs, self };
 }

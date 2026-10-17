@@ -48,7 +48,11 @@
 #
 # The checks, in order:
 #
-#   1. refuse a dirty working tree      — you cannot ship what isn't committed
+#   1. refuse a dirty working tree      — you cannot ship what isn't committed;
+#      and refuse a ref without ratchets when this checkout's HEAD has them:
+#      senders keep sealing to the last ratchet a page announced, for up to
+#      30 days, and a page without ratchets cannot open that (James,
+#      2026-10-17)
 #   2. run the test suite               — and refuse on any failure; with
 #      RETICHAT_BOOT_TESTS=1, so the boot gate's own Chromium tests run too
 #      (a plain `npm test` skips them). First, refuse while ../LXMF-rust has
@@ -96,9 +100,10 @@
 #   export RETICHAT_SSH_HOST=retichat@retichat.com
 #   export RETICHAT_SSH_PASS=...        # leave empty to use key auth
 #
-# Bypass for a genuine emergency: DEPLOY_ALLOW_DIRTY=1 (tree check) and
-# DEPLOY_SKIP_TESTS=1 (suite). Both print a loud warning and are recorded in
-# .deploy.log. If you find yourself using them routinely, fix the cause.
+# Bypass for a genuine emergency: DEPLOY_ALLOW_DIRTY=1 (tree check),
+# DEPLOY_SKIP_TESTS=1 (suite) and DEPLOY_ALLOW_PRE_RATCHETS=1 (a ref without
+# ratchets). Each prints a loud warning and is recorded in .deploy.log. If
+# you find yourself using them routinely, fix the cause.
 # There is no bypass for strays: clean them, it is reversible.
 #
 # The boot gate uses the Playwright + Chromium that the staging harness uses
@@ -139,10 +144,12 @@ EXCLUDE=(config.json config.local.json)
 # could be the host's or another site's on a shared docroot, so it is reported
 # there as not ours and never flagged or moved.
 OWNED_NAMES=(debug.html debug-standalone.html packet.js post_interface.js
+             destination.js link.js reticulum.js
              config.local.json config.template.json selectiv-snapshot
              deploy.sh verify-deploy.sh deploy.env deploy.env.example .deploy.log)
 OWNED_BASES=(index.html app.js style.css retichat-icon.png config.json lib
-             debug.html debug-standalone.html packet.js post_interface.js)
+             debug.html debug-standalone.html packet.js post_interface.js
+             destination.js link.js reticulum.js)
 BACKUP_SUFFIXES=('.bak*' '.orig*' '.old*' '.save*' '~')
 
 # Moved strays go here, relative to the node account's home: outside every
@@ -700,6 +707,30 @@ REF_SUBJECT="$(git -C "$REPO_DIR" log -1 --format=%s "$REF")"
 echo "  ${GREEN}✓${NC} deploying ${REF_SHA} — ${REF_SUBJECT}"
 echo "  ${GREEN}✓${NC} to: ${TARGETS[*]}"
 
+# A page announces its delivery ratchet, and a sender seals to the last one it
+# heard for up to 30 days (RNS Identity.get_ratchet; an announce without one
+# does not replace it). A ref whose app.js does not turn ratchets on cannot
+# open those messages, so taking the web back past ratchets loses them (shown
+# on private staging, "Token HMAC was invalid"). HEAD stands for what is live:
+# deploys come from this checkout's main.
+# (grep reads all of app.js: with -q it would stop at the match, and git's
+# SIGPIPE would fail the pipeline under pipefail.)
+ratchets_on() { git -C "$REPO_DIR" show "$1:app.js" 2>/dev/null | grep 'ratchets: OwnRatchets\.store(' >/dev/null; }
+if ratchets_on HEAD && ! ratchets_on "$REF"; then
+  if [[ "${DEPLOY_ALLOW_PRE_RATCHETS:-0}" == "1" ]]; then
+    echo "${YELLOW}⚠ ${REF_SHA} has no ratchets and DEPLOY_ALLOW_PRE_RATCHETS=1 — deploying it anyway${NC}"
+    echo "${YELLOW}  messages sealed to the ratchets the pages announced will not open, for up to 30 days${NC}"
+  else
+    echo "${RED}${REF_SHA} has no ratchets; this checkout's HEAD has them.${NC}"
+    echo
+    echo "${DIM}Senders keep sealing to the last ratchet a page announced, for up to"
+    echo "30 days, and a page without ratchets cannot open that: those messages"
+    echo "would be lost. Deploy a ref with ratchets, or set"
+    echo "DEPLOY_ALLOW_PRE_RATCHETS=1 to accept the loss.${NC}"
+    die "refusing to take the web back past ratchets"
+  fi
+fi
+
 # ── 2. The suite must be green ───────────────────────────────────────────
 step "Running test suite"
 
@@ -885,9 +916,9 @@ else
   VERIFY_OK=0
 fi
 
-printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  boot_checked=%s  verified=%s\n' \
+printf '%s  ref=%s  nodes=%s  dirty_override=%s  tests_skipped=%s  pre_ratchets_override=%s  boot_checked=%s  verified=%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REF_SHA" "${ONLY_NODE:-all}" \
-  "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "$BOOT_CHECKED" "$VERIFY_OK" >> "$LOG_FILE"
+  "${DEPLOY_ALLOW_DIRTY:-0}" "${DEPLOY_SKIP_TESTS:-0}" "${DEPLOY_ALLOW_PRE_RATCHETS:-0}" "$BOOT_CHECKED" "$VERIFY_OK" >> "$LOG_FILE"
 
 [[ $VERIFY_OK -eq 1 ]] || die "post-deploy verification failed — a served app does not match ${REF_SHA}"
 

@@ -1,0 +1,170 @@
+{
+  "spec": "RNS 1.5.2 ratchets: Identity.py (RATCHETSIZE, RATCHET_EXPIRY, _get_ratchet_id, encrypt, decrypt), Destination.py (RATCHET_COUNT, RATCHET_INTERVAL, enable_ratchets, rotate_ratchets, _persist_ratchets, announce); LXMF 1.1.1 LXMRouter.get_announce_app_data",
+  "format_version": 1,
+  "generator": "Retichat-js tools/ratchet_vectors.py (RNS 1.5.2, LXMF 1.1.1)",
+  "notes": [
+    "Generated with the Python reference (RNS 1.5.2, LXMF 1.1.1, RNS.vendor.umsgpack) by running RNS's own code; do not edit by hand. Regenerate with the generator; --check fails if this file drifted.",
+    "Only RNS's randomness and clock were replaced, each for the one step that needs it: RNS.Cryptography.X25519PrivateKey.generate returns a fixed key (ratchet rotation; the ephemeral key of Identity.encrypt), os.urandom returns fixed bytes (the 16-byte IV of Token.encrypt), RNS.Identity.get_random_hash returns a fixed 16 bytes (the announce uses the first 5), time.time returns a fixed second (ratchet rotation; the announce's emitted time). Each step must use exactly the values it was given. Transport.owner is a stand-in reporting no shared instance (there is no Reticulum instance), and LXMRouter's methods ran against a stand-in router holding only the delivery destination.",
+    "All *_hex values are lowercase hex. Fixed inputs are SHA-256 of 'retichat-js ratchet vectors v1/<label>'; X25519 private keys are clamped, as every key RNS generates is, so the ratchet file is the same under RNS's OpenSSL and internal providers.",
+    "identity.private_key_hex is the X25519 private key (32) | Ed25519 seed (32). lxmf_delivery_hash_hex = Destination.hash(identity, 'lxmf', 'delivery'); name_hash_hex = SHA-256('lxmf.delivery')[0:10].",
+    "ratchets are the destination's ratchets newest first, as Destination.ratchets holds them and the file stores them: rotate_ratchets inserts each new ratchet at index 0. ratchet_id = SHA-256(ratchet public key)[0:10] (Identity._get_ratchet_id). unlisted_ratchet is a fourth key that is not among them.",
+    "ratchet_file.file_hex is the exact file Destination._persist_ratchets wrote after the three rotations: msgpack map {'signature': bin64, 'ratchets': bin(packed_ratchets)} with the keys in that order, where packed_ratchets = msgpack array of the 32-byte private keys newest first and signature = the identity's Ed25519 signature over packed_ratchets. empty_file_hex is what enable_ratchets wrote first, with no ratchets. Python persists no rotation time; latest_ratchet_time starts at 0 on every load, so the first announce after a load rotates. LXMF names the file <lxmf_delivery_hash hex>.ratchets in its ratchets directory.",
+    "announce is Destination.announce(app_data, send=False) for lxmf.delivery, packed: announce data = public_key(64) | name_hash(10) | random_hash(10) | ratchet(32) | signature(64) | app_data, random_hash = 5 random bytes | emitted time (5 bytes big-endian, whole seconds). signed_data = destination_hash | public_key | name_hash | random_hash | ratchet | app_data. The packet's context flag is set because it carries a ratchet: flags = header_type 0 << 6 | context_flag 1 << 5 | transport_type 0 << 4 | SINGLE 0 << 2 | ANNOUNCE 1. app_data is LXMF 1.1.1's msgpack [display_name bin, stamp_cost, [SF_COMPRESSION]].",
+    "decrypt_cases: ciphertexts from RNS Identity.encrypt (the sender holding only the public key) to the named key, each read with RNS Identity.decrypt(ciphertext, ratchets=the three ratchets newest first, enforce_ratchets=False and True). Each result is what decrypt returned (null = None) and the ratchet id it reported through ratchet_id_receiver.latest_ratchet_id (null = None, the identity key or a failure).",
+    "encrypt_case: Identity.encrypt(plaintext, ratchet=the newest ratchet's public key) with the ephemeral key and IV fixed, so an implementation given them must produce ciphertext_hex exactly: ephemeral_public(32) | iv(16) | AES-256-CBC(PKCS7(plaintext)) | HMAC-SHA256(32) over iv | AES output. shared_key_hex and derived_key_hex are intermediates, checked against the ciphertext: derived_key = HKDF-SHA256(64, shared_key, salt = identity hash, info empty); its first 32 bytes are the HMAC key, the last 32 the AES key."
+  ],
+  "constants": {
+    "RATCHETSIZE": 256,
+    "RATCHET_EXPIRY": 2592000,
+    "RATCHET_COUNT": 512,
+    "RATCHET_INTERVAL": 1800,
+    "ratchet_id_length": 10,
+    "units": "RATCHETSIZE in bits; RATCHET_EXPIRY and RATCHET_INTERVAL in seconds; RATCHET_COUNT is the number of ratchets a destination retains"
+  },
+  "identity": {
+    "private_key_hex": "de553cea22104c87b2ec328b0b2b61fd9516a956447bd85817f1b9aaef4d204f6939c340249950f4b641d3fdf4de0a438bd06c5a8595ad84465279b478919ec0",
+    "public_key_hex": "aec780579c46616c4245ced6c2cc5724a4586616d09a81448cae7ae0c3fdb8084c83f1fe10e4434b0355a00fd1cae89b62edd92c325cc34a2dc4b657a4b10a09",
+    "identity_hash_hex": "acba9b194ebba9b63bd2285a93a630c8",
+    "lxmf_delivery_hash_hex": "32e1e6cd6e078b17fb1c7c90fdf9c756",
+    "name_hash_hex": "6ec60bc318e2c0f0d908"
+  },
+  "ratchets": [
+    {
+      "private_key_hex": "c01d2833d08877038f875d0a93ef58ba7d5fb1b2157704e4dd1a312204bb736d",
+      "public_key_hex": "4477d43c1a3468da864f7408460bd9f659ad4cbf97707f0b5c276cebe6c8565b",
+      "ratchet_id_hex": "db8bd17c1ca3bf01aa7f"
+    },
+    {
+      "private_key_hex": "60c0d774c69883abe000a9c4d5ec847c5ea951278bcdb9bda3068208ac34bb46",
+      "public_key_hex": "ca380147fc3814576b0940939d7b026c13ddc82a339bc073008b34facb4afb01",
+      "ratchet_id_hex": "4c34e45cf03fa0ab08cc"
+    },
+    {
+      "private_key_hex": "5802583586d1794d44a262e2ec4f145f3e0ea79037b5ec209773fbe3c3cb5656",
+      "public_key_hex": "f491c3b89bbee58c888997994526aeeb7db4e004821ba629cbc3df4184e09872",
+      "ratchet_id_hex": "b3174f0ec610217325d8"
+    }
+  ],
+  "unlisted_ratchet": {
+    "private_key_hex": "7849a5b916085a3122d696e195c066ac31b9160654ba4637093343d668c61750",
+    "public_key_hex": "b9e96b0783de40e31ffbd0095eb6f83f2eb6a795c727407213adfcbc881ed875",
+    "ratchet_id_hex": "b3f3b9c72da98aaf0548"
+  },
+  "ratchet_file": {
+    "rotated_at": [
+      1790000000,
+      1790003600,
+      1790007200
+    ],
+    "packed_ratchets_hex": "93c420c01d2833d08877038f875d0a93ef58ba7d5fb1b2157704e4dd1a312204bb736dc42060c0d774c69883abe000a9c4d5ec847c5ea951278bcdb9bda3068208ac34bb46c4205802583586d1794d44a262e2ec4f145f3e0ea79037b5ec209773fbe3c3cb5656",
+    "signature_hex": "feda84b6f90d6bf68de6e98b0d3a22f88da373ccdb9d9f6b2a44f4f726e970158e6da3a90a76c4c7e0108fa171365da46111ddd64193482b998073757c4d830f",
+    "file_hex": "82a97369676e6174757265c440feda84b6f90d6bf68de6e98b0d3a22f88da373ccdb9d9f6b2a44f4f726e970158e6da3a90a76c4c7e0108fa171365da46111ddd64193482b998073757c4d830fa87261746368657473c46793c420c01d2833d08877038f875d0a93ef58ba7d5fb1b2157704e4dd1a312204bb736dc42060c0d774c69883abe000a9c4d5ec847c5ea951278bcdb9bda3068208ac34bb46c4205802583586d1794d44a262e2ec4f145f3e0ea79037b5ec209773fbe3c3cb5656",
+    "empty_file_hex": "82a97369676e6174757265c4407d2fdc9f49c7159f76ad4605fe5367d65c5149c519fa710502d5bd6691df2464f101d9fadcf13582c05a521e7fa84c5bbc0bf55d356b8e150e218ca619733005a87261746368657473c40190"
+  },
+  "announce": {
+    "display_name": "Ratchet Vectors",
+    "stamp_cost": 8,
+    "app_data_hex": "93c40f5261746368657420566563746f7273089100",
+    "emitted_at": 1790007800,
+    "random_hash_hex": "7f313a8535006ab159f8",
+    "ratchet_public_hex": "4477d43c1a3468da864f7408460bd9f659ad4cbf97707f0b5c276cebe6c8565b",
+    "ratchet_id_hex": "db8bd17c1ca3bf01aa7f",
+    "signature_hex": "69a845af3140a321bc2ad6d7ad209038962c1e7d852e337cde3cf5958605bdf4392e78f53b604de8941a9242bb62a57f3af62e2199eae8db0f367154b355680e",
+    "announce_data_hex": "aec780579c46616c4245ced6c2cc5724a4586616d09a81448cae7ae0c3fdb8084c83f1fe10e4434b0355a00fd1cae89b62edd92c325cc34a2dc4b657a4b10a096ec60bc318e2c0f0d9087f313a8535006ab159f84477d43c1a3468da864f7408460bd9f659ad4cbf97707f0b5c276cebe6c8565b69a845af3140a321bc2ad6d7ad209038962c1e7d852e337cde3cf5958605bdf4392e78f53b604de8941a9242bb62a57f3af62e2199eae8db0f367154b355680e93c40f5261746368657420566563746f7273089100",
+    "signed_data_hex": "32e1e6cd6e078b17fb1c7c90fdf9c756aec780579c46616c4245ced6c2cc5724a4586616d09a81448cae7ae0c3fdb8084c83f1fe10e4434b0355a00fd1cae89b62edd92c325cc34a2dc4b657a4b10a096ec60bc318e2c0f0d9087f313a8535006ab159f84477d43c1a3468da864f7408460bd9f659ad4cbf97707f0b5c276cebe6c8565b93c40f5261746368657420566563746f7273089100",
+    "flags_hex": "21",
+    "context_flag": 1,
+    "hops": 0,
+    "context_hex": "00",
+    "packet_hex": "210032e1e6cd6e078b17fb1c7c90fdf9c75600aec780579c46616c4245ced6c2cc5724a4586616d09a81448cae7ae0c3fdb8084c83f1fe10e4434b0355a00fd1cae89b62edd92c325cc34a2dc4b657a4b10a096ec60bc318e2c0f0d9087f313a8535006ab159f84477d43c1a3468da864f7408460bd9f659ad4cbf97707f0b5c276cebe6c8565b69a845af3140a321bc2ad6d7ad209038962c1e7d852e337cde3cf5958605bdf4392e78f53b604de8941a9242bb62a57f3af62e2199eae8db0f367154b355680e93c40f5261746368657420566563746f7273089100",
+    "packet_hash_hex": "b88889e57c2fd7693c7e1a255a7fc2e0ed7fb8615412fc290d5fac8050311c94"
+  },
+  "decrypt_cases": [
+    {
+      "name": "newest_ratchet",
+      "encrypted_to": "the newest ratchet, ratchets[0]: the one the announce carries",
+      "ratchet_public_hex": "4477d43c1a3468da864f7408460bd9f659ad4cbf97707f0b5c276cebe6c8565b",
+      "plaintext_hex": "7261746368657420766563746f723a20746f20746865206e65776573742072617463686574",
+      "ciphertext_hex": "74a5a1da8ec1e73d7b285db5fd0a17c792727792e7f3e32ffe3a3c2307a188512bee3618221d89e3c1f38e3392e3cbaa4b7289ea8d88f6a4c81d1beecfa8998407f777da804761ee29b7e80c24abbab401b61533cab1864f6ffdcbd5525d0f18b60c44f9999825f5c001b6de70152c34536cac70b52470f1f149366477f39921",
+      "results": [
+        {
+          "enforce_ratchets": false,
+          "plaintext_hex": "7261746368657420766563746f723a20746f20746865206e65776573742072617463686574",
+          "ratchet_id_hex": "db8bd17c1ca3bf01aa7f"
+        },
+        {
+          "enforce_ratchets": true,
+          "plaintext_hex": "7261746368657420766563746f723a20746f20746865206e65776573742072617463686574",
+          "ratchet_id_hex": "db8bd17c1ca3bf01aa7f"
+        }
+      ]
+    },
+    {
+      "name": "oldest_ratchet",
+      "encrypted_to": "the oldest of the three ratchets, ratchets[2]",
+      "ratchet_public_hex": "f491c3b89bbee58c888997994526aeeb7db4e004821ba629cbc3df4184e09872",
+      "plaintext_hex": "7261746368657420766563746f723a20746f20746865206f6c64657374206f6620746865207468726565207261746368657473",
+      "ciphertext_hex": "4db57fc6f131eeec9aac9d6cbd93822d1aed770d09f3aa84813d675ce1ffd77c3736e5741374c1929d72f9025a3464a981a16ee30abf20039c147e4d1cf01cc8824cbfeeff30a6cba02fd1b0fb11622446baff0c27bc657c94301aef0ae57634a75fbc84c4b6f460ad82a976c58a49c66b627a0b98240b5be373dd103ba1e08cf56daf9a42c38f1e2239fb3e4e40956e",
+      "results": [
+        {
+          "enforce_ratchets": false,
+          "plaintext_hex": "7261746368657420766563746f723a20746f20746865206f6c64657374206f6620746865207468726565207261746368657473",
+          "ratchet_id_hex": "b3174f0ec610217325d8"
+        },
+        {
+          "enforce_ratchets": true,
+          "plaintext_hex": "7261746368657420766563746f723a20746f20746865206f6c64657374206f6620746865207468726565207261746368657473",
+          "ratchet_id_hex": "b3174f0ec610217325d8"
+        }
+      ]
+    },
+    {
+      "name": "identity_key",
+      "encrypted_to": "no ratchet: the identity's own X25519 key",
+      "ratchet_public_hex": null,
+      "plaintext_hex": "7261746368657420766563746f723a20746f20746865206964656e74697479206b65792c206e6f2072617463686574",
+      "ciphertext_hex": "f849101f2166a0c2623893f51d0f5e6b809926cac4eb263646b43819384d09432f0bbd89375f8afa7c7eebcfc261ee460e62947139bf22472d4bc4b70e209a51d2301c2b93e47d11ca33c27e687d631fc15ec1922d1e06a51e1607e06351dce59076a485b8001ffb3f23424c9709cda55997a113bfed84836a0e3571aff73018",
+      "results": [
+        {
+          "enforce_ratchets": false,
+          "plaintext_hex": "7261746368657420766563746f723a20746f20746865206964656e74697479206b65792c206e6f2072617463686574",
+          "ratchet_id_hex": null
+        },
+        {
+          "enforce_ratchets": true,
+          "plaintext_hex": null,
+          "ratchet_id_hex": null
+        }
+      ]
+    },
+    {
+      "name": "unlisted_ratchet",
+      "encrypted_to": "a fourth ratchet that is not in the list (unlisted_ratchet)",
+      "ratchet_public_hex": "b9e96b0783de40e31ffbd0095eb6f83f2eb6a795c727407213adfcbc881ed875",
+      "plaintext_hex": "7261746368657420766563746f723a20746f206120726174636865742074686174206973206e6f7420696e20746865206c697374",
+      "ciphertext_hex": "ee6a1fbe2fb693c74bf45b0dc0975684dbcbb6316f47ec4eca783aeec8224e4e37fc9a5fdee2e2aedc2614d96e6e31caca20966f3b7ae2e633aa80a4a786dbb40d40913703067c248cf324415b38809b85f1678221bebd34f1d890cdb932d54d4074411d538e08a03ac9a3dd2d0ce74504530f527d7344dbb158bb40ebdda79ec029a3340fdd957ec323531f8bbf3b04",
+      "results": [
+        {
+          "enforce_ratchets": false,
+          "plaintext_hex": null,
+          "ratchet_id_hex": null
+        },
+        {
+          "enforce_ratchets": true,
+          "plaintext_hex": null,
+          "ratchet_id_hex": null
+        }
+      ]
+    }
+  ],
+  "encrypt_case": {
+    "ratchet_public_hex": "4477d43c1a3468da864f7408460bd9f659ad4cbf97707f0b5c276cebe6c8565b",
+    "ephemeral_private_hex": "58a0f807042513826b60e0b710d96dde6dbacee856ff9f920981d2799e60bb64",
+    "ephemeral_public_hex": "1cc6e2e7dfcc0a81511c010b228cab5d8c16586b7792ddf050a4c0d65e5e4415",
+    "iv_hex": "f28bd934061bcfdc08c97dfb0fd412cd",
+    "plaintext_hex": "7261746368657420766563746f723a2064657465726d696e697374696320656e637279707420746f20746865206e65776573742072617463686574",
+    "ciphertext_hex": "1cc6e2e7dfcc0a81511c010b228cab5d8c16586b7792ddf050a4c0d65e5e4415f28bd934061bcfdc08c97dfb0fd412cd199aa61e9affcd752a8a91e4ce7fe14dd51d5fb5249530169a55b6b498acf659c511132e57e8922da5988f9cb8dffa247fd6d2a18304c4baab39b0b3b572cacebc203a12af6d71bacd1b8f430a731b0d5741e763aa709691c8389241efa09f2c",
+    "shared_key_hex": "12ab4a9226f9ecba38d5487e1ddf44791aecbce1d129c810e51167e754c02d38",
+    "derived_key_hex": "d682b42c90148fbdca52f2f3b4d7455278c20ddd2b5ddc253a07059b6b1d421fef43f7ec55151145638c3e87adba8433eaf92150baff9f45067fea5783cfa4fb"
+  }
+}

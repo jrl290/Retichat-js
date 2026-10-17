@@ -147,6 +147,7 @@ test("a DM pulled late (router handler) is stored at its sent time, among the me
         sGet: storage.sGet, sSet: storage.sSet, LXMF, Date,
         migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
         cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
+        PeerRatchets: { rowAdded() {} },
     });
     ContactStore.init();
     const MsgStore = build("MsgStore", { sGet: storage.sGet, sSet: storage.sSet, Harness, Date });

@@ -180,6 +180,7 @@ function stores(me, storage = memory(), { filter = true } = {}) {
         sGet, sSet, LXMF, Date,
         migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
         cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
+        PeerRatchets: { rowAdded() {} },
     });
     ContactStore.init();
     const GroupStore = build("GroupStore", {
@@ -214,6 +215,7 @@ function recipient({ me = Identity.create(), storage, filter = true } = {}) {
     });
     const destination = new EventEmitter();
     destination.hash = Destination.hash(me, "lxmf", "delivery");
+    destination.decryptSoon = (ciphertext) => me.decrypt(ciphertext);
     const router = new LXMRouter({ registerDestination: () => destination }, me, { filter: s.PrivacyFilter });
     const self = { _onMsg: [], _pendingTickets: new Map(), groups: [], transfers: [] };
     self._handleGroupMessage = (...a) => self.groups.push(a);
@@ -314,7 +316,7 @@ test("the filter is off by default on the web (James, 2026-10-01): never touched
     assert.match(settings, /"Only accept messages from contacts you have explicitly added"/, "the natives' words");
     assert.match(settings, /checked: PrivacyFilter\.on,/);
     assert.match(settings, /onChange: \(e\) => \{ PrivacyFilter\.set\(e\.target\.checked\); \}/, "applied on change, no Save needed");
-    assert.match(methodBody("async connect()"), /new LXMRouter\(this\._rns, IdMgr\.id, \{ filter: PrivacyFilter, tickets: OutboundTickets \}\)/,
+    assert.match(methodBody("async connect()"), /new LXMRouter\(this\._rns, IdMgr\.id, \{ filter: PrivacyFilter, tickets: OutboundTickets, ratchets: OwnRatchets\.store\(ownLxmfDestinationHash\(\)\) \}\)/,
         "the router is built with the filter, so no message arrives before it");
 });
 

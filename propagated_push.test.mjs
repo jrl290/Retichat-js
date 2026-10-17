@@ -108,9 +108,10 @@ function page({ me = Identity.create(), storage = memoryStorage(), node = propag
     self._waitForResponse = (link, request) => node.answer(request);
     let decrypts = 0;
     let parses = 0;
-    const IdMgr = { id: { decrypt: (b) => { decrypts++; return me.decrypt(b); } } };
+    // the delivery destination decrypts (LXMRouter.decryptPropagated)
+    destination.decryptSoon = (b) => { decrypts++; return me.decrypt(b); };
     const counted = new Proxy(LXMessage, { get: (t, k) => (k === "unpackFromBytes" ? (...a) => { parses++; return LXMessage.unpackFromBytes(...a); } : t[k]) });
-    installPropagated(self, { Link, Buffer, LXMessage: counted, MsgPack, IdMgr, console: log, PropagatedHeld: propagatedHeld(storage) });
+    installPropagated(self, { Link, Buffer, LXMessage: counted, MsgPack, console: log, PropagatedHeld: propagatedHeld(storage) });
 
     // rfed.link, as _ensureRfedLink wires it: rfed is `a`, this page `b`.
     const distroBlobs = [];
@@ -345,8 +346,9 @@ test("SPEC §17.14: a pushed message refused whole (its payload repeats a key, o
     assert.deepEqual(answers, [true, true], "taken");
     assert.deepEqual(p.inbox(sender), [], "nothing stored");
     assert.deepEqual(p.emitted, [], "nothing handed to the page");
-    // Every line but the trace of each push's arrival ("rfed.link push path=... bytes=...").
-    const said = [...lines, ...p.logs.slice(appLines)].filter((l) => !/rfed\.link push path=[0-9a-f]+ bytes=/.test(l));
+    // Every line but the trace of each push's arrival ("rfed.link push path=... bytes=...")
+    // and the key that decrypted it ("[RATCHET] decrypt ...").
+    const said = [...lines, ...p.logs.slice(appLines)].filter((l) => !/rfed\.link push path=[0-9a-f]+ bytes=|^\[RATCHET\] /.test(l));
     assert.equal(said.length, 2, `one line each: ${said.join(" | ")}`);
     assert.match(said[0], /refused whole: a map at depth 1 repeats a key \(15\)/);
     assert.match(said[1], /refused: its GROUP_ID is not a str of 32 hex characters/);

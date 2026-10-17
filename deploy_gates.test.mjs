@@ -205,6 +205,16 @@ const commitAll = (dir, message) => {
     git(dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", message);
 };
 
+/** The line deploy.sh's ratchet guard looks for in a ref's app.js: the
+ *  router built with OwnRatchets' store, as app.js turns ratchets on. */
+const RATCHETS_ON = "// new LXMRouter(this._rns, IdMgr.id, { filter, tickets, ratchets: OwnRatchets.store(ownLxmfDestinationHash()) })\n";
+/** Commit, on top of a fixture repo, an app.js that turns ratchets on: the
+ *  marker first, then the page, then `pad` bytes of comment. */
+function commitRatchets(repo, pad = 0) {
+    write(join(repo, "app.js"), RATCHETS_ON + readFileSync(join(repo, "app.js"), "utf8") + (pad ? `// ${"x".repeat(pad)}\n` : ""));
+    commitAll(repo, "ratchets");
+}
+
 /** An LXMF-rust working tree as the suite reads it: tests/ holding the
  *  shared vectors, committed. */
 function lxmfFixture(dir) {
@@ -664,6 +674,7 @@ describe("deploy gates", { concurrency: 2 }, () => {
             const probes = block.replace("STRAY_PROBES=(", "").split(/\s+/).filter(Boolean);
             assert.ok(probes.length >= 30, `probes: ${probes.length}`);
             for (const must of ["debug.html", "debug-standalone.html", "packet.js", "post_interface.js",
+                "destination.js", "link.js", "reticulum.js",
                 "app.js.bak-bug135", "app.js.bak-sendas-20260816", "index.html.bak", "style.css.bak"]) {
                 assert.ok(probes.includes(must), `verify-deploy.sh probes ${must}`);
             }
@@ -994,6 +1005,49 @@ describe("deploy gates", { concurrency: 2 }, () => {
             assert.equal(curlUrls(logs).length, 0);
             assert.deepEqual(snapshot(nodes.root), before);
             assert.ok(!existsSync(join(repo, ".deploy.log")));
+        });
+
+        test("a ref without ratchets, from a checkout whose HEAD has them, is refused before the suite runs or any node is contacted; DEPLOY_ALLOW_PRE_RATCHETS=1 deploys it loudly and the log says so", async () => {
+            const repo = fixtureRepo("deploy-pre-ratchets");
+            const old = git(repo, "rev-parse", "--short", "HEAD").trim();
+            // Far more of app.js after the marker than a pipe holds, so a
+            // check that stops reading at the match fails the pipeline
+            // (SIGPIPE under pipefail) and would see no ratchets at HEAD.
+            commitRatchets(repo, 300_000);
+            const nodes = fakeNodes("deploy-pre-ratchets");
+            const before = snapshot(nodes.root);
+            const { env, logs } = scriptEnv(nodes, { DEPLOY_PLAYWRIGHT_DIR: NO_BROWSER });
+            const r = await run(join(repo, "deploy.sh"), [old, "selectiv"], { env });
+            assert.equal(r.code, 1, r.out);
+            assert.ok(r.out.includes(`${old} has no ratchets; this checkout's HEAD has them.`), r.out);
+            assert.match(r.out, /refusing to take the web back past ratchets/);
+            assert.doesNotMatch(r.out, /Running test suite/);
+            assert.equal(sshCalls(logs).length, 0);
+            assert.equal(curlUrls(logs).length, 0);
+            assert.deepEqual(snapshot(nodes.root), before);
+            assert.ok(!existsSync(join(repo, ".deploy.log")));
+
+            const forced = await run(join(repo, "deploy.sh"), [old, "selectiv"], { env: { ...env, DEPLOY_ALLOW_PRE_RATCHETS: "1" } });
+            assert.equal(forced.code, 0, forced.out);
+            assert.ok(forced.out.includes(`⚠ ${old} has no ratchets and DEPLOY_ALLOW_PRE_RATCHETS=1 — deploying it anyway`), forced.out);
+            assert.match(readFileSync(join(repo, ".deploy.log"), "utf8"), new RegExp(`ref=${old} .*pre_ratchets_override=1 .*verified=1`));
+        });
+
+        test("a ref with ratchets deploys from a checkout with them, unasked; the log records no override", async () => {
+            const repo = fixtureRepo("deploy-with-ratchets");
+            commitRatchets(repo, 300_000);
+            const nodes = fakeNodes("deploy-with-ratchets");
+            const { env } = scriptEnv(nodes, { DEPLOY_PLAYWRIGHT_DIR: NO_BROWSER });
+            const r = await run(join(repo, "deploy.sh"), ["HEAD", "selectiv"], { env });
+            assert.equal(r.code, 0, r.out);
+            assert.doesNotMatch(r.out, /has no ratchets/);
+            assert.match(readFileSync(join(repo, ".deploy.log"), "utf8"), /pre_ratchets_override=0 .*verified=1/);
+        });
+
+        test("the line deploy.sh's ratchet guard looks for is the one app.js turns ratchets on with", () => {
+            assert.match(readFileSync(join(ROOT, "deploy.sh"), "utf8"), /grep 'ratchets: OwnRatchets\\\.store\(' >\/dev\/null/);
+            assert.ok(readFileSync(join(ROOT, "app.js"), "utf8").includes("ratchets: OwnRatchets.store("), "app.js turns ratchets on with it");
+            assert.ok(RATCHETS_ON.includes("ratchets: OwnRatchets.store("), "and the fixtures carry it");
         });
 
         test("a subcommand that fails says why and never prints \"deploy aborted\", which belongs to the deploy flow", async () => {
