@@ -233,6 +233,7 @@ function page(me) {
     const ContactStore = build("ContactStore", {
         sGet, sSet, LXMF, Date, migrateContact: DN.migrateContact, contactName: DN.contactName, shortHash: DN.shortHash,
         cleanDisplayName: DN.clean, acceptMessageNameAt: DN.acceptMessageNameAt,
+        PeerRatchets: { rowAdded() {} },
     });
     ContactStore.init();
     const own = lxmfHash(me);
