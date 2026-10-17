@@ -787,7 +787,7 @@ chromiumTest("the real page: a saved exchange the policy blocks is said from the
         await until("Settings on the exchange field", () => document.activeElement?.id === "cfg-exchange");
         assert.equal(await page.locator("#cfg-exchange-refusal").textContent(), s.exchangeBlocked, "Settings says why");
         const violations = await page.evaluate(() => window.__violations);
-        assert.deepEqual(violations, [`connect-src ${BLOCKED}/v1/interfaces/register`], "one refusal, of the first request; none since");
+        assert.deepEqual(violations, [`connect-src ${BLOCKED}/v1/interfaces/challenge`], "one refusal, of the first request (the challenge, since Stage 1); none since");
         assert.equal(held.length, 1, "the read is still held");
         assert.deepEqual([exchangeHits, pageErrors, elsewhere], [[], [], []], "no exchange reached, no error, nothing left this machine but esm.sh");
         await context.close();

@@ -77,6 +77,13 @@ async function servePage() {
         if (path === "/config.json") { json(res, { exchangeUrl: `http://127.0.0.1:${server.address().port}/exchange` }); return; }
         if (path.startsWith("/exchange/")) {
             for await (const _ of req);
+            // A PHP node without Stage 1 (signed registration) answers the
+            // challenge 404, the one answer on which the page registers
+            // unsigned (post_interface.js); any other answer stops it.
+            if (path === "/exchange/v1/interfaces/challenge") {
+                res.writeHead(404).end();
+                return;
+            }
             if (path === "/exchange/v1/interfaces/register") {
                 json(res, { interface_id: "f".repeat(32), session_token: "e".repeat(64), max_batch_packets: 64, max_packet_bytes: 500, idle_exchange_interval_ms: 100 });
                 return;
