@@ -301,6 +301,30 @@ test("the responder pongs only when its outbound has been quiet for a keepalive 
     assert.equal(wire.length, 1, "a second ping right after is not answered again");
 });
 
+test("the responder answers by the initiator's keepalive, not its own (L73)", () => {
+    // A responder's rtt is max(measured, the initiator's), so its keepalive is
+    // never the shorter one. rfed over the PHP node measured ~1.07 s against
+    // the web's ~0.53 s: gated by its own 220 s it left the web's 109 s pings
+    // unanswered until the web's 218 s stale time closed the link.
+    const { link, wire } = liveLink({ initiator: false });
+    link.status = Link.HANDSHAKE;
+    link.requestTime = Date.now() - 1070;
+    link.destination.rns.activateLink = (l) => { l.status = Link.ACTIVE; };
+    link.onLinkRequestRtt({ data: link.encrypt(MsgPack.pack(0.53)) });
+    link._clearKeepaliveWatchdog();
+    const initiatorK = 0.53 * (Link.KEEPALIVE_MAX / Link.KEEPALIVE_MAX_RTT) * 1000;
+    assert.ok(link.keepalive * 1000 > 2 * initiatorK - 10_000, "the responder's own keepalive is the measured one");
+
+    link.lastOutbound = Date.now() - 30_000;              // spoke inside the initiator's period
+    link.onPacket(pkt(Packet.KEEPALIVE, [0xFF]));
+    assert.equal(wire.length, 0, "recent outbound already told the initiator the link is alive");
+
+    link.lastOutbound = Date.now() - initiatorK - 5_000;  // quiet past the initiator's period, not ours
+    link.onPacket(pkt(Packet.KEEPALIVE, [0xFF]));
+    assert.equal(wire.length, 1, "the initiator's ping went unanswered");
+    assert.deepEqual([...wire[0].data], [0xFE]);
+});
+
 test("an initiator ignores a ping entirely (Link.py:938)", async () => {
     const { link, wire } = liveLink({ initiator: true });
     link.status = Link.STALE;
