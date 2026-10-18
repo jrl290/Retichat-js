@@ -804,6 +804,15 @@ html, body {
 .msg-status.proved      { color: var(--primary); opacity: 1; }
 .msg-status.sent        { color: var(--primary); opacity: 0.7; }
 .msg-status.failed      { color: var(--danger); opacity: 1; }
+/* On the light theme the outgoing bubble is --primary itself, and
+   --text-secondary and --danger come out as dark as it: every mark but the
+   hourglass vanished into the bubble (Retichat-js #2). There they take the
+   bubble's text colour, told apart by glyph and opacity as above, and the
+   failed cross a red pale enough to read on the blue. */
+[data-theme="light"] .msg-row.own .msg-status:is(.sending, .propagated, .sent, .proved) {
+    color: var(--bubble-out-text);
+}
+[data-theme="light"] .msg-row.own .msg-status.failed { color: #FFB8B8; }
 
 .msg-system {
     align-self: center;
