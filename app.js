@@ -76,7 +76,7 @@ import { addInOrder } from "./lib/message_order.js";
 import { bubbleText, enterSends, TOUCH_FIRST } from "./lib/message_text.js";
 import { QUICK_REACTIONS, applyReaction, reactionChips, reactionOf } from "./lib/reactions.js";
 import { exchangeUrlRefusal, exchangeRefusalFromViolation } from "./lib/connect_policy.js";
-import { FIELD_FILE_ATTACHMENTS, isImageAttachment, mimeForName } from "./lib/rns/lxmf/lxmf.js";
+import { FIELD_FILE_ATTACHMENTS, FIELD_IMAGE, isImageAttachment, mimeForName, outgoingImage, setAttachmentFields } from "./lib/rns/lxmf/lxmf.js";
 import {
     applyVisibility, filterChannelChars, initialChannelValue, pasteChannelName,
     regenerateRoot, typeChannelName, validateChannelName, visibilityHint,
@@ -3033,9 +3033,10 @@ const RnsClient = {
         });
     },
 
-    /** The FIELD_FILE_ATTACHMENTS value of an outgoing record, from the bytes
-     *  this tab holds now (sync: _sendPacket packs in the same tick it is
-     *  called). null for a record with none; throws when one is not held. */
+    /** An outgoing record's attachments as [[name, bytes], ...], for
+     *  setAttachmentFields, from the bytes this tab holds now (sync:
+     *  _sendPacket packs in the same tick it is called). null for a record
+     *  with none; throws when one is not held. */
     _attachmentFieldNow(record) {
         if (!record?.attachments?.length) return null;
         return record.attachments.map((meta) => {
@@ -4470,9 +4471,10 @@ const RnsClient = {
      * it. After initialization, one sent while the exchange is down is
      * stored "failed" and never sent. Returns the stored record.
      *
-     * `attachments` ([{name, bytes}], at most MAX_ATTACHMENTS) go as
-     * FIELD_FILE_ATTACHMENTS [[name, bytes], ...] at their original size,
-     * as iOS and Android send them. Each one's MIME type is ours, from its
+     * `attachments` ([{name, bytes}], at most MAX_ATTACHMENTS) go at their
+     * original size, as iOS and Android send them: one photo as FIELD_IMAGE
+     * [type, bytes], the rest as FIELD_FILE_ATTACHMENTS [[name, bytes], ...]
+     * (setAttachmentFields). Each one's MIME type is ours, from its
      * name (mimeForName), never one it came with: a picked file's type is
      * whatever the browser guessed (text/html for a .html), and an object
      * URL of that type opened in a tab runs as this page. A message over
@@ -4515,9 +4517,11 @@ const RnsClient = {
         ContactStore.touch(contact.destHash);
         // Attachments are kept with the record whatever happens to it next
         // (queued, failed or sent): the bubble shows what the user sent.
+        // Each one's field is the one it leaves in (setAttachmentFields).
+        const image = attachments.length ? outgoingImage(attachments.map(a => a.name)) : null;
         const withAttachments = (record) => attachments.length
-            ? this._keepAttachments(MsgStore, contact.destHash, record, attachments.map(a => ({
-                name: a.name, mime: mimeForName(a.name), bytes: a.bytes, field: FIELD_FILE_ATTACHMENTS,
+            ? this._keepAttachments(MsgStore, contact.destHash, record, attachments.map((a, i) => ({
+                name: a.name, mime: mimeForName(a.name), bytes: a.bytes, field: i === image?.index ? FIELD_IMAGE : FIELD_FILE_ATTACHMENTS,
             })))
             : record;
         if (!this._initialized) {
@@ -4699,7 +4703,7 @@ const RnsClient = {
             msg.fields = new Map();
             msg.fields.set(LXMF.FIELD_TICKET, ticket);
             applyDisplayName(msg.fields, record.lxmfName);
-            if (record.attachments?.length) msg.fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));
+            if (record.attachments?.length) setAttachmentFields(msg.fields, this._attachmentFieldNow(record));
             msg.pack(sender.identity, false);
             const lxmfHash = Buffer.from(msg.hash).toString("hex");
             MsgStore.update(contact.destHash, outMsg.id, { lxmfTimestamp: msg.timestamp, lxmfTicket: ticket, lxmfHash });
@@ -4809,7 +4813,7 @@ const RnsClient = {
                 return;
             }
             if (settled(stored())) return;
-            msg.fields.set(FIELD_FILE_ATTACHMENTS, field);
+            setAttachmentFields(msg.fields, field);
         }
         // Pack non-opportunistic so destinationHash is at offset 0.
         // The propagation node reads dest_hash in cleartext from lxmf_data[0..16]
@@ -6432,12 +6436,13 @@ const RnsClient = {
         // decision.
         const record = MsgStore.get(contactHash).find(m => m.id === messageId);
         applyDisplayName(msg.fields, record?.lxmfName);
-        // Its attachments as FIELD_FILE_ATTACHMENTS [[name, bytes], ...], at
-        // their original size, from the bytes this tab holds now (the send
-        // put them there; _dispatchQueued warms a queued one's).
+        // Its attachments at their original size (setAttachmentFields: a
+        // photo as FIELD_IMAGE, the rest as FIELD_FILE_ATTACHMENTS), from
+        // the bytes this tab holds now (the send put them there;
+        // _dispatchQueued warms a queued one's).
         if (record?.attachments?.length) {
             try {
-                msg.fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));
+                setAttachmentFields(msg.fields, this._attachmentFieldNow(record));
             } catch (e) {
                 MsgStore.update(contactHash, messageId, { sendError: e.message });
                 if (onError) onError(messageId);

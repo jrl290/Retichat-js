@@ -38,7 +38,7 @@ import LXMessage from "./lib/rns/lxmf/lxmf_message.js";
 import LXMRouter from "./lib/rns/lxmf/lxmf_router.js";
 import Link from "./lib/rns/link.js";
 import Packet from "./lib/rns/packet.js";
-import { FIELD_FILE_ATTACHMENTS, mimeForName } from "./lib/rns/lxmf/lxmf.js";
+import { FIELD_FILE_ATTACHMENTS, FIELD_IMAGE, attachmentsFromFields, mimeForName, outgoingImage, setAttachmentFields } from "./lib/rns/lxmf/lxmf.js";
 import * as DN from "./lib/display_name.js";
 import { AttachmentStore, attachmentKey, memoryBackend } from "./lib/attachment_store.js";
 import {
@@ -119,7 +119,7 @@ function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = nul
     const timers = [];
     const env = {
         MsgStore, Attachments, attachmentKey, Cryptography, Identity, Buffer, Destination, LXMessage, LXMRouter, Link, Packet,
-        FIELD_FILE_ATTACHMENTS, mimeForName, formatSize, attachmentRefusal, estimatePackedSize, propagationFailure, console: quiet,
+        FIELD_FILE_ATTACHMENTS, FIELD_IMAGE, outgoingImage, setAttachmentFields, mimeForName, formatSize, attachmentRefusal, estimatePackedSize, propagationFailure, console: quiet,
         withoutLocation: strip,
         applyDisplayName: DN.applyToFields, crypto: globalThis.crypto, Harness: { error() {} },
         ContactStore: { allow() {}, touch() {}, setReachable() {}, propagationDelay: (h) => (contacts.get(h)?.isDistro ? 0 : 5), getAll: () => [...contacts.values()] },
@@ -161,7 +161,7 @@ function sender({ backend = memoryBackend({ persistent: true }), perSyncKb = nul
 const contactOf = (identity, extra = {}) => ({ destHash: lxmfHash(identity), publicKey: identity.getPublicKey().toString("hex"), isDistro: false, ...extra });
 const fieldsOf = (packed) => MsgPack.unpack(packed.subarray(96))[3];
 
-test("a DM with attachments goes direct as one Resource carrying 0x05 [[name, bytes], ...] at original size", async () => {
+test("a DM with attachments goes direct as one Resource: the photo as 0x06 [type, bytes], the rest as 0x05 [[name, bytes], ...], at original size", async () => {
     const s = sender();
     const peer = Identity.create();
     const c = contactOf(peer);
@@ -172,14 +172,18 @@ test("a DM with attachments goes direct as one Resource carrying 0x05 [[name, by
     assert.equal(rec.status, "sending");
     assert.equal(rec.content, "", "captionless");
     assert.deepEqual(rec.attachments.map(({ name, mime, size, field }) => ({ name, mime, size, field })), [
-        { name: "IMG_0001.jpg", mime: "image/jpeg", size: 600_000, field: 5 },
+        { name: "IMG_0001.jpg", mime: "image/jpeg", size: 600_000, field: 6 },
         { name: "notes.pdf", mime: "application/pdf", size: 1000, field: 5 },
-    ]);
+    ], "each kept with the field it leaves in");
     const [sent] = s.direct;
     assert.equal(sent.representation, LXMessage.RESOURCE);
-    const field = fieldsOf(sent.packed).get(FIELD_FILE_ATTACHMENTS);
-    assert.deepEqual(field.map(([n, b]) => [n, Buffer.from(b).length]), [["IMG_0001.jpg", 600_000], ["notes.pdf", 1000]]);
-    assert.ok(Buffer.from(field[0][1]).equals(photo.bytes), "the bytes as picked: nothing downscaled");
+    const fields = fieldsOf(sent.packed);
+    assert.deepEqual([...fields.keys()].filter((k) => k === 5 || k === 6), [5, 6]);
+    const field = fields.get(FIELD_FILE_ATTACHMENTS);
+    assert.deepEqual(field.map(([n, b]) => [n, Buffer.from(b).length]), [["notes.pdf", 1000]]);
+    const image = fields.get(FIELD_IMAGE);
+    assert.equal(image[0], "jpg", "MeshChat and Sideband's form: the extension, no image/");
+    assert.ok(Buffer.from(image[1]).equals(photo.bytes), "the bytes as picked: nothing downscaled");
     await settle();
     assert.equal(s.MsgStore.get(c.destHash)[0].attachments[0].stored, "persisted", "kept for the bubble");
 });
@@ -253,11 +257,11 @@ test("a photo leaves without where it was taken: the packed field, the bubble's 
     const rec = s.self.sendMessage(c, "", [photo, doc]);
     const [sent] = s.direct;
     const field = fieldsOf(sent.packed).get(FIELD_FILE_ATTACHMENTS);
-    const left = Buffer.from(field[0][1]);
+    const left = Buffer.from(fieldsOf(sent.packed).get(FIELD_IMAGE)[1]);
     assert.ok(left.equals(cleaned), "the photo that leaves is withoutLocation's");
     assert.deepEqual(sentinelsIn(left), [], "no GPS, XMP or IPTC in it");
     assert.equal(numberOf(readTiff(exifOf(left)).ifd0.get(TAG.Orientation), true), 6, "and it is upright, as picked");
-    assert.ok(Buffer.from(field[1][1]).equals(doc.bytes), "a file that is no photo goes as picked");
+    assert.ok(Buffer.from(field[0][1]).equals(doc.bytes), "a file that is no photo goes as picked");
     assert.deepEqual(rec.attachments.map(({ size, sha256 }) => ({ size, sha256 })), [
         { size: cleaned.length, sha256: Cryptography.fullHash(cleaned).toString("hex") },
         { size: 1000, sha256: Cryptography.fullHash(doc.bytes).toString("hex") },
@@ -296,18 +300,48 @@ test("every attachment passes withoutLocation in RnsClient.sendMessage, before i
     for (const keep of ["MsgStore.add(", "this._keepAttachments("]) assert.ok(at < body.indexOf(keep), `before ${keep}`);
     assert.match(app, /^import \{ withoutLocation \} from "\.\/lib\/photo_metadata\.js";$/m);
     // Every outgoing attachment field is built from the store (_attachmentFieldNow,
-    // _attachmentField), and the one place an outgoing message's attachments
-    // are kept is this method's.
+    // _attachmentField) and written by setAttachmentFields, and the one place an
+    // outgoing message's attachments are kept is this method's.
     assert.equal((app.match(/_keepAttachments\(MsgStore, contact\.destHash,/g) || []).length, 1);
-    assert.deepEqual(app.match(/fields\.set\(FIELD_FILE_ATTACHMENTS, [^;]*;/g), [
-        "fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));",        // _sentHashFor: M packed for its Distro Sync's key 12
-        "fields.set(FIELD_FILE_ATTACHMENTS, field);",                                   // _propagateMessage: field = await this._attachmentField(record)
-        "fields.set(FIELD_FILE_ATTACHMENTS, this._attachmentFieldNow(record));",        // _sendPacket
+    assert.deepEqual(app.match(/setAttachmentFields\(msg\.fields, [^;]*;/g), [
+        "setAttachmentFields(msg.fields, this._attachmentFieldNow(record));",        // _sentHashFor: M packed for its Distro Sync's key 12
+        "setAttachmentFields(msg.fields, field);",                                   // _propagateMessage: field = await this._attachmentField(record)
+        "setAttachmentFields(msg.fields, this._attachmentFieldNow(record));",        // _sendPacket
     ]);
+    assert.equal(app.match(/fields\.set\(FIELD_(FILE_ATTACHMENTS|IMAGE)\b/g), null, "no send writes either field itself");
     assert.match(methodBody("async _propagateMessage(contact, outMsg)"), /field = await this\._attachmentField\(record\);/);
     // The composer holds a picked file as it will leave (the one place a picked file is read).
     assert.match(methodBody("async _addAttachments(chatId, files)"), /const bytes = withoutLocation\(new Uint8Array\(await file\.arrayBuffer\(\)\)\);\s*if \(!bytes\) \{/);
     assert.equal((app.match(/\.arrayBuffer\(\)/g) || []).length, 1);
+});
+
+test("a photo leaves as 0x06, which MeshChat and Sideband show inline: the last picture, the rest as files (James, 2026-10-17)", () => {
+    const pick = (...names) => outgoingImage(names);
+    assert.deepEqual(pick("photo_1.jpg"), { index: 0, type: "jpg" });
+    assert.deepEqual(pick("IMG_0001.JPG"), { index: 0, type: "jpg" }, "lower case");
+    for (const type of ["jpeg", "png", "gif", "webp"]) assert.deepEqual(pick(`a.${type}`), { index: 0, type });
+    // heic: neither a browser's <img> nor Sideband shows it.
+    assert.equal(pick(), null);
+    assert.equal(pick("a.heic", "b.pdf", "jpg", "c.jpg.zip"), null);
+    assert.deepEqual(pick("a.jpg", "b.png", "c.pdf"), { index: 1, type: "png" }, "the last picture");
+
+    // Written and read back: three photos and a file arrive in the order sent.
+    const bytes = (n) => Buffer.from([n]);
+    const sent = [["a.jpg", bytes(1)], ["b.jpg", bytes(2)], ["notes.pdf", bytes(3)], ["c.webp", bytes(4)]];
+    const fields = new Map([[0x0C, "ticket"]]);
+    setAttachmentFields(fields, sent);
+    assert.deepEqual([...fields.keys()], [0x0C, 5, 6], "0x05 then 0x06, after what was there");
+    assert.deepEqual(fields.get(6), ["webp", bytes(4)]);
+    const back = attachmentsFromFields(MsgPack.unpack(MsgPack.pack(fields)));
+    assert.deepEqual(back.map((a) => [a.field, Buffer.from(a.bytes)[0]]), [[5, 1], [5, 2], [5, 3], [6, 4]]);
+    assert.equal(back[3].mime, "image/webp");
+
+    const only = new Map();
+    setAttachmentFields(only, [["IMG_1.jpg", bytes(9)]]);
+    assert.deepEqual([...only.keys()], [6], "one photo: no 0x05 at all");
+    const files = new Map();
+    setAttachmentFields(files, [["a.heic", bytes(1)], ["b.pdf", bytes(2)]]);
+    assert.deepEqual([...files.keys()], [5], "no picture: 0x05 alone, as before");
 });
 
 test("its propagated copy is the same message, attachments and hash, even read back from the store", async () => {
@@ -337,7 +371,8 @@ test("to a distro address: propagated only, with its attachments", async () => {
     await fallback.f();
     await settle();
     assert.equal(s.resources.length, 1);
-    assert.deepEqual(fieldsOf(s.resources[0].subarray(Link.MDU + 1)).get(5).map(([n]) => n), ["x.png"]);
+    const fields = fieldsOf(s.resources[0].subarray(Link.MDU + 1));
+    assert.deepEqual([fields.get(6)[0], Buffer.from(fields.get(6)[1]).length, fields.has(5)], ["png", 2000, false]);
     assert.equal(s.MsgStore.get(c.destHash).find((m) => m.id === rec.id).status, "propagated");
 });
 
@@ -393,7 +428,7 @@ test("a DM queued before initialization (or a reload) is sent with its attachmen
     await settle();
     const [sent] = before.direct;
     assert.ok(sent, "dispatched");
-    assert.equal(Buffer.from(fieldsOf(sent.packed).get(5)[0][1]).length, 30_000);
+    assert.equal(Buffer.from(fieldsOf(sent.packed).get(6)[1]).length, 30_000, "the photo, as 0x06");
     // A boolean: node's assert runs out of memory describing 30 KB of bytes.
     assert.equal(before.Attachments.peek(queued.attachments[0].key) === null, true, "and let go after");
 
