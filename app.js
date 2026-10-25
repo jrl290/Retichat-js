@@ -2192,6 +2192,23 @@ const PrivacyFilter = {
             Harness.event("sent-copy-drop", { src: src.slice(0, 12), path });
             return false;
         }
+        // The same for every other Distro control message (0xFB
+        // "rfed.distro.*": the Distro Sync of a channel join or leave, of
+        // Group actions, a kind this build does not know) that is no group
+        // message: kept, it was a blank direct message from the Distro
+        // Address, a chat row (James, 2026-10-24: none of our sync packets
+        // may make one). Here the web departs from iOS and Android, which
+        // drop only the sent copy. Not the Distro Identity transfer, the one
+        // that goes to a Device Address, which is read as the phones read it
+        // (a malformed one goes on as a message); and beside a group id the
+        // marker means nothing, as on Android (DeliveryPolicy.directRoute):
+        // the group id decides, read as the handler reads it.
+        const distroType = LXMF.distroControlType(LXMessage.routingFields(lxmfMsg));
+        if (distroType !== null && distroType !== LXMF.DISTRO_TRANSFER_TYPE && !LXMessage.groupInfo(lxmfMsg)?.groupId) {
+            console.log(`[retichat] ${path} message from ${src.slice(0, 12)}: DROPPED Distro control message ${distroType} outside Distro Fanout`);
+            Harness.event("distro-control-drop", { src: src.slice(0, 12), path, type: distroType });
+            return false;
+        }
         let accepted;
         if (LXMF.distroTransferKeyFromFields(LXMessage.routingFields(lxmfMsg)) !== null) {
             // An offer the user answers, checked before the allowlist on iOS
@@ -9491,6 +9508,17 @@ const RnsClient = {
                     fromDistro: srcHashHex === myLxmfHash,
                     signedByDistro: srcHashHex === myLxmfHash && signedByDistro(),
                 }) ? true : dropped();
+            }
+
+            // A Distro control message this build does not act on (a kind a
+            // newer client added, or a transfer, which goes to a Device
+            // Address) is no message: until 2026-10-24 it was stored as one,
+            // "[Attachment not available …]" from the Distro Address in the
+            // chat list (James: none of our sync packets may make a chat).
+            const distroType = LXMF.distroControlType(entryFields);
+            if (distroType !== null) {
+                console.log(`[distro] Distro control message ${distroType} from ${srcHashHex.slice(0,12)} is no kind this build acts on — dropped, not a message`);
+                return dropped();
             }
 
             // REACTIONS-DESIGN.md §3 on Distro Fanout: a reaction to a
