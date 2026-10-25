@@ -131,3 +131,5 @@ No `package.json`. No `node_modules`. No build step.
 ## License
 
 MIT, except `lib/rns/`, which is a JavaScript port of Mark Qvist's Reticulum and LXMF and is distributed under the Reticulum License, including its conditions: the software may not be used in systems that can purposefully harm people, or to build AI, machine-learning or language-model training datasets. See [lib/rns/LICENSE](lib/rns/LICENSE).
+
+We follow the license as written. When Mark Qvist introduced the AI condition, he explained that it does not restrict which tools a developer uses ([his reply of 17 April 2025](https://github.com/markqvist/Reticulum/discussions/790#discussioncomment-12871253)).
