@@ -811,7 +811,8 @@ const GROUP_ACTIONS_THAT_RELAY = new Set(["relay_req"]);
 //  surfaces that offer contacts show: the New Conversation list and the
 //  group picker. The chat list (chats()) shows every contact, with "Tap to
 //  chat" until there is a message (iOS createDirectChat, Android
-//  getOrCreateDirectChat: a chat with an empty preview), and every hidden
+//  getOrCreateDirectChat: a chat with an empty preview), placed and dated
+//  by when the user made it a contact, which no announce changes; every hidden
 //  row with a DM conversation (MsgStore records), with its preview, as iOS
 //  and Android show the chat of a sender they accepted without making it a
 //  contact. Such a conversation's contact-info sheet offers "Add contact".
@@ -1022,9 +1023,16 @@ const ContactStore = {
 
     /** The row _put stores for `destHash` (32 lowercase hex): what an
      *  existing row holds, names, key and allowlisting included, with the
-     *  given listing; nothing is stored. */
+     *  given listing; nothing is stored.
+     *
+     *  `listedAt` is when the row became a contact: the time its chat was
+     *  made, which places and dates the chat until it has a message (iOS
+     *  ensureChat, Android getOrCreateDirectChat's createdAt). Listing a row
+     *  that was hidden, or none, sets it; a contact keeps its own. A row
+     *  listed before 2026-10-24 has none, and its chat goes by addedAt. */
     _row(destHash, publicKey, hidden, nameOnly = false, isDistro = false) {
         const existing = this._contacts.get(destHash);
+        const wasListed = !!existing && !existing.hidden;
         return {
             destHash,
             localName: existing?.localName ?? null,
@@ -1040,6 +1048,7 @@ const ContactStore = {
             hidden,
             nameOnly,
             allowlisted: existing?.allowlisted === true,
+            listedAt: hidden || wasListed ? (existing?.listedAt ?? null) : Date.now(),
         };
     },
 
@@ -2181,6 +2190,23 @@ const PrivacyFilter = {
         if (LXMF.distroSentCopyFromFields(LXMessage.routingFields(lxmfMsg)) !== null) {
             console.log(`[retichat] ${path} message from ${src.slice(0, 12)}: DROPPED distro sent-copy marker outside fan-out (RFed SPEC §17.11)`);
             Harness.event("sent-copy-drop", { src: src.slice(0, 12), path });
+            return false;
+        }
+        // The same for every other Distro control message (0xFB
+        // "rfed.distro.*": the Distro Sync of a channel join or leave, of
+        // Group actions, a kind this build does not know) that is no group
+        // message: kept, it was a blank direct message from the Distro
+        // Address, a chat row (James, 2026-10-24: none of our sync packets
+        // may make one). Here the web departs from iOS and Android, which
+        // drop only the sent copy. Not the Distro Identity transfer, the one
+        // that goes to a Device Address, which is read as the phones read it
+        // (a malformed one goes on as a message); and beside a group id the
+        // marker means nothing, as on Android (DeliveryPolicy.directRoute):
+        // the group id decides, read as the handler reads it.
+        const distroType = LXMF.distroControlType(LXMessage.routingFields(lxmfMsg));
+        if (distroType !== null && distroType !== LXMF.DISTRO_TRANSFER_TYPE && !LXMessage.groupInfo(lxmfMsg)?.groupId) {
+            console.log(`[retichat] ${path} message from ${src.slice(0, 12)}: DROPPED Distro control message ${distroType} outside Distro Fanout`);
+            Harness.event("distro-control-drop", { src: src.slice(0, 12), path, type: distroType });
             return false;
         }
         let accepted;
@@ -9484,6 +9510,17 @@ const RnsClient = {
                 }) ? true : dropped();
             }
 
+            // A Distro control message this build does not act on (a kind a
+            // newer client added, or a transfer, which goes to a Device
+            // Address) is no message: until 2026-10-24 it was stored as one,
+            // "[Attachment not available …]" from the Distro Address in the
+            // chat list (James: none of our sync packets may make a chat).
+            const distroType = LXMF.distroControlType(entryFields);
+            if (distroType !== null) {
+                console.log(`[distro] Distro control message ${distroType} from ${srcHashHex.slice(0,12)} is no kind this build acts on — dropped, not a message`);
+                return dropped();
+            }
+
             // REACTIONS-DESIGN.md §3 on Distro Fanout: a reaction to a
             // message of the chat with its source, applied there by the
             // message's LXMF hash, or dropped with one line; never a bubble,
@@ -10891,10 +10928,15 @@ const App = {
 
         // Build unified chat entry list (DMs + groups + channels), sorted
         // by last activity: the latest message's time (lastMessageTime; a
-        // message pulled late keeps the time it was sent).
+        // message pulled late keeps the time it was sent). A DM with no
+        // message goes by when the user made it a contact (listedAt, else
+        // addedAt), never by lastSeen: every announce from the peer sets
+        // lastSeen, and until 2026-10-24 that put a "Tap to chat" row at the
+        // top, dated now, each time the peer announced (James: "opening a
+        // chat"). iOS and Android place an empty chat at the time it was made.
         const entries = [];
         for (const c of dms) {
-            const lastTs = lastMessageTime(MsgStore.get(c.destHash), c.lastSeen);
+            const lastTs = lastMessageTime(MsgStore.get(c.destHash), c.listedAt ?? c.addedAt ?? 0);
             entries.push({ type: "dm", id: c.destHash, name: ContactStore.name(c.destHash),
                 lastTs, data: c, preview: MsgStore.preview(c.destHash) });
         }
@@ -11094,11 +11136,12 @@ const App = {
      *  no message yet (iOS and Android show the empty preview of a chat the
      *  user started); a conversation shows its last message, even one
      *  whose preview is empty (no text, no attachment), never "Tap to
-     *  chat". */
+     *  chat". Its time is its last message's, else when the user made it a
+     *  contact; an announce changes neither (_buildSidebarContent). */
     _buildContactItem(c) {
         const name = ContactStore.name(c.destHash);
         const preview = MsgStore.preview(c.destHash);
-        const lastTs = lastMessageTime(MsgStore.get(c.destHash), c.lastSeen);
+        const lastTs = lastMessageTime(MsgStore.get(c.destHash), c.listedAt ?? c.addedAt ?? 0);
         const isActive = this.state.activeHash === c.destHash;
         const hue = avatarHue(name);
         const avatarText = name.charAt(0).toUpperCase();

@@ -583,6 +583,46 @@ test("no clean-up: a row an older build stored without the hidden key stays a co
     assert.deepEqual([p.ContactStore.isContact(P), chatList(p).length], [true, 1], "keep() leaves a contact a contact");
 });
 
+// ── an announce opens no chat ──────────────────────────────────────────────
+
+test("an announce moves no chat: a contact with no message stays where the user made it, dated so; an older build's listed poster too", async () => {
+    const storage = memoryStorage();
+    const poster = Identity.create(), P = lxmfHash(poster);
+    // As 7af5969 stored a channel poster it listed by itself, at 1000 ms.
+    storage.sSet("contacts_v2", [{ destHash: P, displayName: `?${P.slice(0, 8)}`, publicKey: null, nameCustomized: false,
+        addedAt: 1000, lastSeen: 1000, reachable: null, isDistro: false }]);
+    const p = page({ storage });
+    const sender = Identity.create(), S = lxmfHash(sender);
+    await p.dm(lxm(sender, p.own(), "an hour ago"));
+    // A channel poster's hidden row, made long ago, that the user adds now.
+    const member = Identity.create(), M = lxmfHash(member);
+    assert.equal(channelOf(p)(channelLxmPack(CHANNEL, member, "hello", DN.nameState("Mo")).wire), true);
+    p.ContactStore.get(M).addedAt = 2000;
+    const friend = Identity.create(), F = lxmfHash(friend);
+    const before = Date.now();
+    p.ui.addPeer(F, keyHex(friend));
+    p.ui.addPeer(M);
+
+    const rows = () => p.ui._buildSidebarContent().all(classed("contact-item")).map((e) => ({
+        name: e.find(classed("contact-name")).textContent,
+        time: e.find(classed("contact-time")).textContent,
+        preview: e.find(classed("contact-preview"))?.textContent ?? null,
+    }));
+    const placed = rows();
+    assert.deepEqual(placed.map((r) => r.preview), ["Tap to chat", "Tap to chat", "an hour ago", "Tap to chat"]);
+    assert.deepEqual([placed.slice(0, 2).map((r) => r.name).sort(), placed[2].name, placed[3].name],
+        [[short(F), short(M)].sort(), short(S), short(P)],
+        "the two contacts added now first (the same millisecond, either order), then the conversation, then the old build's row");
+    assert.ok(placed.slice(0, 2).every((r) => Number(r.time) >= before), "a contact is dated when the user added it");
+    assert.equal(placed[3].time, "1000", "the old build's row by when it was made");
+
+    for (const [identity, hash] of [[poster, P], [friend, F], [member, M], [sender, S], [poster, P]]) {
+        p.ContactStore.updateFromAnnounce(hash, { appData: null, identity });
+    }
+    assert.ok(p.ContactStore.get(P).lastSeen > 1000, "the announces were heard");
+    assert.deepEqual(rows(), placed, "and moved no row and dated none anew");
+});
+
 // ── the source: one way in ─────────────────────────────────────────────────
 
 test("a contact is made only by the user: ContactStore.add has one caller, _addContact, and only the user's acts call that", () => {
